@@ -189,6 +189,11 @@ class MerkleProofServiceTests(unittest.TestCase):
     def mine(self) -> dict:
         status, block = self.svc.mine_block()
         self.assertEqual(status, 201, block)
+        # Blocks enter the chain pending; the proof tests target confirmed
+        # blocks, so confirm immediately and hand back the mining response.
+        status, body = self.svc.confirm_block(block["height"])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["status"], "confirmed")
         return block
 
     def test_proof_for_empty_genesis(self) -> None:
@@ -271,6 +276,46 @@ class MerkleProofServiceTests(unittest.TestCase):
         self.assertEqual(self.svc.get_proof(1, "A" * 64)[0], 404)  # uppercase hex
 
 
+class PendingTipRestartTests(unittest.TestCase):
+    """Index rebuild and rollback after a restart with a pending chain tip."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "restart.json")
+        self.ka, self.A = keypair()
+        self.kb, self.B = keypair()
+        self.svc = LedgerService(LedgerStore(self.path), initial_balance=100_000)
+        self.payload = make_tx(self.ka, self.A, self.B, 10)
+        self.assertEqual(self.svc.submit_transaction(self.payload)[0], 202)
+        _, self.block = self.svc.mine_block()
+        self.assertEqual(self.block["status"], "pending")
+        self.tx_id = self.svc.store.chain[1].transactions[0].tx_id
+
+    def test_index_excludes_pending_after_reopen(self) -> None:
+        # Reopen with the tip still pending: no confirmed index entry.
+        reopened = LedgerService(LedgerStore(self.path), initial_balance=100_000)
+        self.assertNotIn(self.tx_id, reopened.store.tx_index)
+        # Accounts only see confirmed blocks, so neither side exists yet.
+        self.assertEqual(reopened.get_account(self.A)[0], 404)
+        self.assertEqual(reopened.get_account(self.B)[0], 404)
+        # The pending tx must not be resubmittable (it lives in the pending tip).
+        self.assertEqual(reopened.submit_transaction(self.payload)[0], 409)
+
+        # Rollback from the reopened state restores the tx to the mempool.
+        status, rb = reopened.rollback_block(self.block["height"])
+        self.assertEqual(status, 200)
+        self.assertEqual(rb["status"], "rolled_back")
+        self.assertIn(self.tx_id, reopened.store.pending)
+        # Restarting once more, the restored mempool survives and the
+        # re-mined block reproduces the original hash.
+        again = LedgerService(LedgerStore(self.path), initial_balance=100_000)
+        self.assertIn(self.tx_id, again.store.pending)
+        _, remined = again.mine_block()
+        self.assertEqual(remined["block_hash"], self.block["block_hash"])
+        self.assertEqual(again.confirm_block(1)[0], 200)
+        self.assertEqual(again.store.tx_index[self.tx_id], 1)
+
+
 class MerkleProofHttpTests(unittest.TestCase):
     """End-to-end checks against the stdlib HTTP server (random local port)."""
 
@@ -314,6 +359,26 @@ class MerkleProofHttpTests(unittest.TestCase):
         status, block = self.request("POST", "/v1/blocks", {})
         self.assertEqual(status, 201)
         height = block["height"]
+        self.assertEqual(block["status"], "pending")
+
+        # A pending block exposes no proof (409) and reports its status.
+        self.assertEqual(self.request("GET", f"/v1/blocks/{height}/proof/{t1['tx_id']}")[0], 409)
+        status, st = self.request("GET", f"/v1/blocks/{height}/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(st, {"height": height, "status": "pending"})
+        # Mining again while the tip is pending is rejected.
+        self.assertEqual(self.request("POST", "/v1/blocks", {})[0], 409)
+
+        # Confirm the tip; the call is idempotent and genesis stays confirmed.
+        status, conf = self.request("POST", f"/v1/blocks/{height}/confirm", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(conf, {"height": height, "status": "confirmed"})
+        self.assertEqual(self.request("POST", f"/v1/blocks/{height}/confirm", {})[0], 200)
+        self.assertEqual(self.request("POST", "/v1/blocks/0/confirm", {})[0], 200)
+        self.assertEqual(self.request("POST", "/v1/blocks/999/confirm", {})[0], 409)
+        status, st = self.request("GET", f"/v1/blocks/{height}/status")
+        self.assertEqual((status, st), (200, {"height": height, "status": "confirmed"}))
+        self.assertEqual(self.request("GET", "/v1/blocks/999/status")[0], 404)
 
         status, proof = self.request("GET", f"/v1/blocks/{height}/proof/{t1['tx_id']}")
         self.assertEqual(status, 200, proof)
@@ -346,6 +411,35 @@ class MerkleProofHttpTests(unittest.TestCase):
         self.assertEqual(self.request("GET", "/v1/accounts/unknown")[0], 404)
         status, dup = self.request("POST", "/v1/transactions", payload1)
         self.assertEqual(status, 409)  # already confirmed
+
+        # Rollback flow over HTTP: mine a pending tip, roll it back, re-mine.
+        payload3 = make_tx(self.ka, self.A, self.B, 3)
+        self.assertEqual(self.request("POST", "/v1/transactions", payload3)[0], 202)
+        status, block3 = self.request("POST", "/v1/blocks", {})
+        self.assertEqual(status, 201)
+        h3 = block3["height"]
+        self.assertEqual(h3, height + 1)
+        # confirmed blocks and unknown heights reject rollback
+        self.assertEqual(self.request("POST", f"/v1/blocks/{height}/rollback", {})[0], 409)
+        self.assertEqual(self.request("POST", "/v1/blocks/999/rollback", {})[0], 404)
+        status, rb = self.request("POST", f"/v1/blocks/{h3}/rollback", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(rb, {"height": h3, "status": "rolled_back"})
+        # block gone; repeated rollback is now a 404
+        self.assertEqual(self.request("GET", f"/v1/blocks/{h3}")[0], 404)
+        self.assertEqual(self.request("GET", f"/v1/blocks/{h3}/status")[0], 404)
+        self.assertEqual(self.request("POST", f"/v1/blocks/{h3}/rollback", {})[0], 404)
+        # restored tx cannot be resubmitted, and re-mining reproduces the hash
+        self.assertEqual(self.request("POST", "/v1/transactions", payload3)[0], 409)
+        status, block3b = self.request("POST", "/v1/blocks", {})
+        self.assertEqual(status, 201)
+        self.assertEqual(block3b["height"], h3)
+        self.assertEqual(block3b["block_hash"], block3["block_hash"])
+        self.assertEqual(self.request("POST", f"/v1/blocks/{h3}/confirm", {})[0], 200)
+        self.assertEqual(
+            self.request("GET", f"/v1/blocks/{h3}/status"),
+            (200, {"height": h3, "status": "confirmed"}),
+        )
 
 
 class CliProofTests(unittest.TestCase):
@@ -383,20 +477,43 @@ class CliProofTests(unittest.TestCase):
         status = self.service.submit_transaction(payload)[0]
         self.assertEqual(status, 202)
         _, block = self.service.mine_block()
-        tx_id = self.service.store.chain[block["height"]].transactions[0].tx_id
+        height = block["height"]
+        tx_id = self.service.store.chain[height].transactions[0].tx_id
 
-        rc, proof, raw = self.run_cli("proof", str(block["height"]), tx_id)
+        # status subcommand: the freshly mined block is pending.
+        rc, st, raw = self.run_cli("status", str(height))
+        self.assertEqual(rc, 0, raw)
+        self.assertEqual(st, {"height": height, "status": "pending"})
+
+        # A pending block exposes no proof (non-2xx -> exit 1, one JSON line).
+        rc, body, _ = self.run_cli("proof", str(height), tx_id)
+        self.assertEqual(rc, 1)
+        self.assertIn("error", body)
+
+        # confirm the tip; confirmation is idempotent.
+        rc, conf, raw = self.run_cli("confirm", str(height))
+        self.assertEqual(rc, 0, raw)
+        self.assertEqual(conf, {"height": height, "status": "confirmed"})
+        rc, conf2, _ = self.run_cli("confirm", str(height))
+        self.assertEqual(rc, 0)
+        self.assertEqual(conf2["status"], "confirmed")
+
+        rc, proof, raw = self.run_cli("proof", str(height), tx_id)
         self.assertEqual(rc, 0, raw)
         self.assertEqual(proof["tx_id"], tx_id)
         self.assertEqual(proof["block_hash"], block["block_hash"])
 
         # Non-2xx still prints JSON and exits 1.
-        rc, body, _ = self.run_cli("proof", str(block["height"]), "a" * 64)
+        rc, body, _ = self.run_cli("proof", str(height), "a" * 64)
         self.assertEqual(rc, 1)
         self.assertIn("error", body)
         rc, _, _ = self.run_cli("proof", "999", tx_id)
         self.assertEqual(rc, 1)
-        rc, _, _ = self.run_cli("proof", str(block["height"]), "malformed")
+        rc, _, _ = self.run_cli("proof", str(height), "malformed")
+        self.assertEqual(rc, 1)
+        rc, _, _ = self.run_cli("status", "999")
+        self.assertEqual(rc, 1)
+        rc, _, _ = self.run_cli("confirm", "999")
         self.assertEqual(rc, 1)
 
         # account subcommand: valid hex account and an encoded special-char
@@ -408,10 +525,28 @@ class CliProofTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(missing["error"], "account not found")
 
-        # block subcommand regression.
-        rc, summary, _ = self.run_cli("block", str(block["height"]))
+        # block subcommand regression, now carrying status.
+        rc, summary, _ = self.run_cli("block", str(height))
         self.assertEqual(rc, 0)
         self.assertEqual(summary["block_hash"], block["block_hash"])
+        self.assertEqual(summary["status"], "confirmed")
+
+        # rollback subcommand against the pending tip.
+        payload2 = make_tx(self.kb, self.B, self.A, 4)
+        self.assertEqual(self.service.submit_transaction(payload2)[0], 202)
+        _, block2 = self.service.mine_block()
+        h2 = block2["height"]
+        rc, _, _ = self.run_cli("rollback", str(height))  # confirmed -> 409
+        self.assertEqual(rc, 1)
+        rc, _, _ = self.run_cli("rollback", "999")  # unknown -> 404
+        self.assertEqual(rc, 1)
+        rc, rb, raw = self.run_cli("rollback", str(h2))
+        self.assertEqual(rc, 0, raw)
+        self.assertEqual(rb, {"height": h2, "status": "rolled_back"})
+        rc, _, _ = self.run_cli("rollback", str(h2))  # repeated -> 404
+        self.assertEqual(rc, 1)
+        rc, _, _ = self.run_cli("status", str(h2))  # block gone -> 404
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

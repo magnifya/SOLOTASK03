@@ -1,4 +1,5 @@
-"""Command line interface: send, mine, block, account, proof subcommands.
+"""Command line interface: send, mine, block, account, proof, confirm,
+rollback and status subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -148,6 +149,27 @@ def cmd_proof(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_confirm(args: argparse.Namespace) -> int:
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/blocks/{args.height}/confirm", {}
+    )
+    return _emit(status, body)
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/blocks/{args.height}/rollback", {}
+    )
+    return _emit(status, body)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/blocks/{args.height}/status", None
+    )
+    return _emit(status, body)
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -183,6 +205,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_proof.add_argument("height", help="block height containing the transaction")
     p_proof.add_argument("tx_id", help="transaction id (64-char hex)")
     p_proof.set_defaults(func=cmd_proof)
+
+    p_confirm = sub.add_parser("confirm", help="confirm the pending chain-tip block")
+    p_confirm.add_argument("height", help="block height to confirm")
+    p_confirm.set_defaults(func=cmd_confirm)
+
+    p_rollback = sub.add_parser("rollback", help="roll back the pending chain-tip block")
+    p_rollback.add_argument("height", help="block height to roll back")
+    p_rollback.set_defaults(func=cmd_rollback)
+
+    p_status = sub.add_parser("status", help="fetch a block's confirmation status")
+    p_status.add_argument("height", help="block height (0 = genesis)")
+    p_status.set_defaults(func=cmd_status)
 
     return parser
 

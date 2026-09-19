@@ -6,6 +6,12 @@ from dataclasses import dataclass
 
 from . import crypto
 
+# Block lifecycle states.
+STATUS_CONFIRMED = "confirmed"
+STATUS_PENDING = "pending"
+# Virtual status reported after a rollback deleted the block.
+STATUS_ROLLED_BACK = "rolled_back"
+
 
 @dataclass
 class Transaction:
@@ -63,10 +69,15 @@ class Block:
     merkle_root: str
     transactions: list[Transaction]
     block_hash: str
+    status: str = STATUS_CONFIRMED
 
     @classmethod
     def create(
-        cls, height: int, prev_hash: str, transactions: list[Transaction]
+        cls,
+        height: int,
+        prev_hash: str,
+        transactions: list[Transaction],
+        status: str = STATUS_CONFIRMED,
     ) -> "Block":
         ordered = sorted(transactions, key=lambda tx: tx.tx_id)
         merkle = crypto.merkle_root([tx.tx_id for tx in ordered])
@@ -77,6 +88,7 @@ class Block:
             merkle_root=merkle,
             transactions=ordered,
             block_hash=block_hash,
+            status=status,
         )
 
     def to_dict(self) -> dict:
@@ -85,17 +97,20 @@ class Block:
             "prev_hash": self.prev_hash,
             "merkle_root": self.merkle_root,
             "block_hash": self.block_hash,
+            "status": self.status,
             "transactions": [tx.to_dict() for tx in self.transactions],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Block":
+        # Files written before the status field existed only held confirmed blocks.
         return cls(
             height=int(data["height"]),
             prev_hash=data["prev_hash"],
             merkle_root=data["merkle_root"],
             block_hash=data["block_hash"],
             transactions=[Transaction.from_dict(t) for t in data["transactions"]],
+            status=data.get("status", STATUS_CONFIRMED),
         )
 
     def to_summary(self) -> dict:
@@ -105,5 +120,6 @@ class Block:
             "block_hash": self.block_hash,
             "prev_hash": self.prev_hash,
             "merkle_root": self.merkle_root,
+            "status": self.status,
             "transaction_ids": [tx.tx_id for tx in self.transactions],
         }

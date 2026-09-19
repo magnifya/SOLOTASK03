@@ -58,6 +58,26 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     self._read_json()
                 status, body = service.mine_block()
                 self._send_json(status, body)
+            elif path.startswith("/v1/blocks/"):
+                # POST /v1/blocks/{height}/confirm | /rollback
+                remainder = path[len("/v1/blocks/") :]
+                action = None
+                height_raw = remainder
+                for suffix in ("/confirm", "/rollback"):
+                    if remainder.endswith(suffix):
+                        action = suffix.lstrip("/")
+                        height_raw = remainder[: -len(suffix)]
+                        break
+                if action is None or not height_raw or "/" in height_raw:
+                    self._send_json(404, {"error": "not found"})
+                    return
+                if self.headers.get("Content-Length"):
+                    self._read_json()
+                if action == "confirm":
+                    status, body = service.confirm_block(unquote(height_raw))
+                else:
+                    status, body = service.rollback_block(unquote(height_raw))
+                self._send_json(status, body)
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -72,6 +92,14 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(404, {"error": "not found"})
                         return
                     status, body = service.get_proof(unquote(height_raw), unquote(tx_raw))
+                    self._send_json(status, body)
+                elif remainder.endswith("/status"):
+                    # GET /v1/blocks/{height}/status
+                    height_raw = remainder[: -len("/status")]
+                    if not height_raw or "/" in height_raw:
+                        self._send_json(404, {"error": "not found"})
+                        return
+                    status, body = service.get_block_status(unquote(height_raw))
                     self._send_json(status, body)
                 else:
                     height = unquote(remainder)
