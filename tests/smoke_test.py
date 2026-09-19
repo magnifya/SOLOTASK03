@@ -45,6 +45,7 @@ def main() -> None:
     status, genesis = svc.get_block(0)
     assert status == 200 and genesis["height"] == 0
     assert genesis["prev_hash"] == "0" * 64 and genesis["transaction_ids"] == []
+    assert genesis["status"] == "confirmed"
 
     # invalid: missing field, non-positive amount, wrong signer
     assert svc.submit_transaction({"from": A})[0] == 400
@@ -56,13 +57,19 @@ def main() -> None:
     _, t2 = svc.submit_transaction(make_tx(ka, A, B, 900))
     assert svc.submit_transaction(make_tx(ka, A, B, 1))[0] == 400
 
-    # mining packs in ascending tx_id order
+    # mining packs in ascending tx_id order; the new block is pending
     status, block = svc.mine_block()
-    assert status == 201 and block["height"] == 1
-    assert svc.mine_block()[0] == 409
+    assert status == 201 and block["height"] == 1 and block["status"] == "pending"
+    assert svc.mine_block()[0] == 409  # tip is pending
     _, stored = svc.get_block(1)
     assert stored["transaction_ids"] == sorted([t1["tx_id"], t2["tx_id"]])
     assert stored["prev_hash"] == genesis["block_hash"]
+    assert stored["status"] == "pending"
+
+    # confirm the tip, then mining with an empty mempool is a 409
+    status, confirmed = svc.confirm_block(1)
+    assert status == 200 and confirmed["status"] == "confirmed"
+    assert svc.mine_block()[0] == 409
 
     # balances
     _, acc_a = svc.get_account(A)
@@ -83,6 +90,7 @@ def main() -> None:
     svc3 = LedgerService(LedgerStore(state_a), initial_balance=1000)
     _, reopened = svc3.get_block(1)
     assert reopened["block_hash"] == block["block_hash"]
+    assert reopened["status"] == "confirmed"
 
     print("smoke test OK")
 

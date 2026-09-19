@@ -189,6 +189,9 @@ class MerkleProofServiceTests(unittest.TestCase):
     def mine(self) -> dict:
         status, block = self.svc.mine_block()
         self.assertEqual(status, 201, block)
+        # Proofs and accounts only cover confirmed blocks.
+        status, body = self.svc.confirm_block(block["height"])
+        self.assertEqual(status, 200, body)
         return block
 
     def test_proof_for_empty_genesis(self) -> None:
@@ -314,6 +317,9 @@ class MerkleProofHttpTests(unittest.TestCase):
         status, block = self.request("POST", "/v1/blocks", {})
         self.assertEqual(status, 201)
         height = block["height"]
+        status, confirmed = self.request("POST", f"/v1/blocks/{height}/confirm", {})
+        self.assertEqual(status, 200, confirmed)
+        self.assertEqual(confirmed["status"], "confirmed")
 
         status, proof = self.request("GET", f"/v1/blocks/{height}/proof/{t1['tx_id']}")
         self.assertEqual(status, 200, proof)
@@ -383,6 +389,7 @@ class CliProofTests(unittest.TestCase):
         status = self.service.submit_transaction(payload)[0]
         self.assertEqual(status, 202)
         _, block = self.service.mine_block()
+        self.service.confirm_block(block["height"])
         tx_id = self.service.store.chain[block["height"]].transactions[0].tx_id
 
         rc, proof, raw = self.run_cli("proof", str(block["height"]), tx_id)

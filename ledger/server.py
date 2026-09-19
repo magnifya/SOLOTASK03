@@ -58,6 +58,20 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     self._read_json()
                 status, body = service.mine_block()
                 self._send_json(status, body)
+            elif path.startswith("/v1/blocks/"):
+                remainder = path[len("/v1/blocks/") :]
+                # POST /v1/blocks/{height}/confirm | /v1/blocks/{height}/rollback
+                if self.headers.get("Content-Length"):
+                    self._read_json()
+                if remainder.endswith("/confirm"):
+                    height = unquote(remainder[: -len("/confirm")])
+                    status, body = service.confirm_block(height)
+                elif remainder.endswith("/rollback"):
+                    height = unquote(remainder[: -len("/rollback")])
+                    status, body = service.rollback_block(height)
+                else:
+                    status, body = 404, {"error": "not found"}
+                self._send_json(status, body)
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -72,6 +86,11 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                         self._send_json(404, {"error": "not found"})
                         return
                     status, body = service.get_proof(unquote(height_raw), unquote(tx_raw))
+                    self._send_json(status, body)
+                elif remainder.endswith("/status"):
+                    # GET /v1/blocks/{height}/status
+                    height = unquote(remainder[: -len("/status")])
+                    status, body = service.get_block_status(height)
                     self._send_json(status, body)
                 else:
                     height = unquote(remainder)
