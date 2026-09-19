@@ -79,6 +79,10 @@ class LedgerStore:
         # Derived, confirmed-only views; rebuilt by rebuild_derived().
         self.tx_index: dict[str, int] = {}
         self.accounts: dict[str, dict] = {}
+        # Verified fork candidates keyed by their tip block hash. Each value is
+        # the candidate chain (a non-empty list[Block] rooted at the canonical
+        # genesis); filled in once fork validation lands.
+        self.forks: dict[str, list[Block]] = {}
         self._lock = threading.RLock()
         self.load()
 
@@ -111,21 +115,22 @@ class LedgerStore:
                 os.makedirs(directory, exist_ok=True)
                 self.chain = [self.create_genesis()]
                 self.pending = {}
+                self.forks = {}
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
                 return
 
-            valid: list[tuple[int, str, list[Block], dict[str, Transaction]]] = []
+            valid: list[tuple[int, str, list[Block], dict[str, Transaction], dict[str, list[Block]]]] = []
             errors: list[StateRecoveryError] = []
             for candidate in candidates:
                 try:
                     data = self._read_candidate(candidate)
-                    parsed = self._parse_snapshot(candidate, data)
+                    chain, pending, forks, generation = self._parse_snapshot(candidate, data)
                 except StateRecoveryError as exc:
                     errors.append(exc)
                     continue
-                valid.append((parsed[2], candidate, parsed[0], parsed[1]))
+                valid.append((generation, candidate, chain, pending, forks))
 
             if not valid:
                 details = "; ".join(f"{exc.path} ({exc.reason})" for exc in errors)
@@ -135,9 +140,9 @@ class LedgerStore:
 
             max_generation = max(item[0] for item in valid)
             top = [item for item in valid if item[0] == max_generation]
-            reference = self._canonical_view(top[0][2], top[0][3])
+            reference = self._canonical_view(top[0][2], top[0][3], top[0][4])
             for item in top[1:]:
-                if self._canonical_view(item[2], item[3]) != reference:
+                if self._canonical_view(item[2], item[3], item[4]) != reference:
                     paths = " vs ".join(item[1] for item in top)
                     raise StateRecoveryError(
                         directory,
@@ -152,7 +157,7 @@ class LedgerStore:
                 if os.path.abspath(item[1]) == main_abs:
                     winner = item
                     break
-            generation, winner_path, chain, pending = winner
+            generation, winner_path, chain, pending, forks = winner
 
             if os.path.abspath(winner_path) != main_abs:
                 # The newest durable state only ever made it to a temp
@@ -162,6 +167,7 @@ class LedgerStore:
 
             self.chain = chain
             self.pending = pending
+            self.forks = forks
             self.generation = generation
             self.rebuild_derived()
             self._cleanup_candidates(directory)
@@ -186,13 +192,19 @@ class LedgerStore:
 
     @staticmethod
     def _canonical_view(
-        chain: list[Block], pending: dict[str, Transaction]
+        chain: list[Block],
+        pending: dict[str, Transaction],
+        forks: dict[str, list[Block]] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection."""
         return json.dumps(
             {
                 "chain": [block.to_dict() for block in chain],
                 "pending": [pending[tx_id].to_dict() for tx_id in sorted(pending)],
+                "forks": [
+                    [block.to_dict() for block in forks[tip]]
+                    for tip in sorted(forks or {})
+                ],
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -237,15 +249,16 @@ class LedgerStore:
 
     def _parse_snapshot(
         self, path: str, data: dict
-    ) -> tuple[list[Block], dict[str, Transaction], int]:
+    ) -> tuple[list[Block], dict[str, Transaction], dict[str, list[Block]], int]:
         """Strictly validate one decoded snapshot.
 
         Checks the persisted generation, consecutive heights, prev_hash
         linkage, recomputed block hashes, recomputed Merkle roots, every
         transaction's tx_id and Ed25519 signature, the pending-only-at-tip
-        rule, and de-duplication between mempool and chain. Returns the parsed
-        chain, mempool and generation. Raises StateRecoveryError on the first
-        defect, with ``path`` identifying the candidate.
+        rule, and de-duplication between mempool and chain. Fork candidates
+        are validated with the same per-block rules. Returns the parsed chain,
+        mempool, fork candidates and generation. Raises StateRecoveryError on
+        the first defect, with ``path`` identifying the candidate.
         """
         def fail(reason: str) -> None:
             raise StateRecoveryError(path, reason)
@@ -265,6 +278,72 @@ class LedgerStore:
         # bool is an int subclass; reject it explicitly along with negatives.
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             fail("state.generation must be a non-negative integer")
+
+        chain, seen_tx_ids = self._validate_chain(path, chain_raw, "block")
+
+        # Mempool: well-formed, no internal duplicates, never overlapping the
+        # chain (neither confirmed nor pending-block transactions).
+        pending: dict[str, Transaction] = {}
+        pending_raw = data.get("pending", [])
+        if not isinstance(pending_raw, list):
+            fail("'pending' must be a list")
+        for tx_raw in pending_raw:
+            if not isinstance(tx_raw, dict):
+                fail("pending entry is not a JSON object")
+            try:
+                tx = Transaction.from_dict(tx_raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                fail(f"pending transaction is malformed: {exc}")
+            self._validate_transaction(path, tx)
+            if tx_raw.get("tx_id") != tx.tx_id:
+                fail(
+                    f"pending transaction has a mismatched tx_id (stored "
+                    f"{tx_raw.get('tx_id')!r}, recomputed {tx.tx_id})"
+                )
+            if tx.tx_id in pending:
+                fail(f"duplicate pending transaction {tx.tx_id} in mempool")
+            if tx.tx_id in seen_tx_ids:
+                fail(
+                    f"pending transaction {tx.tx_id} already exists in a block"
+                )
+            pending[tx.tx_id] = tx
+
+        # Fork candidates: same strict per-chain validation; keyed by tip hash.
+        # They must root at exactly the canonical chain's genesis block.
+        canonical_genesis_hash = chain[0].block_hash
+        forks = self._validate_forks_section(
+            path, data.get("forks", []), fail, canonical_genesis_hash
+        )
+
+        # Cross-check the persisted tip summary against the chain tail.
+        tip = chain[-1]
+        if state.get("height") is not None and state["height"] != tip.height:
+            fail("state.height does not match the chain tip")
+        if state.get("tip_hash") is not None and state["tip_hash"] != tip.block_hash:
+            fail("state.tip_hash does not match the chain tip")
+        if (
+            state.get("tip_status") is not None
+            and state["tip_status"] != tip.status
+        ):
+            fail("state.tip_status does not match the chain tip")
+
+        return chain, pending, forks, generation
+
+    def _validate_chain(
+        self, path: str, chain_raw: object, noun: str
+    ) -> tuple[list[Block], set[str]]:
+        """Validate a serialized chain (canonical or one fork candidate).
+
+        Enforces consecutive heights, prev_hash linkage, known status with
+        pending only at the tip, a fixed empty confirmed genesis, ascending
+        within-block tx_ids unique across the whole chain, stored/recomputed
+        tx_ids, Merkle roots, block hashes and Ed25519 signatures.
+        """
+        def fail(reason: str) -> None:
+            raise StateRecoveryError(path, reason)
+
+        if not isinstance(chain_raw, list) or not chain_raw:
+            fail(f"{noun} chain must be a non-empty list of blocks")
 
         chain: list[Block] = []
         seen_tx_ids: set[str] = set()
@@ -302,7 +381,9 @@ class LedgerStore:
             for j, tx in enumerate(block.transactions):
                 self._validate_transaction(path, tx)
                 stored_tx_id = txs_raw[j].get("tx_id") if isinstance(txs_raw[j], dict) else None
-                if stored_tx_id != tx.tx_id:
+                # tx_id is derivable from the signed message: it may be
+                # omitted, but a present value must match the recomputed id.
+                if stored_tx_id is not None and stored_tx_id != tx.tx_id:
                     fail(
                         f"transaction in block {block.height} has a mismatched "
                         f"tx_id (stored {stored_tx_id!r}, recomputed {tx.tx_id})"
@@ -327,47 +408,37 @@ class LedgerStore:
             if recomputed_hash != block.block_hash:
                 fail(f"block {block.height} block_hash mismatch")
             chain.append(block)
+        return chain, seen_tx_ids
 
-        # Mempool: well-formed, no internal duplicates, never overlapping the
-        # chain (neither confirmed nor pending-block transactions).
-        pending: dict[str, Transaction] = {}
-        pending_raw = data.get("pending", [])
-        if not isinstance(pending_raw, list):
-            fail("'pending' must be a list")
-        for tx_raw in pending_raw:
-            if not isinstance(tx_raw, dict):
-                fail("pending entry is not a JSON object")
-            try:
-                tx = Transaction.from_dict(tx_raw)
-            except (KeyError, TypeError, ValueError) as exc:
-                fail(f"pending transaction is malformed: {exc}")
-            self._validate_transaction(path, tx)
-            if tx_raw.get("tx_id") != tx.tx_id:
+    def _validate_forks_section(
+        self, path: str, forks_raw: object, fail, canonical_genesis_hash: str
+    ) -> dict[str, list[Block]]:
+        """Validate and index the persisted ``forks`` candidate section."""
+        if forks_raw is None:
+            # Snapshots written before forks existed carry no section.
+            return {}
+        if not isinstance(forks_raw, list):
+            fail("'forks' must be a list")
+        forks: dict[str, list[Block]] = {}
+        for i, entry in enumerate(forks_raw):
+            if not isinstance(entry, dict):
+                fail(f"fork candidate at position {i} is not a JSON object")
+            tip_hash = entry.get("tip_hash")
+            if not crypto.is_hex64(tip_hash):
+                fail(f"fork candidate at position {i} has an invalid tip_hash")
+            blocks_raw = entry.get("blocks")
+            chain, _ = self._validate_chain(path, blocks_raw, f"fork {i}")
+            if chain[0].block_hash != canonical_genesis_hash:
                 fail(
-                    f"pending transaction has a mismatched tx_id (stored "
-                    f"{tx_raw.get('tx_id')!r}, recomputed {tx.tx_id})"
+                    f"fork candidate {tip_hash} does not root at the canonical "
+                    "genesis block"
                 )
-            if tx.tx_id in pending:
-                fail(f"duplicate pending transaction {tx.tx_id} in mempool")
-            if tx.tx_id in seen_tx_ids:
-                fail(
-                    f"pending transaction {tx.tx_id} already exists in a block"
-                )
-            pending[tx.tx_id] = tx
-
-        # Cross-check the persisted tip summary against the chain tail.
-        tip = chain[-1]
-        if state.get("height") is not None and state["height"] != tip.height:
-            fail("state.height does not match the chain tip")
-        if state.get("tip_hash") is not None and state["tip_hash"] != tip.block_hash:
-            fail("state.tip_hash does not match the chain tip")
-        if (
-            state.get("tip_status") is not None
-            and state["tip_status"] != tip.status
-        ):
-            fail("state.tip_status does not match the chain tip")
-
-        return chain, pending, generation
+            if chain[-1].block_hash != tip_hash:
+                fail(f"fork candidate {tip_hash} tip_hash does not match its blocks")
+            if tip_hash in forks:
+                fail(f"duplicate fork candidate {tip_hash}")
+            forks[tip_hash] = chain
+        return forks
 
     @staticmethod
     def _validate_transaction(path: str, tx: Transaction) -> None:
@@ -450,6 +521,15 @@ class LedgerStore:
             "pending": [tx.to_dict() for tx in self.pending.values()],
             "index": dict(self.tx_index),
             "accounts": self.accounts,
+            "forks": [
+                {
+                    "tip_hash": tip_hash,
+                    "length": len(self.forks[tip_hash]),
+                    "status": self.forks[tip_hash][-1].status,
+                    "blocks": [block.to_dict() for block in self.forks[tip_hash]],
+                }
+                for tip_hash in sorted(self.forks)
+            ],
         }
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
@@ -528,3 +608,108 @@ class LedgerStore:
         for tx in block.transactions:
             self.pending.setdefault(tx.tx_id, tx)
         return block
+
+    # -- fork candidates ------------------------------------------------------
+
+    def fork_tip_hashes(self) -> list[str]:
+        """Tip hashes of every persisted fork candidate, ascending."""
+        return sorted(self.forks)
+
+    def fork_chain(self, tip_hash: str) -> list[Block] | None:
+        """Return the candidate chain rooted at genesis with the given tip."""
+        return self.forks.get(tip_hash)
+
+    @staticmethod
+    def chain_summary(blocks: list[Block]) -> dict:
+        """The S view: tip_hash, height, length (incl. genesis), tip status."""
+        tip = blocks[-1]
+        return {
+            "tip_hash": tip.block_hash,
+            "height": tip.height,
+            "length": len(blocks),
+            "status": tip.status,
+        }
+
+    def put_fork(self, blocks: list[Block]) -> None:
+        """Persist a validated fork candidate keyed by its tip hash.
+
+        Caller must hold the lock and must have fully validated the chain.
+        Rolls the in-memory registration back if the durable write fails.
+        """
+        tip_hash = blocks[-1].block_hash
+        self.forks[tip_hash] = blocks
+        try:
+            self.save()
+        except BaseException:
+            self.forks.pop(tip_hash, None)
+            raise
+
+    def adopt_fork(self, tip_hash: str) -> list[Block]:
+        """Atomically replace the canonical chain with the candidate fork.
+
+        Transactions confirmed only on the old chain return to the mempool
+        de-duplicated; transactions that lived in the old chain's *pending*
+        tip are dropped (pending transactions never re-enter the pool here).
+        Mempool entries already present on the adopted chain are pruned so
+        chain and pool never overlap. Derived indexes are rebuilt and a new
+        generation is persisted in one atomic write; any failure restores the
+        previous chain, mempool, forks and indexes in memory. Caller must hold
+        the lock; raises KeyError for an unknown tip hash.
+        """
+        new_chain = self.forks[tip_hash]
+        old_chain = self.chain
+        old_pending = dict(self.pending)
+        old_forks = dict(self.forks)
+
+        def confirmed_ids(blocks: list[Block]) -> set[str]:
+            return {
+                tx.tx_id
+                for block in blocks
+                if block.status == STATUS_CONFIRMED
+                for tx in block.transactions
+            }
+
+        new_all_ids = {
+            tx.tx_id for block in new_chain for tx in block.transactions
+        }
+        new_confirmed_ids = confirmed_ids(new_chain)
+        # Transactions unique to the OLD chain's confirmed prefix that are
+        # absent from the whole adopted chain (including its pending tip)
+        # return to the pool. Transactions from the old chain's pending tip
+        # never re-enter the pool ("pending 不入池").
+        restored = [
+            tx
+            for block in old_chain
+            if block.status == STATUS_CONFIRMED
+            for tx in block.transactions
+            if tx.tx_id not in new_all_ids
+        ]
+
+        # The mempool must never overlap the new canonical chain (including a
+        # pending tip): prune every id that is packed on the adopted chain.
+        self.chain = list(new_chain)
+        self.pending = {
+            tx_id: tx
+            for tx_id, tx in self.pending.items()
+            if tx_id not in new_all_ids
+        }
+        # Old-chain-only confirmed transactions return to the pool, deduped.
+        for tx in restored:
+            self.pending.setdefault(tx.tx_id, tx)
+        # The adopted fork is the canonical chain now, not merely a candidate.
+        self.forks.pop(tip_hash, None)
+        # A hash binds the whole ancestry, so any other candidate whose tip
+        # now lands on the canonical chain is fully contained in it: no longer
+        # a fork, drop it. Candidates that diverge remain valid competitors.
+        canonical_hashes = {block.block_hash for block in self.chain}
+        for redundant in [tip for tip, blocks in self.forks.items() if blocks[-1].block_hash in canonical_hashes]:
+            self.forks.pop(redundant, None)
+        try:
+            self.save()
+        except BaseException:
+            self.chain = old_chain
+            self.pending = old_pending
+            self.forks = old_forks
+            self.rebuild_derived()
+            raise
+        return list(new_chain)

@@ -297,3 +297,134 @@ class LedgerService:
             if tx.sender == account:
                 balance -= tx.amount
         return balance
+
+    # -- forks ----------------------------------------------------------------
+
+    def _winner(self, chains: list) -> object:
+        """Longest chain wins; ties break on the smallest tip hash."""
+        return min(chains, key=lambda blocks: (-len(blocks), blocks[-1].block_hash))
+
+    def submit_candidates(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/forks/candidates: validate and register a fork candidate.
+
+        The body is ``{"blocks": [...]}``. Blocks may be submitted as the full
+        chain starting with the canonical genesis block, or starting directly
+        at height 1 (in which case they must connect to the canonical genesis
+        via ``prev_hash``). Every block hash, Merkle root, signature and
+        tx_id ordering is re-verified, tx_ids are unique within the fork,
+        every block but the optional pending tip is confirmed, and replaying
+        the transactions may not overspend an identity's endowment. Returns
+        201 with the chain summary S; malformed candidates yield 400 and a
+        candidate already known (same tip hash) yields 409.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        raw_blocks = payload.get("blocks")
+        if not isinstance(raw_blocks, list) or not raw_blocks:
+            return 400, {"error": "field 'blocks' must be a non-empty list"}
+        if not all(isinstance(block, dict) for block in raw_blocks):
+            return 400, {"error": "every block must be a JSON object"}
+
+        with self.store.lock:
+            genesis_hash = self.store.chain[0].block_hash
+            try:
+                first_height = int(raw_blocks[0]["height"])
+            except (KeyError, TypeError, ValueError):
+                return 400, {"error": "first block has an invalid height"}
+            if isinstance(raw_blocks[0].get("height"), bool):
+                return 400, {"error": "first block has an invalid height"}
+            if first_height == 0:
+                full_raw = list(raw_blocks)
+            elif first_height == 1:
+                # Blocks attach directly to the canonical genesis block.
+                full_raw = [self.store.chain[0].to_dict(), *raw_blocks]
+            else:
+                return 400, {
+                    "error": "candidate must connect to the canonical genesis block"
+                }
+
+            try:
+                blocks, _ = self.store._validate_chain(
+                    "<fork candidate>", full_raw, "candidate"
+                )
+            except ValueError as exc:
+                reason = getattr(exc, "reason", None) or str(exc)
+                return 400, {"error": f"invalid fork candidate: {reason}"}
+            if blocks[0].block_hash != genesis_hash:
+                return 400, {
+                    "error": "candidate genesis block does not match the canonical genesis"
+                }
+            error = self._replay_error(blocks)
+            if error is not None:
+                return 400, {"error": error}
+
+            tip_hash = blocks[-1].block_hash
+            canonical_hashes = {block.block_hash for block in self.store.chain}
+            if tip_hash in self.store.forks or tip_hash in canonical_hashes:
+                return 409, {"error": "fork candidate already exists", "tip_hash": tip_hash}
+            self.store.put_fork(blocks)
+            return 201, self.store.chain_summary(blocks)
+
+    def _replay_error(self, blocks) -> str | None:
+        """Replay a candidate chain; return an error message on overspend."""
+        balances: dict[str, int] = {}
+
+        def balance_of(account: str) -> int:
+            return balances.get(account, self.initial_balance)
+
+        for block in blocks:
+            for tx in block.transactions:
+                if tx.amount > balance_of(tx.sender):
+                    return (
+                        f"replay overspend in block {block.height}: "
+                        f"{tx.sender} spends more than its balance"
+                    )
+                balances[tx.sender] = balance_of(tx.sender) - tx.amount
+                balances[tx.recipient] = balance_of(tx.recipient) + tx.amount
+        return None
+
+    def get_chain(self) -> tuple[int, dict]:
+        """GET /v1/chain.
+
+        Returns the canonical chain summary plus every candidate summary in
+        ascending ``tip_hash`` order, each flagged ``adoptable``. The winner
+        is the longest chain (smallest tip hash on a tie); only a
+        non-canonical winner is adoptable.
+        """
+        with self.store.lock:
+            canonical = self.store.chain
+            candidates = [
+                self.store.forks[tip] for tip in self.store.fork_tip_hashes()
+            ]
+            winner = self._winner([canonical, *candidates])
+            summaries = []
+            for blocks in candidates:
+                summary = self.store.chain_summary(blocks)
+                summary["adoptable"] = blocks is winner
+                summaries.append(summary)
+            return 200, {
+                "canonical": self.store.chain_summary(canonical),
+                "candidates": summaries,
+            }
+
+    def adopt_fork(self, tip_hash: object) -> tuple[int, dict]:
+        """POST /v1/forks/{tip_hash}/adopt.
+
+        Unknown tip hashes return 404; a candidate that is not the current
+        winner (longest chain, smallest tip hash on ties) returns 409.
+        Adoption atomically replaces the canonical chain, bumps the
+        generation and rebuilds the indexes; transactions unique to the old
+        chain are returned to the mempool de-duplicated, except transactions
+        from the old chain's pending tip, which never re-enter the pool.
+        """
+        if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
+            return 404, {"error": "fork candidate not found"}
+        with self.store.lock:
+            blocks = self.store.fork_chain(tip_hash)
+            if blocks is None:
+                return 404, {"error": "fork candidate not found"}
+            winner = self._winner([self.store.chain, *self.store.forks.values()])
+            if blocks is not winner:
+                return 409, {"error": "only the winning fork can be adopted"}
+            new_chain = self.store.adopt_fork(tip_hash)
+            return 200, self.store.chain_summary(new_chain)

@@ -24,6 +24,16 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 
 并发的提交、打包、确认、回滚与启动恢复彼此串行化；写入在落盘前失败时，对应的内存改动会回滚，因此不会超支、重复入池、丢交易或返回未落盘的结果。重启、写入中断、主文件损坏、残留临时文件、哈希/签名错误、重复 pending 之后，next height、账户余额、`confirmed_transactions`、`tx_index`、Merkle proof 与多区块查询保持一致。
 
+## 分叉候选链
+
+除规范链外，服务还接受外部提交的完整候选分叉。分叉摘要 `S = {tip_hash, height, length, status}`，其中 `length` 含创世块。
+
+- **提交候选**：`POST /v1/forks/candidates`，请求体 `{"blocks":[...]}`。每个块含 `height`、`prev_hash`、`merkle_root`、`block_hash`、`status` 与 `transactions`；每笔交易含 `from`、`to`、`amount`、`signature`、`tx_id`（可省略，服务端重算）。`blocks` 可以从创世块开始（必须逐字节等于规范创世块），也可以直接从高度 1 开始（此时 `prev_hash` 必须指向规范创世块）。服务会重新校验高度/`prev_hash` 相连、块哈希、Merkle 根、每笔 Ed25519 签名、块内 `tx_id` 唯一且升序，并按链重放交易确保余额不超支；除末块允许 `pending` 外其余块必须 `confirmed`。合法返回 `201` 与候选 `S`，非法返回 `400`，相同 `tip_hash`（或重提规范链上已有的某一段）返回 `409`。
+- **比较与可采用性**：`GET /v1/chain` 返回 `{"canonical": S, "candidates": [...]}`，候选按 `tip_hash` 升序排列，每个候选 `S` 额外带 `adoptable`。比较规则为**最长优先，同长取最小 `tip_hash`**；规范链本身参与比较，只有非规范的获胜者 `adoptable=true`。
+- **采用**：`POST /v1/forks/{tip_hash}/adopt`。未知 `tip_hash` 返回 `404`，非获胜者返回 `409`，成功返回 `200` 与新规范链的 `S`。采用在一次原子写入中完成：整链替换、`generation` 递增、`tx_index` 与账户视图重建；旧规范链**独有**的已确认交易去重回 mempool，旧链 `pending` 末块中的交易不入池，mempool 中已被新链（含其 pending 末块）包含的交易被剔除。成为规范链前缀的旧候选随之移除，仍然分叉的候选保留。
+
+候选链与规范链在同一份快照中原子持久化（`forks` 段，同样逐块严格校验且必须锚定规范创世块）。重启时丢弃无效候选；若规范链无效或同代快照内容冲突，仍抛 `StateRecoveryError`，绝不静默新建链。
+
 
 ## 实现说明
 
@@ -34,9 +44,9 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 | `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/store.py` | 链、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、启动快照扫描与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询 |
-| `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` 八个子命令 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及分叉候选的提交校验、最长链比较与采用 |
+| `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口（含 `/v1/forks/candidates`、`/v1/chain`、`/v1/forks/{tip_hash}/adopt`） |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` 子命令 |
 
 约定：
 
@@ -98,6 +108,13 @@ curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
 curl -s localhost:8080/v1/blocks/1/status          # -> {"height":1,"status":"pending"}
 curl -s -X POST localhost:8080/v1/blocks/1/confirm  # -> 200 {"height":1,"status":"confirmed"}
 curl -s -X POST localhost:8080/v1/blocks/1/rollback # 仅待定链尾可用
+
+# 分叉候选链
+curl -s localhost:8080/v1/chain                     # -> {"canonical":S,"candidates":[S+adoptable...]}
+curl -s -X POST localhost:8080/v1/forks/candidates \
+  -H 'Content-Type: application/json' \
+  -d '{"blocks":[{...}]}'                            # -> 201 S；非法 400，重复 409
+curl -s -X POST localhost:8080/v1/forks/<tip_hash>/adopt  # 未知 404，非胜者 409，成功 200 S
 ```
 
 ## 命令行
@@ -115,6 +132,10 @@ python -m ledger.cli proof 1 <tx-id-hex>
 python -m ledger.cli status 1
 python -m ledger.cli confirm 1
 python -m ledger.cli rollback 1
+# 分叉候选：JSON 可来自文件（@path 或纯路径）、stdin（-）或内联字符串
+python -m ledger.cli candidates @fork.json
+python -m ledger.cli chain
+python -m ledger.cli adopt <tip-hash-hex>
 # 也可以传已有的签名：send --from <pubkey-hex> --signature <sig-hex> --to ... --amount ...
 ```
 
@@ -128,4 +149,5 @@ python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
+python tests/fork_test.py             # 分叉候选：提交校验、最长链比较、原子采用、重启恢复（service/HTTP/CLI）
 ```

@@ -170,6 +170,39 @@ def cmd_status(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_candidates(args: argparse.Namespace) -> int:
+    # The candidate payload {"blocks": [...]} comes from a file ("@file" or a
+    # plain path), stdin ("-"), or an inline JSON string.
+    source = args.json_arg
+    try:
+        if source == "-":
+            text = sys.stdin.read()
+        elif source.startswith("@") or os.path.exists(source):
+            path = source[1:] if source.startswith("@") else source
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        else:
+            text = source
+        payload = json.loads(text)
+    except (OSError, ValueError) as exc:
+        return _emit(400, {"error": f"cannot read candidates JSON: {exc}"})
+    status, body = _request("POST", f"{args.base_url}/v1/forks/candidates", payload)
+    return _emit(status, body)
+
+
+def cmd_chain(args: argparse.Namespace) -> int:
+    status, body = _request("GET", f"{args.base_url}/v1/chain", None)
+    return _emit(status, body)
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.tip_hash, safe="")
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/forks/{quoted}/adopt", {}
+    )
+    return _emit(status, body)
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -217,6 +250,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="fetch a block's confirm status")
     p_status.add_argument("height", help="block height")
     p_status.set_defaults(func=cmd_status)
+
+    p_candidates = sub.add_parser("candidates", help="submit fork candidate blocks")
+    p_candidates.add_argument("json_arg", help="JSON file (@file / path) with {\"blocks\": [...]}, or - for stdin")
+    p_candidates.set_defaults(func=cmd_candidates)
+
+    p_chain = sub.add_parser("chain", help="fetch canonical chain and fork candidates")
+    p_chain.set_defaults(func=cmd_chain)
+
+    p_adopt = sub.add_parser("adopt", help="adopt a fork candidate by tip hash")
+    p_adopt.add_argument("tip_hash", help="tip block hash of the candidate fork")
+    p_adopt.set_defaults(func=cmd_adopt)
 
     return parser
 

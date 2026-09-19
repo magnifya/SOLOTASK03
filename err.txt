@@ -1,0 +1,1 @@
+ledger state recovery failed: cannot recover ledger state from /tmp/tmp.xFvjjz2Mvg: no valid snapshot candidate found: /tmp/tmp.xFvjjz2Mvg/s.json (block 0 block_hash mismatch)
