@@ -106,6 +106,39 @@ class LedgerService:
                 return 404, {"error": "block not found"}
             return 200, self.store.chain[height_int].to_summary()
 
+    def get_proof(self, height: object, tx_id: object) -> tuple[int, dict]:
+        """Return a Merkle inclusion proof for tx_id at the given height.
+
+        Returns 404 for an unknown height, a malformed height/tx_id, or a
+        transaction absent from that block.
+        """
+        try:
+            height_int = int(height)  # type: ignore[arg-type]
+            if str(height_int) != str(height).strip():
+                raise ValueError
+        except (TypeError, ValueError):
+            return 404, {"error": "block not found"}
+        if not crypto.is_hex64(tx_id):
+            return 404, {"error": "transaction not found"}
+        with self.store.lock:
+            if height_int < 0 or height_int >= len(self.store.chain):
+                return 404, {"error": "block not found"}
+            block = self.store.chain[height_int]
+            tx_ids = [tx.tx_id for tx in block.transactions]
+            try:
+                index = tx_ids.index(tx_id)
+            except ValueError:
+                return 404, {"error": "transaction not found"}
+            siblings = crypto.merkle_proof(tx_ids, index)
+            return 200, {
+                "height": block.height,
+                "tx_id": tx_id,
+                "index": index,
+                "merkle_root": block.merkle_root,
+                "block_hash": block.block_hash,
+                "siblings": siblings,
+            }
+
     # -- accounts -----------------------------------------------------------
 
     def get_account(self, account: str) -> tuple[int, dict]:
