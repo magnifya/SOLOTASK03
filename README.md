@@ -8,12 +8,12 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根 |
+| `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与 Merkle 证明 |
 | `ledger/models.py` | Transaction / Block 模型与确定性区块哈希 |
 | `ledger/store.py` | 链与待打包集合的 JSON 原子持久化、创世区块 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、查询 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` 四个子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` 五个子命令 |
 
 约定：
 
@@ -64,6 +64,12 @@ curl -s -X POST localhost:8080/v1/blocks
 # 查询
 curl -s localhost:8080/v1/blocks/0
 curl -s localhost:8080/v1/accounts/<pubkey-hex>
+
+# 已确认交易的 Merkle 证明（siblings 按叶到根排列，direction 表示兄弟节点
+# 位于拼接哈希的左/右侧；区块不存在、交易不在该高度或 tx_id 格式不符均返回 404）
+curl -s localhost:8080/v1/blocks/1/proof/<tx-id>
+# -> 200 {"height":1,"tx_id":"...","index":0,"merkle_root":"...","block_hash":"...",
+#         "siblings":[{"direction":"right","hash":"<64-hex>"}, ...]}
 ```
 
 ## 命令行
@@ -77,6 +83,7 @@ python -m ledger.cli send --signing-key @alice.pem --to <recipient-pubkey-hex> -
 python -m ledger.cli mine
 python -m ledger.cli block 1
 python -m ledger.cli account <pubkey-hex>
+python -m ledger.cli proof 1 <tx-id>
 # 也可以传已有的签名：send --from <pubkey-hex> --signature <sig-hex> --to ... --amount ...
 ```
 
@@ -87,4 +94,5 @@ python -m ledger.cli account <pubkey-hex>
 ```bash
 python -m compileall -q ledger   # 编译检查
 python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
+python tests/proof_test.py       # Merkle 证明接口与 CLI 的端到端测试
 ```

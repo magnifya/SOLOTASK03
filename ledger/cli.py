@@ -1,4 +1,4 @@
-"""Command line interface: send, mine, block, account subcommands.
+"""Command line interface: send, mine, block, account, proof subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -133,9 +134,18 @@ def cmd_block(args: argparse.Namespace) -> int:
 
 
 def cmd_account(args: argparse.Namespace) -> int:
-    quoted = urllib.request.quote(args.account, safe="")
+    quoted = urllib.parse.quote(args.account, safe="")
     status, body = _request(
         "GET", f"{args.base_url}/v1/accounts/{quoted}", None
+    )
+    return _emit(status, body)
+
+
+def cmd_proof(args: argparse.Namespace) -> int:
+    height = urllib.parse.quote(str(args.height), safe="")
+    tx_id = urllib.parse.quote(str(args.tx_id), safe="")
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/blocks/{height}/proof/{tx_id}", None
     )
     return _emit(status, body)
 
@@ -170,6 +180,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_account = sub.add_parser("account", help="fetch an account")
     p_account.add_argument("account", help="account id (public key hex)")
     p_account.set_defaults(func=cmd_account)
+
+    p_proof = sub.add_parser("proof", help="fetch a Merkle proof for a confirmed transaction")
+    p_proof.add_argument("height", help="block height containing the transaction")
+    p_proof.add_argument("tx_id", help="transaction id (64 hex chars)")
+    p_proof.set_defaults(func=cmd_proof)
 
     return parser
 

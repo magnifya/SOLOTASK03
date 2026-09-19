@@ -64,8 +64,12 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             path = self.path.split("?", 1)[0]
             if path.startswith("/v1/blocks/"):
-                height = unquote(path[len("/v1/blocks/") :])
-                status, body = service.get_block(height)
+                rest = unquote(path[len("/v1/blocks/") :])
+                if "/proof/" in rest:
+                    height, tx_id = rest.split("/proof/", 1)
+                    status, body = service.get_transaction_proof(height, tx_id)
+                else:
+                    status, body = service.get_block(rest)
                 self._send_json(status, body)
             elif path.startswith("/v1/accounts/"):
                 account = unquote(path[len("/v1/accounts/") :])
