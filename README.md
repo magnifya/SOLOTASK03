@@ -52,6 +52,24 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 - **快照与恢复**：候选与 `generation` 一起写入快照；重启时丢弃任何不再合法的候选
   （不会因此报错），而 canonical 链无效或同代快照内容冲突仍抛
   `ledger.store.StateRecoveryError`，绝不静默新建链。
+- **导出候选**：`GET /v1/forks/{tip_hash}/export` 导出已存候选分叉，返回五字段
+  `{tip_hash, height, length, status, blocks}`：前四个摘要字段均描述末块（tip），
+  `blocks` 含创世块、每笔交易的签名与可选的 pending 末块。canonical tip、未知 tip
+  与非法 tip（非 64 位小写十六进制）都返回 `404`。导出的文档可原样提交给
+  `POST /v1/forks/candidates`（即除 `{"blocks":[...]}` 外也接受该五字段格式），
+  节点会按块重算并核对摘要字段，重验失败 `400`，重复 `409`。
+
+## 交易索引
+
+`GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
+查询参数 AND 组合：`tx_id`（64 位小写十六进制）、`account`（匹配 from 或 to）、
+`height`、`limit`、`cursor`；数值参数必须是首位非 0 的十进制（`0` 本身合法），
+`limit` 默认 50、范围 1–200，`cursor` 默认 0，任何非法值返回 `400`。结果按
+`(height, index, tx_id)` 升序，`index` 是交易在块内从 0 起的位置，与 Merkle
+proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过滤后的总数，
+`cursor` 等于总数时返回空页、大于总数返回 `400`；`next_cursor` 是下一页偏移整数，
+没有更多结果时为 `null`。每个 item 含
+`{tx_id, height, block_hash, index, from, to, amount}`。
 
 
 ## 实现说明
@@ -65,7 +83,7 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` 子命令 |
 
 约定：
 
@@ -139,6 +157,14 @@ curl -s localhost:8080/v1/chain
 
 # 采用胜出候选（未知 tip 404，非胜者 409）
 curl -s -X POST localhost:8080/v1/forks/<tip-hash>/adopt
+
+# 导出候选分叉（canonical/未知/非法 tip 均 404）；导出文档可原样再提交 candidates
+curl -s localhost:8080/v1/forks/<tip-hash>/export
+# -> 200 {"tip_hash":"...","height":N,"length":N+1,"status":"...","blocks":[...]}
+
+# 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
+curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
+# -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
 ```
 
 ## 命令行
@@ -162,6 +188,10 @@ python -m ledger.cli rollback 1
 python -m ledger.cli candidates '[{"height":0,...},{"height":1,...}]'
 python -m ledger.cli chain
 python -m ledger.cli adopt <tip-hash>
+
+# 导出候选分叉与确认链交易索引
+python -m ledger.cli export <tip-hash>
+python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--cursor N] [--limit N]
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -175,4 +205,5 @@ python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）�
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
+python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 ```

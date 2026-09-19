@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 from .service import LedgerService
 
@@ -90,9 +90,22 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 self._send_json(404, {"error": "not found"})
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
-            path = self.path.split("?", 1)[0]
+            path, _, query = self.path.partition("?")
             if path == "/v1/chain":
                 status, body = service.get_chain()
+                self._send_json(status, body)
+            elif path == "/v1/index/transactions":
+                # GET /v1/index/transactions?tx_id=&account=&height=&limit=&cursor=
+                params = {
+                    key: values[0]
+                    for key, values in parse_qs(query, keep_blank_values=True).items()
+                }
+                status, body = service.list_transactions(params)
+                self._send_json(status, body)
+            elif path.startswith("/v1/forks/") and path.endswith("/export"):
+                # GET /v1/forks/{tip_hash}/export
+                tip_hash = unquote(path[len("/v1/forks/") : -len("/export")])
+                status, body = service.export_fork(tip_hash)
                 self._send_json(status, body)
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]

@@ -1,5 +1,5 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain and adopt subcommands.
+rollback, status, candidates, chain, adopt, export and index subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -198,6 +198,32 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.tip_hash, safe="")
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/forks/{quoted}/export", None
+    )
+    return _emit(status, body)
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    filters = {
+        "tx_id": args.tx_id,
+        "account": args.account,
+        "height": args.height,
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/index/transactions"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -261,6 +287,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_adopt = sub.add_parser("adopt", help="adopt a candidate fork by tip hash")
     p_adopt.add_argument("tip_hash", help="candidate fork tip block hash")
     p_adopt.set_defaults(func=cmd_adopt)
+
+    p_export = sub.add_parser("export", help="export a candidate fork by tip hash")
+    p_export.add_argument("tip_hash", help="candidate fork tip block hash")
+    p_export.set_defaults(func=cmd_export)
+
+    p_index = sub.add_parser(
+        "index", help="query the confirmed-chain transaction index"
+    )
+    p_index.add_argument("--tx-id", help="filter by transaction id (64-char hex)")
+    p_index.add_argument("--account", help="filter by sender or recipient account")
+    p_index.add_argument("--height", help="filter by block height (decimal)")
+    p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
+    p_index.set_defaults(func=cmd_index)
 
     return parser
 

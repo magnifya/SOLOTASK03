@@ -48,6 +48,19 @@ def _parse_height(height: object) -> int | None:
         return None
 
 
+def _parse_decimal(value: object) -> int | None:
+    """Strict non-negative decimal parse; None when malformed.
+
+    Only ``0`` or a digit string whose first digit is non-zero is accepted:
+    leading zeros, signs, whitespace and non-string types are all rejected.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if value != "0" and (not value.isdigit() or value[0] == "0"):
+        return None
+    return int(value)
+
+
 class LedgerService:
     def __init__(self, store: LedgerStore, initial_balance: int = DEFAULT_INITIAL_BALANCE) -> None:
         self.store = store
@@ -345,6 +358,13 @@ class LedgerService:
             fork = self.store.validate_fork_blocks(blocks_raw)
         except ValueError as exc:
             return 400, {"error": str(exc)}
+        summary = self._fork_summary(fork)
+        # An exported fork (the five-field {tip_hash, height, length, status,
+        # blocks} document) may be resubmitted verbatim; every supplied summary
+        # field is re-verified against the recomputed descriptor.
+        for field in ("tip_hash", "height", "length", "status"):
+            if field in payload and payload[field] != summary[field]:
+                return 400, {"error": f"summary field {field!r} does not match the blocks"}
         tip_hash = fork[-1].block_hash
         with self.store.lock:
             # A tip hash equal to any canonical block hash means the candidate
@@ -415,3 +435,99 @@ class LedgerService:
                 self.store.rebuild_derived()
                 raise
             return 200, self._fork_summary(fork)
+
+    def export_fork(self, tip_hash: object) -> tuple[int, dict]:
+        """GET /v1/forks/{tip_hash}/export — full export of a candidate fork.
+
+        Only stored candidates are exportable: the canonical tip, an unknown
+        tip and a malformed tip hash (not 64 lowercase hex chars) all return
+        404. The response carries exactly five fields — the fork descriptor
+        (tip_hash, height, length, status, all describing the tip block) plus
+        the full block list including the genesis block, every transaction's
+        signature and an optional pending tip — and can be resubmitted to
+        POST /v1/forks/candidates verbatim.
+        """
+        if not crypto.is_hex64(tip_hash):
+            return 404, {"error": "unknown fork tip"}
+        with self.store.lock:
+            fork = self.store.forks.get(tip_hash)
+            if fork is None:
+                return 404, {"error": "unknown fork tip"}
+            body = self._fork_summary(fork)
+            body["blocks"] = [block.to_dict() for block in fork]
+            return 200, body
+
+    # -- transaction index ----------------------------------------------------
+
+    INDEX_DEFAULT_LIMIT = 50
+    INDEX_MAX_LIMIT = 200
+
+    def list_transactions(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/index/transactions — paginated confirmed-chain tx index.
+
+        Pending-tip transactions are excluded. Filters (AND-combined):
+        ``tx_id`` (64 lowercase hex), ``account`` (matches sender or
+        recipient) and ``height``; ``limit`` (default 50, range 1-200) and
+        ``cursor`` (default 0) paginate. Numeric filters must be plain
+        decimals without leading zeros; any malformed value returns 400.
+        Rows are ordered by (height, index, tx_id); ``index`` is the
+        transaction's 0-based position inside its block, matching the Merkle
+        proof index. A cursor beyond the filtered total returns 400, a cursor
+        equal to it returns an empty page.
+        """
+        tx_id = params.get("tx_id")
+        if tx_id is not None and not crypto.is_hex64(tx_id):
+            return 400, {"error": "tx_id must be 64 lowercase hex characters"}
+        account = params.get("account")
+        if account is not None and (not isinstance(account, str) or not account):
+            return 400, {"error": "account must be a non-empty string"}
+
+        height = None
+        if params.get("height") is not None:
+            height = _parse_decimal(params["height"])
+            if height is None:
+                return 400, {"error": "height must be a non-negative decimal"}
+        limit = self.INDEX_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.INDEX_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 200"}
+            limit = parsed
+        cursor = 0
+        if params.get("cursor") is not None:
+            parsed = _parse_decimal(params["cursor"])
+            if parsed is None:
+                return 400, {"error": "cursor must be a non-negative decimal"}
+            cursor = parsed
+
+        with self.store.lock:
+            rows: list[dict] = []
+            for block in self.store.chain:
+                if block.status != STATUS_CONFIRMED:
+                    continue
+                if height is not None and block.height != height:
+                    continue
+                for index, tx in enumerate(block.transactions):
+                    if tx_id is not None and tx.tx_id != tx_id:
+                        continue
+                    if account is not None and account not in (tx.sender, tx.recipient):
+                        continue
+                    rows.append(
+                        {
+                            "tx_id": tx.tx_id,
+                            "height": block.height,
+                            "block_hash": block.block_hash,
+                            "index": index,
+                            "from": tx.sender,
+                            "to": tx.recipient,
+                            "amount": tx.amount,
+                        }
+                    )
+        # Chain order is already (height, index) ascending; the tx_id
+        # tiebreaker is implied because ids are unique within a block.
+        total = len(rows)
+        if cursor > total:
+            return 400, {"error": "cursor is beyond the result set"}
+        items = rows[cursor : cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < total else None
+        return 200, {"items": items, "total": total, "next_cursor": next_cursor}
