@@ -28,6 +28,8 @@ transaction in an empty ledger could never be accepted.
 """
 from __future__ import annotations
 
+import re
+
 from . import crypto
 from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
 from .store import LedgerStore
@@ -35,6 +37,21 @@ from .store import LedgerStore
 DEFAULT_INITIAL_BALANCE = 1_000_000
 
 REQUIRED_TX_FIELDS = ("from", "to", "amount", "signature")
+
+# Strict non-negative decimal with no sign, whitespace or leading zero
+# (the single value "0" is allowed). Query parameters for the transaction
+# index must look exactly like this.
+_DECIMAL_RE = re.compile(r"0|[1-9][0-9]*")
+
+DEFAULT_INDEX_LIMIT = 50
+MAX_INDEX_LIMIT = 200
+
+
+def _strict_decimal(value: object) -> int | None:
+    """Parse a non-negative decimal without a leading zero; None if malformed."""
+    if not isinstance(value, str) or _DECIMAL_RE.fullmatch(value) is None:
+        return None
+    return int(value)
 
 
 def _parse_height(height: object) -> int | None:
@@ -415,3 +432,128 @@ class LedgerService:
                 self.store.rebuild_derived()
                 raise
             return 200, self._fork_summary(fork)
+
+    # -- fork export ---------------------------------------------------------
+
+    def export_fork(self, tip_hash: object) -> tuple[int, dict]:
+        """GET /v1/forks/{tip_hash}/export — export one candidate fork.
+
+        Only a stored *candidate* fork can be exported. The canonical chain
+        (its tip is never held as a candidate), an unknown tip hash, and a
+        malformed (non-64-lowercase-hex) tip hash all return 404. On success
+        the response is the fork descriptor S plus a ``blocks`` array holding
+        every block of the fork (canonical genesis first, signed transactions
+        inline, and an optional pending tip block) in storage form.
+        """
+        if not crypto.is_hex64(tip_hash):
+            return 404, {"error": "unknown fork tip"}
+        with self.store.lock:
+            fork = self.store.forks.get(tip_hash)
+            if fork is None:
+                # Covers both a genuinely unknown tip and the canonical chain,
+                # whose tip is never stored as a candidate.
+                return 404, {"error": "unknown fork tip"}
+            summary = self._fork_summary(fork)
+            summary["blocks"] = [block.to_dict() for block in fork]
+        return 200, summary
+
+    # -- transaction index ----------------------------------------------------
+
+    def get_transaction_index(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/index/transactions — page over confirmed-chain transactions.
+
+        Only confirmed blocks are indexed; a pending tip is excluded. Filters
+        are combined with AND:
+
+        - ``tx_id``  exact 64-char lowercase hex transaction id
+        - ``account`` matches transactions sent *or* received by the account
+        - ``height`` exact block height (strict non-negative decimal)
+        - ``limit``  page size, 1..200 (default 50)
+        - ``cursor`` offset into the *filtered* sequence (default 0)
+
+        Rows are ordered by (height, index-in-block, tx_id) ascending. Any
+        malformed parameter (bad hex/decimal, out-of-range limit) returns 400.
+        ``cursor`` may equal the filtered total (an empty trailing page) but a
+        cursor past the total returns 400. Returns
+        ``{items, total, next_cursor}``; ``next_cursor`` is the next offset or
+        null at the end.
+        """
+        if not isinstance(params, dict):
+            return 400, {"error": "query parameters must be a mapping"}
+
+        f_tx_id = params.get("tx_id")
+        f_account = params.get("account")
+        f_height_raw = params.get("height")
+        f_limit_raw = params.get("limit")
+        f_cursor_raw = params.get("cursor")
+
+        # tx_id must be 64-char lowercase hex when supplied.
+        if f_tx_id is not None:
+            if not crypto.is_hex64(f_tx_id):
+                return 400, {"error": "query 'tx_id' must be 64 lowercase hex chars"}
+        # An account filter is an opaque exact-match string: a value that
+        # matches no identity simply yields an empty page rather than an error.
+        if f_account is not None and (not isinstance(f_account, str) or not f_account):
+            return 400, {"error": "query 'account' must be a non-empty string"}
+
+        f_height = None
+        if f_height_raw is not None:
+            f_height = _strict_decimal(f_height_raw)
+            if f_height is None:
+                return 400, {"error": "query 'height' must be a non-negative decimal integer"}
+
+        limit = DEFAULT_INDEX_LIMIT
+        if f_limit_raw is not None:
+            limit = _strict_decimal(f_limit_raw)
+            if limit is None or not (1 <= limit <= MAX_INDEX_LIMIT):
+                return 400, {
+                    "error": f"query 'limit' must be a decimal integer in 1..{MAX_INDEX_LIMIT}"
+                }
+
+        cursor = 0
+        if f_cursor_raw is not None:
+            cursor = _strict_decimal(f_cursor_raw)
+            if cursor is None:
+                return 400, {"error": "query 'cursor' must be a non-negative decimal integer"}
+
+        with self.store.lock:
+            # Walking the chain in height order and each block in its stored
+            # (tx_id ascending) order yields the required (height, index,
+            # tx_id) ordering with no further sort. Pending blocks are skipped.
+            filtered: list[dict] = []
+            for block in self.store.chain:
+                if block.status != STATUS_CONFIRMED:
+                    continue
+                if f_height is not None and block.height != f_height:
+                    continue
+                block_hash = block.block_hash
+                for index, tx in enumerate(block.transactions):
+                    if f_tx_id is not None and tx.tx_id != f_tx_id:
+                        continue
+                    if f_account is not None and (
+                        tx.sender != f_account and tx.recipient != f_account
+                    ):
+                        continue
+                    filtered.append(
+                        {
+                            "tx_id": tx.tx_id,
+                            "height": block.height,
+                            "block_hash": block_hash,
+                            "index": index,
+                            "from": tx.sender,
+                            "to": tx.recipient,
+                            "amount": tx.amount,
+                        }
+                    )
+
+        total = len(filtered)
+        # cursor == total is a valid (empty) trailing page; beyond it is 400.
+        if cursor > total:
+            return 400, {
+                "error": "query 'cursor' is past the last page",
+                "total": total,
+            }
+        page = filtered[cursor : cursor + limit]
+        end = cursor + len(page)
+        next_cursor = end if end < total else None
+        return 200, {"items": page, "total": total, "next_cursor": next_cursor}

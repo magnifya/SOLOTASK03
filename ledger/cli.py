@@ -198,6 +198,36 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.tip_hash, safe="")
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/forks/{quoted}/export", None
+    )
+    return _emit(status, body)
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    # Only forward the filters the user supplied; the server applies defaults
+    # and strict decimal/hex validation. Values stay verbatim (no int
+    # coercion) so a malformed argument reaches the server and is reported 400.
+    query = {}
+    if args.tx_id is not None:
+        query["tx_id"] = args.tx_id
+    if args.account is not None:
+        query["account"] = args.account
+    if args.height is not None:
+        query["height"] = args.height
+    if args.cursor is not None:
+        query["cursor"] = args.cursor
+    if args.limit is not None:
+        query["limit"] = args.limit
+    suffix = ("?" + urllib.parse.urlencode(query)) if query else ""
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/index/transactions{suffix}", None
+    )
+    return _emit(status, body)
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -261,6 +291,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_adopt = sub.add_parser("adopt", help="adopt a candidate fork by tip hash")
     p_adopt.add_argument("tip_hash", help="candidate fork tip block hash")
     p_adopt.set_defaults(func=cmd_adopt)
+
+    p_export = sub.add_parser("export", help="export a candidate fork by tip hash")
+    p_export.add_argument("tip_hash", help="candidate fork tip block hash (64-char hex)")
+    p_export.set_defaults(func=cmd_export)
+
+    # Index filters stay strings: the server enforces strict decimal format
+    # (no leading zero) and value ranges, so the CLI must not normalise them.
+    p_index = sub.add_parser(
+        "index", help="query the confirmed-chain transaction index"
+    )
+    p_index.add_argument("--tx-id", help="filter by exact transaction id (64-char hex)")
+    p_index.add_argument("--account", help="filter by sender or recipient account id")
+    p_index.add_argument("--height", help="filter by block height (decimal)")
+    p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_index.add_argument("--limit", help="page size 1..200 (default 50)")
+    p_index.set_defaults(func=cmd_index)
 
     return parser
 
