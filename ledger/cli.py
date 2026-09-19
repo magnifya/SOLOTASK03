@@ -1,12 +1,14 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback and status subcommands.
+rollback, status, candidates, chain and adopt subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
 
 Signing a transaction locally is supported through ``send --signing-key``;
 the key may be 32 raw hex bytes or ``@/path/to/ed25519-key.pem``. An already
-produced signature can be passed instead with ``--from/--signature``.
+produced signature can be passed instead with ``--from/--signature``. The
+``candidates`` subcommand takes the candidate fork's block array (or a
+``{"blocks": [...]}`` object) as a single JSON argument.
 """
 from __future__ import annotations
 
@@ -170,6 +172,32 @@ def cmd_status(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_candidates(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(args.blocks_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON payload: {exc}"})
+    # Accept either the bare blocks array or the full {"blocks": [...]} object.
+    body = {"blocks": payload} if isinstance(payload, list) else payload
+    status, resp = _request(
+        "POST", f"{args.base_url}/v1/forks/candidates", body
+    )
+    return _emit(status, resp)
+
+
+def cmd_chain(args: argparse.Namespace) -> int:
+    status, body = _request("GET", f"{args.base_url}/v1/chain", None)
+    return _emit(status, body)
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.tip_hash, safe="")
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/forks/{quoted}/adopt", {}
+    )
+    return _emit(status, body)
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -217,6 +245,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="fetch a block's confirm status")
     p_status.add_argument("height", help="block height")
     p_status.set_defaults(func=cmd_status)
+
+    p_candidates = sub.add_parser(
+        "candidates", help="submit a candidate fork from a blocks JSON array"
+    )
+    p_candidates.add_argument(
+        "blocks_json",
+        help='fork blocks as a JSON array (or a {"blocks": [...]} object)',
+    )
+    p_candidates.set_defaults(func=cmd_candidates)
+
+    p_chain = sub.add_parser("chain", help="fetch the canonical chain and candidate forks")
+    p_chain.set_defaults(func=cmd_chain)
+
+    p_adopt = sub.add_parser("adopt", help="adopt a candidate fork by tip hash")
+    p_adopt.add_argument("tip_hash", help="candidate fork tip block hash")
+    p_adopt.set_defaults(func=cmd_adopt)
 
     return parser
 

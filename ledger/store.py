@@ -19,12 +19,15 @@ with the offending path and reason — a fresh chain is never silently created.
 
 One atomic write persists everything: the chain (each block carries its
 confirm/rollback ``status``), a small ``state`` summary, the mempool
-(``pending``), the confirmed-transaction ``index`` and the confirmed
-``accounts`` activity. Derived data (index/accounts) is *rebuilt* from the
-chain on every load and every save — pending blocks are excluded, so a
-restart never resurrects unconfirmed transactions into balances. A
-re-entrant lock serializes all updates, and a class-wide recovery lock
-serializes startup scans against in-flight writes.
+(``pending``), candidate fork chains (``forks``, each a full block list
+anchored at the canonical genesis and keyed by its tip hash), the
+confirmed-transaction ``index`` and the confirmed ``accounts`` activity.
+Derived data (index/accounts) is *rebuilt* from the chain on every load and
+every save — pending blocks are excluded, so a restart never resurrects
+unconfirmed transactions into balances. Persisted fork candidates are
+re-validated on startup and invalid ones are dropped, while canonical-chain
+invalidity remains fatal. A re-entrant lock serializes all updates, and a
+class-wide recovery lock serializes startup scans against in-flight writes.
 """
 from __future__ import annotations
 
@@ -46,7 +49,7 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 3
+STATE_VERSION = 4
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -69,10 +72,16 @@ class StateRecoveryError(ValueError):
 
 
 class LedgerStore:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, initial_balance: int | None = None) -> None:
         self.path = path
         self.chain: list[Block] = []
         self.pending: dict[str, Transaction] = {}
+        # Candidate fork chains keyed by tip block hash. Each value is the
+        # fork's full block list (including the shared genesis block).
+        self.forks: dict[str, list[Block]] = {}
+        # Per-identity endowment used for candidate replay checks; recorded in
+        # the snapshot so recovery validates against the same convention.
+        self.initial_balance: int | None = initial_balance
         # Monotonic counter bumped on every successful atomic write. It is
         # persisted with each snapshot and lets startup pick the newest one.
         self.generation: int = 0
@@ -111,12 +120,13 @@ class LedgerStore:
                 os.makedirs(directory, exist_ok=True)
                 self.chain = [self.create_genesis()]
                 self.pending = {}
+                self.forks = {}
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
                 return
 
-            valid: list[tuple[int, str, list[Block], dict[str, Transaction]]] = []
+            valid: list[tuple] = []
             errors: list[StateRecoveryError] = []
             for candidate in candidates:
                 try:
@@ -125,7 +135,9 @@ class LedgerStore:
                 except StateRecoveryError as exc:
                     errors.append(exc)
                     continue
-                valid.append((parsed[2], candidate, parsed[0], parsed[1]))
+                valid.append(
+                    (parsed[2], candidate, parsed[0], parsed[1], parsed[3], parsed[4])
+                )
 
             if not valid:
                 details = "; ".join(f"{exc.path} ({exc.reason})" for exc in errors)
@@ -135,9 +147,9 @@ class LedgerStore:
 
             max_generation = max(item[0] for item in valid)
             top = [item for item in valid if item[0] == max_generation]
-            reference = self._canonical_view(top[0][2], top[0][3])
+            reference = self._canonical_view(top[0][2], top[0][3], top[0][4])
             for item in top[1:]:
-                if self._canonical_view(item[2], item[3]) != reference:
+                if self._canonical_view(item[2], item[3], item[4]) != reference:
                     paths = " vs ".join(item[1] for item in top)
                     raise StateRecoveryError(
                         directory,
@@ -152,7 +164,7 @@ class LedgerStore:
                 if os.path.abspath(item[1]) == main_abs:
                     winner = item
                     break
-            generation, winner_path, chain, pending = winner
+            generation, winner_path, chain, pending, forks, winner_init_balance = winner
 
             if os.path.abspath(winner_path) != main_abs:
                 # The newest durable state only ever made it to a temp
@@ -162,7 +174,14 @@ class LedgerStore:
 
             self.chain = chain
             self.pending = pending
+            self.forks = forks
             self.generation = generation
+            # Prefer the endowment recorded by the writer; fall back to the
+            # value this instance was constructed with, and finally to the
+            # service default, so older snapshots without the field still
+            # validate fork replays against the configured endowment.
+            if winner_init_balance is not None:
+                self.initial_balance = winner_init_balance
             self.rebuild_derived()
             self._cleanup_candidates(directory)
 
@@ -186,13 +205,19 @@ class LedgerStore:
 
     @staticmethod
     def _canonical_view(
-        chain: list[Block], pending: dict[str, Transaction]
+        chain: list[Block],
+        pending: dict[str, Transaction],
+        forks: dict[str, list[Block]],
     ) -> str:
         """Order-independent canonical content hash for conflict detection."""
         return json.dumps(
             {
                 "chain": [block.to_dict() for block in chain],
                 "pending": [pending[tx_id].to_dict() for tx_id in sorted(pending)],
+                "forks": [
+                    [block.to_dict() for block in forks[tip]]
+                    for tip in sorted(forks)
+                ],
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -237,15 +262,22 @@ class LedgerStore:
 
     def _parse_snapshot(
         self, path: str, data: dict
-    ) -> tuple[list[Block], dict[str, Transaction], int]:
+    ) -> tuple[
+        list[Block],
+        dict[str, Transaction],
+        int,
+        dict[str, list[Block]],
+        int | None,
+    ]:
         """Strictly validate one decoded snapshot.
 
         Checks the persisted generation, consecutive heights, prev_hash
         linkage, recomputed block hashes, recomputed Merkle roots, every
         transaction's tx_id and Ed25519 signature, the pending-only-at-tip
         rule, and de-duplication between mempool and chain. Returns the parsed
-        chain, mempool and generation. Raises StateRecoveryError on the first
-        defect, with ``path`` identifying the candidate.
+        chain, mempool, generation, candidate forks and the recorded initial
+        balance. Raises StateRecoveryError on the first defect, with ``path``
+        identifying the candidate.
         """
         def fail(reason: str) -> None:
             raise StateRecoveryError(path, reason)
@@ -265,6 +297,13 @@ class LedgerStore:
         # bool is an int subclass; reject it explicitly along with negatives.
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             fail("state.generation must be a non-negative integer")
+        initial_balance = state.get("initial_balance")
+        if initial_balance is not None and (
+            isinstance(initial_balance, bool)
+            or not isinstance(initial_balance, int)
+            or initial_balance <= 0
+        ):
+            fail("state.initial_balance must be a positive integer")
 
         chain: list[Block] = []
         seen_tx_ids: set[str] = set()
@@ -367,7 +406,8 @@ class LedgerStore:
         ):
             fail("state.tip_status does not match the chain tip")
 
-        return chain, pending, generation
+        forks = self._parse_persisted_forks(data.get("forks", []), chain)
+        return chain, pending, generation, forks, initial_balance
 
     @staticmethod
     def _validate_transaction(path: str, tx: Transaction) -> None:
@@ -445,12 +485,20 @@ class LedgerStore:
                 "height": self.chain[-1].height,
                 "tip_hash": self.chain[-1].block_hash,
                 "tip_status": self.chain[-1].status,
+                "initial_balance": self.initial_balance,
             },
             "chain": [block.to_dict() for block in self.chain],
             "pending": [tx.to_dict() for tx in self.pending.values()],
             "index": dict(self.tx_index),
             "accounts": self.accounts,
         }
+        # Only persist a forks section when candidates exist so a chain with
+        # no forks keeps the canonical snapshot layout; loads default to [].
+        if self.forks:
+            data["forks"] = [
+                [block.to_dict() for block in fork]
+                for fork in sorted(self.forks.values(), key=lambda f: f[-1].block_hash)
+            ]
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
         # Hold the class-wide recovery lock while a .ledger-* snapshot exists
@@ -528,3 +576,181 @@ class LedgerStore:
         for tx in block.transactions:
             self.pending.setdefault(tx.tx_id, tx)
         return block
+
+    # -- fork candidates ------------------------------------------------------
+
+    @staticmethod
+    def _valid_tx_fields(tx: Transaction) -> None:
+        """Structural checks shared by candidate submission and recovery."""
+        if not isinstance(tx.sender, str) or not tx.sender:
+            raise ValueError("transaction has an invalid 'from' field")
+        if not isinstance(tx.recipient, str) or not tx.recipient:
+            raise ValueError("transaction has an invalid 'to' field")
+        if isinstance(tx.amount, bool) or not isinstance(tx.amount, int) or tx.amount <= 0:
+            raise ValueError("transaction amount must be a positive integer")
+        if not isinstance(tx.signature, str) or not tx.signature:
+            raise ValueError("transaction is missing a signature")
+
+    def _parse_verified_chain(
+        self, blocks_raw: object, endowment: int, genesis: Block | None = None
+    ) -> list[Block]:
+        """Strictly validate a block list submitted as (or persisted as) a fork.
+
+        The list must start from the canonical genesis block, connect through
+        consecutive heights and prev_hash values, and carry recomputed-correct
+        Merkle roots and block hashes. Transactions must have valid Ed25519
+        signatures, ascending and globally unique tx_ids, and a replay from the
+        per-identity endowment must never overspend. All blocks must be
+        confirmed except an optional pending tip. Raises ValueError on any
+        defect.
+        """
+        if not isinstance(blocks_raw, list) or not blocks_raw:
+            raise ValueError("'blocks' must be a non-empty list")
+        genesis = genesis if genesis is not None else self.chain[0]
+        blocks: list[Block] = []
+        seen_tx_ids: set[str] = set()
+        for i, block_raw in enumerate(blocks_raw):
+            if not isinstance(block_raw, dict):
+                raise ValueError(f"block at position {i} is not a JSON object")
+            try:
+                block = Block.from_dict(block_raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"block {i} is malformed: {exc}") from exc
+            if isinstance(block.height, bool) or block.height != i:
+                raise ValueError(
+                    f"block at position {i} has non-consecutive height {block.height}"
+                )
+            expected_prev = GENESIS_PREV_HASH if i == 0 else blocks[i - 1].block_hash
+            if block.prev_hash != expected_prev:
+                raise ValueError(f"block {i} has a mismatched prev_hash")
+            if block.status not in (STATUS_PENDING, STATUS_CONFIRMED):
+                raise ValueError(f"block {i} has unknown status {block.status!r}")
+            if i == 0:
+                # The candidate must connect to *the* canonical genesis.
+                if (
+                    block.status != STATUS_CONFIRMED
+                    or block.transactions
+                    or block.block_hash != genesis.block_hash
+                    or block.merkle_root != genesis.merkle_root
+                ):
+                    raise ValueError("first block must be the canonical genesis block")
+            elif i < len(blocks_raw) - 1 and block.status == STATUS_PENDING:
+                raise ValueError(f"pending block {i} is not the chain tip")
+
+            txs_raw = block_raw.get("transactions")
+            if not isinstance(txs_raw, list):
+                raise ValueError(f"block {i} transactions must be a list")
+            tx_ids: list[str] = []
+            for j, tx in enumerate(block.transactions):
+                self._valid_tx_fields(tx)
+                if not crypto.verify_signature(tx.sender, tx.message, tx.signature):
+                    raise ValueError(f"block {i} transaction {j} has an invalid signature")
+                stored_id = txs_raw[j].get("tx_id") if isinstance(txs_raw[j], dict) else None
+                if stored_id != tx.tx_id:
+                    raise ValueError(
+                        f"block {i} transaction {j} has a mismatched tx_id"
+                    )
+                if tx.tx_id in seen_tx_ids:
+                    raise ValueError(f"duplicate transaction {tx.tx_id} in candidate")
+                seen_tx_ids.add(tx.tx_id)
+                tx_ids.append(tx.tx_id)
+            if tx_ids != sorted(tx_ids):
+                raise ValueError(f"block {i} transactions are not tx_id sorted")
+            if crypto.merkle_root(tx_ids) != block.merkle_root:
+                raise ValueError(f"block {i} Merkle root mismatch")
+            if (
+                compute_block_hash(block.height, block.prev_hash, block.merkle_root)
+                != block.block_hash
+            ):
+                raise ValueError(f"block {i} block_hash mismatch")
+            blocks.append(block)
+
+        # Replay every transaction from the per-identity endowment; unconfirmed
+        # (pending tip) transactions are included so a candidate can never hide
+        # an overspend behind a pending final block.
+        balances: dict[str, int] = {}
+        for block in blocks:
+            for tx in block.transactions:
+                sender_balance = balances.get(tx.sender, endowment)
+                if sender_balance < tx.amount:
+                    raise ValueError(
+                        f"replay overspend by {tx.sender} in block {block.height}"
+                    )
+                balances[tx.sender] = sender_balance - tx.amount
+                balances[tx.recipient] = balances.get(tx.recipient, endowment) + tx.amount
+        return blocks
+
+    def validate_fork_blocks(self, blocks_raw: object) -> list[Block]:
+        """Validate and parse a candidate fork submitted by a client.
+
+        The blocks must start from the canonical genesis block, connect via
+        consecutive heights and prev_hash, carry correct block hashes and
+        Merkle roots, unique ascending tx_ids with valid Ed25519 signatures and
+        no replay overspend, and be all confirmed except an optional pending
+        tip. Raises ValueError with a descriptive reason on any defect.
+        """
+        endowment = (
+            self.initial_balance if self.initial_balance is not None else 1_000_000
+        )
+        return self._parse_verified_chain(blocks_raw, endowment)
+
+    def _parse_persisted_forks(
+        self, forks_raw: object, canonical_chain: list[Block]
+    ) -> dict[str, list[Block]]:
+        """Parse persisted candidate forks, dropping invalid ones on restart.
+
+        Every stored fork is re-validated exactly like a fresh submission
+        (genesis connection, hashes, Merkle roots, signatures, uniqueness,
+        replay). A fork that no longer validates is silently discarded rather
+        than failing recovery of the canonical chain. Recovery of the canonical
+        chain itself remains strict and still raises StateRecoveryError.
+        """
+        if not isinstance(forks_raw, list):
+            return {}
+        endowment = self.initial_balance if self.initial_balance is not None else 1_000_000
+        genesis = canonical_chain[0]
+        forks: dict[str, list[Block]] = {}
+        for entry in forks_raw:
+            try:
+                fork = self._parse_verified_chain(entry, endowment, genesis)
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not fork or fork[0].block_hash != genesis.block_hash:
+                continue
+            tip_hash = fork[-1].block_hash
+            # The canonical chain (or a strict prefix of it, matched by any
+            # canonical block hash) is never also stored as a candidate.
+            if any(tip_hash == block.block_hash for block in canonical_chain):
+                continue
+            forks.setdefault(tip_hash, fork)
+        return forks
+
+    def replace_chain(self, new_chain: list[Block]) -> None:
+        """Atomically adopt a fork: swap the canonical chain, reconcile the
+        mempool (old-chain-only confirmed transactions return de-duplicated;
+        pending-block transactions never enter the pool) and rebuild indexes.
+        Does not save; the caller persists.
+        """
+        old_confirmed_ids = {
+            tx.tx_id
+            for block in self.chain
+            if block.status == STATUS_CONFIRMED
+            for tx in block.transactions
+        }
+        new_ids = {tx.tx_id for block in new_chain for tx in block.transactions}
+        old_tx_by_id = {
+            tx.tx_id: tx
+            for block in self.chain
+            for tx in block.transactions
+        }
+        # Transactions unique to the superseded chain's confirmed history go
+        # back to the mempool, de-duplicated against anything already queued.
+        # Transactions from the old pending tip are not in old_confirmed_ids,
+        # so they are dropped, never re-enqueued.
+        for tx_id in old_confirmed_ids - new_ids:
+            self.pending.setdefault(tx_id, old_tx_by_id[tx_id])
+        # Transactions now on the adopted chain must leave the mempool.
+        for tx_id in new_ids:
+            self.pending.pop(tx_id, None)
+        self.chain = new_chain
+        self.rebuild_derived()

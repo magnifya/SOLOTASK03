@@ -25,6 +25,35 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 并发的提交、打包、确认、回滚与启动恢复彼此串行化；写入在落盘前失败时，对应的内存改动会回滚，因此不会超支、重复入池、丢交易或返回未落盘的结果。重启、写入中断、主文件损坏、残留临时文件、哈希/签名错误、重复 pending 之后，next height、账户余额、`confirmed_transactions`、`tx_index`、Merkle proof 与多区块查询保持一致。
 
 
+## 候选分叉与采用
+
+除逐笔打包外，还可以整链提交**候选分叉**，由节点校验后按最长链规则选用。
+
+- **提交候选**：`POST /v1/forks/candidates`，请求体 `{"blocks":[...]}`，每个块含
+  `height`、`prev_hash`、`merkle_root`、`block_hash`、`status`、`transactions`，
+  每笔交易含 `from`、`to`、`amount`、`signature`、`tx_id`。候选必须**接 canonical
+  创世块**（第 0 块与 canonical 创世块逐字节一致：高度 0、空交易、已确认），随后
+  逐块高度连续、`prev_hash` 相连。节点逐块重算 `block_hash` 与 Merkle 根、逐笔校验
+  `tx_id` 与 Ed25519 签名，要求块内及全链 `tx_id` 唯一且按 `tx_id` 升序，并按初始
+  余额重放整链确保任何账户都不超支；`status` 只能全部 `confirmed` 或仅末块
+  `pending`。合法返回 `201` 与分叉描述
+  `S = {"tip_hash","height","length","status"}`，其中 `length` **含创世块**；非法
+  候选 `400`，与 canonical 或已存在候选重复（tip_hash 相同）返回 `409`。
+- **查询链视图**：`GET /v1/chain` 返回
+  `{"canonical": S, "candidates": [S,...], "adoptable": [S]}`。候选按
+  `tip_hash` 升序排列；`canonical` 是当前链。`adoptable` 至多一个元素：当某个**非
+  canonical** 候选在比较中胜出时放入它，否则为空。
+- **比较与采用**：链之间「最长优先」，长度相同取 `tip_hash` 最小者。
+  `POST /v1/forks/{tip_hash}/adopt` 采用胜出候选：未知 tip（含非 64 位十六进制）
+  返回 `404`，候选不是当前胜者返回 `409`，成功 `200` 返回新链的 S。采用在**一次
+  原子写入**中替换 canonical 链、单调递增 `generation` 并重建全部索引：旧链独有的
+  **已确认**交易去重后回到待打包集合，旧链 pending 末块与新链已含的交易都不入池；
+  新链若带 pending 末块，该末块同样不进入内存池。
+- **快照与恢复**：候选与 `generation` 一起写入快照；重启时丢弃任何不再合法的候选
+  （不会因此报错），而 canonical 链无效或同代快照内容冲突仍抛
+  `ledger.store.StateRecoveryError`，绝不静默新建链。
+
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：
@@ -33,10 +62,10 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/store.py` | 链、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、启动快照扫描与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询 |
+| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` 八个子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` 子命令 |
 
 约定：
 
@@ -98,6 +127,18 @@ curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
 curl -s localhost:8080/v1/blocks/1/status          # -> {"height":1,"status":"pending"}
 curl -s -X POST localhost:8080/v1/blocks/1/confirm  # -> 200 {"height":1,"status":"confirmed"}
 curl -s -X POST localhost:8080/v1/blocks/1/rollback # 仅待定链尾可用
+
+# 候选分叉（blocks 为完整块数组，第 0 块必须与 canonical 创世块一致）
+curl -s -X POST localhost:8080/v1/forks/candidates \
+  -H 'Content-Type: application/json' \
+  -d '{"blocks":[{...genesis...},{...block1...}]}'
+# -> 201 {"tip_hash":"...","height":1,"length":2,"status":"confirmed"}；非法 400，重复 409
+
+# 链视图：canonical、按 tip_hash 升序的 candidates、非 canonical 胜者 adoptable
+curl -s localhost:8080/v1/chain
+
+# 采用胜出候选（未知 tip 404，非胜者 409）
+curl -s -X POST localhost:8080/v1/forks/<tip-hash>/adopt
 ```
 
 ## 命令行
@@ -116,6 +157,11 @@ python -m ledger.cli status 1
 python -m ledger.cli confirm 1
 python -m ledger.cli rollback 1
 # 也可以传已有的签名：send --from <pubkey-hex> --signature <sig-hex> --to ... --amount ...
+
+# 候选分叉：candidates 参数为块数组（或 {"blocks":[...]} 对象）的 JSON
+python -m ledger.cli candidates '[{"height":0,...},{"height":1,...}]'
+python -m ledger.cli chain
+python -m ledger.cli adopt <tip-hash>
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -128,4 +174,5 @@ python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
+python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 ```

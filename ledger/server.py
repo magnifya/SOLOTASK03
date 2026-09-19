@@ -52,6 +52,20 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_transaction(payload)
                 self._send_json(status, body)
+            elif path == "/v1/forks/candidates":
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.submit_fork_candidate(payload)
+                self._send_json(status, body)
+            elif path.startswith("/v1/forks/") and path.endswith("/adopt"):
+                # POST /v1/forks/{tip_hash}/adopt — a body is not required.
+                if self.headers.get("Content-Length"):
+                    self._read_json()
+                tip_hash = unquote(path[len("/v1/forks/") : -len("/adopt")])
+                status, body = service.adopt_fork(tip_hash)
+                self._send_json(status, body)
             elif path == "/v1/blocks":
                 # A body is not required; drain one if present.
                 if self.headers.get("Content-Length"):
@@ -77,7 +91,10 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             path = self.path.split("?", 1)[0]
-            if path.startswith("/v1/blocks/"):
+            if path == "/v1/chain":
+                status, body = service.get_chain()
+                self._send_json(status, body)
+            elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
                 if "/proof/" in remainder:
                     # GET /v1/blocks/{height}/proof/{tx_id}

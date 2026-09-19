@@ -52,6 +52,10 @@ class LedgerService:
     def __init__(self, store: LedgerStore, initial_balance: int = DEFAULT_INITIAL_BALANCE) -> None:
         self.store = store
         self.initial_balance = initial_balance
+        # Record the endowment convention so persisted fork replay checks and
+        # recovery use the same value the service was configured with.
+        if self.store.initial_balance is None:
+            self.store.initial_balance = initial_balance
 
     # -- transactions -------------------------------------------------------
 
@@ -297,3 +301,117 @@ class LedgerService:
             if tx.sender == account:
                 balance -= tx.amount
         return balance
+
+    # -- fork candidates -----------------------------------------------------
+
+    @staticmethod
+    def _fork_summary(blocks: list) -> dict:
+        """Public fork descriptor S: tip_hash, height, length, status."""
+        tip = blocks[-1]
+        return {
+            "tip_hash": tip.block_hash,
+            "height": tip.height,
+            # The length counts every block including the genesis block.
+            "length": len(blocks),
+            "status": tip.status,
+        }
+
+    def _winning_fork(self) -> tuple[str, list]:
+        """Pick the winner among the canonical chain and every candidate.
+
+        Longest chain wins; equal lengths are broken by the smallest tip hash
+        (lexicographic hex order). Returns (tip_hash, block list).
+        """
+        contenders: list[tuple[str, list]] = [
+            (self.store.tip_hash(), self.store.chain)
+        ]
+        contenders.extend(self.store.forks.items())
+        contenders.sort(key=lambda item: (-len(item[1]), item[0]))
+        return contenders[0]
+
+    def submit_fork_candidate(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/forks/candidates — validate and store a candidate fork.
+
+        Returns 201 with the fork descriptor S. Malformed or invalid forks
+        return 400; a fork already known (identical to the canonical tip or an
+        existing candidate tip) returns 409.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        blocks_raw = payload.get("blocks")
+        if not isinstance(blocks_raw, list):
+            return 400, {"error": "missing field: blocks (must be a list)"}
+        try:
+            fork = self.store.validate_fork_blocks(blocks_raw)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
+        tip_hash = fork[-1].block_hash
+        with self.store.lock:
+            # A tip hash equal to any canonical block hash means the candidate
+            # is exactly the canonical chain or a prefix of it (the block hash
+            # binds height, parent and Merkle root), so it carries nothing new.
+            if any(tip_hash == block.block_hash for block in self.store.chain):
+                return 409, {"error": "fork is identical to the canonical chain"}
+            if tip_hash in self.store.forks:
+                return 409, {"error": "candidate fork already exists", "tip_hash": tip_hash}
+            self.store.forks[tip_hash] = fork
+            try:
+                self.store.save()
+            except BaseException:
+                self.store.forks.pop(tip_hash, None)
+                raise
+        return 201, self._fork_summary(fork)
+
+    def get_chain(self) -> tuple[int, dict]:
+        """GET /v1/chain — canonical chain, candidates sorted by tip hash and
+        the adoptable winner (a non-canonical chain that beats canonical).
+        """
+        with self.store.lock:
+            canonical = self._fork_summary(self.store.chain)
+            candidates = [
+                self._fork_summary(self.store.forks[tip])
+                for tip in sorted(self.store.forks)
+            ]
+            winner_tip, winner_chain = self._winning_fork()
+            adoptable: list[dict] = []
+            if winner_tip != self.store.tip_hash():
+                adoptable.append(self._fork_summary(winner_chain))
+            return 200, {
+                "canonical": canonical,
+                "candidates": candidates,
+                "adoptable": adoptable,
+            }
+
+    def adopt_fork(self, tip_hash: object) -> tuple[int, dict]:
+        """POST /v1/forks/{tip_hash}/adopt — atomically switch to the winner.
+
+        Unknown tips return 404; adopting anything other than the current
+        winning (longest / smallest-tip-hash) chain returns 409. Adoption
+        replaces the canonical chain and mempool in one atomic write that
+        advances the generation and rebuilds all indexes; transactions unique
+        to the old chain's confirmed history return to the mempool, while
+        pending-block transactions never enter it.
+        """
+        if not crypto.is_hex64(tip_hash):
+            return 404, {"error": "unknown fork tip"}
+        with self.store.lock:
+            fork = self.store.forks.get(tip_hash)
+            if fork is None:
+                return 404, {"error": "unknown fork tip"}
+            winner_tip, _ = self._winning_fork()
+            if winner_tip != tip_hash:
+                return 409, {"error": "only the winning fork can be adopted"}
+            old_chain = self.store.chain
+            old_pending = dict(self.store.pending)
+            self.store.forks.pop(tip_hash)
+            self.store.replace_chain(fork)
+            try:
+                self.store.save()
+            except BaseException:
+                # Restore the pre-adoption in-memory state on a failed write.
+                self.store.chain = old_chain
+                self.store.pending = old_pending
+                self.store.forks[tip_hash] = fork
+                self.store.rebuild_derived()
+                raise
+            return 200, self._fork_summary(fork)
