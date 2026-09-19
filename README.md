@@ -11,6 +11,20 @@
 
 GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404。账户只统计已确认区块：balance 额外扣除待定块中自己的支出，但不计入待定收入；只出现在待定块中的账户查询返回 404。链、状态、待打包集合、交易索引与账户视图在一次原子写入中落盘，落盘后才响应；重启时从链重建索引（排除待定块）并校验 prev_hash 链接，杜绝孤儿块。
 
+## 多区块一致性与崩溃恢复
+
+每次成功的原子写入都把单调递增的 `generation` 写入快照。写入流程是：在主文件同目录创建唯一名 `.ledger-*` 临时快照 → 写入并 `fsync` 文件 → `os.replace` 原子提升为主文件 → `fsync` 目录。因此断电只会留下「旧主文件」或「已落盘但未改名的完整快照」，绝不会留下写了一半的主文件。`generation` 只在提升成功后才在内存推进，失败的写入不消耗 generation。
+
+启动时扫描主文件及同目录所有 `.ledger-*` 候选：
+
+- **一个文件都不存在**：按既有约定创建唯一创世块（仅此一种情况会新建链）。
+- **只要存在文件**：逐一严格校验 JSON、`generation`、连续高度、`prev_hash`、重算 `block_hash` 与 Merkle 根、每笔交易的 `tx_id` 与 Ed25519 签名，以及「pending 只能位于链尾」「pending 与链上交易不得重复（块内/内存池内部也不得重复）」。
+- 选择**有效快照中 generation 最大**者；若它仍是临时快照，则原子提升为主文件，并清理所有已判定的旧候选与残留临时文件。
+- 同代快照内容冲突，或目录里没有任何有效候选时，抛出公开可捕获的 `ledger.store.StateRecoveryError`（`ValueError` 子类），携带 `path`（候选文件或所在目录）与 `reason`，**绝不静默新建链**。`python -m ledger` 遇到该错误会向 stderr 打印路径与原因并以退出码 2 结束。
+
+并发的提交、打包、确认、回滚与启动恢复彼此串行化；写入在落盘前失败时，对应的内存改动会回滚，因此不会超支、重复入池、丢交易或返回未落盘的结果。重启、写入中断、主文件损坏、残留临时文件、哈希/签名错误、重复 pending 之后，next height、账户余额、`confirmed_transactions`、`tx_index`、Merkle proof 与多区块查询保持一致。
+
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：
@@ -19,7 +33,7 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/store.py` | 链、状态、待打包集合、索引与账户的 JSON 原子持久化、创世区块、重启重建 |
+| `ledger/store.py` | 链、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、启动快照扫描与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` 八个子命令 |
@@ -113,4 +127,5 @@ python -m compileall -q ledger   # 编译检查
 python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
+python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 ```

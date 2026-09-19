@@ -91,7 +91,13 @@ class LedgerService:
             if self.available_balance(sender) < amount:
                 return 400, {"error": "insufficient balance"}
             self.store.pending[tx.tx_id] = tx
-            self.store.save()
+            try:
+                self.store.save()
+            except BaseException:
+                # Persistence failed: drop the in-memory enqueue so memory
+                # keeps matching the last durably committed state.
+                self.store.pending.pop(tx.tx_id, None)
+                raise
         return 202, {"tx_id": tx.tx_id}
 
     # -- blocks -------------------------------------------------------------
@@ -115,9 +121,14 @@ class LedgerService:
                 status=STATUS_PENDING,
             )
             self.store.chain.append(block)
-            for tx in ordered:
-                self.store.pending.pop(tx.tx_id, None)
-            self.store.save()
+            removed = [self.store.pending.pop(tx.tx_id) for tx in ordered]
+            try:
+                self.store.save()
+            except BaseException:
+                # Undo the in-memory block so nothing un-persisted is visible.
+                self.store.chain.pop()
+                self.store.pending.update({tx.tx_id: tx for tx in removed})
+                raise
         return 201, {
             "height": block.height,
             "block_hash": block.block_hash,
@@ -170,7 +181,11 @@ class LedgerService:
             if parent is None or parent.status != STATUS_CONFIRMED:
                 return 409, {"error": "previous block is not confirmed"}
             block.status = STATUS_CONFIRMED
-            self.store.save()
+            try:
+                self.store.save()
+            except BaseException:
+                block.status = STATUS_PENDING
+                raise
             return 200, {"height": block.height, "status": STATUS_CONFIRMED}
 
     def rollback_block(self, height: object) -> tuple[int, dict]:
@@ -190,8 +205,17 @@ class LedgerService:
                 return 409, {"error": "confirmed block cannot be rolled back"}
             if block is not self.store.tip():
                 return 409, {"error": "only the chain tip can be rolled back"}
+            pending_before = set(self.store.pending)
             rolled_back = self.store.rollback_tip()
-            self.store.save()
+            try:
+                self.store.save()
+            except BaseException:
+                # Restore the block and drop only the mempool entries we added.
+                self.store.chain.append(rolled_back)
+                for tx_id in list(self.store.pending):
+                    if tx_id not in pending_before:
+                        del self.store.pending[tx_id]
+                raise
             return 200, {"height": rolled_back.height, "status": "rolled_back"}
 
     def get_proof(self, height: object, tx_id: object) -> tuple[int, dict]:

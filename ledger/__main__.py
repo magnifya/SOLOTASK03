@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 from .server import serve
 from .service import DEFAULT_INITIAL_BALANCE, LedgerService
-from .store import LedgerStore
+from .store import LedgerStore, StateRecoveryError
 
 DEFAULT_STATE_PATH = os.environ.get("LEDGER_STATE", "ledger_state.json")
 DEFAULT_HOST = os.environ.get("LEDGER_HOST", "0.0.0.0")
@@ -27,16 +28,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    store = LedgerStore(args.state)
+    try:
+        store = LedgerStore(args.state)
+    except StateRecoveryError as exc:
+        # Never silently start a fresh chain on corrupt/unrecoverable state:
+        # report the failing location and reason, then exit non-zero.
+        print(f"ledger state recovery failed: {exc}", file=sys.stderr)
+        return 2
     service = LedgerService(store, initial_balance=args.initial_balance)
     print(f"ledger listening on http://{args.host}:{args.port} (state: {args.state})")
     try:
         serve(service, args.host, args.port)
     except KeyboardInterrupt:
         print("ledger shutting down")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
