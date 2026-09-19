@@ -11,6 +11,19 @@
 
 GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404。账户只统计已确认区块：balance 额外扣除待定块中自己的支出，但不计入待定收入；只出现在待定块中的账户查询返回 404。链、状态、待打包集合、交易索引与账户视图在一次原子写入中落盘，落盘后才响应；重启时从链重建索引（排除待定块）并校验 prev_hash 链接，杜绝孤儿块。
 
+## 多区块一致性与崩溃恢复
+
+每次成功的原子写入都会把单调递增的 `generation` 写入快照：状态先序列化并 `fsync` 到状态目录下的 `.ledger-*` 临时快照，再以 `os.replace` 原子提升为主文件并 `fsync` 目录。因此写入中断只会留下上一份完好主文件，或一份完整且更新代次的临时快照，绝不会出现写坏的主文件。
+
+启动时扫描主文件及同目录全部 `.ledger-*` 候选：
+
+- 主文件与候选**全部不存在**时，才按既有约定创建唯一创世块（gen 0 → 首次写入 gen 1）；
+- 只要存在任何文件，就逐一完整校验：JSON 结构、`generation`、连续高度、`prev_hash` 链接、`block_hash`、Merkle 根、每笔交易的 `tx_id`（与规范化消息重算一致）与 Ed25519 签名，以及 pending 集合与链上交易（含待定块）不得重复、待定块只能位于链尾；
+- 选择 **generation 最大**的有效快照；同代快照内容冲突（链或 mempool 不同）时抛出 `ledger.store.StateRecoveryError`；所有候选都无效时同样抛出，错误对象包含 `path`（相关路径）与 `reason`（具体原因），**禁止静默新建链**。`StateRecoveryError` 同时是 `ValueError` 子类，兼容旧的损坏链捕获方式；
+- 选中临时快照后原子提升为主文件，并删除本次扫描中已判定为旧代/损坏的候选文件；同代内容完全相同的快照不视为冲突，优先保留主文件。
+
+并发的提交、打包、确认、回滚都在同一把可重入锁内串行化（恢复仅在启动单线程阶段执行）：同一笔交易不会重复入池，余额校验不会超支，回滚恢复的交易不丢失、不重复，任何成功响应对应的状态都已持久化。重启后 `next height`、账户余额、`confirmed_transactions`、`tx_index`、Merkle proof 与多区块查询保持一致。
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：
@@ -19,7 +32,7 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/store.py` | 链、状态、待打包集合、索引与账户的 JSON 原子持久化、创世区块、重启重建 |
+| `ledger/store.py` | 链、状态、待打包集合、索引与账户的 generation 快照原子持久化、创世区块、启动候选扫描校验与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` 八个子命令 |
@@ -113,4 +126,5 @@ python -m compileall -q ledger   # 编译检查
 python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
+python tests/recovery_test.py    # generation 快照、崩溃恢复、损坏拒绝与并发串行化
 ```
