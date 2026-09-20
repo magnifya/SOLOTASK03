@@ -1,6 +1,6 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain, adopt, export, index, sync and syncs
-subcommands.
+rollback, status, candidates, chain, adopt, export, index, sync, syncs,
+trust (register/rotate/revoke/export), audit and verify subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -261,6 +261,60 @@ def cmd_index(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_trust_register(args: argparse.Namespace) -> int:
+    payload = {
+        "source": args.source,
+        "public_key": args.public_key,
+        "expires_at": args.expires_at,
+    }
+    status, body = _request("POST", f"{args.base_url}/v1/trust/sources", payload)
+    return _emit(status, body)
+
+
+def cmd_trust_rotate(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.source, safe="")
+    payload = {
+        "public_key": args.public_key,
+        "expires_at": args.expires_at,
+        "expected_version": args.expected_version,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/trust/sources/{quoted}/rotate", payload
+    )
+    return _emit(status, body)
+
+
+def cmd_trust_revoke(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.source, safe="")
+    payload = {"expected_version": args.expected_version}
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/trust/sources/{quoted}/revoke", payload
+    )
+    return _emit(status, body)
+
+
+def cmd_trust_export(args: argparse.Namespace) -> int:
+    status, body = _request("GET", f"{args.base_url}/v1/trust", None)
+    return _emit(status, body)
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    filters = {
+        "source": args.source,
+        "kind": args.kind,
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/audit/events"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Offline light-client verification; no server contact is made."""
     from .light_client import verify_bundle
@@ -387,6 +441,61 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_index.set_defaults(func=cmd_index)
+
+    p_trust = sub.add_parser("trust", help="manage trusted signing sources")
+    trust_sub = p_trust.add_subparsers(dest="trust_action", required=True)
+
+    p_trust_register = trust_sub.add_parser(
+        "register", help="register a trusted source (version 1, active)"
+    )
+    p_trust_register.add_argument("--source", required=True, help="source identifier")
+    p_trust_register.add_argument(
+        "--public-key", required=True, help="Ed25519 public key (64 lowercase hex chars)"
+    )
+    p_trust_register.add_argument(
+        "--expires-at", required=True, type=int, help="expiry as Unix seconds"
+    )
+    p_trust_register.set_defaults(func=cmd_trust_register)
+
+    p_trust_rotate = trust_sub.add_parser(
+        "rotate", help="rotate a trusted source's public key (version advances)"
+    )
+    p_trust_rotate.add_argument("--source", required=True, help="source identifier")
+    p_trust_rotate.add_argument(
+        "--public-key", required=True, help="new Ed25519 public key (64 hex chars)"
+    )
+    p_trust_rotate.add_argument(
+        "--expires-at", required=True, type=int, help="new expiry as Unix seconds"
+    )
+    p_trust_rotate.add_argument(
+        "--expected-version",
+        required=True,
+        type=int,
+        help="current version for optimistic concurrency",
+    )
+    p_trust_rotate.set_defaults(func=cmd_trust_rotate)
+
+    p_trust_revoke = trust_sub.add_parser("revoke", help="revoke a trusted source")
+    p_trust_revoke.add_argument("--source", required=True, help="source identifier")
+    p_trust_revoke.add_argument(
+        "--expected-version",
+        required=True,
+        type=int,
+        help="current version for optimistic concurrency",
+    )
+    p_trust_revoke.set_defaults(func=cmd_trust_revoke)
+
+    p_trust_export = trust_sub.add_parser(
+        "export", help="fetch the verification (trust) document"
+    )
+    p_trust_export.set_defaults(func=cmd_trust_export)
+
+    p_audit = sub.add_parser("audit", help="query the append-only audit event log")
+    p_audit.add_argument("--source", help="filter by source identifier")
+    p_audit.add_argument("--kind", help="filter by event kind")
+    p_audit.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_audit.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
+    p_audit.set_defaults(func=cmd_audit)
 
     p_verify = sub.add_parser(
         "verify",

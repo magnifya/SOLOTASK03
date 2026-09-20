@@ -91,6 +91,66 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `generation` 并重建索引：旧链独有的已确认交易去重回池，旧链 pending 末块与
   新链已含交易都不入池；已采用 tip 的同步记录继续可查询直到过期。
 
+## 持久化来源信任与审计
+
+节点把「可签名的同步来源」作为安全状态持久化，并维护一份只增的审计事件日志。
+
+### 信任来源管理
+
+- **注册**：`POST /v1/trust/sources`，请求 JSON 含
+  `{"source","public_key","expires_at"}`：`source` 非空字符串，`public_key`
+  必须是 64 位小写十六进制，`expires_at` 是整数 Unix 秒。新来源返回 `201`，
+  `version=1`、`status=active`，并附 `event_id`；对**完全相同**的三元组重复
+  注册是幂等的，返回 `200` 与首次结果（含原 `event_id`），不新增事件；同名来源
+  但公钥或过期时间不同返回 `409`；任一字段缺失或格式不对返回 `400`。
+- **轮换公钥**：`POST /v1/trust/sources/{source}/rotate`，请求 JSON 含
+  `{"public_key","expires_at","expected_version"}`。未知来源或**已撤销**来源
+  返回 `404`；`expected_version` 与当前版本不符返回 `409`（响应含
+  `current_version`）；成功则 `version` 加一、保持 `active`，返回新记录与
+  `event_id`。
+- **撤销**：`POST /v1/trust/sources/{source}/revoke`，请求 JSON 含
+  `{"expected_version"}`。未知来源 `404`，版本不符 `409`，成功把 `status`
+  置为 `revoked`（`version` 不变）返回 `200`；以相同版本重复撤销是幂等的，
+  返回 `200` 与首次结果且**不新增事件**。撤销后不能再 rotate（`404`）。
+- **校验文档**：`GET /v1/trust` 返回
+  `{"genesis_hash","sources","allowlist"}`：`genesis_hash` 固定为创世块哈希；
+  `sources` 只含**未过期且未撤销**的来源（每项 `{public_key, expires_at}`），
+  过期/已撤销条目仍留在注册表中但不出现在文档里；无签名来源的 `allowlist`
+  原样保留。
+
+### 审计事件
+
+`GET /v1/audit/events` 支持 `source`、`kind`、`limit`（默认 50，范围 1–200）、
+`cursor`（默认 0）；数值参数必须是首位非 0 的十进制（`0` 合法），非法值 `400`。
+结果严格按 `event_id` **升序**（事件只增、从 1 开始连续编号），返回
+`{items, total, next_cursor}`：`cursor == total` 返回空页，`cursor > total`
+返回 `400`，没有更多结果时 `next_cursor` 为 `null`。每个 item 含
+`{event_id, kind, source, at, details}`。
+
+事件覆盖信任变更与同步生命周期：
+
+| kind | 触发时机 |
+| --- | --- |
+| `trust_source_registered` | 新信任来源注册（version 1） |
+| `trust_source_rotated` | 来源公钥轮换（version 递增，details 含 previous_public_key） |
+| `trust_source_revoked` | 来源被撤销（重复撤销不新增事件） |
+| `sync_received` | `POST /v1/forks/sync` 首次接收候选（同键重试不新增） |
+| `sync_adopted` | 同步来的候选被采用（每条仍存活的引用记录一条） |
+| `sync_expired` | 同步记录过期被清理（随清理原子落盘） |
+
+同步候选**被采用之后、记录过期之后**，其审计事件仍可通过
+`GET /v1/audit/events` 查询——审计日志只增，不随同步记录删除。
+
+### 原子性与恢复
+
+注册表、allowlist 与审计事件和链、分叉、同步记录写在**同一个原子快照**里：
+信任变更与其事件、同步状态迁移与其事件要么一起可见，要么一起回滚（写盘失败时
+内存改动全部撤销，不留「无事件的变更」或「无变更的事件」）。启动恢复时对
+`trust_sources` / `allowlist` / `audit_events` 做**严格**校验（字段类型、
+64 位公钥、合法 status、event_id 从 1 起连续无重复），任何损坏都抛
+`ledger.store.StateRecoveryError`；同代快照在这些段上的内容冲突同样抛错，
+绝不静默修复或新建状态。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
@@ -151,11 +211,11 @@ tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`e
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用 |
+| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、信任来源、allowlist 与审计日志的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，信任来源注册/轮换/撤销、信任文档、审计查询，以及同步接收/采用/过期的审计事件 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / 离线 `verify` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / `trust`（`register`/`rotate`/`revoke`/`export`）/ `audit` / 离线 `verify` 子命令 |
 
 约定：
 
@@ -248,6 +308,23 @@ curl -s 'localhost:8080/v1/forks/sync?source=node-2&min_height=1&limit=50&cursor
 # 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
+
+# 信任来源：注册（201 version=1/active；同内容重复 200；冲突 409）
+curl -s -X POST localhost:8080/v1/trust/sources \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"node-2","public_key":"<64-hex>","expires_at":1800000000}'
+# 轮换公钥（未知/已撤销 404，版本错 409，成功 version 加一）
+curl -s -X POST localhost:8080/v1/trust/sources/node-2/rotate \
+  -H 'Content-Type: application/json' \
+  -d '{"public_key":"<new-64-hex>","expires_at":1900000000,"expected_version":1}'
+# 撤销（未知 404，版本错 409，重复撤销 200 且不新增事件）
+curl -s -X POST localhost:8080/v1/trust/sources/node-2/revoke \
+  -H 'Content-Type: application/json' -d '{"expected_version":2}'
+# 校验文档（genesis_hash 固定；sources 仅未过期未撤销；allowlist 保留）
+curl -s localhost:8080/v1/trust
+# 审计事件（source/kind/limit/cursor；按 event_id 升序）
+curl -s 'localhost:8080/v1/audit/events?source=node-2&kind=sync_adopted&limit=50&cursor=0'
+# -> 200 {"items":[{event_id,kind,source,at,details}...],"total":N,"next_cursor":null}
 ```
 
 ## 命令行
@@ -284,6 +361,14 @@ python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [
 python -m ledger.cli verify --bundle bundle.json --trust trust.json
 cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
 # -> 成功单行 {"ok":true,...} 退出 0；失败单行 {"ok":false,"error":"..."} 退出 1
+
+# 信任来源管理与校验文档
+python -m ledger.cli trust register --source node-2 --public-key <64-hex> --expires-at 1800000000
+python -m ledger.cli trust rotate --source node-2 --public-key <new-hex> --expires-at 1900000000 --expected-version 1
+python -m ledger.cli trust revoke --source node-2 --expected-version 2
+python -m ledger.cli trust export
+# 审计事件查询
+python -m ledger.cli audit [--source node-2] [--kind sync_adopted] [--cursor N] [--limit N]
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -299,5 +384,6 @@ python tests/recovery_test.py         # generation、多区块一致性、快照
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
+python tests/trust_audit_test.py      # 信任来源注册/轮换/撤销（201/200/404/409/400、幂等、原子性）、信任文档、审计分页、同步事件、损坏/同代冲突恢复与 HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 ```

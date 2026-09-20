@@ -21,7 +21,10 @@ One atomic write persists everything: the chain (each block carries its
 confirm/rollback ``status``), a small ``state`` summary, the mempool
 (``pending``), candidate fork chains (``forks``, each a full block list
 anchored at the canonical genesis and keyed by its tip hash), the
-confirmed-transaction ``index`` and the confirmed ``accounts`` activity.
+confirmed-transaction ``index`` and the confirmed ``accounts`` activity, plus
+the trusted-signing-source registry (``trust_sources``), the keyless-source
+``allowlist`` and an append-only ``audit_events`` log. Trust/audit sections are
+strictly validated on recovery like the chain itself.
 Derived data (index/accounts) is *rebuilt* from the chain on every load and
 every save — pending blocks are excluded, so a restart never resurrects
 unconfirmed transactions into balances. Persisted fork candidates are
@@ -50,7 +53,21 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 5
+STATE_VERSION = 6
+
+# Trust source lifecycle states.
+TRUST_ACTIVE = "active"
+TRUST_REVOKED = "revoked"
+TRUST_STATUSES = (TRUST_ACTIVE, TRUST_REVOKED)
+
+# Audit event kinds. Trust lifecycle changes ...
+EVENT_TRUST_REGISTERED = "trust_source_registered"
+EVENT_TRUST_ROTATED = "trust_source_rotated"
+EVENT_TRUST_REVOKED = "trust_source_revoked"
+# ... and inter-node candidate sync lifecycle changes.
+EVENT_SYNC_RECEIVED = "sync_received"
+EVENT_SYNC_ADOPTED = "sync_adopted"
+EVENT_SYNC_EXPIRED = "sync_expired"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -88,6 +105,17 @@ class LedgerStore:
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
+        # Trusted sync sources keyed by source name. Each record is
+        # {"public_key", "expires_at", "version", "status"}; status is either
+        # "active" or "revoked".
+        self.trust_sources: dict[str, dict] = {}
+        # Keyless sources accepted without signatures: source -> expires_at.
+        self.allowlist: dict[str, int] = {}
+        # Append-only audit log. Each event is
+        # {"event_id", "kind", "source", "at", "details"} with event_id a
+        # 1-based sequence number; events are never deleted, so expired and
+        # adopted-away syncs stay traceable.
+        self.audit_events: list[dict] = []
         # Monotonic counter bumped on every successful atomic write. It is
         # persisted with each snapshot and lets startup pick the newest one.
         self.generation: int = 0
@@ -128,6 +156,9 @@ class LedgerStore:
                 self.pending = {}
                 self.forks = {}
                 self.syncs = {}
+                self.trust_sources = {}
+                self.allowlist = {}
+                self.audit_events = []
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
@@ -151,6 +182,9 @@ class LedgerStore:
                         parsed[3],
                         parsed[4],
                         parsed[5],
+                        parsed[6],
+                        parsed[7],
+                        parsed[8],
                     )
                 )
 
@@ -163,11 +197,25 @@ class LedgerStore:
             max_generation = max(item[0] for item in valid)
             top = [item for item in valid if item[0] == max_generation]
             reference = self._canonical_view(
-                top[0][2], top[0][3], top[0][4], top[0][6]
+                top[0][2],
+                top[0][3],
+                top[0][4],
+                top[0][6],
+                top[0][7],
+                top[0][8],
+                top[0][9],
             )
             for item in top[1:]:
                 if (
-                    self._canonical_view(item[2], item[3], item[4], item[6])
+                    self._canonical_view(
+                        item[2],
+                        item[3],
+                        item[4],
+                        item[6],
+                        item[7],
+                        item[8],
+                        item[9],
+                    )
                     != reference
                 ):
                     paths = " vs ".join(item[1] for item in top)
@@ -192,6 +240,9 @@ class LedgerStore:
                 forks,
                 winner_init_balance,
                 syncs,
+                trust_sources,
+                allowlist,
+                audit_events,
             ) = winner
 
             if os.path.abspath(winner_path) != main_abs:
@@ -204,6 +255,9 @@ class LedgerStore:
             self.pending = pending
             self.forks = forks
             self.syncs = syncs
+            self.trust_sources = trust_sources
+            self.allowlist = allowlist
+            self.audit_events = audit_events
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -238,6 +292,9 @@ class LedgerStore:
         pending: dict[str, Transaction],
         forks: dict[str, list[Block]],
         syncs: dict[tuple[str, str], dict] | None = None,
+        trust_sources: dict[str, dict] | None = None,
+        allowlist: dict[str, int] | None = None,
+        audit_events: list[dict] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection."""
         sync_records = [
@@ -250,6 +307,16 @@ class LedgerStore:
             }
             for key, rec in sorted((syncs or {}).items())
         ]
+        trust_records = [
+            {
+                "source": source,
+                "public_key": rec["public_key"],
+                "expires_at": rec["expires_at"],
+                "version": rec["version"],
+                "status": rec["status"],
+            }
+            for source, rec in sorted((trust_sources or {}).items())
+        ]
         return json.dumps(
             {
                 "chain": [block.to_dict() for block in chain],
@@ -259,6 +326,14 @@ class LedgerStore:
                     for tip in sorted(forks)
                 ],
                 "syncs": sync_records,
+                "trust_sources": trust_records,
+                "allowlist": [
+                    {"source": source, "expires_at": expires_at}
+                    for source, expires_at in sorted((allowlist or {}).items())
+                ],
+                # The audit log is order-sensitive: events are compared in
+                # their persisted append order, not sorted.
+                "audit_events": list(audit_events or []),
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -310,6 +385,9 @@ class LedgerStore:
         dict[str, list[Block]],
         int | None,
         dict[tuple[str, str], dict],
+        dict[str, dict],
+        dict[str, int],
+        list[dict],
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -460,7 +538,149 @@ class LedgerStore:
         canonical_hashes = {block.block_hash for block in chain}
         for tip in synced_tips - live_tips - canonical_hashes:
             forks.pop(tip, None)
-        return chain, pending, generation, forks, initial_balance, syncs
+        trust_sources = self._parse_persisted_trust_sources(
+            data.get("trust_sources", []), path, fail
+        )
+        allowlist = self._parse_persisted_allowlist(
+            data.get("allowlist", []), path, fail
+        )
+        audit_events = self._parse_persisted_audit_events(
+            data.get("audit_events", []), path, fail
+        )
+        return (
+            chain,
+            pending,
+            generation,
+            forks,
+            initial_balance,
+            syncs,
+            trust_sources,
+            allowlist,
+            audit_events,
+        )
+
+    @staticmethod
+    def _parse_persisted_trust_sources(
+        raw: object, path: str, fail
+    ) -> dict[str, dict]:
+        """Strictly parse the persisted trusted-source registry.
+
+        Unlike fork/sync records, any defect here is fatal: the trust registry
+        is security state, so recovery must never silently drop or repair it.
+        """
+        if raw is None:
+            return {}
+        if not isinstance(raw, list):
+            fail("'trust_sources' must be a list")
+        sources: dict[str, dict] = {}
+        for entry in raw:
+            if not isinstance(entry, dict):
+                fail("trust source entry is not a JSON object")
+            source = entry.get("source")
+            public_key = entry.get("public_key")
+            expires_at = entry.get("expires_at")
+            version = entry.get("version")
+            status = entry.get("status")
+            if not isinstance(source, str) or not source:
+                fail("trust source entry has an invalid 'source'")
+            if not crypto.is_hex64(public_key):
+                fail(f"trust source {source!r} has an invalid public_key")
+            if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+                fail(f"trust source {source!r} expires_at must be an integer")
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version < 1
+            ):
+                fail(f"trust source {source!r} version must be a positive integer")
+            if status not in TRUST_STATUSES:
+                fail(f"trust source {source!r} has unknown status {status!r}")
+            if source in sources:
+                fail(f"duplicate trust source {source!r}")
+            sources[source] = {
+                "public_key": public_key,
+                "expires_at": expires_at,
+                "version": version,
+                "status": status,
+            }
+        return sources
+
+    @staticmethod
+    def _parse_persisted_allowlist(raw: object, path: str, fail) -> dict[str, int]:
+        """Strictly parse the keyless-source allowlist (source -> expires_at)."""
+        if raw is None:
+            return {}
+        if not isinstance(raw, list):
+            fail("'allowlist' must be a list")
+        allowlist: dict[str, int] = {}
+        for entry in raw:
+            if not isinstance(entry, dict):
+                fail("allowlist entry is not a JSON object")
+            source = entry.get("source")
+            expires_at = entry.get("expires_at")
+            if not isinstance(source, str) or not source:
+                fail("allowlist entry has an invalid 'source'")
+            if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+                fail(f"allowlist entry {source!r} expires_at must be an integer")
+            if source in allowlist:
+                fail(f"duplicate allowlist entry {source!r}")
+            allowlist[source] = expires_at
+        return allowlist
+
+    @staticmethod
+    def _parse_persisted_audit_events(raw: object, path: str, fail) -> list[dict]:
+        """Strictly parse the append-only audit log.
+
+        Event ids must be positive integers starting at 1 with no gaps or
+        duplicates; the log is order-sensitive. Any structural defect is
+        fatal rather than silently truncated.
+        """
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            fail("'audit_events' must be a list")
+        events: list[dict] = []
+        seen_ids: set[int] = set()
+        for i, entry in enumerate(raw):
+            if not isinstance(entry, dict):
+                fail(f"audit event at position {i} is not a JSON object")
+            event_id = entry.get("event_id")
+            kind = entry.get("kind")
+            source = entry.get("source")
+            at = entry.get("at")
+            details = entry.get("details", {})
+            if (
+                isinstance(event_id, bool)
+                or not isinstance(event_id, int)
+                or event_id < 1
+            ):
+                fail(f"audit event at position {i} has an invalid event_id")
+            if event_id in seen_ids:
+                fail(f"duplicate audit event_id {event_id}")
+            if event_id != len(events) + 1:
+                fail(
+                    f"audit event_id {event_id} is not consecutive "
+                    f"(expected {len(events) + 1})"
+                )
+            if not isinstance(kind, str) or not kind:
+                fail(f"audit event {event_id} has an invalid kind")
+            if not isinstance(source, str) or not source:
+                fail(f"audit event {event_id} has an invalid source")
+            if isinstance(at, bool) or not isinstance(at, int):
+                fail(f"audit event {event_id} has an invalid timestamp")
+            if not isinstance(details, dict):
+                fail(f"audit event {event_id} details must be a JSON object")
+            seen_ids.add(event_id)
+            events.append(
+                {
+                    "event_id": event_id,
+                    "kind": kind,
+                    "source": source,
+                    "at": at,
+                    "details": details,
+                }
+            )
+        return events
 
     def _parse_persisted_syncs(
         self,
@@ -625,6 +845,27 @@ class LedgerStore:
                 }
                 for key, rec in sorted(self.syncs.items())
             ]
+        # Trust sources, keyless allowlist and the append-only audit log share
+        # the same atomic document, so a trust change and the event recording
+        # it are never torn across writes.
+        if self.trust_sources:
+            data["trust_sources"] = [
+                {
+                    "source": source,
+                    "public_key": rec["public_key"],
+                    "expires_at": rec["expires_at"],
+                    "version": rec["version"],
+                    "status": rec["status"],
+                }
+                for source, rec in sorted(self.trust_sources.items())
+            ]
+        if self.allowlist:
+            data["allowlist"] = [
+                {"source": source, "expires_at": expires_at}
+                for source, expires_at in sorted(self.allowlist.items())
+            ]
+        if self.audit_events:
+            data["audit_events"] = [dict(event) for event in self.audit_events]
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
         # Hold the class-wide recovery lock while a .ledger-* snapshot exists
@@ -922,3 +1163,21 @@ class LedgerStore:
             self.syncs.setdefault(key, rec)
         for tip, fork in forks.items():
             self.forks.setdefault(tip, fork)
+
+    # -- trust registry and audit log ----------------------------------------
+
+    def append_event(self, kind: str, source: str, at: int, details: dict) -> dict:
+        """Append an audit event with the next 1-based event_id.
+
+        Does not save; the caller persists the state change and the event
+        together in one atomic write. Caller must hold the lock.
+        """
+        event = {
+            "event_id": len(self.audit_events) + 1,
+            "kind": kind,
+            "source": source,
+            "at": at,
+            "details": details,
+        }
+        self.audit_events.append(event)
+        return event
