@@ -494,18 +494,39 @@ class LedgerService:
         ).hexdigest()
 
     def _prune_expired_syncs(self) -> list[str]:
-        """Remove expired sync records and the candidate forks they brought in.
+        """Sweep expired sync records and persist the sweep atomically.
 
         A candidate received through a sync lives only while its record is
         unexpired; on expiry both the record and its still-stored candidate fork
-        are dropped in memory. Candidates submitted directly (no sync record)
-        never expire, and an adopted tip is no longer in ``forks`` (it is on the
-        canonical chain) so its expiring record leaves the chain untouched.
+        are dropped, together and in a single atomic save that advances the
+        generation. Candidates submitted directly (no sync record) never
+        expire, and an adopted tip is no longer in ``forks`` (it is on the
+        canonical chain), so its expiring audit record leaves the chain
+        untouched. If the write fails the pre-cleanup records and forks are
+        restored so no success is ever reported for an un-persisted sweep.
         Caller must hold the store lock. Returns the pruned tip hashes.
         """
-        expired_tips = self.store.prune_syncs()
+        expired_tips, removed = self.store.prune_syncs()
+        if not removed:
+            return expired_tips
+        removed_forks: dict[str, list] = {}
+        canonical_hashes = {block.block_hash for block in self.store.chain}
+        # The same tip could theoretically be referenced by another live
+        # record; only drop a fork nothing still points at.
+        live_tips = {rec["tip_hash"] for rec in self.store.syncs.values()}
         for tip in expired_tips:
-            self.store.forks.pop(tip, None)
+            if tip in canonical_hashes or tip in live_tips:
+                continue
+            fork = self.store.forks.pop(tip, None)
+            if fork is not None:
+                removed_forks[tip] = fork
+        try:
+            self.store.save()
+        except BaseException:
+            # Restore the pre-cleanup state: a failed write must neither leave
+            # the records gone nor their candidates orphaned.
+            self.store.restore_syncs(removed, removed_forks)
+            raise
         return expired_tips
 
     def _tip_descriptor(self, tip_hash: str) -> dict | None:
@@ -571,10 +592,35 @@ class LedgerService:
 
             key = (source, request_id)
             existing = self.store.syncs.get(key)
+
+            # A new delivery whose deadline already passed is rejected before
+            # the chain is examined. A retry on a still-live key skips this:
+            # replaying a recorded request must stay idempotent even when the
+            # client echoes an expires_at that has since elapsed.
+            if existing is None and expires_at <= time.time():
+                return 410, {"error": "sync request has expired"}
+
+            # Re-validate the whole candidate chain and recompute the tip
+            # summary BEFORE any idempotency decision: a request whose supplied
+            # tip_hash/height/length/status were tampered with must fail 400,
+            # never be answered with the cached 200 for its source+request_id.
+            try:
+                fork = self.store.validate_fork_blocks(blocks_raw)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            summary = self._fork_summary(fork)
+            if isinstance(candidate, dict):
+                for field in ("tip_hash", "height", "length", "status"):
+                    if field in candidate and candidate[field] != summary[field]:
+                        return 400, {
+                            "error": f"candidate field {field!r} does not match the blocks"
+                        }
+            tip_hash = fork[-1].block_hash
+            fingerprint = self._candidate_fingerprint(blocks_raw)
+
             if existing is not None:
                 # A retry on a live key is idempotent only when it carries the
                 # identical candidate content; a changed body conflicts 409.
-                fingerprint = self._candidate_fingerprint(blocks_raw)
                 if fingerprint != existing["fingerprint"]:
                     return 409, {
                         "error": "request_id already used with different content"
@@ -592,26 +638,6 @@ class LedgerService:
                     "status": descriptor.get("status"),
                     "expires_at": existing["expires_at"],
                 }
-
-            # Expiry is enforced after the idempotency lookup but before the
-            # expensive chain validation: an expired delivery is rejected 410.
-            if expires_at <= time.time():
-                return 410, {"error": "sync request has expired"}
-
-            try:
-                fork = self.store.validate_fork_blocks(blocks_raw)
-            except ValueError as exc:
-                return 400, {"error": str(exc)}
-            summary = self._fork_summary(fork)
-            # Re-verify any export-format summary fields carried on the doc.
-            if isinstance(candidate, dict):
-                for field in ("tip_hash", "height", "length", "status"):
-                    if field in candidate and candidate[field] != summary[field]:
-                        return 400, {
-                            "error": f"candidate field {field!r} does not match the blocks"
-                        }
-            tip_hash = fork[-1].block_hash
-            fingerprint = self._candidate_fingerprint(blocks_raw)
 
             if any(tip_hash == block.block_hash for block in self.store.chain):
                 return 409, {"error": "fork is identical to the canonical chain"}

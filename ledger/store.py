@@ -883,20 +883,42 @@ class LedgerStore:
 
     # -- sync records ---------------------------------------------------------
 
-    def prune_syncs(self, now: float | None = None) -> None:
-        """Drop expired sync records, returning their orphaned tip hashes.
+    def prune_syncs(
+        self, now: float | None = None
+    ) -> tuple[list[str], dict[tuple[str, str], dict]]:
+        """Drop expired sync records in memory.
 
-        A record expires once ``expires_at`` has passed. The caller decides
-        what to do with the returned tips (typically dropping the candidate
-        forks they brought in); tips adopted onto the canonical chain are not
-        present in ``forks`` and are simply skipped there. Does not save; the
+        A record expires once ``expires_at`` has passed. Returns the orphaned
+        tip hashes together with every removed record (keyed by
+        ``(source, request_id)``) so the caller can persist the sweep
+        atomically and restore the pre-cleanup state if that write fails.
+        Tips adopted onto the canonical chain are not present in ``forks`` and
+        are simply skipped when the caller reconciles them. Does not save; the
         caller persists.
         """
         current = time.time() if now is None else now
         expired_tips: list[str] = []
+        removed: dict[tuple[str, str], dict] = {}
         for key in list(self.syncs):
             rec = self.syncs[key]
             if rec["expires_at"] <= current:
                 expired_tips.append(rec["tip_hash"])
+                removed[key] = rec
                 del self.syncs[key]
-        return expired_tips
+        return expired_tips, removed
+
+    def restore_syncs(
+        self,
+        removed: dict[tuple[str, str], dict],
+        forks: dict[str, list[Block]],
+    ) -> None:
+        """Restore sync records and candidate forks removed by a failed sweep.
+
+        Only records still missing are re-inserted, and the matching candidate
+        forks are put back only when no other live record still references the
+        tip. Caller must hold the lock.
+        """
+        for key, rec in removed.items():
+            self.syncs.setdefault(key, rec)
+        for tip, fork in forks.items():
+            self.forks.setdefault(tip, fork)

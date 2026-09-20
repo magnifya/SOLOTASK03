@@ -247,6 +247,97 @@ class ForkSyncServiceTests(unittest.TestCase):
         doc["tip_hash"] = "a" * 64
         self.assertEqual(self.sync(doc)[0], 400)
 
+    def test_tampered_summary_retry_is_400_not_200(self) -> None:
+        # The tip summary must be recomputed from the blocks and checked
+        # BEFORE the source+request_id idempotency decision, so a retry that
+        # reuses a live key but forges any summary field is rejected 400 and
+        # can never be answered with the cached 200.
+        block = self.block1()
+        exp = int(time.time()) + 3600
+        doc = make_fork(self.genesis, [self.genesis, block])
+        self.assertEqual(self.sync(doc, expires_at=exp)[0], 201)
+        for field, forged in (
+            ("tip_hash", "a" * 64),
+            ("height", 9),
+            ("length", 3),
+            ("status", "pending"),
+        ):
+            forged_doc = dict(doc)
+            forged_doc[field] = forged
+            status, body = self.sync(forged_doc, expires_at=exp)
+            self.assertEqual(status, 400, (field, body))
+        # The untouched document still replays the original result as 200.
+        status, retry = self.sync(doc, expires_at=exp + 999)
+        self.assertEqual(status, 200)
+        self.assertEqual(retry["tip_hash"], block.block_hash)
+
+    def test_expiry_sweep_is_persisted_before_response(self) -> None:
+        # A read (audit query) that triggers the lazy expiry sweep must remove
+        # the record and its candidate in one atomic save before responding.
+        block = self.block1(self.C, amount=3)
+        tip = block.block_hash
+        self.assertEqual(
+            self.sync(
+                make_fork(self.genesis, [self.genesis, block]),
+                source="node-x", request_id="qx", expires_at=int(time.time()) + 1,
+            )[0],
+            201,
+        )
+        generation_before = self.store.generation
+        time.sleep(1.1)
+        status, listing = self.svc.list_fork_syncs({})
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["total"], 0)
+        # The sweep advanced the generation ...
+        self.assertEqual(self.store.generation, generation_before + 1)
+        # ... and was durably persisted before the response was produced.
+        with open(self.state_path, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk["state"]["generation"], self.store.generation)
+        self.assertNotIn(
+            "qx", [rec.get("request_id") for rec in on_disk.get("syncs", [])]
+        )
+        on_disk_tips = [fork[-1]["block_hash"] for fork in on_disk.get("forks", [])]
+        self.assertNotIn(tip, on_disk_tips)
+        self.assertNotIn(tip, self.store.forks)
+
+    def test_failed_sweep_save_restores_pre_cleanup_state(self) -> None:
+        # If persisting an expiry sweep fails, the swept records and their
+        # candidate forks must be restored in memory and no success reported.
+        block = self.block1(self.C, amount=2)
+        tip = block.block_hash
+        key = ("node-y", "qy")
+        self.assertEqual(
+            self.sync(
+                make_fork(self.genesis, [self.genesis, block]),
+                source=key[0], request_id=key[1], expires_at=int(time.time()) + 1,
+            )[0],
+            201,
+        )
+        time.sleep(1.1)
+
+        original_save = self.store.save
+
+        def failing_save() -> None:
+            raise OSError("simulated persistence failure")
+
+        self.store.save = failing_save
+        try:
+            with self.assertRaises(OSError):
+                self.svc.list_fork_syncs({})
+        finally:
+            self.store.save = original_save
+
+        # The expired record and its candidate were restored, not dropped.
+        self.assertIn(key, self.store.syncs)
+        self.assertIn(tip, self.store.forks)
+        # The next successful sweep completes normally.
+        status, listing = self.svc.list_fork_syncs({})
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["total"], 0)
+        self.assertNotIn(key, self.store.syncs)
+        self.assertNotIn(tip, self.store.forks)
+
     # -- expiry --------------------------------------------------------------
 
     def test_expired_request_is_410(self) -> None:
