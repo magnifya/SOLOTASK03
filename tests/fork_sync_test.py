@@ -530,6 +530,164 @@ class ForkSyncServiceTests(unittest.TestCase):
         self.assertEqual(self.svc.adopt_fork(tip)[0], 404)
         self.assertNotIn(tip, self.store.forks)
 
+    # -- lifecycle / atomic persistence --------------------------------------
+
+    def test_retry_with_tampered_summary_is_not_200(self) -> None:
+        block = self.block1()
+        doc = make_fork(self.genesis, [self.genesis, block])
+        self.assertEqual(self.sync(doc)[0], 201)
+        # Same key, same blocks, but a tampered summary field: the descriptor
+        # is recomputed from the blocks first, so this must not replay a 200.
+        for field, bad in (
+            ("tip_hash", "a" * 64),
+            ("height", 9),
+            ("length", 99),
+            ("status", "pending"),
+        ):
+            tampered = make_fork(self.genesis, [self.genesis, block])
+            tampered[field] = bad
+            status, _ = self.sync(tampered)
+            self.assertEqual(status, 400, field)
+        # An untampered retry still replays the original 200 result.
+        self.assertEqual(
+            self.sync(make_fork(self.genesis, [self.genesis, block]))[0], 200
+        )
+
+    def test_sweep_persists_before_response(self) -> None:
+        block = self.block1()
+        tip = block.block_hash
+        self.assertEqual(
+            self.sync(
+                make_fork(self.genesis, [self.genesis, block]),
+                expires_at=int(time.time()) + 1,
+            )[0],
+            201,
+        )
+        time.sleep(1.1)
+        # The audit query sweeps and atomically persists before responding.
+        status, listing = self.svc.list_fork_syncs({})
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["total"], 0)
+        with open(self.state_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertFalse(doc.get("syncs"))
+        self.assertFalse(doc.get("forks"))
+        # A restart therefore finds no trace of the expired record/candidate.
+        reopened = LedgerStore(self.state_path, initial_balance=1000)
+        self.assertEqual(reopened.syncs, {})
+        self.assertNotIn(tip, reopened.forks)
+
+    def test_sweep_save_failure_restores_state(self) -> None:
+        block = self.block1()
+        tip = block.block_hash
+        self.assertEqual(
+            self.sync(
+                make_fork(self.genesis, [self.genesis, block]),
+                expires_at=int(time.time()) + 1,
+            )[0],
+            201,
+        )
+        time.sleep(1.1)
+        key = ("node-1", "req-1")
+        original_save = self.store.save
+
+        def failing_save():
+            raise OSError("disk full")
+
+        self.store.save = failing_save  # type: ignore[assignment]
+        try:
+            with self.assertRaises(OSError):
+                self.svc.list_fork_syncs({})
+        finally:
+            self.store.save = original_save  # type: ignore[assignment]
+        # The failed sweep was rolled back: record and candidate survive.
+        self.assertIn(key, self.store.syncs)
+        self.assertIn(tip, self.store.forks)
+        # A later working operation sweeps again and persists successfully.
+        status, listing = self.svc.list_fork_syncs({})
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["total"], 0)
+        self.assertNotIn(tip, self.store.forks)
+
+    def test_expired_adopted_tip_keeps_canonical_chain(self) -> None:
+        # Synced fork outgrows the canonical chain and gets adopted.
+        f1 = Block.create(
+            1, self.genesis.block_hash, [tx_obj(self.ka, self.A, self.C, 20)]
+        )
+        f2 = Block.create(
+            2, f1.block_hash, [tx_obj(self.kc, self.C, self.A, 5)]
+        )
+        doc = make_fork(self.genesis, [self.genesis, f1, f2])
+        status, body = self.sync(doc, expires_at=int(time.time()) + 1)
+        self.assertEqual(status, 201)
+        tip = body["tip_hash"]
+        self.assertEqual(self.svc.adopt_fork(tip)[0], 200)
+        self.assertEqual(self.store.tip_hash(), tip)
+        time.sleep(1.1)
+        # The expiring record drops only the audit metadata; the canonical
+        # chain built from the adopted fork is untouched.
+        status, listing = self.svc.list_fork_syncs({})
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["total"], 0)
+        self.assertEqual(self.store.tip_hash(), tip)
+        self.assertEqual(len(self.store.chain), 3)
+
+    def test_concurrent_sync_query_adopt_are_serialized(self) -> None:
+        # Seed several distinct candidates so concurrent workers have
+        # something to sync, list and adopt.
+        tips: list[str] = []
+        for i in range(4):
+            block = Block.create(
+                1,
+                self.genesis.block_hash,
+                [tx_obj(self.ka, self.A, self.B, 10 + i)],
+            )
+            status, body = self.sync(
+                make_fork(self.genesis, [self.genesis, block]),
+                source=f"n{i}", request_id=f"r{i}",
+            )
+            self.assertEqual(status, 201, body)
+            tips.append(body["tip_hash"])
+        winner = min(tips)
+        errors: list[BaseException] = []
+
+        def work(i: int) -> None:
+            try:
+                for _ in range(10):
+                    self.svc.list_fork_syncs({})
+                    self.svc.get_chain()
+                    # Idempotent retry of an already-known key.
+                    block = Block.create(
+                        1,
+                        self.genesis.block_hash,
+                        [tx_obj(self.ka, self.A, self.B, 10 + (i % 4))],
+                    )
+                    self.svc.submit_fork_sync(
+                        {
+                            "source": f"n{i % 4}",
+                            "request_id": f"r{i % 4}",
+                            "expires_at": int(time.time()) + 3600,
+                            "candidate": make_fork(
+                                self.genesis, [self.genesis, block]
+                            ),
+                        }
+                    )
+                    self.svc.adopt_fork(winner)
+            except BaseException as exc:  # noqa: BLE001 - collected below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        # The winner was adopted exactly once; the state is consistent.
+        self.assertEqual(self.store.tip_hash(), winner)
+        status, chain = self.svc.get_chain()
+        self.assertEqual(status, 200)
+        self.assertEqual(chain["canonical"]["tip_hash"], winner)
+
 
 class ForkSyncHttpTests(unittest.TestCase):
     """Both endpoints over the real HTTP server."""

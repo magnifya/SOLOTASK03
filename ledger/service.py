@@ -371,7 +371,7 @@ class LedgerService:
                 return 400, {"error": f"summary field {field!r} does not match the blocks"}
         tip_hash = fork[-1].block_hash
         with self.store.lock:
-            self._prune_expired_syncs()
+            self._sweep_expired_syncs()
             # A tip hash equal to any canonical block hash means the candidate
             # is exactly the canonical chain or a prefix of it (the block hash
             # binds height, parent and Merkle root), so it carries nothing new.
@@ -392,7 +392,7 @@ class LedgerService:
         the adoptable winner (a non-canonical chain that beats canonical).
         """
         with self.store.lock:
-            self._prune_expired_syncs()
+            self._sweep_expired_syncs()
             canonical = self._fork_summary(self.store.chain)
             candidates = [
                 self._fork_summary(self.store.forks[tip])
@@ -421,7 +421,7 @@ class LedgerService:
         if not crypto.is_hex64(tip_hash):
             return 404, {"error": "unknown fork tip"}
         with self.store.lock:
-            self._prune_expired_syncs()
+            self._sweep_expired_syncs()
             fork = self.store.forks.get(tip_hash)
             if fork is None:
                 return 404, {"error": "unknown fork tip"}
@@ -493,20 +493,38 @@ class LedgerService:
             json.dumps(blocks_raw, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
 
-    def _prune_expired_syncs(self) -> list[str]:
-        """Remove expired sync records and the candidate forks they brought in.
+    def _sweep_expired_syncs(self) -> None:
+        """Remove expired sync records and their unadopted candidate forks,
+        persisting the removal in one atomic save before any response is built.
 
         A candidate received through a sync lives only while its record is
         unexpired; on expiry both the record and its still-stored candidate fork
-        are dropped in memory. Candidates submitted directly (no sync record)
+        are dropped together. Candidates submitted directly (no sync record)
         never expire, and an adopted tip is no longer in ``forks`` (it is on the
-        canonical chain) so its expiring record leaves the chain untouched.
-        Caller must hold the store lock. Returns the pruned tip hashes.
+        canonical chain) so its expiring record leaves the canonical chain
+        untouched — only the audit metadata is dropped. Caller must hold the
+        store lock. If the atomic save fails, the pre-sweep in-memory state is
+        restored and the error propagates, so no success response can be built
+        on top of an un-persisted sweep.
         """
+        syncs_before = dict(self.store.syncs)
         expired_tips = self.store.prune_syncs()
+        if not expired_tips:
+            return
+        forks_before: dict[str, list] = {}
         for tip in expired_tips:
-            self.store.forks.pop(tip, None)
-        return expired_tips
+            fork = self.store.forks.pop(tip, None)
+            if fork is not None:
+                forks_before[tip] = fork
+        try:
+            self.store.save()
+        except BaseException:
+            # Persistence failed: put the records and candidates back so
+            # memory keeps matching the last durably committed state.
+            for key, rec in syncs_before.items():
+                self.store.syncs.setdefault(key, rec)
+            self.store.forks.update(forks_before)
+            raise
 
     def _tip_descriptor(self, tip_hash: str) -> dict | None:
         """Resolve (height/length/status) for a synced tip.
@@ -540,9 +558,12 @@ class LedgerService:
 
         Returns 201 with ``{tip_hash, height, length, status, expires_at}``.
         An expired request returns 410; malformed fields or a failing chain
-        validation return 400. A retry with the same source + request_id and
-        identical content replays the original result as 200; the same key with
-        different content, or a duplicate tip already known, returns 409.
+        validation return 400. The descriptor fields are always recomputed
+        from the blocks and any summary fields on the document are verified
+        first, so a retry with a tampered summary never replays a 200. A
+        retry with the same source + request_id and identical content replays
+        the original result as 200; the same key with different content, or a
+        duplicate tip already known, returns 409.
         """
         if not isinstance(payload, dict):
             return 400, {"error": "request body must be a JSON object"}
@@ -567,14 +588,32 @@ class LedgerService:
             return 400, {"error": "field 'candidate' must contain a 'blocks' list"}
 
         with self.store.lock:
-            self._prune_expired_syncs()
+            self._sweep_expired_syncs()
+
+            # The candidate's tip_hash/height/length/status are always
+            # recomputed from the blocks and any supplied summary fields are
+            # verified *before* the idempotency decision: a retry carrying a
+            # tampered summary must not replay a 200.
+            try:
+                fork = self.store.validate_fork_blocks(blocks_raw)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            summary = self._fork_summary(fork)
+            # Re-verify any export-format summary fields carried on the doc.
+            if isinstance(candidate, dict):
+                for field in ("tip_hash", "height", "length", "status"):
+                    if field in candidate and candidate[field] != summary[field]:
+                        return 400, {
+                            "error": f"candidate field {field!r} does not match the blocks"
+                        }
+            tip_hash = fork[-1].block_hash
+            fingerprint = self._candidate_fingerprint(blocks_raw)
 
             key = (source, request_id)
             existing = self.store.syncs.get(key)
             if existing is not None:
                 # A retry on a live key is idempotent only when it carries the
                 # identical candidate content; a changed body conflicts 409.
-                fingerprint = self._candidate_fingerprint(blocks_raw)
                 if fingerprint != existing["fingerprint"]:
                     return 409, {
                         "error": "request_id already used with different content"
@@ -593,25 +632,10 @@ class LedgerService:
                     "expires_at": existing["expires_at"],
                 }
 
-            # Expiry is enforced after the idempotency lookup but before the
-            # expensive chain validation: an expired delivery is rejected 410.
+            # Expiry is enforced after the idempotency lookup: an expired
+            # first-time delivery is rejected 410.
             if expires_at <= time.time():
                 return 410, {"error": "sync request has expired"}
-
-            try:
-                fork = self.store.validate_fork_blocks(blocks_raw)
-            except ValueError as exc:
-                return 400, {"error": str(exc)}
-            summary = self._fork_summary(fork)
-            # Re-verify any export-format summary fields carried on the doc.
-            if isinstance(candidate, dict):
-                for field in ("tip_hash", "height", "length", "status"):
-                    if field in candidate and candidate[field] != summary[field]:
-                        return 400, {
-                            "error": f"candidate field {field!r} does not match the blocks"
-                        }
-            tip_hash = fork[-1].block_hash
-            fingerprint = self._candidate_fingerprint(blocks_raw)
 
             if any(tip_hash == block.block_hash for block in self.store.chain):
                 return 409, {"error": "fork is identical to the canonical chain"}
@@ -682,7 +706,7 @@ class LedgerService:
             cursor = parsed
 
         with self.store.lock:
-            self._prune_expired_syncs()
+            self._sweep_expired_syncs()
             rows: list[dict] = []
             for (rec_source, request_id), rec in self.store.syncs.items():
                 if source is not None and rec_source != source:
