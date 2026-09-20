@@ -261,6 +261,28 @@ def cmd_index(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Offline light-client verification; no server contact is made."""
+    from .light_client import verify_bundle
+
+    try:
+        if args.bundle == "-":
+            bundle = json.loads(sys.stdin.read())
+        else:
+            with open(args.bundle, "r", encoding="utf-8") as fh:
+                bundle = json.load(fh)
+        with open(args.trust, "r", encoding="utf-8") as fh:
+            trust = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON inputs are reported in the same envelope as
+        # every other verification failure.
+        body = {"ok": False, "error": "input"}
+    else:
+        body = verify_bundle(bundle, trust)
+    print(json.dumps(body, sort_keys=True, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -365,6 +387,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_index.set_defaults(func=cmd_index)
+
+    p_verify = sub.add_parser(
+        "verify",
+        help="offline-verify a proof bundle against a local trust document",
+    )
+    p_verify.add_argument(
+        "--bundle",
+        required=True,
+        help="bundle JSON file path, or - to read it from standard input",
+    )
+    p_verify.add_argument(
+        "--trust",
+        required=True,
+        help="local trust JSON file (genesis_hash, sources, allowlist)",
+    )
+    p_verify.set_defaults(func=cmd_verify)
 
     return parser
 

@@ -103,6 +103,45 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 没有更多结果时为 `null`。每个 item 含
 `{tx_id, height, block_hash, index, from, to, amount}`。
 
+## 离线轻客户端验证
+
+不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
+**信任文档**（trust）离线核对响应：
+
+- **bundle**：`{source, expires_at, response, candidate, proofs[, signature]}`。
+  `expires_at` 是 Unix 秒；`candidate` 是自创世块起的完整块数组（也接受现有
+  导出五字段文档）；`proofs` 为 `{height, proof}` 列表，`proof` 即
+  `/proof/` 接口返回的 `{height, tx_id, index, merkle_root, block_hash,
+  siblings}` 文档；`signature` 可选，为 Ed25519 签名的十六进制。
+- **trust**：`{genesis_hash, sources, allowlist}`。`genesis_hash` 锚定创世块；
+  `sources[source] = {public_key, expires_at}`；
+  `allowlist[source] = expires_at`。
+- **来源与签名**：`source` 必须受信（在 `sources` 或 `allowlist` 中）且未过期
+  （束、来源、allowlist 三处的 `expires_at` 逐一检查，`<= now` 即过期）。
+  受信且有公钥的来源**必须**验签：签名覆盖
+  `SHA256(bundle 去掉 signature 后排序紧凑 UTF-8 JSON)`，再做 Ed25519 验签；
+  无公钥来源只有在 `allowlist` 中且束**不带签名**时才可接受。
+- **重算链**：从 `genesis_hash` 锚定的创世块起，逐块核对连续高度与 `prev_hash`、
+  重算每笔交易的 `tx_id` 并验证其 Ed25519 签名、`tx_id` 全链唯一且块内升序、
+  重算 Merkle 根与 `block_hash`，且 pending 块只能位于链尾。
+- **核对 response 与 proofs**：`response` 中出现的 `tip_hash/height/length/
+  status` 必须与重算链的链尾描述符 `S` 完全一致（一个都不出现则无法绑定，拒绝）。
+  每个 proof 必须唯一（同 `height`+`tx_id` 不得重复），其 `tx_id`、`height`、
+  `index` 与区块字段（`block_hash`、`merkle_root`）必须与候选链中的块一致，
+  Merkle 路径按现有 `verify_merkle_proof` 规则验证；**pending 链尾禁止出 proof**。
+
+成功返回 `{ok: true, source, S, verified_tx_ids}`（`verified_tx_ids` 为按
+tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`error` 仅取
+`input` / `auth` / `expired` / `integrity` / `proof` 五类：
+
+| error | 含义 |
+| --- | --- |
+| `input` | bundle/trust 结构或字段类型不合法（含非 64 位十六进制公钥、布尔数值） |
+| `auth` | 来源不受信、受信来源缺签名，或 allowlist 来源带了无法核对的签名 |
+| `expired` | 束或信任条目已过期 |
+| `integrity` | 签名错误、链重算不一致（创世块/prev_hash/tx_id/签名/Merkle/block_hash）或 response 与链尾不符 |
+| `proof` | proof 重复、字段与区块不一致、Merkle 路径无效或指向 pending 链尾 |
+
 
 ## 实现说明
 
@@ -115,7 +154,8 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` 子命令 |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / 离线 `verify` 子命令 |
 
 约定：
 
@@ -239,6 +279,11 @@ python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N]
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
 python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
+
+# 离线轻客户端验证（不连接服务端；--bundle - 从标准输入读取束 JSON）
+python -m ledger.cli verify --bundle bundle.json --trust trust.json
+cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
+# -> 成功单行 {"ok":true,...} 退出 0；失败单行 {"ok":false,"error":"..."} 退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -254,4 +299,5 @@ python tests/recovery_test.py         # generation、多区块一致性、快照
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
+python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 ```
