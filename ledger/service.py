@@ -34,11 +34,21 @@ import time
 
 from . import crypto
 from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
-from .store import LedgerStore
+from .store import TRUST_ACTIVE, TRUST_REVOKED, LedgerStore
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
 
 REQUIRED_TX_FIELDS = ("from", "to", "amount", "signature")
+
+# Audit event kinds. The log is append-only: trust lifecycle changes
+# (registered/rotated/revoked) and inter-node sync events
+# (received/adopted/expired) are all recorded permanently.
+EVENT_SOURCE_REGISTERED = "source_registered"
+EVENT_SOURCE_ROTATED = "source_rotated"
+EVENT_SOURCE_REVOKED = "source_revoked"
+EVENT_SYNC_RECEIVED = "sync_received"
+EVENT_SYNC_ADOPTED = "sync_adopted"
+EVENT_SYNC_EXPIRED = "sync_expired"
 
 
 def _parse_height(height: object) -> int | None:
@@ -432,6 +442,22 @@ class LedgerService:
             old_pending = dict(self.store.pending)
             self.store.forks.pop(tip_hash)
             self.store.replace_chain(fork)
+            # An adopted synced tip keeps its sync records (queryable until
+            # expiry); record the adoption once per provenance entry.
+            adopted_keys = sorted(
+                key
+                for key, rec in self.store.syncs.items()
+                if rec["tip_hash"] == tip_hash
+            )
+            for rec_source, request_id in adopted_keys:
+                self.store.append_audit_event(
+                    EVENT_SYNC_ADOPTED,
+                    {
+                        "source": rec_source,
+                        "request_id": request_id,
+                        "tip_hash": tip_hash,
+                    },
+                )
             try:
                 self.store.save()
             except BaseException:
@@ -440,6 +466,7 @@ class LedgerService:
                 self.store.pending = old_pending
                 self.store.forks[tip_hash] = fork
                 self.store.rebuild_derived()
+                del self.store.audit_events[len(self.store.audit_events) - len(adopted_keys) :]
                 raise
             return 200, self._fork_summary(fork)
 
@@ -520,11 +547,26 @@ class LedgerService:
             fork = self.store.forks.pop(tip, None)
             if fork is not None:
                 removed_forks[tip] = fork
+        # Record one permanent expiry event per removed sync record. A tip
+        # already adopted onto the canonical chain still gets its event: the
+        # record's expiry is auditable even though the chain is untouched.
+        for (rec_source, request_id), rec in sorted(removed.items()):
+            self.store.append_audit_event(
+                EVENT_SYNC_EXPIRED,
+                {
+                    "source": rec_source,
+                    "request_id": request_id,
+                    "tip_hash": rec["tip_hash"],
+                    "expires_at": rec["expires_at"],
+                },
+            )
         try:
             self.store.save()
         except BaseException:
             # Restore the pre-cleanup state: a failed write must neither leave
-            # the records gone nor their candidates orphaned.
+            # the records gone nor their candidates orphaned, nor the events
+            # durably visible.
+            del self.store.audit_events[len(self.store.audit_events) - len(removed) :]
             self.store.restore_syncs(removed, removed_forks)
             raise
         return expired_tips
@@ -653,13 +695,23 @@ class LedgerService:
                 "expires_at": expires_at,
                 "fingerprint": fingerprint,
             }
+            self.store.append_audit_event(
+                EVENT_SYNC_RECEIVED,
+                {
+                    "source": source,
+                    "request_id": request_id,
+                    "tip_hash": tip_hash,
+                    "expires_at": expires_at,
+                },
+            )
             try:
                 self.store.save()
             except BaseException:
-                # Roll back both the candidate and its metadata together so a
-                # failed write never leaves one without the other.
+                # Roll back the candidate, its metadata and the audit event
+                # together so a failed write never leaves one without the others.
                 self.store.syncs.pop(key, None)
                 self.store.forks.pop(tip_hash, None)
+                self.store.audit_events.pop()
                 raise
 
             result = dict(summary)
@@ -815,3 +867,283 @@ class LedgerService:
         items = rows[cursor : cursor + limit]
         next_cursor = cursor + limit if cursor + limit < total else None
         return 200, {"items": items, "total": total, "next_cursor": next_cursor}
+
+    # -- source trust registry ------------------------------------------------
+
+    @staticmethod
+    def _trust_record(source: str, rec: dict) -> dict:
+        """Public shape of one trust-source record."""
+        return {
+            "source": source,
+            "public_key": rec["public_key"],
+            "expires_at": rec["expires_at"],
+            "version": rec["version"],
+            "status": rec["status"],
+        }
+
+    def _validate_trust_input(self, payload: object, require_version: bool) -> tuple | None:
+        """Validate a trust registration/rotation body.
+
+        ``source`` must be a non-empty string, ``public_key`` 64 lowercase
+        hex characters and ``expires_at`` a plain (non-boolean) integer.
+        Rotation/revocation additionally require a positive integer
+        ``expected_version``. Returns (source, public_key, expires_at[,
+        expected_version]) or None after sending a 400.
+        """
+        if not isinstance(payload, dict):
+            return None
+        for field in ("source", "public_key", "expires_at"):
+            if field not in payload:
+                return None
+        source = payload["source"]
+        public_key = payload["public_key"]
+        expires_at = payload["expires_at"]
+        if not isinstance(source, str) or not source:
+            return None
+        if not crypto.is_hex64(public_key):
+            return None
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+            return None
+        if not require_version:
+            return source, public_key, expires_at
+        expected_version = payload.get("expected_version")
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 1
+        ):
+            return None
+        return source, public_key, expires_at, expected_version
+
+    def register_trust_source(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/trust/sources — register a trusted source.
+
+        A new source is created at version 1 with status ``active`` and the
+        change is persisted together with its audit event in one atomic write
+        (201). Re-posting the exact same (public_key, expires_at) content is
+        idempotent (200, the stored record unchanged); the same source with
+        different content conflicts (409).
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in ("source", "public_key", "expires_at"):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+        parsed = self._validate_trust_input(payload, require_version=False)
+        if parsed is None:
+            return 400, {
+                "error": "source must be a non-empty string, public_key 64 "
+                "lowercase hex characters and expires_at an integer"
+            }
+        source, public_key, expires_at = parsed
+        with self.store.lock:
+            existing = self.store.trust_sources.get(source)
+            if existing is not None:
+                if (
+                    existing["public_key"] == public_key
+                    and existing["expires_at"] == expires_at
+                ):
+                    # Idempotent re-registration: the stored record is reported
+                    # unchanged, with no new version and no new audit event.
+                    return 200, self._trust_record(source, existing)
+                return 409, {"error": "trust source already exists with different content"}
+            record = {
+                "public_key": public_key,
+                "expires_at": expires_at,
+                "version": 1,
+                "status": TRUST_ACTIVE,
+            }
+            self.store.trust_sources[source] = record
+            self.store.append_audit_event(
+                EVENT_SOURCE_REGISTERED,
+                {
+                    "source": source,
+                    "public_key": public_key,
+                    "expires_at": expires_at,
+                    "version": 1,
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Undo both the registry change and its event together.
+                self.store.trust_sources.pop(source, None)
+                self.store.audit_events.pop()
+                raise
+            return 201, self._trust_record(source, record)
+
+    def rotate_trust_source(self, source: object, payload: object) -> tuple[int, dict]:
+        """POST /v1/trust/sources/{source}/rotate — install a new public key.
+
+        Requires ``public_key``, ``expires_at`` and ``expected_version``. An
+        unknown or already-revoked source returns 404; a stale
+        ``expected_version`` returns 409. A successful rotation increments the
+        version, keeps the source active and persists the change with an audit
+        event atomically.
+        """
+        if not isinstance(source, str) or not source:
+            return 404, {"error": "unknown trust source"}
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in ("public_key", "expires_at", "expected_version"):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+        body = dict(payload)
+        body["source"] = source
+        parsed = self._validate_trust_input(body, require_version=True)
+        if parsed is None:
+            return 400, {
+                "error": "public_key must be 64 lowercase hex characters and "
+                "expires_at/expected_version integers"
+            }
+        _, public_key, expires_at, expected_version = parsed
+        with self.store.lock:
+            existing = self.store.trust_sources.get(source)
+            if existing is None or existing["status"] == TRUST_REVOKED:
+                return 404, {"error": "unknown trust source"}
+            if existing["version"] != expected_version:
+                return 409, {"error": "expected_version does not match the current version"}
+            old_record = dict(existing)
+            existing["public_key"] = public_key
+            existing["expires_at"] = expires_at
+            existing["version"] = old_record["version"] + 1
+            self.store.append_audit_event(
+                EVENT_SOURCE_ROTATED,
+                {
+                    "source": source,
+                    "public_key": public_key,
+                    "expires_at": expires_at,
+                    "version": existing["version"],
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                self.store.trust_sources[source] = old_record
+                self.store.audit_events.pop()
+                raise
+            return 200, self._trust_record(source, existing)
+
+    def revoke_trust_source(self, source: object, payload: object) -> tuple[int, dict]:
+        """POST /v1/trust/sources/{source}/revoke — revoke a trusted source.
+
+        Requires ``expected_version``. An unknown source returns 404 and a
+        version mismatch returns 409; revoking an already-revoked source at the
+        recorded version is idempotent (200). A new revocation marks the source
+        revoked and is persisted with its audit event atomically.
+        """
+        if not isinstance(source, str) or not source:
+            return 404, {"error": "unknown trust source"}
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        if "expected_version" not in payload:
+            return 400, {"error": "missing field: expected_version"}
+        expected_version = payload["expected_version"]
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 1
+        ):
+            return 400, {"error": "expected_version must be a positive integer"}
+        with self.store.lock:
+            existing = self.store.trust_sources.get(source)
+            if existing is None:
+                return 404, {"error": "unknown trust source"}
+            if existing["version"] != expected_version:
+                return 409, {"error": "expected_version does not match the current version"}
+            if existing["status"] == TRUST_REVOKED:
+                # Idempotent repeat revocation: no second event, no new write.
+                return 200, self._trust_record(source, existing)
+            old_status = existing["status"]
+            existing["status"] = TRUST_REVOKED
+            self.store.append_audit_event(
+                EVENT_SOURCE_REVOKED,
+                {
+                    "source": source,
+                    "public_key": existing["public_key"],
+                    "expires_at": existing["expires_at"],
+                    "version": existing["version"],
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                existing["status"] = old_status
+                self.store.audit_events.pop()
+                raise
+            return 200, self._trust_record(source, existing)
+
+    def get_trust_document(self) -> tuple[int, dict]:
+        """GET /v1/trust — the offline light-client verify document.
+
+        ``genesis_hash`` always pins the fixed canonical genesis block;
+        ``sources`` contains only active, unexpired entries in the light
+        client's shape ``{public_key, expires_at}``; the keyless
+        ``allowlist`` is preserved verbatim.
+        """
+        with self.store.lock:
+            now = time.time()
+            sources = {}
+            for source, rec in self.store.trust_sources.items():
+                if rec["status"] != TRUST_ACTIVE or rec["expires_at"] <= now:
+                    continue
+                sources[source] = {
+                    "public_key": rec["public_key"],
+                    "expires_at": rec["expires_at"],
+                }
+            return 200, {
+                "genesis_hash": self.store.chain[0].block_hash,
+                "sources": sources,
+                "allowlist": dict(self.store.allowlist),
+            }
+
+    # -- audit log ------------------------------------------------------------
+
+    AUDIT_DEFAULT_LIMIT = 50
+    AUDIT_MAX_LIMIT = 200
+
+    def list_audit_events(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/audit/events — paginated append-only audit log.
+
+        Filters ``source`` and ``kind`` are AND-combined; ``limit`` defaults
+        to 50 and must be 1-200, ``cursor`` defaults to 0. Numeric values
+        must be plain decimals without leading zeros. Events are ordered by
+        their ascending ``event_id``; ``cursor == total`` returns an empty
+        page, ``cursor > total`` returns 400.
+        """
+        source = params.get("source")
+        if source is not None and (not isinstance(source, str) or not source):
+            return 400, {"error": "source must be a non-empty string"}
+        kind = params.get("kind")
+        if kind is not None and (not isinstance(kind, str) or not kind):
+            return 400, {"error": "kind must be a non-empty string"}
+        limit = self.AUDIT_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.AUDIT_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 200"}
+            limit = parsed
+        cursor = 0
+        if params.get("cursor") is not None:
+            parsed = _parse_decimal(params["cursor"])
+            if parsed is None:
+                return 400, {"error": "cursor must be a non-negative decimal"}
+            cursor = parsed
+
+        with self.store.lock:
+            # Sweep expired syncs first so their expiry events are visible on
+            # the same page that observes the removal.
+            self._prune_expired_syncs()
+            items = [
+                dict(event)
+                for event in self.store.audit_events
+                if (source is None or event.get("source") == source)
+                and (kind is None or event.get("kind") == kind)
+            ]
+        # Events are stored in ascending event_id order; filtering preserves it.
+        total = len(items)
+        if cursor > total:
+            return 400, {"error": "cursor is beyond the result set"}
+        page = items[cursor : cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < total else None
+        return 200, {"items": page, "total": total, "next_cursor": next_cursor}

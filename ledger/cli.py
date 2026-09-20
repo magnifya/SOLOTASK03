@@ -261,6 +261,60 @@ def cmd_index(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_trust_add(args: argparse.Namespace) -> int:
+    payload = {
+        "source": args.source,
+        "public_key": args.public_key,
+        "expires_at": args.expires_at,
+    }
+    status, body = _request("POST", f"{args.base_url}/v1/trust/sources", payload)
+    return _emit(status, body)
+
+
+def cmd_trust_rotate(args: argparse.Namespace) -> int:
+    source = urllib.parse.quote(args.source, safe="")
+    payload = {
+        "public_key": args.public_key,
+        "expires_at": args.expires_at,
+        "expected_version": args.expected_version,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/trust/sources/{source}/rotate", payload
+    )
+    return _emit(status, body)
+
+
+def cmd_trust_revoke(args: argparse.Namespace) -> int:
+    source = urllib.parse.quote(args.source, safe="")
+    payload = {"expected_version": args.expected_version}
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/trust/sources/{source}/revoke", payload
+    )
+    return _emit(status, body)
+
+
+def cmd_trust_export(args: argparse.Namespace) -> int:
+    status, body = _request("GET", f"{args.base_url}/v1/trust", None)
+    return _emit(status, body)
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    filters = {
+        "source": args.source,
+        "kind": args.kind,
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/audit/events"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Offline light-client verification; no server contact is made."""
     from .light_client import verify_bundle
@@ -403,6 +457,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="local trust JSON file (genesis_hash, sources, allowlist)",
     )
     p_verify.set_defaults(func=cmd_verify)
+
+    # Source-trust management: `trust <action> ...`.
+    p_trust = sub.add_parser("trust", help="manage trusted sources and export the trust document")
+    trust_sub = p_trust.add_subparsers(dest="trust_action", required=True)
+
+    p_trust_add = trust_sub.add_parser("add", help="register a trusted source")
+    p_trust_add.add_argument("--source", required=True, help="source node identifier")
+    p_trust_add.add_argument("--public-key", required=True, help="Ed25519 public key (64 hex chars)")
+    p_trust_add.add_argument("--expires-at", required=True, type=int, help="expiry as Unix seconds")
+    p_trust_add.set_defaults(func=cmd_trust_add)
+
+    p_trust_rotate = trust_sub.add_parser("rotate", help="rotate a trusted source's public key")
+    p_trust_rotate.add_argument("--source", required=True, help="source node identifier")
+    p_trust_rotate.add_argument("--public-key", required=True, help="new Ed25519 public key (64 hex chars)")
+    p_trust_rotate.add_argument("--expires-at", required=True, type=int, help="new expiry as Unix seconds")
+    p_trust_rotate.add_argument("--expected-version", required=True, type=int, help="current source version")
+    p_trust_rotate.set_defaults(func=cmd_trust_rotate)
+
+    p_trust_revoke = trust_sub.add_parser("revoke", help="revoke a trusted source")
+    p_trust_revoke.add_argument("--source", required=True, help="source node identifier")
+    p_trust_revoke.add_argument("--expected-version", required=True, type=int, help="current source version")
+    p_trust_revoke.set_defaults(func=cmd_trust_revoke)
+
+    p_trust_export = trust_sub.add_parser("export", help="export the offline verify trust document")
+    p_trust_export.set_defaults(func=cmd_trust_export)
+
+    p_audit = sub.add_parser("audit", help="query the append-only audit event log")
+    p_audit.add_argument("--source", help="filter by source identifier")
+    p_audit.add_argument("--kind", help="filter by event kind")
+    p_audit.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_audit.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
+    p_audit.set_defaults(func=cmd_audit)
 
     return parser
 

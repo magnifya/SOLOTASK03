@@ -66,6 +66,31 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_fork_sync(payload)
                 self._send_json(status, body)
+            elif path == "/v1/trust/sources":
+                # POST /v1/trust/sources — register a trusted source.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.register_trust_source(payload)
+                self._send_json(status, body)
+            elif (
+                path.startswith("/v1/trust/sources/")
+                and (path.endswith("/rotate") or path.endswith("/revoke"))
+            ):
+                # POST /v1/trust/sources/{source}/rotate | /revoke
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                remainder = path[len("/v1/trust/sources/") :]
+                if remainder.endswith("/rotate"):
+                    source = unquote(remainder[: -len("/rotate")])
+                    status, body = service.rotate_trust_source(source, payload)
+                else:
+                    source = unquote(remainder[: -len("/revoke")])
+                    status, body = service.revoke_trust_source(source, payload)
+                self._send_json(status, body)
             elif path.startswith("/v1/forks/") and path.endswith("/adopt"):
                 # POST /v1/forks/{tip_hash}/adopt — a body is not required.
                 if self.headers.get("Content-Length"):
@@ -98,7 +123,18 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             path, _, query = self.path.partition("?")
-            if path == "/v1/chain":
+            if path == "/v1/trust":
+                status, body = service.get_trust_document()
+                self._send_json(status, body)
+            elif path == "/v1/audit/events":
+                # GET /v1/audit/events?source=&kind=&cursor=&limit=
+                params = {
+                    key: values[0]
+                    for key, values in parse_qs(query, keep_blank_values=True).items()
+                }
+                status, body = service.list_audit_events(params)
+                self._send_json(status, body)
+            elif path == "/v1/chain":
                 status, body = service.get_chain()
                 self._send_json(status, body)
             elif path == "/v1/forks/sync":
