@@ -1,6 +1,6 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain, adopt, export, index, sync and syncs
-subcommands.
+rollback, status, candidates, chain, adopt, export, index, sync, syncs and
+verify subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -243,6 +243,33 @@ def cmd_syncs(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Offline-verify a light-client bundle; no server is contacted.
+
+    The bundle is read from ``--bundle PATH`` (``-`` reads standard input) and
+    the trust document from ``--trust PATH``. The result is one line of JSON:
+    ``{"ok": true, ...}`` exits 0, every failure
+    (``{"ok": false, "error": ...}``) exits 1. Unreadable or non-JSON inputs
+    are reported as the ``input`` error category.
+    """
+    from .light_client import verify_bundle
+
+    try:
+        if args.bundle == "-":
+            bundle = json.loads(sys.stdin.read())
+        else:
+            with open(args.bundle, "r", encoding="utf-8") as fh:
+                bundle = json.load(fh)
+        with open(args.trust, "r", encoding="utf-8") as fh:
+            trust = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        result = {"ok": False, "error": "input"}
+    else:
+        result = verify_bundle(bundle, trust)
+    print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+    return 0 if result.get("ok") else 1
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     filters = {
         "tx_id": args.tx_id,
@@ -365,6 +392,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_index.set_defaults(func=cmd_index)
+
+    p_verify = sub.add_parser(
+        "verify", help="offline-verify a light-client bundle (no server needed)"
+    )
+    p_verify.add_argument(
+        "--bundle", required=True, help="bundle JSON file, or '-' to read stdin"
+    )
+    p_verify.add_argument("--trust", required=True, help="trust-document JSON file")
+    p_verify.set_defaults(func=cmd_verify)
 
     return parser
 

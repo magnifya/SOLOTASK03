@@ -104,6 +104,44 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 `{tx_id, height, block_hash, index, from, to, amount}`。
 
 
+## 离线轻客户端验证
+
+客户端无需联网、也不必信任提供响应的节点：给定一份**信任文档**和一个**响应
+束（bundle）**，`ledger.light_client.verify_bundle(bundle, trust)` 重算整条
+候选链并逐项核对，`ledger verify` 子命令在命令行提供同样的能力。
+
+- **信任文档**：JSON 对象，含
+  - `genesis_hash`：受信创世块哈希（64 位小写十六进制）；
+  - `sources`：`sources[source] = [public_key, expires_at]`，两元素均可为
+    `null`（`null` 公钥表示该来源不能签名，`null` 过期时刻表示永不过期）；
+  - `allowlist`：`allowlist[source] = expires_at`（同样允许 `null`）。
+- **bundle**：`{source, expires_at, response, candidate, proofs[, signature]}`。
+  `candidate` 接受导出格式五字段文档、`{"blocks": [...]}` 或裸块数组；
+  `proofs` 是 `{"height": H, "proof": P}` 列表，P 为标准证明对象
+  `{tx_id, index, merkle_root, block_hash, siblings}`（P 内可带 `height`，
+  必须与外层一致）。
+- **来源与过期**：`source` 必须在 `sources` 或 `allowlist` 中且未过期，
+  bundle 自身 `expires_at` 也必须未到；否则分别返回 `auth` / `expired`。
+- **签名策略**：签名（若有）为 Ed25519 十六进制，消息是
+  `SHA256(bundle 去掉 "signature" 后、key 排序、紧凑无空白 UTF-8 JSON)`
+  的 **32 字节摘要**。来源在 `sources` 中登记了公钥就**必须**验签，验签失败
+  返回 `integrity`；没有公钥时**只有** `allowlist` 中的来源允许无签名 bundle。
+- **重算链**：从受信 `genesis_hash` 起逐块重算并核对创世块、连续
+  `height`/`prev_hash`、每笔交易的 `tx_id` 与 Ed25519 签名、Merkle 根与
+  `block_hash`，`tx_id` 全链唯一且块内升序，pending 只能位于链尾；导出文档
+  自带的摘要字段也逐一核对。任何不符返回 `integrity`。
+- **证明与响应**：每个 proof 必须唯一（tx_id、height/index 均不得重复），
+  其 `tx_id`/`height`/`index`/区块字段与重算链一致，siblings 按现有
+  `verify_merkle_proof` 规则验证；**pending tip 禁止作为 proof 锚点**。
+  `response` 中的交易主张（proof 对象、索引行或 `items` 列表）、区块摘要与
+  分叉描述 S 都与重算链及 proof 交叉核对；主张缺少对应 proof 或字段不符返回
+  `integrity`，proof 自身问题返回 `proof`。
+- **结果**：成功返回
+  `{"ok": true, "source", "S", "verified_tx_ids"}`（`S` 为候选链 tip 的
+  `{tip_hash, height, length, status}`，`verified_tx_ids` 升序排列）；失败返回
+  `{"ok": false, "error": 类别}`，类别只能是
+  `input` / `auth` / `expired` / `integrity` / `proof` 之一。
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：
@@ -115,7 +153,8 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / `verify` 子命令 |
+| `ledger/light_client.py` | 离线轻客户端：重算候选链、验证来源签名与 Merkle 包含证明、交叉核对响应 |
 
 约定：
 
@@ -239,6 +278,12 @@ python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N]
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
 python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
+
+# 离线轻客户端验证（不访问服务；- 表示从 stdin 读 bundle）
+python -m ledger.cli verify --bundle bundle.json --trust trust.json
+cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
+# 成功打印单行 {"ok": true, "source": ..., "S": {...}, "verified_tx_ids": [...]} 并退出 0；
+# 失败打印单行 {"ok": false, "error": "input|auth|expired|integrity|proof"} 并退出 1。
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -254,4 +299,5 @@ python tests/recovery_test.py         # generation、多区块一致性、快照
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
+python tests/light_client_test.py     # 离线轻客户端 bundle 验证（来源/签名/过期、重算链、Merkle proof 唯一性与 pending 禁用、响应核对）与 CLI
 ```
