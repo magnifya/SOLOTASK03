@@ -35,6 +35,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 
 from .models import (
     STATUS_CONFIRMED,
@@ -49,7 +50,7 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 4
+STATE_VERSION = 5
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -79,6 +80,11 @@ class LedgerStore:
         # Candidate fork chains keyed by tip block hash. Each value is the
         # fork's full block list (including the shared genesis block).
         self.forks: dict[str, list[Block]] = {}
+        # Inter-node sync submissions keyed by (source, request_id). Each
+        # record stores delivery metadata plus the tip hash of the synced
+        # candidate chain (kept in ``forks``) and a content fingerprint used
+        # for same-key retry/idempotency checks.
+        self.syncs: dict[tuple[str, str], dict] = {}
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
@@ -121,6 +127,7 @@ class LedgerStore:
                 self.chain = [self.create_genesis()]
                 self.pending = {}
                 self.forks = {}
+                self.syncs = {}
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
@@ -136,7 +143,15 @@ class LedgerStore:
                     errors.append(exc)
                     continue
                 valid.append(
-                    (parsed[2], candidate, parsed[0], parsed[1], parsed[3], parsed[4])
+                    (
+                        parsed[2],
+                        candidate,
+                        parsed[0],
+                        parsed[1],
+                        parsed[3],
+                        parsed[4],
+                        parsed[5],
+                    )
                 )
 
             if not valid:
@@ -147,9 +162,14 @@ class LedgerStore:
 
             max_generation = max(item[0] for item in valid)
             top = [item for item in valid if item[0] == max_generation]
-            reference = self._canonical_view(top[0][2], top[0][3], top[0][4])
+            reference = self._canonical_view(
+                top[0][2], top[0][3], top[0][4], top[0][6]
+            )
             for item in top[1:]:
-                if self._canonical_view(item[2], item[3], item[4]) != reference:
+                if (
+                    self._canonical_view(item[2], item[3], item[4], item[6])
+                    != reference
+                ):
                     paths = " vs ".join(item[1] for item in top)
                     raise StateRecoveryError(
                         directory,
@@ -164,7 +184,15 @@ class LedgerStore:
                 if os.path.abspath(item[1]) == main_abs:
                     winner = item
                     break
-            generation, winner_path, chain, pending, forks, winner_init_balance = winner
+            (
+                generation,
+                winner_path,
+                chain,
+                pending,
+                forks,
+                winner_init_balance,
+                syncs,
+            ) = winner
 
             if os.path.abspath(winner_path) != main_abs:
                 # The newest durable state only ever made it to a temp
@@ -175,6 +203,7 @@ class LedgerStore:
             self.chain = chain
             self.pending = pending
             self.forks = forks
+            self.syncs = syncs
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -208,8 +237,19 @@ class LedgerStore:
         chain: list[Block],
         pending: dict[str, Transaction],
         forks: dict[str, list[Block]],
+        syncs: dict[tuple[str, str], dict] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection."""
+        sync_records = [
+            {
+                "source": key[0],
+                "request_id": key[1],
+                "tip_hash": rec["tip_hash"],
+                "expires_at": rec["expires_at"],
+                "fingerprint": rec["fingerprint"],
+            }
+            for key, rec in sorted((syncs or {}).items())
+        ]
         return json.dumps(
             {
                 "chain": [block.to_dict() for block in chain],
@@ -218,6 +258,7 @@ class LedgerStore:
                     [block.to_dict() for block in forks[tip]]
                     for tip in sorted(forks)
                 ],
+                "syncs": sync_records,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -268,6 +309,7 @@ class LedgerStore:
         int,
         dict[str, list[Block]],
         int | None,
+        dict[tuple[str, str], dict],
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -407,7 +449,78 @@ class LedgerStore:
             fail("state.tip_status does not match the chain tip")
 
         forks = self._parse_persisted_forks(data.get("forks", []), chain)
-        return chain, pending, generation, forks, initial_balance
+        syncs, synced_tips = self._parse_persisted_syncs(
+            data.get("syncs", []), forks, chain
+        )
+        # A fork brought in only by a sync record loses its right to exist once
+        # that record is gone (expired/invalid on restart): without this, the
+        # independently-persisted fork would resurrect as a never-expiring
+        # candidate. Direct submissions carry no sync record and are untouched.
+        live_tips = {rec["tip_hash"] for rec in syncs.values()}
+        canonical_hashes = {block.block_hash for block in chain}
+        for tip in synced_tips - live_tips - canonical_hashes:
+            forks.pop(tip, None)
+        return chain, pending, generation, forks, initial_balance, syncs
+
+    def _parse_persisted_syncs(
+        self,
+        syncs_raw: object,
+        forks: dict[str, list[Block]],
+        canonical_chain: list[Block],
+    ) -> tuple[dict[tuple[str, str], dict], set[str]]:
+        """Parse persisted sync records, dropping unusable ones on restart.
+
+        A record is kept only when it is structurally valid and has not yet
+        expired. Its tip must reference either a surviving candidate fork or a
+        block on the canonical chain (a synced candidate may have been adopted);
+        records pointing at neither are stale orphans and are pruned. Invalid
+        or expired records are silently dropped rather than failing recovery of
+        the canonical chain. Also returns the set of every tip any sync record
+        claims provenance for (including expired ones), so the caller can drop
+        forks that only an expired sync kept alive.
+        """
+        if not isinstance(syncs_raw, list):
+            return {}, set()
+        now = time.time()
+        canonical_hashes = {block.block_hash for block in canonical_chain}
+        syncs: dict[tuple[str, str], dict] = {}
+        synced_tips: set[str] = set()
+        for rec_raw in syncs_raw:
+            if not isinstance(rec_raw, dict):
+                continue
+            source = rec_raw.get("source")
+            request_id = rec_raw.get("request_id")
+            tip_hash = rec_raw.get("tip_hash")
+            expires_at = rec_raw.get("expires_at")
+            fingerprint = rec_raw.get("fingerprint")
+            if not isinstance(source, str) or not source:
+                continue
+            if not isinstance(request_id, str) or not request_id:
+                continue
+            if not crypto.is_hex64(tip_hash):
+                continue
+            # Provenance is recorded even for expired records: it proves the
+            # matching fork must not outlive the sync that delivered it.
+            synced_tips.add(tip_hash)
+            if (
+                isinstance(expires_at, bool)
+                or not isinstance(expires_at, int)
+                or expires_at <= now
+            ):
+                continue
+            if not isinstance(fingerprint, str) or not fingerprint:
+                continue
+            if tip_hash not in forks and tip_hash not in canonical_hashes:
+                continue
+            key = (source, request_id)
+            if key in syncs:
+                continue
+            syncs[key] = {
+                "tip_hash": tip_hash,
+                "expires_at": expires_at,
+                "fingerprint": fingerprint,
+            }
+        return syncs, synced_tips
 
     @staticmethod
     def _validate_transaction(path: str, tx: Transaction) -> None:
@@ -498,6 +611,19 @@ class LedgerStore:
             data["forks"] = [
                 [block.to_dict() for block in fork]
                 for fork in sorted(self.forks.values(), key=lambda f: f[-1].block_hash)
+            ]
+        # Sync metadata is persisted in the same atomic document as the
+        # candidate chains it references.
+        if self.syncs:
+            data["syncs"] = [
+                {
+                    "source": key[0],
+                    "request_id": key[1],
+                    "tip_hash": rec["tip_hash"],
+                    "expires_at": rec["expires_at"],
+                    "fingerprint": rec["fingerprint"],
+                }
+                for key, rec in sorted(self.syncs.items())
             ]
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
@@ -754,3 +880,23 @@ class LedgerStore:
             self.pending.pop(tx_id, None)
         self.chain = new_chain
         self.rebuild_derived()
+
+    # -- sync records ---------------------------------------------------------
+
+    def prune_syncs(self, now: float | None = None) -> None:
+        """Drop expired sync records, returning their orphaned tip hashes.
+
+        A record expires once ``expires_at`` has passed. The caller decides
+        what to do with the returned tips (typically dropping the candidate
+        forks they brought in); tips adopted onto the canonical chain are not
+        present in ``forks`` and are simply skipped there. Does not save; the
+        caller persists.
+        """
+        current = time.time() if now is None else now
+        expired_tips: list[str] = []
+        for key in list(self.syncs):
+            rec = self.syncs[key]
+            if rec["expires_at"] <= current:
+                expired_tips.append(rec["tip_hash"])
+                del self.syncs[key]
+        return expired_tips

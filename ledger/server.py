@@ -59,6 +59,13 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_fork_candidate(payload)
                 self._send_json(status, body)
+            elif path == "/v1/forks/sync":
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.submit_fork_sync(payload)
+                self._send_json(status, body)
             elif path.startswith("/v1/forks/") and path.endswith("/adopt"):
                 # POST /v1/forks/{tip_hash}/adopt — a body is not required.
                 if self.headers.get("Content-Length"):
@@ -93,6 +100,14 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             path, _, query = self.path.partition("?")
             if path == "/v1/chain":
                 status, body = service.get_chain()
+                self._send_json(status, body)
+            elif path == "/v1/forks/sync":
+                # GET /v1/forks/sync?source=&min_height=&max_height=&limit=&cursor=
+                params = {
+                    key: values[0]
+                    for key, values in parse_qs(query, keep_blank_values=True).items()
+                }
+                status, body = service.list_fork_syncs(params)
                 self._send_json(status, body)
             elif path == "/v1/index/transactions":
                 # GET /v1/index/transactions?tx_id=&account=&height=&limit=&cursor=

@@ -1,5 +1,6 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain, adopt, export and index subcommands.
+rollback, status, candidates, chain, adopt, export, index, sync and syncs
+subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -206,6 +207,42 @@ def cmd_export(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    try:
+        candidate = json.loads(args.candidate_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON candidate: {exc}"})
+    # Accept the bare blocks array or any export-format object verbatim.
+    if isinstance(candidate, list):
+        candidate = {"blocks": candidate}
+    payload = {
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "candidate": candidate,
+    }
+    status, body = _request("POST", f"{args.base_url}/v1/forks/sync", payload)
+    return _emit(status, body)
+
+
+def cmd_syncs(args: argparse.Namespace) -> int:
+    filters = {
+        "source": args.source,
+        "min_height": args.min_height,
+        "max_height": args.max_height,
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/forks/sync"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     filters = {
         "tx_id": args.tx_id,
@@ -291,6 +328,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser("export", help="export a candidate fork by tip hash")
     p_export.add_argument("tip_hash", help="candidate fork tip block hash")
     p_export.set_defaults(func=cmd_export)
+
+    p_sync = sub.add_parser(
+        "sync", help="push a candidate fork received from another node"
+    )
+    p_sync.add_argument("--source", required=True, help="originating node identifier")
+    p_sync.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync.add_argument(
+        "--expires-at",
+        required=True,
+        type=int,
+        help="expiry as Unix seconds; an expired delivery is rejected 410",
+    )
+    p_sync.add_argument(
+        "candidate_json",
+        help="candidate fork: an export-format object or a blocks JSON array",
+    )
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_syncs = sub.add_parser("syncs", help="audit-list received synced candidates")
+    p_syncs.add_argument("--source", help="filter by originating node identifier")
+    p_syncs.add_argument("--min-height", help="minimum tip height (decimal)")
+    p_syncs.add_argument("--max-height", help="maximum tip height (decimal)")
+    p_syncs.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_syncs.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
+    p_syncs.set_defaults(func=cmd_syncs)
 
     p_index = sub.add_parser(
         "index", help="query the confirmed-chain transaction index"

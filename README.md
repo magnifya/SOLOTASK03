@@ -59,6 +59,38 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `POST /v1/forks/candidates`（即除 `{"blocks":[...]}` 外也接受该五字段格式），
   节点会按块重算并核对摘要字段，重验失败 `400`，重复 `409`。
 
+## 节点间候选链同步与审计查询
+
+除本地提交候选外，节点还能接收其他节点推来的候选链并提供审计查询。
+
+- **接收同步**：`POST /v1/forks/sync`，请求 JSON 含
+  `{"source","request_id","expires_at","candidate"}`：`source` 是来源节点标识，
+  `request_id` 是该来源作用域内的幂等键，`expires_at` 是 Unix 秒过期时刻，
+  `candidate` 按现有导出格式（五字段文档，也接受 `{"blocks":[...]}` 或裸块数组）。
+  节点对候选按既有规则**全量重验**：canonical 创世块逐字节一致、高度连续、
+  `prev_hash` 相连、重算 `block_hash` 与 Merkle 根、逐笔校验 `tx_id` 与 Ed25519
+  签名、`tx_id` 全链唯一且块内升序、按初始余额重放不超支、仅允许末块 `pending`，
+  导出文档自带的摘要字段也会逐一核对。成功 `201` 返回
+  `{tip_hash, height, length, status, expires_at}`；请求已过期返回 `410`；
+  字段格式或候选校验失败返回 `400`。
+- **幂等与冲突**：同一 `source` + `request_id` 重试时，候选内容相同则返回
+  `200` 与**首次的原结果**（含原 `expires_at`）；内容不同返回 `409`；
+  候选 `tip_hash` 与 canonical 或任一已存候选重复也返回 `409`。
+- **过期处理**：同步带来的候选只在记录未过期期间存活；一旦过期，记录与其候选
+  分叉一并移除（已采用上链的 tip 只留审计记录、不影响 canonical 链）。元数据与
+  候选在**同一次原子写入**中落盘；重启时重验全部候选并丢弃过期或失效记录。
+- **审计查询**：`GET /v1/forks/sync` 支持 `source`、`min_height`、`max_height`、
+  `limit`（默认 50，范围 1–200）、`cursor`（默认 0）。数值参数必须是首位非 0 的
+  十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。结果按
+  `(height, tip_hash, source)` 升序，返回 `{items, total, next_cursor}`；
+  `cursor == total` 返回空页，`cursor > total` 返回 `400`，没有更多结果时
+  `next_cursor` 为 `null`。每个 item 含
+  `{source, request_id, tip_hash, height, length, status, expires_at}`。
+- **串行化与采用**：同步接收、审计查询与候选采用共用同一把锁串行化。采用规则
+  不变（最长链优先、同长取最小 `tip_hash`），在一次原子写入中换链、递增
+  `generation` 并重建索引：旧链独有的已确认交易去重回池，旧链 pending 末块与
+  新链已含交易都不入池；已采用 tip 的同步记录继续可查询直到过期。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
@@ -83,7 +115,7 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` 子命令 |
 
 约定：
 
@@ -162,6 +194,17 @@ curl -s -X POST localhost:8080/v1/forks/<tip-hash>/adopt
 curl -s localhost:8080/v1/forks/<tip-hash>/export
 # -> 200 {"tip_hash":"...","height":N,"length":N+1,"status":"...","blocks":[...]}
 
+# 节点间同步：推送他节点候选（201；相同 source+request_id 同内容重试 200，
+# 内容不同/tip 重复 409，过期 410，格式或校验失败 400）
+curl -s -X POST localhost:8080/v1/forks/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"node-2","request_id":"req-7","expires_at":1800000000,"candidate":{...export 文档...}}'
+# -> 201 {"tip_hash":"...","height":N,"length":N+1,"status":"...","expires_at":1800000000}
+
+# 同步审计查询（source/min_height/max_height/limit/cursor；非法数值 400）
+curl -s 'localhost:8080/v1/forks/sync?source=node-2&min_height=1&limit=50&cursor=0'
+# -> 200 {"items":[{source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
+
 # 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
@@ -192,6 +235,10 @@ python -m ledger.cli adopt <tip-hash>
 # 导出候选分叉与确认链交易索引
 python -m ledger.cli export <tip-hash>
 python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--cursor N] [--limit N]
+
+# 节点间候选链同步与审计查询
+python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
+python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -206,4 +253,5 @@ python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/C
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
+python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 ```
