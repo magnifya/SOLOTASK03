@@ -1,5 +1,6 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain, adopt, export and index subcommands.
+rollback, status, candidates, chain, adopt, export, index, sync and syncs
+subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -224,6 +225,42 @@ def cmd_index(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    try:
+        candidate = json.loads(args.candidate_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON candidate: {exc}"})
+    # Accept either the five-field export document or a bare blocks array.
+    if isinstance(candidate, list):
+        candidate = {"blocks": candidate}
+    payload = {
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "candidate": candidate,
+    }
+    status, body = _request("POST", f"{args.base_url}/v1/forks/sync", payload)
+    return _emit(status, body)
+
+
+def cmd_syncs(args: argparse.Namespace) -> int:
+    filters = {
+        "source": args.source,
+        "min_height": args.min_height,
+        "max_height": args.max_height,
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/forks/sync"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -301,6 +338,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_index.set_defaults(func=cmd_index)
+
+    p_sync = sub.add_parser(
+        "sync", help="push a candidate chain to a peer via /v1/forks/sync"
+    )
+    p_sync.add_argument("--source", required=True, help="sending peer identifier")
+    p_sync.add_argument("--request-id", required=True, help="idempotency key")
+    p_sync.add_argument(
+        "--expires-at", required=True, type=int, help="offer expiry as Unix seconds"
+    )
+    p_sync.add_argument(
+        "candidate_json",
+        help="candidate as an export document or a blocks JSON array",
+    )
+    p_sync.set_defaults(func=cmd_sync)
+
+    p_syncs = sub.add_parser(
+        "syncs", help="query the peer-sync audit log at /v1/forks/sync"
+    )
+    p_syncs.add_argument("--source", help="filter by source peer")
+    p_syncs.add_argument("--min-height", help="minimum tip height (decimal)")
+    p_syncs.add_argument("--max-height", help="maximum tip height (decimal)")
+    p_syncs.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_syncs.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
+    p_syncs.set_defaults(func=cmd_syncs)
 
     return parser
 

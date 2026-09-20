@@ -129,3 +129,53 @@ class Block:
             "status": self.status,
             "transaction_ids": [tx.tx_id for tx in self.transactions],
         }
+
+
+@dataclass
+class SyncRecord:
+    """A candidate chain received from a peer via POST /v1/forks/sync.
+
+    The sync metadata (source peer, client-supplied idempotency key and expiry
+    instant) is persisted atomically together with the full, re-validated
+    candidate block list.
+    """
+
+    source: str
+    request_id: str
+    expires_at: int
+    blocks: list[Block]
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.source, self.request_id)
+
+    @property
+    def tip_hash(self) -> str:
+        return self.blocks[-1].block_hash
+
+    def metadata_dict(self) -> dict:
+        """The metadata fields persisted alongside the candidate blocks."""
+        return {
+            "source": self.source,
+            "request_id": self.request_id,
+            "expires_at": self.expires_at,
+        }
+
+    def to_dict(self) -> dict:
+        """Storage shape: metadata plus the full candidate block list."""
+        data = self.metadata_dict()
+        data["blocks"] = [block.to_dict() for block in self.blocks]
+        return data
+
+    def descriptor(self) -> dict:
+        """Public descriptor returned by the sync endpoints."""
+        tip = self.blocks[-1]
+        return {
+            "source": self.source,
+            "request_id": self.request_id,
+            "tip_hash": tip.block_hash,
+            "height": tip.height,
+            "length": len(self.blocks),
+            "status": tip.status,
+            "expires_at": self.expires_at,
+        }

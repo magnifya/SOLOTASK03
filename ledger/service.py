@@ -29,7 +29,7 @@ transaction in an empty ledger could never be accepted.
 from __future__ import annotations
 
 from . import crypto
-from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
+from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, SyncRecord, Transaction
 from .store import LedgerStore
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
@@ -333,8 +333,11 @@ class LedgerService:
         """Pick the winner among the canonical chain and every candidate.
 
         Longest chain wins; equal lengths are broken by the smallest tip hash
-        (lexicographic hex order). Returns (tip_hash, block list).
+        (lexicographic hex order). Expired peer offers are evicted from the
+        in-memory pool first (read paths do not persist; the next mutating
+        write does). Returns (tip_hash, block list).
         """
+        self.store.reconcile_sync_pool()
         contenders: list[tuple[str, list]] = [
             (self.store.tip_hash(), self.store.chain)
         ]
@@ -367,6 +370,8 @@ class LedgerService:
                 return 400, {"error": f"summary field {field!r} does not match the blocks"}
         tip_hash = fork[-1].block_hash
         with self.store.lock:
+            # Release tip slots owned by expired peer offers first.
+            self.store.reconcile_sync_pool()
             # A tip hash equal to any canonical block hash means the candidate
             # is exactly the canonical chain or a prefix of it (the block hash
             # binds height, parent and Merkle root), so it carries nothing new.
@@ -387,6 +392,7 @@ class LedgerService:
         the adoptable winner (a non-canonical chain that beats canonical).
         """
         with self.store.lock:
+            self.store.reconcile_sync_pool()
             canonical = self._fork_summary(self.store.chain)
             candidates = [
                 self._fork_summary(self.store.forks[tip])
@@ -423,7 +429,9 @@ class LedgerService:
                 return 409, {"error": "only the winning fork can be adopted"}
             old_chain = self.store.chain
             old_pending = dict(self.store.pending)
-            self.store.forks.pop(tip_hash)
+            old_syncs = dict(self.store.syncs)
+            old_sync_tips = set(self.store.sync_tips)
+            self.store.remove_candidate(tip_hash)
             self.store.replace_chain(fork)
             try:
                 self.store.save()
@@ -431,6 +439,8 @@ class LedgerService:
                 # Restore the pre-adoption in-memory state on a failed write.
                 self.store.chain = old_chain
                 self.store.pending = old_pending
+                self.store.syncs = old_syncs
+                self.store.sync_tips = old_sync_tips
                 self.store.forks[tip_hash] = fork
                 self.store.rebuild_derived()
                 raise
@@ -456,6 +466,190 @@ class LedgerService:
             body = self._fork_summary(fork)
             body["blocks"] = [block.to_dict() for block in fork]
             return 200, body
+
+    # -- peer sync ------------------------------------------------------------
+
+    SYNC_REQUIRED_FIELDS = ("source", "request_id", "expires_at", "candidate")
+
+    def _validate_sync_candidate(self, candidate: object) -> tuple[list | None, str | None]:
+        """Re-validate a synced candidate in the export format.
+
+        Accepts the five-field export document
+        ``{tip_hash, height, length, status, blocks}`` (or a bare
+        ``{"blocks": [...]}`` object). Runs the same strict chain checks as
+        POST /v1/forks/candidates: canonical genesis, consecutive heights and
+        prev_hash linkage, recomputed hashes/Merkle roots, signatures, unique
+        ascending tx_ids, balance replay and the pending-tip rule. Any
+        supplied summary field must match the recomputed descriptor. Returns
+        (blocks, None) on success or (None, reason) on failure.
+        """
+        if not isinstance(candidate, dict):
+            # A bare blocks array is accepted just like at
+            # POST /v1/forks/candidates, but anything non-object/non-list is not.
+            if not isinstance(candidate, list):
+                return None, "field 'candidate' must be a JSON object or a blocks list"
+            candidate = {"blocks": candidate}
+        blocks_raw = candidate.get("blocks")
+        if not isinstance(blocks_raw, list):
+            return None, "field 'candidate.blocks' must be a list"
+        try:
+            blocks = self.store.validate_fork_blocks(blocks_raw)
+        except ValueError as exc:
+            return None, str(exc)
+        summary = self._fork_summary(blocks)
+        for field in ("tip_hash", "height", "length", "status"):
+            if field in candidate and candidate[field] != summary[field]:
+                return None, f"candidate summary field {field!r} does not match the blocks"
+        return blocks, None
+
+    def sync_candidate(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/forks/sync — receive a candidate chain from a peer.
+
+        The request carries ``source``, ``request_id`` (the client's
+        idempotency key), ``expires_at`` (Unix seconds) and ``candidate`` (an
+        export-format fork document). The candidate is fully re-validated.
+        Returns 201 with the record descriptor; an expired request returns
+        410; malformed input or a candidate failing re-validation returns 400;
+        a repeated (source, request_id) with identical content returns 200
+        with the original result, with different content 409; a duplicate tip
+        hash (canonical chain or another candidate) returns 409. Metadata and
+        candidate are persisted in one atomic write.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in self.SYNC_REQUIRED_FIELDS:
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+
+        source = payload["source"]
+        request_id = payload["request_id"]
+        expires_at = payload["expires_at"]
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "field 'source' must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "field 'request_id' must be a non-empty string"}
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int) or expires_at < 0:
+            return 400, {"error": "field 'expires_at' must be a non-negative Unix-seconds integer"}
+
+        # Re-validate the candidate before touching the lock, exactly like a
+        # manual fork submission.
+        blocks, reason = self._validate_sync_candidate(payload["candidate"])
+        if blocks is None:
+            return 400, {"error": reason}
+
+        with self.store.lock:
+            # Expiry is decided against the store clock while serialized with
+            # every other mutation.
+            if expires_at <= self.store.current_time():
+                return 410, {"error": "sync request has expired"}
+
+            # Purge records that expired since the last mutation (durable).
+            before = len(self.store.syncs)
+            self.store.reconcile_sync_pool()
+            if len(self.store.syncs) != before:
+                self.store.save()
+
+            key = (source, request_id)
+            existing = self.store.syncs.get(key)
+            tip_hash = blocks[-1].block_hash
+            if existing is not None:
+                # Idempotent retry: same content replays the original result;
+                # a different chain under the same key is a conflict.
+                if existing.tip_hash == tip_hash:
+                    return 200, existing.descriptor()
+                return 409, {"error": "request_id is already used with different content"}
+
+            # Duplicate of the canonical chain/prefix or any live candidate.
+            if any(tip_hash == block.block_hash for block in self.store.chain):
+                return 409, {"error": "candidate is identical to the canonical chain"}
+            if tip_hash in self.store.forks:
+                return 409, {"error": "candidate fork already exists", "tip_hash": tip_hash}
+
+            record = SyncRecord(source, request_id, expires_at, blocks)
+            self.store.add_sync_record(record)
+            try:
+                self.store.save()
+            except BaseException:
+                # Undo the in-memory registration so no unpersisted record is
+                # visible or adoptable.
+                self.store.syncs.pop(key, None)
+                self.store.forks.pop(tip_hash, None)
+                self.store.sync_tips.discard(tip_hash)
+                raise
+            return 201, record.descriptor()
+
+    def list_syncs(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/forks/sync — paginated audit query over received candidates.
+
+        Filters (AND-combined): exact ``source``, ``min_height`` /
+        ``max_height`` (inclusive); ``limit`` (default 50, range 1-200) and
+        ``cursor`` (default 0) paginate. Every numeric parameter must be a
+        plain non-negative decimal without leading zeros or the response is
+        400. Rows are ordered by ``(height, tip_hash, source)``; the response
+        is ``{items, total, next_cursor}`` where each item carries
+        source, request_id, tip_hash, height, length, status and expires_at.
+        A cursor beyond the filtered total returns 400; a cursor equal to it
+        returns an empty page. Expired records are evicted (durable) first, so
+        the audit view only lists live offers.
+        """
+        source = params.get("source")
+        if source is not None and (not isinstance(source, str) or not source):
+            return 400, {"error": "source must be a non-empty string"}
+
+        min_height = None
+        if params.get("min_height") is not None:
+            min_height = _parse_decimal(params["min_height"])
+            if min_height is None:
+                return 400, {"error": "min_height must be a non-negative decimal"}
+        max_height = None
+        if params.get("max_height") is not None:
+            max_height = _parse_decimal(params["max_height"])
+            if max_height is None:
+                return 400, {"error": "max_height must be a non-negative decimal"}
+        if min_height is not None and max_height is not None and min_height > max_height:
+            return 400, {"error": "min_height must not exceed max_height"}
+
+        limit = self.INDEX_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.INDEX_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 200"}
+            limit = parsed
+        cursor = 0
+        if params.get("cursor") is not None:
+            parsed = _parse_decimal(params["cursor"])
+            if parsed is None:
+                return 400, {"error": "cursor must be a non-negative decimal"}
+            cursor = parsed
+
+        with self.store.lock:
+            # Expire offers before answering so the audit log reflects live
+            # state; the eviction is made durable in the same write.
+            before = len(self.store.syncs)
+            self.store.reconcile_sync_pool()
+            if len(self.store.syncs) != before:
+                self.store.save()
+
+            rows: list[dict] = []
+            for record in self.store.syncs.values():
+                tip = record.blocks[-1]
+                if source is not None and record.source != source:
+                    continue
+                if min_height is not None and tip.height < min_height:
+                    continue
+                if max_height is not None and tip.height > max_height:
+                    continue
+                rows.append(record.descriptor())
+
+        # tip_hash is unique across live records, so this key orders every row
+        # deterministically even without appending request_id.
+        rows.sort(key=lambda item: (item["height"], item["tip_hash"], item["source"]))
+        total = len(rows)
+        if cursor > total:
+            return 400, {"error": "cursor is beyond the result set"}
+        items = rows[cursor : cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < total else None
+        return 200, {"items": items, "total": total, "next_cursor": next_cursor}
 
     # -- transaction index ----------------------------------------------------
 

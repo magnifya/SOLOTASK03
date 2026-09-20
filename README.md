@@ -59,6 +59,41 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `POST /v1/forks/candidates`（即除 `{"blocks":[...]}` 外也接受该五字段格式），
   节点会按块重算并核对摘要字段，重验失败 `400`，重复 `409`。
 
+## 节点间候选链同步与审计查询
+
+除手动提交候选外，节点之间还可以整链同步候选，并提供可审计的接收记录查询。
+
+- **同步接收**：`POST /v1/forks/sync`，请求体
+  `{"source","request_id","expires_at","candidate"}`：`source` 是来源节点标识，
+  `request_id` 是来源方提供的幂等键，`expires_at` 是 Unix 秒过期时刻，
+  `candidate` 采用与 `GET /v1/forks/{tip_hash}/export` 相同的导出格式（五字段文档
+  或 `{"blocks":[...]}`）。节点对候选执行与手动提交完全相同的重验：canonical
+  创世块、连续高度与 `prev_hash`、重算 `block_hash` 与 Merkle 根、逐笔 `tx_id`
+  与 Ed25519 签名、`tx_id` 全链唯一且块内升序、按初始余额整链重放不超支，以及
+  「只允许末块 pending」；候选携带的摘要字段同样逐字段核对。
+  - 合法返回 `201` 与
+    `{source, request_id, tip_hash, height, length, status, expires_at}`；
+    请求已过期（`expires_at <= now`）返回 `410`；JSON 格式或任何校验失败返回 `400`。
+  - 同一 `source + request_id` 重试：候选内容相同（tip_hash 相同）返回
+    `200` 与**首次的原结果**（保留原 `expires_at`）；内容不同返回 `409`。
+  - tip_hash 与 canonical 链（含其前缀）或任何现存候选（手动或同步）重复返回 `409`。
+  - 同步元数据与候选链在**同一次原子写入**中落盘（与 generation 同一快照）；
+    写入失败时内存改动回滚。重启时每条记录都重新执行整链校验，非法记录丢弃而不
+    影响 canonical 恢复，过期记录在启动时清理并从候选池撤回（同样落盘）。
+- **审计查询**：`GET /v1/forks/sync`，AND 组合查询参数 `source`（精确匹配）、
+  `min_height`、`max_height`（闭区间）、`limit`（默认 50，范围 1–200）、
+  `cursor`（默认 0）；数值参数必须是首位非 0 的十进制（`0` 本身合法），非法值或
+  `min_height > max_height` 返回 `400`。结果按 `(height, tip_hash, source)` 升序，
+  返回 `{items, total, next_cursor}`：每个 item 含
+  `source, request_id, tip_hash, height, length, status, expires_at`；
+  `cursor` 等于总数时返回空页、大于总数返回 `400`；没有更多结果时
+  `next_cursor` 为 `null`。查询前会先清理过期记录，故审计视图只包含未过期记录。
+- **采用串行化**：同步接收、审计查询与候选采用在同一把锁上彼此串行化。接收到的
+  同步候选（未过期、非 canonical）与手动候选进入同一个采用竞争集合，仍按
+  「最长链优先、同长取最小 tip_hash」决策；采用是一次原子换链，旧链独有的
+  **已确认**交易去重回待打包集合，旧链 pending 末块与新链已含交易均不入池；
+  被采用的同步记录随之删除，过期记录自动退出竞争。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
@@ -80,10 +115,10 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用 |
+| `ledger/store.py` | 链（含候选分叉与节点同步记录）、状态、待打包集合、索引与账户的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、同步记录持久化/重验/过期清理、采用时原子换链、启动快照扫描与崩溃恢复 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，以及候选分叉的提交校验、链比较与原子采用、节点间同步接收（幂等/过期/冲突）与同步审计查询 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` 子命令 |
 
 约定：
 
@@ -165,6 +200,16 @@ curl -s localhost:8080/v1/forks/<tip-hash>/export
 # 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
+
+# 节点间同步：candidate 为导出格式文档（或 {"blocks":[...]}）
+curl -s -X POST localhost:8080/v1/forks/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"node-2","request_id":"req-1","expires_at":1760000000,"candidate":{"tip_hash":"...","blocks":[...]}}'
+# -> 201/200 {source,request_id,tip_hash,height,length,status,expires_at}；过期 410，非法 400，冲突/重复 409
+
+# 同步审计查询（source/min_height/max_height/limit/cursor，非法 400）
+curl -s 'localhost:8080/v1/forks/sync?source=node-2&min_height=1&limit=50'
+# -> 200 {"items":[{source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
 ```
 
 ## 命令行
@@ -192,6 +237,10 @@ python -m ledger.cli adopt <tip-hash>
 # 导出候选分叉与确认链交易索引
 python -m ledger.cli export <tip-hash>
 python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--cursor N] [--limit N]
+
+# 节点间候选链同步与审计查询
+python -m ledger.cli sync --source node-2 --request-id req-1 --expires-at 1760000000 '<export-document-or-blocks-json>'
+python -m ledger.cli syncs [--source <peer>] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -206,4 +255,5 @@ python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/C
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
+python tests/fork_sync_test.py        # 节点间同步接收（201/200/400/409/410）、审计查询分页排序、原子持久化与重启重验/过期清理、串行化采用
 ```
