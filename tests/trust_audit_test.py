@@ -407,6 +407,13 @@ class TrustAuditServiceTests(unittest.TestCase):
         data["audit_events"].append(
             {"event_id": 2, "kind": "source_registered", "at": 1.0, "source": "x"}
         )
+        # Keep the alternative candidate individually valid under the hash
+        # chain: relink the whole log and pin its checkpoint, leaving only the
+        # extra event as the same-generation content conflict.
+        from ledger import audit as audit_mod
+
+        data["audit_events"] = audit_mod.link_events(data["audit_events"])
+        data["audit_checkpoint"] = audit_mod.make_checkpoint(data["audit_events"])
         snapshot = os.path.join(self.tmp, f".ledger-conflict.gen{generation}")
         with open(snapshot, "w", encoding="utf-8") as fh:
             json.dump(data, fh)

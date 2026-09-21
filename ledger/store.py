@@ -61,13 +61,14 @@ from .models import (
     Transaction,
     compute_block_hash,
 )
+from . import audit
 from . import crypto
 
 # Previous hash of the genesis block.
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 7
+STATE_VERSION = 8
 
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
@@ -166,9 +167,14 @@ class LedgerStore:
         # Keyless trust allowlist {source: expires_at}; preserved verbatim and
         # surfaced by GET /v1/trust for offline light clients.
         self.allowlist: dict[str, int] = {}
-        # Append-only audit events, each {"event_id", "kind", "at", ...payload}.
-        # event_id is the 1-based position in this list.
+        # Append-only audit events, each {"event_id", "kind", "at",
+        # "prev_hash", "event_hash", ...payload}. event_id is the 1-based
+        # position in this list; the two hash fields form a SHA-256 chain
+        # anchored at 64 zeroes.
         self.audit_events: list[dict] = []
+        # Head of the audit hash chain: {"event_id", "event_hash"} of the last
+        # event, or {0, "0"*64} for an empty log. Persisted in every snapshot.
+        self.audit_checkpoint: dict = audit.make_checkpoint([])
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
@@ -215,6 +221,7 @@ class LedgerStore:
                 self.trust_sources = {}
                 self.allowlist = {}
                 self.audit_events = []
+                self.audit_checkpoint = audit.make_checkpoint([])
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
@@ -229,6 +236,9 @@ class LedgerStore:
                 except StateRecoveryError as exc:
                     errors.append(exc)
                     continue
+                # parsed = (chain, pending, generation, forks, initial_balance,
+                #           syncs, trust_sources, allowlist, audit_events,
+                #           expired_records, audit_checkpoint, audit_repair)
                 valid.append(
                     (
                         parsed[2],
@@ -242,6 +252,8 @@ class LedgerStore:
                         parsed[7],
                         parsed[8],
                         parsed[9],
+                        parsed[10],
+                        parsed[11],
                     )
                 )
 
@@ -253,6 +265,9 @@ class LedgerStore:
 
             max_generation = max(item[0] for item in valid)
             top = [item for item in valid if item[0] == max_generation]
+            # item layout: (generation, path, chain, pending, forks,
+            # initial_balance, syncs, trust_sources, allowlist, audit_events,
+            # expired_records, audit_checkpoint, audit_repair)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -262,6 +277,7 @@ class LedgerStore:
                 top[0][8],
                 top[0][9],
                 top[0][5],
+                top[0][11],
             )
             for item in top[1:]:
                 if (
@@ -274,6 +290,7 @@ class LedgerStore:
                         item[8],
                         item[9],
                         item[5],
+                        item[11],
                     )
                     != reference
                 ):
@@ -303,6 +320,8 @@ class LedgerStore:
                 allowlist,
                 audit_events,
                 expired_records,
+                audit_checkpoint,
+                audit_repair,
             ) = winner
 
             if os.path.abspath(winner_path) != main_abs:
@@ -318,6 +337,16 @@ class LedgerStore:
             # detection keeps that comparison based on durable content (the
             # backfill carries a current timestamp).
             backfilled = self._backfill_expired_events(audit_events, expired_records)
+            # A snapshot written before audit hash chaining carries no links;
+            # expiry backfill events are likewise appended without hashes. In
+            # both cases the single winning snapshot's log is (re)linked here:
+            # renumbering dense ids and recomputing reproduces every already
+            # validated link byte-for-byte and completes the new tail. A
+            # present-but-wrong chain never reaches this point —
+            # _parse_snapshot rejects it with StateRecoveryError.
+            if audit_repair or backfilled:
+                audit_events = audit.link_events(audit_events)
+            audit_checkpoint = audit.make_checkpoint(audit_events)
             self.chain = chain
             self.pending = pending
             self.forks = forks
@@ -325,6 +354,7 @@ class LedgerStore:
             self.trust_sources = trust_sources
             self.allowlist = allowlist
             self.audit_events = audit_events
+            self.audit_checkpoint = audit_checkpoint
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -335,10 +365,11 @@ class LedgerStore:
             self.rebuild_derived()
             self._cleanup_candidates(directory)
             # Persist the reconciled state (pruned records/forks + backfilled
-            # events) atomically so the next restart never re-derives or
-            # duplicates the events; with nothing to backfill no write happens
-            # and the recovered generation is kept byte-for-byte.
-            if backfilled:
+            # events + legacy hash-chain completion) atomically so the next
+            # restart never re-derives or duplicates anything; with nothing to
+            # reconcile no write happens and the recovered generation is kept
+            # byte-for-byte.
+            if backfilled or audit_repair:
                 self.save()
 
     def _discover_candidates(self, directory: str) -> list[str]:
@@ -369,12 +400,16 @@ class LedgerStore:
         allowlist: dict[str, int] | None = None,
         audit_events: list[dict] | None = None,
         initial_balance: int | None = None,
+        audit_checkpoint: dict | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
         The recorded ``initial_balance`` is part of the authoritative view: two
         same-generation snapshots with identical chains but a different
-        endowment describe a different replay judgment and must conflict.
+        endowment describe a different replay judgment and must conflict. The
+        audit checkpoint participates too: two same-generation snapshots with
+        the same events but a different log head disagree about the audited
+        state and must conflict.
         """
         sync_records = [
             {
@@ -406,6 +441,8 @@ class LedgerStore:
                 "trust_sources": trust_records,
                 "allowlist": dict(sorted((allowlist or {}).items())),
                 "audit_events": audit_events or [],
+                "audit_checkpoint": audit_checkpoint
+                or {"event_id": 0, "event_hash": "0" * 64},
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -461,6 +498,8 @@ class LedgerStore:
         dict[str, int],
         list[dict],
         list[tuple[str, str, dict]],
+        dict,
+        bool,
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -630,6 +669,9 @@ class LedgerStore:
         audit_events = self._parse_persisted_audit_events(
             data.get("audit_events", []), path
         )
+        audit_checkpoint, audit_repair = self._assess_audit_chain(
+            data, audit_events, path
+        )
         syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
         )
@@ -654,7 +696,68 @@ class LedgerStore:
             allowlist,
             audit_events,
             expired_records,
+            audit_checkpoint,
+            audit_repair,
         )
+
+    @staticmethod
+    def _assess_audit_chain(
+        data: dict, audit_events: list[dict], path: str
+    ) -> tuple[dict, bool]:
+        """Validate the persisted audit hash chain and checkpoint.
+
+        Returns ``(checkpoint, needs_repair)``. Three cases:
+
+        * a current snapshot with complete hash links: every dense id,
+          prev_hash link and event_hash is recomputed and the persisted
+          ``audit_checkpoint`` must pin the exact log head — any mismatch is
+          snapshot corruption and fails recovery;
+        * a legacy snapshot predating hash chaining (no link fields, no
+          checkpoint, or a checkpoint-less section): accepted for a one-time
+          repair performed by load() on the unique winner; the checkpoint
+          returned here is the would-be head so same-generation conflict
+          comparison stays content-based;
+        * a partially linked log or a present-but-mismatched checkpoint/link:
+          corruption, never silently repaired.
+        """
+        linked_flags = [
+            isinstance(event, dict)
+            and ("prev_hash" in event or "event_hash" in event)
+            for event in audit_events
+        ]
+        any_linked = any(linked_flags)
+        all_linked = all(linked_flags)
+        checkpoint_raw = data.get("audit_checkpoint")
+        if any_linked and not all_linked:
+            raise StateRecoveryError(
+                path, "audit log is only partially hash-linked"
+            )
+        if all_linked and (audit_events or checkpoint_raw is not None):
+            # A linked log (or an empty log already carrying a checkpoint) is
+            # strictly verified: links recompute and the checkpoint must pin
+            # the exact log head.
+            try:
+                audit.validate_event_chain(audit_events)
+            except audit.AuditChainError as exc:
+                raise StateRecoveryError(path, exc.reason) from exc
+            if checkpoint_raw is None:
+                raise StateRecoveryError(
+                    path, "hash-linked audit log is missing audit_checkpoint"
+                )
+            try:
+                audit.validate_checkpoint(checkpoint_raw, audit_events)
+            except audit.AuditChainError as exc:
+                raise StateRecoveryError(path, exc.reason) from exc
+            return dict(checkpoint_raw), False
+        # Legacy unlinked log (including a pre-feature empty log with no
+        # checkpoint). A present checkpoint is inconsistent with an unlinked
+        # log: treat as corruption rather than silently ignoring it.
+        if checkpoint_raw is not None:
+            raise StateRecoveryError(
+                path, "audit_checkpoint present on an unlinked audit log"
+            )
+        linked = audit.link_events(audit_events)
+        return audit.make_checkpoint(linked), True
 
     @staticmethod
     def _backfill_expired_events(
@@ -1167,6 +1270,15 @@ class LedgerStore:
         # restores the rest of the fields to.
         next_index, next_accounts = self._compute_derived()
         next_generation = self.generation + 1
+        # The in-memory log, its hash head and checkpoint always move together:
+        # refuse to persist a document where they disagree, since that could
+        # never recover. Callers append through append_audit_event(), which
+        # advances both atomically.
+        if self.audit_checkpoint != audit.make_checkpoint(self.audit_events):
+            raise RuntimeError(
+                "audit_checkpoint does not match the audit log head; refusing "
+                "to persist an inconsistent snapshot"
+            )
         data = {
             "state": {
                 "version": STATE_VERSION,
@@ -1180,6 +1292,7 @@ class LedgerStore:
             "pending": [tx.to_dict() for tx in self.pending.values()],
             "index": dict(next_index),
             "accounts": next_accounts,
+            "audit_checkpoint": dict(self.audit_checkpoint),
         }
         # Only persist a forks section when candidates exist so a chain with
         # no forks keeps the canonical snapshot layout; loads default to [].
@@ -1490,17 +1603,41 @@ class LedgerStore:
     def append_audit_event(self, kind: str, payload: dict, at: float | None = None) -> dict:
         """Append an audit event in memory with the next monotonic event_id.
 
-        Does not save; the caller persists the event together with the state
-        change it describes in one atomic write. Caller must hold the lock.
+        The event's ``prev_hash``/``event_hash`` links are computed against
+        the current log head so the append-only hash chain stays continuous.
+        The in-memory checkpoint is advanced together with the event; the
+        caller persists the event, the link and the checkpoint in the same
+        atomic write as the state change the event describes. Caller must
+        hold the lock.
         """
+        prev_hash = (
+            self.audit_checkpoint["event_hash"]
+            if self.audit_events
+            else audit.ZERO_HASH
+        )
         event = {
             "event_id": len(self.audit_events) + 1,
             "kind": kind,
             "at": time.time() if at is None else at,
+            "prev_hash": prev_hash,
         }
         event.update(payload)
+        event["event_hash"] = audit.event_hash(prev_hash, event)
         self.audit_events.append(event)
+        self.audit_checkpoint = audit.make_checkpoint(self.audit_events)
         return event
+
+    def truncate_audit_events(self, count: int) -> None:
+        """Remove the last ``count`` appended events and reset the checkpoint.
+
+        Used by callers to roll an append back when the accompanying atomic
+        write fails: the log, its hash head and the checkpoint always move
+        together, so the checkpoint must return to the new (old) head.
+        Caller must hold the lock.
+        """
+        if count:
+            del self.audit_events[len(self.audit_events) - count :]
+        self.audit_checkpoint = audit.make_checkpoint(self.audit_events)
 
     def prune_syncs(
         self, now: float | None = None

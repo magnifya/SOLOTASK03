@@ -419,6 +419,13 @@ class HistoryServiceTests(unittest.TestCase):
             if event.get("kind") == "sync_received":
                 for field in ("height", "length", "status"):
                     event.pop(field, None)
+        # Dropping payload fields invalidates any stored event_hash, so model
+        # the older snapshot honestly: no audit hash links and no checkpoint
+        # either; recovery backfills them once on the winning snapshot.
+        for event in data["audit_events"]:
+            event.pop("prev_hash", None)
+            event.pop("event_hash", None)
+        data.pop("audit_checkpoint", None)
         with open(self.state_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
 

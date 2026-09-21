@@ -134,6 +134,19 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 }
                 status, body = service.list_audit_events(params)
                 self._send_json(status, body)
+            elif path == "/v1/audit/export":
+                # GET /v1/audit/export?cursor=&limit= — hash-anchored export
+                # pages for offline audit verification. Repeated query
+                # parameters are rejected 400 like the other strict endpoints.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.export_audit_events(params)
+                self._send_json(status, body)
             elif path == "/v1/chain":
                 status, body = service.get_chain()
                 self._send_json(status, body)

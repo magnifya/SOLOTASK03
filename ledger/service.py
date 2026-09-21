@@ -32,6 +32,7 @@ import hashlib
 import json
 import time
 
+from . import audit
 from . import crypto
 from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
 from .store import TRUST_ACTIVE, TRUST_REVOKED, LedgerStore
@@ -480,7 +481,7 @@ class LedgerService:
                 self.store.pending = old_pending
                 self.store.forks[tip_hash] = fork
                 self.store.rebuild_derived()
-                del self.store.audit_events[len(self.store.audit_events) - len(adopted_keys) :]
+                self.store.truncate_audit_events(len(adopted_keys))
                 raise
             return 200, self._fork_summary(fork)
 
@@ -584,7 +585,7 @@ class LedgerService:
             # Restore the pre-cleanup state: a failed write must neither leave
             # the records gone nor their candidates orphaned, nor the events
             # durably visible.
-            del self.store.audit_events[len(self.store.audit_events) - len(removed) :]
+            self.store.truncate_audit_events(len(removed))
             self.store.restore_syncs(removed, removed_forks)
             raise
         return expired_tips
@@ -782,7 +783,7 @@ class LedgerService:
                 # together so a failed write never leaves one without the others.
                 self.store.syncs.pop(key, None)
                 self.store.forks.pop(tip_hash, None)
-                self.store.audit_events.pop()
+                self.store.truncate_audit_events(1)
                 raise
 
             result = dict(summary)
@@ -1191,7 +1192,7 @@ class LedgerService:
             except BaseException:
                 # Undo both the registry change and its event together.
                 self.store.trust_sources.pop(source, None)
-                self.store.audit_events.pop()
+                self.store.truncate_audit_events(1)
                 raise
             return 201, self._trust_record(source, record)
 
@@ -1243,7 +1244,7 @@ class LedgerService:
                 self.store.save()
             except BaseException:
                 self.store.trust_sources[source] = old_record
-                self.store.audit_events.pop()
+                self.store.truncate_audit_events(1)
                 raise
             return 200, self._trust_record(source, existing)
 
@@ -1292,7 +1293,7 @@ class LedgerService:
                 self.store.save()
             except BaseException:
                 existing["status"] = old_status
-                self.store.audit_events.pop()
+                self.store.truncate_audit_events(1)
                 raise
             return 200, self._trust_record(source, existing)
 
@@ -1370,3 +1371,62 @@ class LedgerService:
         page = items[cursor : cursor + limit]
         next_cursor = cursor + limit if cursor + limit < total else None
         return 200, {"items": page, "total": total, "next_cursor": next_cursor}
+
+    def export_audit_events(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/audit/export — hash-anchored export page for offline checks.
+
+        Pagination is identical to ``GET /v1/audit/events`` for the *whole*
+        log (no source/kind filters — an offline verifier replays every
+        event): ``limit`` defaults to 50 and must be 1-200, ``cursor``
+        defaults to 0; both must be plain decimals without leading zeros.
+        Items are the events in ascending ``event_id``, each carrying its
+        ``prev_hash``/``event_hash`` links. The response additionally
+        contains:
+
+        * ``anchor_hash`` — the hash immediately preceding the page's first
+          event (64 zeroes at cursor 0; the head at cursor == total);
+        * ``checkpoint`` — the current ``{event_id, event_hash}`` log head
+          (``{0, "0"*64}`` for an empty log), included on every page.
+
+        ``cursor == total`` returns an empty last page (its anchor is the log
+        head so the final page matches the checkpoint); ``cursor > total`` is
+        400.
+        """
+        limit = self.AUDIT_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.AUDIT_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 200"}
+            limit = parsed
+        cursor = 0
+        if params.get("cursor") is not None:
+            parsed = _parse_decimal(params["cursor"])
+            if parsed is None:
+                return 400, {"error": "cursor must be a non-negative decimal"}
+            cursor = parsed
+
+        with self.store.lock:
+            # Sweep due expiries first, exactly like /v1/audit/events, so the
+            # exported checkpoint and log never lag a durable expiry.
+            self._prune_expired_syncs()
+            events = self.store.audit_events
+            total = len(events)
+            if cursor > total:
+                return 400, {"error": "cursor is beyond the result set"}
+            page = [dict(event) for event in events[cursor : cursor + limit]]
+            # The anchor is the predecessor hash of the page's first event;
+            # for an empty terminal page it is the current log head, which the
+            # offline verifier requires the last page to meet.
+            if cursor == 0:
+                anchor_hash = audit.ZERO_HASH
+            else:
+                anchor_hash = events[cursor - 1]["event_hash"]
+            next_cursor = cursor + limit if cursor + limit < total else None
+            body = {
+                "items": page,
+                "total": total,
+                "next_cursor": next_cursor,
+                "anchor_hash": anchor_hash,
+                "checkpoint": dict(self.store.audit_checkpoint),
+            }
+        return 200, body

@@ -746,6 +746,13 @@ class RestartReauthorizationTests(_ServiceCase):
                 "expires_at": past,
             }
         )
+        # Simulate the crash point under the hash-chained format: relink the
+        # whole log so the durable sync_expired carries valid hashes and pin
+        # the checkpoint to it.
+        from ledger import audit as audit_mod
+
+        data["audit_events"] = audit_mod.link_events(data["audit_events"])
+        data["audit_checkpoint"] = audit_mod.make_checkpoint(data["audit_events"])
         with open(self.state_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
 

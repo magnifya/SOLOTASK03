@@ -1,6 +1,7 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain, adopt, export, index, sync, syncs and
-sync-history subcommands.
+rollback, status, candidates, chain, adopt, export, index, sync, syncs,
+sync-history, audit, audit-export and offline verify/audit-verify
+subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -335,6 +336,48 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_audit_export(args: argparse.Namespace) -> int:
+    filters = {
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/audit/export"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
+def cmd_audit_verify(args: argparse.Namespace) -> int:
+    """Offline audit export verification; no server contact is made.
+
+    The input is one export page or a JSON array of pages (the pages of a
+    full export, in order), read from ``FILE`` or standard input when the
+    argument is ``-``. Prints a single JSON line:
+    ``{"ok": true, "checkpoint": {...}}`` on success or
+    ``{"ok": false, "error": "input"|"integrity"}`` on failure, and exits
+    0/1 respectively.
+    """
+    from .audit import verify_export
+
+    try:
+        if args.export_file == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.export_file, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON input is an input error.
+        body = {"ok": False, "error": "input"}
+    else:
+        body = verify_export(document)
+    print(json.dumps(body, sort_keys=True, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Offline light-client verification; no server contact is made."""
     from .light_client import verify_bundle
@@ -527,6 +570,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_audit.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_audit.set_defaults(func=cmd_audit)
+
+    p_audit_export = sub.add_parser(
+        "audit-export",
+        help="export a hash-anchored audit page for offline verification",
+    )
+    p_audit_export.add_argument(
+        "--cursor", help="pagination offset (decimal, default 0)"
+    )
+    p_audit_export.add_argument(
+        "--limit", help="page size (decimal, 1-200, default 50)"
+    )
+    p_audit_export.set_defaults(func=cmd_audit_export)
+
+    p_audit_verify = sub.add_parser(
+        "audit-verify",
+        help="offline-verify an audit export file (a page or an ordered "
+        "list of pages); - reads standard input",
+    )
+    p_audit_verify.add_argument(
+        "export_file",
+        metavar="FILE|-",
+        help="audit export JSON file, or - to read the document from stdin",
+    )
+    p_audit_verify.set_defaults(func=cmd_audit_verify)
 
     return parser
 

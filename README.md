@@ -155,6 +155,21 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   （`0` 合法），非法值 `400`。事件按 `event_id` 升序分页，返回
   `{items,total,next_cursor}`；`cursor == total` 返回空页，`cursor > total`
   返回 `400`，没有更多结果时 `next_cursor` 为 `null`。
+- **哈希链与检查点**：每个事件额外携带两个链接字段 `prev_hash` 与
+  `event_hash`。首条事件的 `prev_hash` 是 64 个 ASCII `0`，之后每条取前一条的
+  `event_hash`；`event_hash = sha256(prev_hash 的 ASCII 字节 || 事件去掉
+  prev_hash/event_hash 两字段后、key 排序的紧凑 UTF-8 JSON)`（`sort_keys`、
+  `separators=(",",":")`、`ensure_ascii=False`）。快照另存顶层
+  `audit_checkpoint = {event_id, event_hash}` 钉住日志链头，空流为
+  `{0, "0"*64}`；检查点同样参与同代快照冲突比较。事件追加与哈希链接、检查点
+  在同一把锁内一次原子落盘，写盘失败连同事件一起回滚，重试不重不漏。
+- **审计导出**：`GET /v1/audit/export` 的 `cursor`/`limit` 分页语义与
+  `/v1/audit/events` 完全一致（但面向整条日志、不接受 source/kind 过滤）；
+  任何查询参数重复出现返回 `400`。返回
+  `{items,total,next_cursor,anchor_hash,checkpoint}`：`items` 按 `event_id`
+  升序且每个事件含 `prev_hash`/`event_hash`；`anchor_hash` 是本页首条事件的
+  前一哈希（`cursor=0` 为 64 个 0；`cursor=total` 的空末页为当前链头），
+  `checkpoint` 是导出时刻的日志检查点，每页都带。
 - **事件覆盖**：信任变更记录 `source_registered` / `source_rotated` /
   `source_revoked`；节点间同步记录 `sync_received`（接收）、
   `sync_adopted`（候选被采用，按来源同步记录逐条登记）与 `sync_expired`
@@ -162,10 +177,14 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   事件一旦写入永不删除：候选**采用或过期之后仍可按 source/kind 分页查询**。
 - **恢复语义**：信任注册表、allowlist 与审计流是权威配置而非可丢弃缓存，
   快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；`event_id`
-  必须从 1 起连续无重复）。任一损坏，或同代快照在这些区段上内容冲突，都抛出
-  `ledger.store.StateRecoveryError`，绝不静默新建链。停机期间到期/授权失效记录
-  的 `sync_expired` 补写只在同代冲突判定之后、对唯一胜出快照执行一次，补写结果
-  原子落盘；因此冲突比较始终基于持久化内容，重放恢复也不会改变判定。
+  必须从 1 起连续无重复；每条 `prev_hash`/`event_hash` 必须重算一致，
+  `audit_checkpoint` 必须钉住真实链头）。任一错配，或同代快照在这些区段
+  （含检查点）上内容冲突，都抛出 `ledger.store.StateRecoveryError`，绝不静默
+  新建链。写于哈希链特性之前的旧快照（事件无两哈希字段、无检查点）在唯一
+  胜者选定后一次性补齐整链与检查点并原子保存，再次重启不再改写；停机期间
+  到期/授权失效记录补写的 `sync_expired` 也在同一修复中完成链接。补写只在
+  同代冲突判定之后对唯一胜出快照执行，因此冲突比较始终基于持久化内容，
+  重放恢复也不会改变判定。
 
 ## 交易索引
 
@@ -219,6 +238,31 @@ tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`e
 | `proof` | proof 重复、字段与区块不一致、Merkle 路径无效或指向 pending 链尾 |
 
 
+## 审计导出的离线校验
+
+不连接服务端也能核验只增审计流是否被篡改或截断：用
+`GET /v1/audit/export` 逐页拉取（或直接使用某一页），交给 CLI
+`ledger audit-verify FILE|-`（`-` 从标准输入读）。输入可以是**单个导出页
+对象**，也可以是**按顺序排列的多页数组**（对整份导出逐页抓取后的拼接）。
+
+校验逐项进行：
+
+- 每个页面必须具备
+  `{items,total,next_cursor,anchor_hash,checkpoint}` 且类型合法；
+- 页面的 `anchor_hash` 必须等于当前已验位置的前一哈希（首页为 64 个 0）；
+- `items` 的 `event_id` 必须跨页连续（1 起、无缺号），每条 `prev_hash`
+  必须等于前一条的 `event_hash`，且每条 `event_hash` 都按上面的规范重算；
+- 分页计数自洽：非空 `next_cursor` 恰好接续本页且小于 `total`，为 `null`
+  时链头恰好到达 `total`；
+- **最后一页**的链尾（空日志则为 64 个 0）必须与其 `checkpoint` 完全匹配。
+
+输出恒为**单行 JSON**：成功 `{"ok": true, "checkpoint": {event_id,
+event_hash}}`，进程退出码 0；失败
+`{"ok": false, "error": "input"|"integrity"}`，退出码 1。`input` 表示输入
+无法读取/不是 JSON、或文档结构字段缺失/类型非法；`integrity` 表示锚点、
+连续编号、任一哈希链接、分页计数或末页检查点不一致。`audit-verify` 不发起
+任何网络请求。
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：
@@ -227,11 +271,12 @@ tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`e
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist 与只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、信任文档、审计分页与同步事件登记 |
+| `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，以及导出页的离线核验（锚点、连续编号、哈希、末页检查点） |
+| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist 与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链与崩溃恢复 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、信任文档、审计分页、哈希锚定导出与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / `trust add|rotate|revoke|export` / `audit` / 离线 `verify` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / `trust add|rotate|revoke|export` / `audit` / `audit-export` / 离线 `verify` / 离线 `audit-verify` 子命令 |
 
 约定：
 
@@ -353,6 +398,12 @@ curl -s localhost:8080/v1/trust
 # 审计事件流（source/kind/cursor/limit，按 event_id 升序分页）
 curl -s 'localhost:8080/v1/audit/events?kind=sync_received&limit=50&cursor=0'
 # -> 200 {"items":[{event_id,kind,at,...}...],"total":N,"next_cursor":null}
+
+# 哈希锚定审计导出（cursor/limit 分页；重复参数 400）
+curl -s 'localhost:8080/v1/audit/export?limit=50&cursor=0'
+# -> 200 {"items":[{event_id,kind,at,prev_hash,event_hash,...}...],
+#         "total":N,"next_cursor":null,
+#         "anchor_hash":"<本页首条的前一哈希>","checkpoint":{event_id,event_hash}}
 ```
 
 ## 命令行
@@ -395,6 +446,13 @@ python -m ledger.cli trust export > trust.json
 # 只增审计事件流（source/kind/cursor/limit；信任变更与同步接收/采用/过期均可查）
 python -m ledger.cli audit [--source node-2] [--kind source_registered] [--cursor N] [--limit N]
 
+# 哈希锚定审计导出与离线校验（audit-verify 不连接服务端；- 从标准输入读取页或多页数组）
+python -m ledger.cli audit-export [--cursor N] [--limit N] > audit-page.json
+python -m ledger.cli audit-verify audit-page.json
+cat audit-page.json | python -m ledger.cli audit-verify -
+# -> 成功单行 {"ok":true,"checkpoint":{"event_id":N,"event_hash":"..."}} 退出 0；
+#    失败单行 {"ok":false,"error":"input"|"integrity"} 退出 1
+
 # 离线轻客户端验证（不连接服务端；--bundle - 从标准输入读取束 JSON）
 python -m ledger.cli verify --bundle bundle.json --trust trust.json
 cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
@@ -418,4 +476,5 @@ python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/s
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
+python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 ```

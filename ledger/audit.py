@@ -1,0 +1,302 @@
+"""Append-only audit log hash chaining, checkpoints and offline verification.
+
+Every audit event carries two SHA-256 links:
+
+* ``prev_hash``  — the previous event's ``event_hash``; 64 ASCII zeroes for
+  the first event;
+* ``event_hash`` — ``sha256(prev_hash ASCII || canonical-event UTF-8)`` where
+  the canonical event is the event with both hash fields removed, serialized
+  as sorted-key compact JSON (``sort_keys=True, separators=(",", ":")``,
+  non-ASCII characters emitted as raw UTF-8).
+
+``audit_checkpoint`` is ``{"event_id", "event_hash"}`` pinning the latest
+event: a fresh/empty log checks at ``{0, "0"*64}``. Offline verification walks
+one or more exported pages, checking each page anchor, the dense event ids and
+every link, and requires the final page's last event (or the empty log) to
+match its checkpoint.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+
+from . import crypto
+
+# Sentinel previous hash of the first audit event (and checkpoint of an empty
+# log): 64 ASCII zeroes.
+ZERO_HASH = "0" * 64
+
+# Names of the two link fields excluded from the hashed canonical event.
+HASH_FIELDS = ("prev_hash", "event_hash")
+
+# Public offline-verification error categories.
+ERR_INPUT = "input"
+ERR_INTEGRITY = "integrity"
+
+
+class AuditChainError(ValueError):
+    """A persisted audit hash chain or checkpoint failed strict validation.
+
+    Carries a human-readable ``reason``; the persistence layer maps it onto a
+    ``StateRecoveryError`` tagged with the offending snapshot path.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class _VerifyError(Exception):
+    """Internal control-flow exception carrying the public error category."""
+
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(category)
+
+
+def _is_plain_int(value: object) -> bool:
+    """Plain integer test; booleans are rejected (bool subclasses int)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def canonical_event(event: dict) -> bytes:
+    """Sorted-key compact UTF-8 JSON of the event with both hash fields removed.
+
+    This is the exact byte document chained into ``event_hash``; stripping the
+    links makes the hash independent of any re-serialization of the stored
+    event object.
+    """
+    stripped = {key: value for key, value in event.items() if key not in HASH_FIELDS}
+    return json.dumps(
+        stripped, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def event_hash(prev_hash: str, event: dict) -> str:
+    """SHA-256 hex of ``prev_hash`` ASCII bytes followed by the canonical event."""
+    return hashlib.sha256(prev_hash.encode("ascii") + canonical_event(event)).hexdigest()
+
+
+def link_events(events: list[dict]) -> list[dict]:
+    """Return copies of ``events`` with dense ids and fresh hash links.
+
+    Event ids are renumbered 1..N; the first event gets the all-zero
+    ``prev_hash`` and every later event links to its predecessor. Does not
+    mutate the input.
+    """
+    linked: list[dict] = []
+    prev_hash = ZERO_HASH
+    for index, event in enumerate(events):
+        linked_event = dict(event)
+        linked_event["event_id"] = index + 1
+        linked_event["prev_hash"] = prev_hash
+        linked_event["event_hash"] = event_hash(prev_hash, linked_event)
+        linked.append(linked_event)
+        prev_hash = linked_event["event_hash"]
+    return linked
+
+
+def make_checkpoint(events: list[dict]) -> dict:
+    """``{"event_id", "event_hash"}`` pinning the last event (or the zero root)."""
+    if events:
+        return {
+            "event_id": len(events),
+            "event_hash": events[-1]["event_hash"],
+        }
+    return {"event_id": 0, "event_hash": ZERO_HASH}
+
+
+def validate_event_chain(events: object) -> None:
+    """Strictly validate a persisted event list's dense ids and hash links.
+
+    ``event_id`` values must be exactly 1..N; each ``prev_hash`` must equal the
+    previous event's ``event_hash`` (all zeroes for the first event) and every
+    ``event_hash`` must recompute from the event with both hash fields removed.
+    Raises AuditChainError on the first defect.
+    """
+    if not isinstance(events, list):
+        raise AuditChainError("'audit_events' must be a list")
+    prev_hash = ZERO_HASH
+    for index, event in enumerate(events):
+        event_id = index + 1
+        if not isinstance(event, dict):
+            raise AuditChainError(f"audit event {event_id} must be an object")
+        if not _is_plain_int(event.get("event_id")) or event["event_id"] != event_id:
+            raise AuditChainError(
+                f"audit event at position {index} has event_id "
+                f"{event.get('event_id')!r}, expected {event_id}"
+            )
+        stored_prev = event.get("prev_hash")
+        if not crypto.is_hex64(stored_prev) or stored_prev != prev_hash:
+            raise AuditChainError(
+                f"audit event {event_id} has a mismatched prev_hash"
+            )
+        stored_hash = event.get("event_hash")
+        if not crypto.is_hex64(stored_hash):
+            raise AuditChainError(
+                f"audit event {event_id} has an invalid event_hash"
+            )
+        if event_hash(prev_hash, event) != stored_hash:
+            raise AuditChainError(
+                f"audit event {event_id} has a mismatched event_hash"
+            )
+        prev_hash = stored_hash
+
+
+def validate_checkpoint(checkpoint: object, events: list[dict]) -> None:
+    """Validate an ``audit_checkpoint`` against the recovered event list.
+
+    It must be ``{"event_id": N, "event_hash": H}`` with N the (non-negative)
+    number of events and H the last event's hash, or the all-zero root when the
+    log is empty. Raises AuditChainError on any defect.
+    """
+    if not isinstance(checkpoint, dict):
+        raise AuditChainError("'audit_checkpoint' must be an object")
+    event_id = checkpoint.get("event_id")
+    event_hash_value = checkpoint.get("event_hash")
+    if not _is_plain_int(event_id) or event_id < 0:
+        raise AuditChainError("audit_checkpoint.event_id must be a non-negative integer")
+    if not crypto.is_hex64(event_hash_value):
+        raise AuditChainError("audit_checkpoint.event_hash must be 64 lowercase hex chars")
+    expected = make_checkpoint(events)
+    if event_id != expected["event_id"]:
+        raise AuditChainError(
+            f"audit_checkpoint.event_id is {event_id}, log ends at "
+            f"{expected['event_id']}"
+        )
+    if event_hash_value != expected["event_hash"]:
+        raise AuditChainError("audit_checkpoint.event_hash does not match the log head")
+
+
+def verify_export(document: object) -> dict:
+    """Offline-verify one audit export page or an ordered list of pages.
+
+    A page has the server shape
+    ``{items, total, next_cursor, anchor_hash, checkpoint}``. Every page
+    anchor must equal the running predecessor hash, item event ids must be
+    dense and consecutive across pages, every ``prev_hash``/``event_hash``
+    pair must recompute, pagination counters must be self-consistent and the
+    last page's tail must equal its checkpoint.
+
+    Returns ``{"ok": True, "checkpoint": {...}}`` or
+    ``{"ok": False, "error": "input" | "integrity"}``. Never raises for
+    malformed input.
+    """
+    try:
+        pages = _coerce_pages(document)
+        checkpoint = _verify_pages(pages)
+    except _VerifyError as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs report rather than crash.
+        return {"ok": False, "error": ERR_INPUT}
+    return {"ok": True, "checkpoint": checkpoint}
+
+
+def _coerce_pages(document: object) -> list[dict]:
+    """Normalize a single page object / list of pages, validating basic shape."""
+    if isinstance(document, dict):
+        pages = [document]
+    elif isinstance(document, list) and (
+        not document or all(isinstance(page, dict) for page in document)
+    ):
+        pages = document
+    else:
+        raise _VerifyError(ERR_INPUT)
+    if not pages:
+        raise _VerifyError(ERR_INPUT)
+    return pages
+
+
+def _parse_page_shape(page: object) -> dict:
+    """Validate a page's structural fields; returns the dict on success."""
+    if not isinstance(page, dict):
+        raise _VerifyError(ERR_INPUT)
+    for field in ("items", "total", "next_cursor", "anchor_hash", "checkpoint"):
+        if field not in page:
+            raise _VerifyError(ERR_INPUT)
+    items = page["items"]
+    total = page["total"]
+    next_cursor = page["next_cursor"]
+    anchor_hash = page["anchor_hash"]
+    checkpoint = page["checkpoint"]
+    if not isinstance(items, list):
+        raise _VerifyError(ERR_INPUT)
+    if not _is_plain_int(total) or total < 0:
+        raise _VerifyError(ERR_INPUT)
+    if next_cursor is not None and (not _is_plain_int(next_cursor) or next_cursor < 0):
+        raise _VerifyError(ERR_INPUT)
+    if not crypto.is_hex64(anchor_hash):
+        raise _VerifyError(ERR_INPUT)
+    if not isinstance(checkpoint, dict):
+        raise _VerifyError(ERR_INPUT)
+    checkpoint_id = checkpoint.get("event_id")
+    checkpoint_hash = checkpoint.get("event_hash")
+    if not _is_plain_int(checkpoint_id) or checkpoint_id < 0:
+        raise _VerifyError(ERR_INPUT)
+    if not crypto.is_hex64(checkpoint_hash):
+        raise _VerifyError(ERR_INPUT)
+    return page
+
+
+def _verify_pages(pages: list[dict]) -> dict:
+    """Walk every page in order; return the last page's checkpoint on success."""
+    running_id = 0
+    running_hash = ZERO_HASH
+    last_checkpoint: dict | None = None
+    for page in pages:
+        page = _parse_page_shape(page)
+        items = page["items"]
+        total = page["total"]
+        next_cursor = page["next_cursor"]
+        checkpoint = page["checkpoint"]
+
+        # The export is unfiltered, so a page's total is the log length its
+        # checkpoint was taken over.
+        if checkpoint["event_id"] != total:
+            raise _VerifyError(ERR_INTEGRITY)
+        # This page begins exactly where verification currently stands: the
+        # declared anchor is the predecessor hash of its first item (or of the
+        # cursor position for an empty page).
+        if page["anchor_hash"] != running_hash:
+            raise _VerifyError(ERR_INTEGRITY)
+
+        for item in items:
+            if not isinstance(item, dict):
+                raise _VerifyError(ERR_INPUT)
+            event_id = item.get("event_id")
+            prev_hash = item.get("prev_hash")
+            stored_hash = item.get("event_hash")
+            if not _is_plain_int(event_id):
+                raise _VerifyError(ERR_INPUT)
+            if not crypto.is_hex64(prev_hash) or not crypto.is_hex64(stored_hash):
+                raise _VerifyError(ERR_INPUT)
+            if event_id != running_id + 1:
+                raise _VerifyError(ERR_INTEGRITY)
+            if prev_hash != running_hash:
+                raise _VerifyError(ERR_INTEGRITY)
+            if event_hash(running_hash, item) != stored_hash:
+                raise _VerifyError(ERR_INTEGRITY)
+            running_id = event_id
+            running_hash = stored_hash
+
+        # Pagination self-consistency: a non-null next_cursor continues exactly
+        # after this page and stays below total; a server page with limit >= 1
+        # is therefore non-empty whenever it is not the last page. A null
+        # next_cursor ends exactly at the total.
+        if next_cursor is None:
+            if running_id != total:
+                raise _VerifyError(ERR_INTEGRITY)
+        else:
+            if not items or next_cursor != running_id or next_cursor >= total:
+                raise _VerifyError(ERR_INTEGRITY)
+        last_checkpoint = checkpoint
+
+    # The final page must end exactly on its checkpoint.
+    assert last_checkpoint is not None
+    if (
+        running_id != last_checkpoint["event_id"]
+        or running_hash != last_checkpoint["event_hash"]
+    ):
+        raise _VerifyError(ERR_INTEGRITY)
+    return dict(last_checkpoint)

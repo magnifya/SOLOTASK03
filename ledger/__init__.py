@@ -3,6 +3,7 @@
 __all__ = [
     "crypto",
     "models",
+    "audit",
     "store",
     "service",
     "server",
