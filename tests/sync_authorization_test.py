@@ -674,6 +674,134 @@ class RestartReauthorizationTests(_ServiceCase):
         self.assertNotIn(tip, reopened.forks)
         self.assertEqual(reopened.generation, generation_before)
 
+    def test_restart_backfills_expiry_for_each_identical_lifecycle(self) -> None:
+        # Two lifecycles of the same (source, request_id) key carrying the
+        # SAME candidate and the SAME request expires_at: each removal gets
+        # its own sync_expired event — the historical event of lifecycle 1
+        # must never dedup the identical expiry of lifecycle 2.
+        doc = self.candidate(self.block(amount=5))
+        tip = self.block(amount=5).block_hash
+        # Lifecycle 1: the registry entry expires while the process is down.
+        self.assertEqual(
+            self.register("node-1", KEY_A, int(time.time()) + 2)[0], 201
+        )
+        status, body = self.sync(doc, expires_at=FUTURE)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["tip_hash"], tip)
+        time.sleep(2.1)
+        reopened = self._reopen()
+        self.assertEqual(
+            [e["kind"] for e in reopened.audit_events],
+            ["source_registered", "sync_received", "sync_expired"],
+        )
+        # Re-authorize the same source (rotation) and open lifecycle 2 with
+        # an identical key, candidate and request deadline.
+        svc2 = LedgerService(reopened, initial_balance=1000)
+        self.svc = svc2
+        self.assertEqual(
+            svc2.rotate_trust_source(
+                "node-1",
+                {"public_key": KEY_A, "expires_at": FUTURE, "expected_version": 1},
+            )[0],
+            200,
+        )
+        status, body = self.sync(doc, expires_at=FUTURE)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["tip_hash"], tip)
+        # Lifecycle 2 ends by revocation while down.
+        self.assertEqual(
+            svc2.revoke_trust_source("node-1", {"expected_version": 2})[0], 200
+        )
+        before = self._events_snapshot()
+
+        reopened = self._reopen()
+        self.assertNotIn(("node-1", "req-1"), reopened.syncs)
+        self.assertNotIn(tip, reopened.forks)
+        events = [dict(e) for e in reopened.audit_events]
+        self.assertEqual(events[: len(before)], before)
+        self.assertEqual(
+            [e["kind"] for e in events],
+            [
+                "source_registered",
+                "sync_received",
+                "sync_expired",
+                "source_rotated",
+                "sync_received",
+                "source_revoked",
+                "sync_expired",
+            ],
+        )
+        expired = [e for e in events if e["kind"] == "sync_expired"]
+        self.assertEqual(len(expired), 2)
+        # Identical lifecycle payload — distinguished only by event_id/at.
+        for event in expired:
+            self.assertEqual(event["source"], "node-1")
+            self.assertEqual(event["request_id"], "req-1")
+            self.assertEqual(event["tip_hash"], tip)
+            self.assertEqual(event["expires_at"], FUTURE)
+        self.assertNotEqual(expired[0]["event_id"], expired[1]["event_id"])
+        self.assertEqual(
+            [e["event_id"] for e in events], list(range(1, len(events) + 1))
+        )
+        # A further restart adds nothing: both lifecycles are closed.
+        generation_after = reopened.generation
+        reopened_again = self._reopen()
+        self.assertEqual(
+            [dict(e) for e in reopened_again.audit_events], events
+        )
+        self.assertEqual(reopened_again.generation, generation_after)
+
+    def test_restart_backfill_not_deduped_by_runtime_expiry_of_prior_lifecycle(self) -> None:
+        # Lifecycle 1 expires at runtime (lazy sweep writes sync_expired);
+        # lifecycle 2 — same key, same candidate — expires while down. The
+        # restart backfill must append a second event: the durable runtime
+        # expiry belongs to the previous lifecycle.
+        self.assertEqual(self.register("node-1")[0], 201)
+        doc = self.candidate(self.block(amount=6))
+        tip = self.block(amount=6).block_hash
+        status, body = self.sync(doc, expires_at=int(time.time()) + 1)
+        self.assertEqual(status, 201, body)
+        time.sleep(1.1)
+        # Lazy sweep expires lifecycle 1 and records its sync_expired.
+        self.assertEqual(self.svc.list_fork_syncs({})[1]["total"], 0)
+        # Lifecycle 2: same key and candidate, a fresh deadline.
+        status, body = self.sync(doc, expires_at=FUTURE)
+        self.assertEqual(status, 201, body)
+        self.assertEqual(body["tip_hash"], tip)
+        # The new lifecycle replays idempotently while live.
+        status, body = self.sync(doc, expires_at=FUTURE)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["expires_at"], FUTURE)
+        # Lifecycle 2 loses authorization while down.
+        self.assertEqual(self.revoke("node-1", 1)[0], 200)
+        before = self._events_snapshot()
+
+        reopened = self._reopen()
+        self.assertNotIn(("node-1", "req-1"), reopened.syncs)
+        self.assertNotIn(tip, reopened.forks)
+        events = [dict(e) for e in reopened.audit_events]
+        self.assertEqual(events[: len(before)], before)
+        self.assertEqual(
+            [e["kind"] for e in events],
+            [
+                "source_registered",
+                "sync_received",
+                "sync_expired",
+                "sync_received",
+                "source_revoked",
+                "sync_expired",
+            ],
+        )
+        expired = [e for e in events if e["kind"] == "sync_expired"]
+        self.assertEqual(len(expired), 2)
+        self.assertEqual(
+            [(e["source"], e["request_id"], e["tip_hash"]) for e in expired],
+            [("node-1", "req-1", tip)] * 2,
+        )
+        self.assertEqual(
+            [e["event_id"] for e in events], list(range(1, len(events) + 1))
+        )
+
 
 class SaveFailureRollbackTests(_ServiceCase):
     def _fail_save_once(self) -> None:

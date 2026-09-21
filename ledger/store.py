@@ -31,8 +31,12 @@ records still unexpired whose source stays active and unexpired survive;
 records whose own deadline elapsed or whose source is unknown/revoked/
 registry-expired while the process was down are pruned (their non-adopted
 forks removed; an adopted tip never changes the canonical chain) and each
-gets exactly one deduplicated sync_expired audit event backfilled after the
-durable history, persisted in one atomic write. Other staleness (a dangling
+gets exactly one sync_expired audit event backfilled after the durable
+history, persisted in one atomic write. The backfill dedup is
+lifecycle-scoped: only a sync_expired recorded after the key's latest
+sync_received closes the current lifecycle (a crash retry), while an
+identical event from an earlier lifecycle never suppresses the new one.
+Other staleness (a dangling
 tip or a content-fingerprint mismatch) is a silent prune with no event.
 A re-entrant lock serializes all updates, and a class-wide recovery lock
 serializes startup scans against in-flight writes.
@@ -67,6 +71,7 @@ TRUST_REVOKED = "revoked"
 
 # Audit event kinds are owned by the store layer (recovery emits them too);
 # service.EVENT_* constants mirror these literal values.
+EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_EXPIRED = "sync_expired"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
@@ -609,21 +614,31 @@ class LedgerStore:
 
         Mirrors the runtime sweep exactly: records are processed in
         ``(source, request_id)`` order, each gets a dense event_id continuing
-        after the durable history, and events are deduplicated against any
-        already-durable sync_expired identity (source, request_id, tip_hash)
-        so a crash between backfill and promotion can never record an expiry
-        twice. Returns the number of events appended. Mutates ``audit_events``
-        in place.
+        after the durable history, and every lifecycle removal gets its own
+        event. Deduplication is lifecycle-scoped: a ``(source, request_id)``
+        key alternates sync_received/sync_expired, and only a sync_expired
+        recorded *after* that key's latest sync_received closes the current
+        lifecycle (a crash between reconciliation and promotion). An
+        identical event from an earlier lifecycle — even with the same
+        source, request_id, tip_hash and expires_at — belongs to history and
+        must never suppress the new lifecycle's expiry. Returns the number
+        of events appended. Mutates ``audit_events`` in place.
         """
-        existing_expiry = {
-            (event.get("source"), event.get("request_id"), event.get("tip_hash"))
-            for event in audit_events
-            if event.get("kind") == EVENT_SYNC_EXPIRED
-        }
+        last_received: dict[tuple, int] = {}
+        for index, event in enumerate(audit_events):
+            if event.get("kind") == EVENT_SYNC_RECEIVED:
+                last_received[(event.get("source"), event.get("request_id"))] = index
+        closed_identities: set[tuple] = set()
+        for index, event in enumerate(audit_events):
+            if event.get("kind") != EVENT_SYNC_EXPIRED:
+                continue
+            key = (event.get("source"), event.get("request_id"))
+            if index > last_received.get(key, -1):
+                closed_identities.add((key[0], key[1], event.get("tip_hash")))
         backfilled = 0
         for source, request_id, rec in sorted(expired_records):
             identity = (source, request_id, rec["tip_hash"])
-            if identity in existing_expiry:
+            if identity in closed_identities:
                 continue
             audit_events.append(
                 {
@@ -636,7 +651,10 @@ class LedgerStore:
                     "expires_at": rec["expires_at"],
                 }
             )
-            existing_expiry.add(identity)
+            # The just-appended event closes this lifecycle: a duplicated
+            # record for the same key in one reconciliation must not emit
+            # a second event.
+            closed_identities.add(identity)
             backfilled += 1
         return backfilled
 

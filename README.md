@@ -90,8 +90,11 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   **停机期间到期或授权失效的每条记录，恢复时在持久化审计历史之后补写恰好一条
   `sync_expired`**（`event_id` 紧随其后连续编号、保留
   source/request_id/tip_hash/expires_at 字段，并按 `(source, request_id)`
-  排序）；已持久化过 `sync_expired` 的记录不再补写（崩溃重试不重复），补写结果
-  随调和后的记录/分叉在**同一次原子写入**落盘。指纹不符或 tip 无处解析等其他
+  排序）；去重按生命周期判定——只有**当前生命周期**（该键最近一次
+  `sync_received` 之后）已持久化过 `sync_expired` 才不再补写（崩溃重试不重复），
+  历史生命周期留下的相同事件（即使 source、request_id、tip_hash、expires_at
+  全相同）不参与去重，每个生命周期的移除都各记一条；补写结果随调和后的
+  记录/分叉在**同一次原子写入**落盘。指纹不符或 tip 无处解析等其他
   失效仍静默丢弃、不产生事件。历史 `sync_received`/`sync_adopted`/`sync_expired`
   事件逐字保留、`event_id` 从 1 起不间断。
 - **审计查询**：`GET /v1/forks/sync` 支持 `source`、`min_height`、`max_height`、
