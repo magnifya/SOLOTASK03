@@ -411,7 +411,8 @@ class HistoryServiceTests(unittest.TestCase):
         self._sync_block1("node-1", "r1", 10)
         with open(self.state_path, encoding="utf-8") as fh:
             data = json.load(fh)
-        # Simulate a pre-feature snapshot: no frozen summary anywhere.
+        # Simulate a pre-feature snapshot: no frozen summary anywhere and no
+        # audit hash chain/checkpoint (older on-disk format).
         for rec in data["syncs"]:
             for field in ("height", "length", "status"):
                 rec.pop(field, None)
@@ -419,10 +420,16 @@ class HistoryServiceTests(unittest.TestCase):
             if event.get("kind") == "sync_received":
                 for field in ("height", "length", "status"):
                     event.pop(field, None)
+            for field in ("prev_hash", "event_hash"):
+                event.pop(field, None)
+        data.pop("audit_checkpoint", None)
         with open(self.state_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
 
         reopened = LedgerStore(self.state_path, initial_balance=1000)
+        # The legacy log is re-sealed and atomically persisted on recovery.
+        self.assertIn("prev_hash", reopened.audit_events[0])
+        self.assertEqual(reopened.audit_events[0]["prev_hash"], "0" * 64)
         # The live record is repaired from its surviving candidate.
         rec = reopened.syncs[("node-1", "r1")]
         self.assertEqual((rec["height"], rec["length"], rec["status"]),

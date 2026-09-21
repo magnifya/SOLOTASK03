@@ -404,9 +404,17 @@ class TrustAuditServiceTests(unittest.TestCase):
         with open(self.state_path, encoding="utf-8") as fh:
             data = json.load(fh)
         generation = data["state"]["generation"]
-        data["audit_events"].append(
-            {"event_id": 2, "kind": "source_registered", "at": 1.0, "source": "x"}
+        appended = {"event_id": 2, "kind": "source_registered", "at": 1.0, "source": "x"}
+        appended["prev_hash"] = data["audit_events"][-1]["event_hash"]
+        appended["event_hash"] = crypto.audit_event_hash(
+            appended["prev_hash"], appended
         )
+        data["audit_events"].append(appended)
+        # Keep the twin otherwise valid: its checkpoint binds the new tail.
+        data["audit_checkpoint"] = {
+            "event_id": 2,
+            "event_hash": appended["event_hash"],
+        }
         snapshot = os.path.join(self.tmp, f".ledger-conflict.gen{generation}")
         with open(snapshot, "w", encoding="utf-8") as fh:
             json.dump(data, fh)

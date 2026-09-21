@@ -1325,34 +1325,40 @@ class LedgerService:
     AUDIT_DEFAULT_LIMIT = 50
     AUDIT_MAX_LIMIT = 200
 
-    def list_audit_events(self, params: dict) -> tuple[int, dict]:
-        """GET /v1/audit/events — paginated append-only audit log.
+    def _parse_audit_query(
+        self, params: dict
+    ) -> tuple[str | None, str | None, int, int] | None:
+        """Parse the audit query parameters shared by events/export.
 
-        Filters ``source`` and ``kind`` are AND-combined; ``limit`` defaults
-        to 50 and must be 1-200, ``cursor`` defaults to 0. Numeric values
-        must be plain decimals without leading zeros. Events are ordered by
-        their ascending ``event_id``; ``cursor == total`` returns an empty
-        page, ``cursor > total`` returns 400.
+        Returns (source, kind, limit, cursor) or None after the caller has
+        already answered 400.
         """
         source = params.get("source")
         if source is not None and (not isinstance(source, str) or not source):
-            return 400, {"error": "source must be a non-empty string"}
+            return None
         kind = params.get("kind")
         if kind is not None and (not isinstance(kind, str) or not kind):
-            return 400, {"error": "kind must be a non-empty string"}
+            return None
         limit = self.AUDIT_DEFAULT_LIMIT
         if params.get("limit") is not None:
             parsed = _parse_decimal(params["limit"])
             if parsed is None or not 1 <= parsed <= self.AUDIT_MAX_LIMIT:
-                return 400, {"error": "limit must be a decimal between 1 and 200"}
+                return None
             limit = parsed
         cursor = 0
         if params.get("cursor") is not None:
             parsed = _parse_decimal(params["cursor"])
             if parsed is None:
-                return 400, {"error": "cursor must be a non-negative decimal"}
+                return None
             cursor = parsed
+        return source, kind, limit, cursor
 
+    def _audit_page(self, params: dict) -> tuple[int, dict]:
+        """Shared filter/paginate step returning (status, page-or-error)."""
+        parsed = self._parse_audit_query(params)
+        if parsed is None:
+            return 400, {"error": "invalid audit query parameters"}
+        source, kind, limit, cursor = parsed
         with self.store.lock:
             # Sweep expired syncs first so their expiry events are visible on
             # the same page that observes the removal.
@@ -1363,10 +1369,77 @@ class LedgerService:
                 if (source is None or event.get("source") == source)
                 and (kind is None or event.get("kind") == kind)
             ]
-        # Events are stored in ascending event_id order; filtering preserves it.
+            # Anchor/checkpoint describe the whole (unfiltered) stream and are
+            # read in the same locked section so they can never disagree with
+            # the page handed out.
+            if self.store.audit_events:
+                tail_id = self.store.audit_events[-1]["event_id"]
+                tail_hash = self.store.audit_events[-1]["event_hash"]
+            else:
+                tail_id, tail_hash = 0, crypto.AUDIT_GENESIS_PREV_HASH
         total = len(items)
         if cursor > total:
             return 400, {"error": "cursor is beyond the result set"}
-        page = items[cursor : cursor + limit]
+        return 200, {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "cursor": cursor,
+            "tail_id": tail_id,
+            "tail_hash": tail_hash,
+        }
+
+    def list_audit_events(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/audit/events — paginated append-only audit log.
+
+        Filters ``source`` and ``kind`` are AND-combined; ``limit`` defaults
+        to 50 and must be 1-200, ``cursor`` defaults to 0. Numeric values
+        must be plain decimals without leading zeros. Events are ordered by
+        their ascending ``event_id``; ``cursor == total`` returns an empty
+        page, ``cursor > total`` returns 400.
+        """
+        status, page = self._audit_page(params)
+        if status != 200:
+            return status, page
+        items, total = page["items"], page["total"]
+        limit, cursor = page["limit"], page["cursor"]
+        page_items = items[cursor : cursor + limit]
         next_cursor = cursor + limit if cursor + limit < total else None
-        return 200, {"items": page, "total": total, "next_cursor": next_cursor}
+        return 200, {"items": page_items, "total": total, "next_cursor": next_cursor}
+
+    def export_audit_events(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/audit/export — hash-anchored, paginated audit log export.
+
+        Pagination and filtering reuse GET /v1/audit/events exactly
+        (``source``/``kind``/``cursor``/``limit``, same defaults and 400
+        rules). Each item carries the full event including its ``prev_hash``
+        and ``event_hash`` links. ``anchor_hash`` is the hash immediately
+        preceding the page head — the first item's ``prev_hash``, or the
+        stream tail hash (64 zeros for an empty stream) for an empty final
+        page — letting an offline verifier chain successive pages.
+        ``checkpoint`` is ``{event_id, event_hash}`` of the whole (unfiltered)
+        stream tail, conventionally 0 / 64 zeros when the stream is empty.
+        """
+        status, page = self._audit_page(params)
+        if status != 200:
+            return status, page
+        items, total = page["items"], page["total"]
+        limit, cursor = page["limit"], page["cursor"]
+        page_items = items[cursor : cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < total else None
+        if page_items:
+            anchor_hash = page_items[0]["prev_hash"]
+        else:
+            # Empty page: only reachable at cursor == total; anchor it at the
+            # current stream tail so a chained verifier still binds it.
+            anchor_hash = page["tail_hash"]
+        return 200, {
+            "items": page_items,
+            "total": total,
+            "next_cursor": next_cursor,
+            "anchor_hash": anchor_hash,
+            "checkpoint": {
+                "event_id": page["tail_id"],
+                "event_hash": page["tail_hash"],
+            },
+        }

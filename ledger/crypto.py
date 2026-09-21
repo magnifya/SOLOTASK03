@@ -29,6 +29,35 @@ def compute_tx_id(message: bytes) -> str:
     return sha256_hex(message)
 
 
+# Previous hash of the first event in the append-only audit hash chain.
+AUDIT_GENESIS_PREV_HASH = "0" * 64
+
+
+def audit_event_payload(event: dict) -> dict:
+    """Event object with the two hash-link fields removed.
+
+    ``prev_hash`` and ``event_hash`` are the chaining envelope; everything
+    else (event_id, kind, at and the event payload) is covered by the hash.
+    """
+    return {key: value for key, value in event.items()
+            if key not in ("prev_hash", "event_hash")}
+
+
+def audit_event_hash(prev_hash: str, event: dict) -> str:
+    """Hash of one audit event in the append-only chain.
+
+    ``event_hash = sha256(prev_hash ASCII || event-without-the-two-hash-fields
+    serialized as sorted-key compact UTF-8 JSON)``.
+    """
+    payload = json.dumps(
+        audit_event_payload(event),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(prev_hash.encode("ascii") + payload).hexdigest()
+
+
 def verify_signature(public_key_hex: str, message: bytes, signature_hex: str) -> bool:
     """Verify an Ed25519 signature (public key and signature are hex strings).
 

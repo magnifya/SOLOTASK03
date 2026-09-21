@@ -42,6 +42,14 @@ the key's latest sync_received), so a reused (source, request_id) key's
 new lifecycle is always audited even when every field matches a previous
 lifecycle's event. Other staleness (a dangling
 tip or a content-fingerprint mismatch) is a silent prune with no event.
+The append-only audit events additionally form a SHA-256 hash chain: each
+event carries ``prev_hash`` (64 zeros for the first) and ``event_hash`` =
+sha256(prev_hash ASCII || sorted compact JSON of the event without the two
+hash fields); an ``audit_checkpoint`` of ``{event_id, event_hash}`` binds the
+stream tail (0 / 64 zeros when empty) and is persisted and conflict-compared
+with everything else. Recovery recomputes the whole chain; pre-chain legacy
+snapshots are re-sealed once, after the unique winner is chosen, and saved
+atomically.
 A re-entrant lock serializes all updates, and a class-wide recovery lock
 serializes startup scans against in-flight writes.
 """
@@ -67,7 +75,8 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 7
+# v8 adds the per-audit-event prev_hash/event_hash chain and audit_checkpoint.
+STATE_VERSION = 8
 
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
@@ -242,6 +251,8 @@ class LedgerStore:
                         parsed[7],
                         parsed[8],
                         parsed[9],
+                        parsed[10],
+                        parsed[11],
                     )
                 )
 
@@ -262,6 +273,7 @@ class LedgerStore:
                 top[0][8],
                 top[0][9],
                 top[0][5],
+                top[0][11],
             )
             for item in top[1:]:
                 if (
@@ -274,6 +286,7 @@ class LedgerStore:
                         item[8],
                         item[9],
                         item[5],
+                        item[11],
                     )
                     != reference
                 ):
@@ -303,6 +316,8 @@ class LedgerStore:
                 allowlist,
                 audit_events,
                 expired_records,
+                _audit_checkpoint,
+                audit_legacy,
             ) = winner
 
             if os.path.abspath(winner_path) != main_abs:
@@ -317,7 +332,15 @@ class LedgerStore:
             # durable history. Doing this after same-generation conflict
             # detection keeps that comparison based on durable content (the
             # backfill carries a current timestamp).
-            backfilled = self._backfill_expired_events(audit_events, expired_records)
+            backfilled = self._backfill_expired_events(
+                audit_events, expired_records, seal_hashes=not audit_legacy
+            )
+            # A snapshot written before audit hash chaining is upgraded once,
+            # after the unique winner is chosen: the whole surviving log is
+            # re-sealed (including the just-backfilled events) and persisted
+            # atomically together with the new checkpoint.
+            if audit_legacy:
+                self._reseal_audit_chain(audit_events)
             self.chain = chain
             self.pending = pending
             self.forks = forks
@@ -334,11 +357,12 @@ class LedgerStore:
                 self.initial_balance = winner_init_balance
             self.rebuild_derived()
             self._cleanup_candidates(directory)
-            # Persist the reconciled state (pruned records/forks + backfilled
-            # events) atomically so the next restart never re-derives or
-            # duplicates the events; with nothing to backfill no write happens
-            # and the recovered generation is kept byte-for-byte.
-            if backfilled:
+            # Persist the reconciled state (pruned records/forks, backfilled
+            # events and/or the re-sealed legacy chain with its checkpoint)
+            # atomically so the next restart never re-derives or duplicates
+            # the events; with nothing to reconcile no write happens and the
+            # recovered generation is kept byte-for-byte.
+            if backfilled or audit_legacy:
                 self.save()
 
     def _discover_candidates(self, directory: str) -> list[str]:
@@ -369,6 +393,7 @@ class LedgerStore:
         allowlist: dict[str, int] | None = None,
         audit_events: list[dict] | None = None,
         initial_balance: int | None = None,
+        audit_checkpoint: dict | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -406,6 +431,7 @@ class LedgerStore:
                 "trust_sources": trust_records,
                 "allowlist": dict(sorted((allowlist or {}).items())),
                 "audit_events": audit_events or [],
+                "audit_checkpoint": audit_checkpoint,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -461,6 +487,8 @@ class LedgerStore:
         dict[str, int],
         list[dict],
         list[tuple[str, str, dict]],
+        dict | None,
+        bool,
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -627,8 +655,11 @@ class LedgerStore:
         # byte-identical snapshots look conflicting. The expired-record
         # reconciliation returned below is applied once, by load(), to the
         # single winning snapshot.
-        audit_events = self._parse_persisted_audit_events(
+        audit_events, audit_legacy = self._parse_persisted_audit_events(
             data.get("audit_events", []), path
+        )
+        audit_checkpoint = self._parse_persisted_audit_checkpoint(
+            data.get("audit_checkpoint"), path, audit_events, audit_legacy
         )
         syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
@@ -654,12 +685,35 @@ class LedgerStore:
             allowlist,
             audit_events,
             expired_records,
+            audit_checkpoint,
+            audit_legacy,
         )
+
+    @staticmethod
+    def _reseal_audit_chain(audit_events: list[dict]) -> None:
+        """Re-seal a legacy audit log with prev_hash/event_hash links.
+
+        Used once, on the single winning snapshot, to upgrade a log written
+        before hash chaining existed: every event gets a ``prev_hash`` (64
+        zeros for the first event) and an ``event_hash`` computed from it.
+        Events already sealed are left untouched. Mutates the list in place.
+        """
+        prev_hash = crypto.AUDIT_GENESIS_PREV_HASH
+        for event in audit_events:
+            if "prev_hash" in event and "event_hash" in event:
+                prev_hash = event["event_hash"]
+                continue
+            event.pop("prev_hash", None)
+            event.pop("event_hash", None)
+            event["prev_hash"] = prev_hash
+            event["event_hash"] = crypto.audit_event_hash(prev_hash, event)
+            prev_hash = event["event_hash"]
 
     @staticmethod
     def _backfill_expired_events(
         audit_events: list[dict],
         expired_records: list[tuple[str, str, dict]],
+        seal_hashes: bool = True,
     ) -> int:
         """Append one sync_expired event per down-time-expired sync record.
 
@@ -713,6 +767,17 @@ class LedgerStore:
                 event["height"] = rec["height"]
                 event["length"] = rec.get("length")
                 event["status"] = rec.get("status")
+            if seal_hashes:
+                # Chain-aware snapshot: extend the hash chain directly. A
+                # legacy log is sealed wholesale afterwards by the caller via
+                # _reseal_audit_chain, so its appended events carry no links
+                # until then.
+                prev_hash = (
+                    audit_events[-1]["event_hash"] if audit_events
+                    else crypto.AUDIT_GENESIS_PREV_HASH
+                )
+                event["prev_hash"] = prev_hash
+                event["event_hash"] = crypto.audit_event_hash(prev_hash, event)
             audit_events.append(event)
             covered.add(identity)
             backfilled += 1
@@ -796,7 +861,7 @@ class LedgerStore:
         return allowlist
 
     @staticmethod
-    def _parse_persisted_audit_events(raw: object, path: str) -> list[dict]:
+    def _parse_persisted_audit_events(raw: object, path: str) -> tuple[list[dict], bool]:
         """Strictly parse the append-only audit event log.
 
         Every event is a JSON object carrying an integer ``at`` timestamp and a
@@ -804,6 +869,17 @@ class LedgerStore:
         or duplicates, since the id is the event's permanent audit position
         (which also fixes the log's total ordering). Payload fields beyond
         those three are retained verbatim.
+
+        Each event additionally carries the hash-chain envelope
+        (``prev_hash`` / ``event_hash``): the first event's ``prev_hash`` is
+        64 zeros, every later one equals the previous ``event_hash``, and the
+        stored ``event_hash`` must equal a fresh
+        ``sha256(prev_hash ASCII || sorted compact JSON of the event without
+        the two hash fields)``. A snapshot written before the chain existed
+        carries neither field on any event: that is a *legacy* log, flagged to
+        the caller, which backfills the chain once, after the unique winning
+        snapshot is chosen. Exactly one of the two fields present, a malformed
+        hash or any mismatch is corruption and fails recovery.
 
         The historical sync lifecycle events additionally have their provenance
         metadata validated: ``sync_received`` / ``sync_adopted`` /
@@ -814,7 +890,7 @@ class LedgerStore:
         missing ones are accepted but malformed ones are corruption.
         """
         if raw is None:
-            return []
+            return [], False
         if not isinstance(raw, list):
             raise StateRecoveryError(path, "'audit_events' must be a list")
         sync_kinds = {
@@ -823,6 +899,10 @@ class LedgerStore:
             EVENT_SYNC_EXPIRED,
         }
         events: list[dict] = []
+        # Hash-chain mode is established by the first populated event and must
+        # be uniform: either every event carries both links (chain-aware) or
+        # none do (a pre-chain legacy log, re-sealed once after recovery).
+        mode: str | None = None
         for i, event in enumerate(raw):
             if not isinstance(event, dict):
                 raise StateRecoveryError(path, f"audit event {i + 1} must be an object")
@@ -843,6 +923,43 @@ class LedgerStore:
                 raise StateRecoveryError(path, f"audit event {event_id} needs a kind")
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 raise StateRecoveryError(path, f"audit event {event_id} needs a numeric 'at'")
+            prev_hash = event.get("prev_hash")
+            event_hash = event.get("event_hash")
+            present = (prev_hash is not None) + (event_hash is not None)
+            if present == 1:
+                raise StateRecoveryError(
+                    path,
+                    f"audit event {event_id} carries only one of prev_hash/event_hash",
+                )
+            if present == 0:
+                if mode == "chain":
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} is missing its hash links"
+                    )
+                mode = "legacy"
+            else:
+                if mode == "legacy":
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} carries hash links in a legacy log",
+                    )
+                mode = "chain"
+                if not crypto.is_hex64(prev_hash) or not crypto.is_hex64(event_hash):
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} has a malformed hash link"
+                    )
+                expected_prev = (
+                    crypto.AUDIT_GENESIS_PREV_HASH if not events
+                    else events[-1]["event_hash"]
+                )
+                if prev_hash != expected_prev:
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} has a mismatched prev_hash"
+                    )
+                if crypto.audit_event_hash(prev_hash, event) != event_hash:
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} has a mismatched event_hash"
+                    )
             if kind in sync_kinds:
                 source = event.get("source")
                 request_id = event.get("request_id")
@@ -900,7 +1017,55 @@ class LedgerStore:
                         f"audit event {event_id} ({kind}) has a partial frozen summary",
                     )
             events.append(dict(event))
-        return events
+        return events, mode == "legacy"
+
+    @staticmethod
+    def _parse_persisted_audit_checkpoint(
+        raw: object, path: str, events: list[dict], legacy: bool
+    ) -> dict | None:
+        """Validate the persisted ``audit_checkpoint`` against the event log.
+
+        Returns the parsed checkpoint ``{event_id, event_hash}`` or None when
+        the section is absent (older snapshots). An absent section is accepted
+        for any snapshot, but a present one must match the final event exactly;
+        a checkpoint alongside a log that does not match its own hash chain is
+        never reached (the log fails parsing first). Malformed or mismatching
+        checkpoints are corruption: recovery fails rather than trusting a
+        stream whose tail may have been truncated.
+        """
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise StateRecoveryError(path, "'audit_checkpoint' must be an object")
+        event_id = raw.get("event_id")
+        event_hash = raw.get("event_hash")
+        if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 0:
+            raise StateRecoveryError(
+                path, "audit_checkpoint.event_id must be a non-negative integer"
+            )
+        if not crypto.is_hex64(event_hash):
+            raise StateRecoveryError(
+                path, "audit_checkpoint.event_hash must be 64 lowercase hex characters"
+            )
+        if event_id != len(events):
+            raise StateRecoveryError(
+                path,
+                f"audit_checkpoint.event_id {event_id} does not match the "
+                f"{len(events)}-event log",
+            )
+        if events:
+            tail_hash = events[-1].get("event_hash")
+            # Legacy logs carry no hashes yet; the checkpoint cannot bind them.
+            # The post-conflict backfill re-seals and persists such a snapshot.
+            if not legacy and event_hash != tail_hash:
+                raise StateRecoveryError(
+                    path, "audit_checkpoint.event_hash does not match the last event"
+                )
+        elif event_hash != crypto.AUDIT_GENESIS_PREV_HASH:
+            raise StateRecoveryError(
+                path, "empty audit log checkpoint must carry 64 zeroes"
+            )
+        return {"event_id": event_id, "event_hash": event_hash}
 
     def _parse_persisted_syncs(
         self,
@@ -1214,9 +1379,16 @@ class LedgerStore:
         if self.allowlist:
             data["allowlist"] = dict(sorted(self.allowlist.items()))
         # The audit trail is append-only; every trust change and every sync
-        # reception/adoption/expiry is recorded here in write order.
+        # reception/adoption/expiry is recorded here in write order. Each event
+        # carries its hash-chain links and a matching audit_checkpoint is
+        # persisted in the same atomic document (omitted only for an empty
+        # stream, whose checkpoint is conventionally 0 / 64 zeros).
         if self.audit_events:
             data["audit_events"] = list(self.audit_events)
+            data["audit_checkpoint"] = {
+                "event_id": self.audit_events[-1]["event_id"],
+                "event_hash": self.audit_events[-1]["event_hash"],
+            }
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
         # Hold the class-wide recovery lock while a .ledger-* snapshot exists
@@ -1490,8 +1662,13 @@ class LedgerStore:
     def append_audit_event(self, kind: str, payload: dict, at: float | None = None) -> dict:
         """Append an audit event in memory with the next monotonic event_id.
 
-        Does not save; the caller persists the event together with the state
-        change it describes in one atomic write. Caller must hold the lock.
+        The event is sealed with the append-only hash chain: its
+        ``prev_hash`` is the previous event's ``event_hash`` (64 zeros for
+        the first event) and ``event_hash`` is computed over that previous
+        hash concatenated with the event minus its two hash fields. Does not
+        save; the caller persists the event and the checkpoint together with
+        the state change it describes in one atomic write. Caller must hold
+        the lock.
         """
         event = {
             "event_id": len(self.audit_events) + 1,
@@ -1499,6 +1676,12 @@ class LedgerStore:
             "at": time.time() if at is None else at,
         }
         event.update(payload)
+        prev_hash = (
+            self.audit_events[-1]["event_hash"] if self.audit_events
+            else crypto.AUDIT_GENESIS_PREV_HASH
+        )
+        event["prev_hash"] = prev_hash
+        event["event_hash"] = crypto.audit_event_hash(prev_hash, event)
         self.audit_events.append(event)
         return event
 

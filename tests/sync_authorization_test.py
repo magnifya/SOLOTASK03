@@ -735,17 +735,26 @@ class RestartReauthorizationTests(_ServiceCase):
         with open(self.state_path, encoding="utf-8") as fh:
             data = json.load(fh)
         data["syncs"][0]["expires_at"] = past
-        data["audit_events"].append(
-            {
-                "event_id": 3,
-                "kind": "sync_expired",
-                "at": 1.0,
-                "source": "node-1",
-                "request_id": "req-1",
-                "tip_hash": tip,
-                "expires_at": past,
-            }
+        expired_event = {
+            "event_id": 3,
+            "kind": "sync_expired",
+            "at": 1.0,
+            "source": "node-1",
+            "request_id": "req-1",
+            "tip_hash": tip,
+            "expires_at": past,
+        }
+        # The durable event carries its hash-chain links; a real atomic write
+        # would have advanced the checkpoint to it as well.
+        expired_event["prev_hash"] = data["audit_events"][-1]["event_hash"]
+        expired_event["event_hash"] = crypto.audit_event_hash(
+            expired_event["prev_hash"], expired_event
         )
+        data["audit_events"].append(expired_event)
+        data["audit_checkpoint"] = {
+            "event_id": 3,
+            "event_hash": expired_event["event_hash"],
+        }
         with open(self.state_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
 

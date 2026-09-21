@@ -126,6 +126,20 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             if path == "/v1/trust":
                 status, body = service.get_trust_document()
                 self._send_json(status, body)
+            elif path == "/v1/audit/export":
+                # GET /v1/audit/export?source=&kind=&cursor=&limit=
+                # Pagination reuses /v1/audit/events; unlike that endpoint a
+                # repeated query parameter is a hard 400 (exports are meant to
+                # be byte-stable for offline verification).
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.export_audit_events(params)
+                self._send_json(status, body)
             elif path == "/v1/audit/events":
                 # GET /v1/audit/events?source=&kind=&cursor=&limit=
                 params = {

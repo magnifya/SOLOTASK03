@@ -335,6 +335,41 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_audit_export(args: argparse.Namespace) -> int:
+    filters = {
+        "source": args.source,
+        "kind": args.kind,
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/audit/export"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
+def cmd_audit_verify(args: argparse.Namespace) -> int:
+    """Offline audit-export verification; no server contact is made."""
+    from .audit import verify_export
+
+    try:
+        if args.file == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.file, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        body = {"ok": False, "error": "input"}
+    else:
+        body = verify_export(document)
+    print(json.dumps(body, sort_keys=True, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Offline light-client verification; no server contact is made."""
     from .light_client import verify_bundle
@@ -527,6 +562,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_audit.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_audit.set_defaults(func=cmd_audit)
+
+    p_audit_export = sub.add_parser(
+        "audit-export",
+        help="export hash-anchored audit log pages (same pagination as audit)",
+    )
+    p_audit_export.add_argument("--source", help="filter by source identifier")
+    p_audit_export.add_argument("--kind", help="filter by event kind")
+    p_audit_export.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_audit_export.add_argument(
+        "--limit", help="page size (decimal, 1-200, default 50)"
+    )
+    p_audit_export.set_defaults(func=cmd_audit_export)
+
+    p_audit_verify = sub.add_parser(
+        "audit-verify",
+        help="offline-verify an audit export file (anchors, numbering, hashes, checkpoint)",
+    )
+    p_audit_verify.add_argument(
+        "file",
+        help="audit export JSON file (one page object or an ordered page array), "
+        "or - to read it from standard input",
+    )
+    p_audit_verify.set_defaults(func=cmd_audit_verify)
 
     return parser
 
