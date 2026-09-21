@@ -602,10 +602,13 @@ class LedgerService:
         unique ascending tx_ids, endowment replay, pending-only-at-tip).
 
         Returns 201 with ``{tip_hash, height, length, status, expires_at}``.
-        An expired request returns 410; malformed fields or a failing chain
-        validation return 400. A retry with the same source + request_id and
-        identical content replays the original result as 200; the same key with
-        different content, or a duplicate tip already known, returns 409.
+        A new request from an unknown, revoked or trust-expired source returns
+        403 before anything else; an authorized but already-expired request
+        returns 410; malformed fields or a failing chain validation return 400.
+        A retry with the same source + request_id and identical content
+        replays the original result as 200 regardless of later trust changes;
+        the same key with different content, or a duplicate tip already known,
+        returns 409.
         """
         if not isinstance(payload, dict):
             return 400, {"error": "request body must be a JSON object"}
@@ -635,12 +638,28 @@ class LedgerService:
             key = (source, request_id)
             existing = self.store.syncs.get(key)
 
-            # A new delivery whose deadline already passed is rejected before
-            # the chain is examined. A retry on a still-live key skips this:
-            # replaying a recorded request must stay idempotent even when the
-            # client echoes an expires_at that has since elapsed.
-            if existing is None and expires_at <= time.time():
-                return 410, {"error": "sync request has expired"}
+            if existing is None:
+                # Authorization gate for *new* deliveries: the source must
+                # correspond to a persistently registered trust source that is
+                # still active and whose registration has not expired. Unknown,
+                # revoked and trust-expired sources are forbidden (403) before
+                # the request's own expiry or the candidate chain are examined.
+                trusted = self.store.trust_sources.get(source)
+                if (
+                    trusted is None
+                    or trusted["status"] != TRUST_ACTIVE
+                    or trusted["expires_at"] <= time.time()
+                ):
+                    return 403, {"error": "sync source is not a trusted, active source"}
+                # A new delivery whose deadline already passed is rejected only
+                # after authorization passes.
+                if expires_at <= time.time():
+                    return 410, {"error": "sync request has expired"}
+
+            # A retry on a still-live key skips both the authorization gate and
+            # the expiry check: replaying a recorded request must stay
+            # idempotent even when the source has since been rotated/revoked or
+            # the client echoes an expires_at that has since elapsed.
 
             # Re-validate the whole candidate chain and recompute the tip
             # summary BEFORE any idempotency decision: a request whose supplied

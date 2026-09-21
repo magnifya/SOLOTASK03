@@ -265,6 +265,11 @@ class TrustAuditServiceTests(unittest.TestCase):
 
     # -- sync events: received / adopted / expired --------------------------
 
+    def _register_sync_source(self, source="node-2", key_hex=KEY_A):
+        self.svc.register_trust_source(
+            {"source": source, "public_key": key_hex, "expires_at": FUTURE}
+        )
+
     def _sync_fork(self, *, source="node-2", request_id="req-1", expires_at=None):
         block = make_block(self.genesis, self.key, self.pub, self.pub2, 10)
         candidate = make_fork(self.genesis, [self.genesis, block])
@@ -280,6 +285,7 @@ class TrustAuditServiceTests(unittest.TestCase):
         )
 
     def test_sync_received_event_persisted(self) -> None:
+        self._register_sync_source()
         status, body = self._sync_fork()
         self.assertEqual(status, 201, body)
         _, audit = self.svc.list_audit_events({"kind": "sync_received"})
@@ -291,11 +297,16 @@ class TrustAuditServiceTests(unittest.TestCase):
         self.assertEqual(event["expires_at"], body["expires_at"])
 
     def test_sync_adopted_event_survives_adoption(self) -> None:
+        self._register_sync_source()
         _, body = self._sync_fork()
         status, _ = self.svc.adopt_fork(body["tip_hash"])
         self.assertEqual(status, 200)
         _, audit = self.svc.list_audit_events({"source": "node-2"})
-        kinds = [e["kind"] for e in audit["items"]]
+        kinds = [
+            e["kind"]
+            for e in audit["items"]
+            if e["kind"] in ("sync_received", "sync_adopted")
+        ]
         self.assertEqual(kinds, ["sync_received", "sync_adopted"])
         # Still queryable after adoption, by kind and source.
         _, adopted = self.svc.list_audit_events({"kind": "sync_adopted"})
@@ -303,6 +314,7 @@ class TrustAuditServiceTests(unittest.TestCase):
         self.assertEqual(adopted["items"][0]["tip_hash"], body["tip_hash"])
 
     def test_sync_expired_event_survives_expiry(self) -> None:
+        self._register_sync_source()
         _, body = self._sync_fork(expires_at=int(time.time()) - 10)
         # A fresh expired submission is 410 and records nothing; instead
         # register live, then force expiry and trigger the sweep.
@@ -326,6 +338,7 @@ class TrustAuditServiceTests(unittest.TestCase):
         self.assertEqual(again["total"], 1)
 
     def test_adopted_sync_expiry_leaves_chain_intact(self) -> None:
+        self._register_sync_source()
         _, body = self._sync_fork(expires_at=int(time.time()) + 3600)
         self.assertEqual(self.svc.adopt_fork(body["tip_hash"])[0], 200)
         tip_hash = body["tip_hash"]
@@ -342,6 +355,7 @@ class TrustAuditServiceTests(unittest.TestCase):
             "node-1", {"public_key": KEY_B, "expires_at": FUTURE, "expected_version": 1}
         )
         self.svc.revoke_trust_source("node-1", {"expected_version": 2})
+        self._register_sync_source()
         self._sync_fork()
         reopened = LedgerStore(self.state_path, initial_balance=1000)
         self.assertIn("node-1", reopened.trust_sources)
@@ -352,10 +366,16 @@ class TrustAuditServiceTests(unittest.TestCase):
         kinds = [e["kind"] for e in reopened.audit_events]
         self.assertEqual(
             kinds,
-            ["source_registered", "source_rotated", "source_revoked", "sync_received"],
+            [
+                "source_registered",
+                "source_rotated",
+                "source_revoked",
+                "source_registered",
+                "sync_received",
+            ],
         )
         # event_ids are dense 1..N
-        self.assertEqual([e["event_id"] for e in reopened.audit_events], [1, 2, 3, 4])
+        self.assertEqual([e["event_id"] for e in reopened.audit_events], [1, 2, 3, 4, 5])
 
     def test_corrupt_trust_section_fails_recovery(self) -> None:
         self.register()

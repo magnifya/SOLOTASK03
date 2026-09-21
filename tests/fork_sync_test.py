@@ -42,6 +42,18 @@ from ledger.server import build_handler
 from ledger.service import LedgerService
 from ledger.store import LedgerStore
 
+# Sync deliveries require a registered, active, unexpired trust source. These
+# tests focus on the sync machinery (idempotency, expiry, adoption, recovery);
+# every source they use is therefore pre-registered in setUp. The
+# authorization gate itself (403/410 ordering, restart re-checks) is covered
+# separately in trust_sync_auth_test.py.
+TRUST_PUBLIC_KEY = "a" * 64
+TRUST_EXPIRES = 1_900_000_000
+SYNC_SOURCES = (
+    "node-1", "node-2", "node-x", "node-y", "n",
+    "s1", "s2", "node-a", "node-b", "node-c", "node-z",
+)
+
 
 def keypair() -> tuple[Ed25519PrivateKey, str]:
     key = Ed25519PrivateKey.generate()
@@ -84,6 +96,14 @@ class ForkSyncServiceTests(unittest.TestCase):
         self.ka, self.A = keypair()
         self.kb, self.B = keypair()
         self.kc, self.C = keypair()
+        for source in SYNC_SOURCES:
+            self.svc.register_trust_source(
+                {
+                    "source": source,
+                    "public_key": TRUST_PUBLIC_KEY,
+                    "expires_at": TRUST_EXPIRES,
+                }
+            )
 
     def block1(self, to=None, amount=10, *, status="confirmed") -> Block:
         return Block.create(
@@ -634,6 +654,13 @@ class ForkSyncHttpTests(unittest.TestCase):
             LedgerStore(os.path.join(cls.tmp, "http.json"), initial_balance=1000),
             initial_balance=1000,
         )
+        cls.service.register_trust_source(
+            {
+                "source": "http-node",
+                "public_key": TRUST_PUBLIC_KEY,
+                "expires_at": TRUST_EXPIRES,
+            }
+        )
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(cls.service))
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
@@ -728,6 +755,13 @@ class ForkSyncCliTests(unittest.TestCase):
         cls.service = LedgerService(
             LedgerStore(os.path.join(cls.tmp, "cli.json"), initial_balance=1000),
             initial_balance=1000,
+        )
+        cls.service.register_trust_source(
+            {
+                "source": "cli-node",
+                "public_key": TRUST_PUBLIC_KEY,
+                "expires_at": TRUST_EXPIRES,
+            }
         )
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(cls.service))
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)

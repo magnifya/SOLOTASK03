@@ -67,18 +67,33 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `{"source","request_id","expires_at","candidate"}`：`source` 是来源节点标识，
   `request_id` 是该来源作用域内的幂等键，`expires_at` 是 Unix 秒过期时刻，
   `candidate` 按现有导出格式（五字段文档，也接受 `{"blocks":[...]}` 或裸块数组）。
-  节点对候选按既有规则**全量重验**：canonical 创世块逐字节一致、高度连续、
-  `prev_hash` 相连、重算 `block_hash` 与 Merkle 根、逐笔校验 `tx_id` 与 Ed25519
-  签名、`tx_id` 全链唯一且块内升序、按初始余额重放不超支、仅允许末块 `pending`，
-  导出文档自带的摘要字段也会逐一核对。成功 `201` 返回
-  `{tip_hash, height, length, status, expires_at}`；请求已过期返回 `410`；
-  字段格式或候选校验失败返回 `400`。
-- **幂等与冲突**：同一 `source` + `request_id` 重试时，候选内容相同则返回
-  `200` 与**首次的原结果**（含原 `expires_at`）；内容不同返回 `409`；
-  候选 `tip_hash` 与 canonical 或任一已存候选重复也返回 `409`。
+  **来源授权（仅针对新请求）**：`source` 必须对应持久化信任注册表中仍为
+  `active` 且来源自身 `expires_at > now` 的条目；未知来源、已撤销来源或来源
+  信任已过期一律 `403`。判定顺序为：信封字段格式错误 `400` → 来源授权
+  `403` → 请求自身 `expires_at <= now` 为 `410` → 候选整链校验 / 摘要核对 /
+  tip 去重。即一个来源不受信的请求即使同时过期或候选非法，也先返回 `403`；
+  字段类型不合法仍先返回 `400`。授权通过后节点对候选按既有规则**全量重验**：
+  canonical 创世块逐字节一致、高度连续、`prev_hash` 相连、重算 `block_hash` 与
+  Merkle 根、逐笔校验 `tx_id` 与 Ed25519 签名、`tx_id` 全链唯一且块内升序、
+  按初始余额重放不超支、仅允许末块 `pending`，导出文档自带的摘要字段也会逐一
+  核对。成功 `201` 返回 `{tip_hash, height, length, status, expires_at}`。
+- **幂等与冲突**：同一 `source` + `request_id` 的**未过期**记录重试时**跳过
+  授权与过期检查**：候选内容相同则返回 `200` 与**首次的原结果**（含原
+  `expires_at`），即使该来源此后已轮换公钥或被撤销；内容不同返回 `409`；
+  候选 `tip_hash` 与 canonical 或任一已存候选重复也返回 `409`。一旦记录本身
+  过期被清理，同一键的再次投递即视为新请求，重新走授权门（已撤销来源 `403`）。
 - **过期处理**：同步带来的候选只在记录未过期期间存活；一旦过期，记录与其候选
-  分叉一并移除（已采用上链的 tip 只留审计记录、不影响 canonical 链）。元数据与
-  候选在**同一次原子写入**中落盘；重启时重验全部候选并丢弃过期或失效记录。
+  分叉一并移除（已采用上链的 tip 只留审计记录、不影响 canonical 链）。接收、
+  采用、过期清理与信任变更共用**同一把锁**并在**同一份原子快照**中完成；
+  保存失败会完整恢复链、候选分叉、同步元数据与 `generation`，既有审计事件逐字
+  不变、不丢事件、`event_id` 不间断。元数据与候选在同一次原子写入中落盘。
+- **重启重校验**：重启时先严格恢复信任注册表与审计序列，再据此**重新授权**
+  每条同步记录并重新校验候选：来源未知、已撤销或信任已过期、请求已过期、或
+  指向的候选/链上块已不存在的记录一律丢弃，其**独占**的候选分叉一并删除；
+  失效记录被丢弃但对应的 `sync_received` / `sync_adopted` / `sync_expired`
+  **历史审计事件逐字保留、仍可查询**。已采用为 canonical tip 的记录即使丢弃也
+  不影响 canonical 链。信任注册表或审计序列本身损坏仍抛
+  `ledger.store.StateRecoveryError`。
 - **审计查询**：`GET /v1/forks/sync` 支持 `source`、`min_height`、`max_height`、
   `limit`（默认 50，范围 1–200）、`cursor`（默认 0）。数值参数必须是首位非 0 的
   十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。结果按
@@ -275,8 +290,9 @@ curl -s -X POST localhost:8080/v1/forks/<tip-hash>/adopt
 curl -s localhost:8080/v1/forks/<tip-hash>/export
 # -> 200 {"tip_hash":"...","height":N,"length":N+1,"status":"...","blocks":[...]}
 
-# 节点间同步：推送他节点候选（201；相同 source+request_id 同内容重试 200，
-# 内容不同/tip 重复 409，过期 410，格式或校验失败 400）
+# 节点间同步：推送他节点候选（来源须已注册且 active 未过期，否则 403；
+# 201；相同 source+request_id 同内容重试 200——即使来源后被轮换/撤销；
+# 新请求内容不同/tip 重复 409，请求自身过期 410，格式或校验失败 400）
 curl -s -X POST localhost:8080/v1/forks/sync \
   -H 'Content-Type: application/json' \
   -d '{"source":"node-2","request_id":"req-7","expires_at":1800000000,"candidate":{...export 文档...}}'
@@ -372,6 +388,7 @@ python tests/recovery_test.py         # generation、多区块一致性、快照
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
+python tests/trust_sync_auth_test.py   # 同步来源授权（未知/撤销/过期来源 403、403 先于 410/校验、400 优先、撤销/轮换后幂等 200/409、重启丢弃失效记录但保留审计事件、失败保存完整恢复）与 HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 ```
