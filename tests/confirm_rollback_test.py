@@ -209,7 +209,16 @@ class StateMachineServiceTests(unittest.TestCase):
             data = json.load(fh)
         self.assertEqual(
             set(data),
-            {"state", "chain", "pending", "index", "accounts", "audit_checkpoint"},
+            {
+                "state",
+                "chain",
+                "pending",
+                "index",
+                "accounts",
+                "audit_checkpoint",
+                "audit_signer",
+                "audit_signer_history",
+            },
         )
         self.assertEqual(data["state"]["tip_status"], "confirmed")
         self.assertEqual(data["chain"][1]["status"], "confirmed")

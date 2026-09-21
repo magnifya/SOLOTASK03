@@ -356,10 +356,12 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
 
     The input is one export page or a JSON array of pages (the pages of a
     full export, in order), read from ``FILE`` or standard input when the
-    argument is ``-``. Prints a single JSON line:
+    argument is ``-``. Without ``--trust`` only the hash chain is checked;
+    with a trust document the Ed25519 checkpoint authentication and the
+    cross-page binding are verified too. Prints a single JSON line:
     ``{"ok": true, "checkpoint": {...}}`` on success or
-    ``{"ok": false, "error": "input"|"integrity"}`` on failure, and exits
-    0/1 respectively.
+    ``{"ok": false, "error": "input"|"integrity"|"auth"}`` on failure, and
+    exits 0/1 respectively.
     """
     from .audit import verify_export
 
@@ -369,13 +371,29 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
         else:
             with open(args.export_file, "r", encoding="utf-8") as fh:
                 document = json.load(fh)
+        trust = None
+        if args.trust is not None:
+            with open(args.trust, "r", encoding="utf-8") as fh:
+                trust = json.load(fh)
     except (OSError, ValueError, UnicodeDecodeError):
         # Unreadable or non-JSON input is an input error.
         body = {"ok": False, "error": "input"}
     else:
-        body = verify_export(document)
+        body = verify_export(document, trust)
     print(json.dumps(body, sort_keys=True, ensure_ascii=False))
     return 0 if body.get("ok") is True else 1
+
+
+def cmd_audit_signer_rotate(args: argparse.Namespace) -> int:
+    """Rotate the node's audit Ed25519 checkpoint signer over HTTP."""
+    payload = {
+        "private_key": args.private_key,
+        "expected_version": args.expected_version,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/audit/signer/rotate", payload
+    )
+    return _emit(status, body)
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -593,7 +611,30 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE|-",
         help="audit export JSON file, or - to read the document from stdin",
     )
+    p_audit_verify.add_argument(
+        "--trust",
+        help="optional trust JSON document (genesis_hash + audit_signers); "
+        "when supplied the Ed25519 checkpoint authentication and cross-page "
+        "binding are verified (a failure reports error \"auth\")",
+    )
     p_audit_verify.set_defaults(func=cmd_audit_verify)
+
+    p_signer_rotate = sub.add_parser(
+        "signer-rotate",
+        help="rotate the node's Ed25519 audit checkpoint signer",
+    )
+    p_signer_rotate.add_argument(
+        "--private-key",
+        required=True,
+        help="new Ed25519 private key: 64 lowercase hex characters",
+    )
+    p_signer_rotate.add_argument(
+        "--expected-version",
+        required=True,
+        type=int,
+        help="the current signer key version (optimistic concurrency check)",
+    )
+    p_signer_rotate.set_defaults(func=cmd_audit_signer_rotate)
 
     return parser
 

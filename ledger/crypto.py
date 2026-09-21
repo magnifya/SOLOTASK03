@@ -7,7 +7,11 @@ import json
 import re
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 
 def canonical_message(sender: str, recipient: str, amount: int) -> bytes:
@@ -48,6 +52,56 @@ def verify_signature(public_key_hex: str, message: bytes, signature_hex: str) ->
     except (InvalidSignature, ValueError):
         return False
     return True
+
+
+def generate_keypair_hex() -> tuple[str, str]:
+    """Generate a fresh Ed25519 keypair, returned as ``(private_hex, public_hex)``.
+
+    Both are lowercase hex strings: the private key is 64 hex chars (32 raw
+    seed bytes) — exactly the format accepted by POST /v1/audit/signer/rotate
+    — and the public key is 64 hex chars (32 raw bytes).
+    """
+    private_key = Ed25519PrivateKey.generate()
+    private_hex = private_key.private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    ).hex()
+    public_hex = public_key_from_private_hex(private_hex)
+    return private_hex, public_hex
+
+
+def is_private_hex64(value: object) -> bool:
+    """True iff ``value`` is a 64-char lowercase hex Ed25519 private key string."""
+    if not _is_hex64(value):
+        return False
+    try:
+        Ed25519PrivateKey.from_private_bytes(bytes.fromhex(value))
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def public_key_from_private_hex(private_key_hex: str) -> str:
+    """Derive the 64-char lowercase hex public key from a private key hex string."""
+    private_key = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(private_key_hex)
+    )
+    return private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+
+
+def sign_with_private_hex(private_key_hex: str, message: bytes) -> str:
+    """Sign ``message`` with an Ed25519 private key given as 64 hex chars.
+
+    Returns the signature as 128 lowercase hex chars. Raises ValueError for a
+    malformed private key.
+    """
+    private_key = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(private_key_hex)
+    )
+    return private_key.sign(message).hex()
 
 
 # Merkle root of an empty transaction list; fixed so genesis blocks are identical.

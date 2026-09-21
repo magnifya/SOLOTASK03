@@ -68,7 +68,7 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 8
+STATE_VERSION = 9
 
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
@@ -79,6 +79,8 @@ TRUST_REVOKED = "revoked"
 EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
+# Rotation of the Ed25519 key that authenticates audit export checkpoints.
+EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -175,6 +177,17 @@ class LedgerStore:
         # Head of the audit hash chain: {"event_id", "event_hash"} of the last
         # event, or {0, "0"*64} for an empty log. Persisted in every snapshot.
         self.audit_checkpoint: dict = audit.make_checkpoint([])
+        # The Ed25519 key that currently authenticates audit export
+        # checkpoints: {"version", "private_key", "public_key",
+        # "activated_event_id"}. A node creates version 1 on first start. The
+        # private key is a 64-char lowercase hex seed; it never leaves the
+        # node (only the public key is exported in the trust document).
+        self.audit_signer: dict | None = None
+        # Public keys of every audit signer, current key last, ordered by
+        # ascending key_version:
+        # [{"key_version", "public_key", "activated_event_id"}]. Rotation only
+        # ever appends, so an old checkpoint stays verifiable forever.
+        self.audit_signer_history: list[dict] = []
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
@@ -222,6 +235,9 @@ class LedgerStore:
                 self.allowlist = {}
                 self.audit_events = []
                 self.audit_checkpoint = audit.make_checkpoint([])
+                self.audit_signer, self.audit_signer_history = (
+                    self._generate_audit_signer_v1()
+                )
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
@@ -238,7 +254,9 @@ class LedgerStore:
                     continue
                 # parsed = (chain, pending, generation, forks, initial_balance,
                 #           syncs, trust_sources, allowlist, audit_events,
-                #           expired_records, audit_checkpoint, audit_repair)
+                #           expired_records, audit_checkpoint, audit_repair,
+                #           audit_signer, audit_signer_history,
+                #           signer_migration)
                 valid.append(
                     (
                         parsed[2],
@@ -254,6 +272,9 @@ class LedgerStore:
                         parsed[9],
                         parsed[10],
                         parsed[11],
+                        parsed[12],
+                        parsed[13],
+                        parsed[14],
                     )
                 )
 
@@ -265,35 +286,41 @@ class LedgerStore:
 
             max_generation = max(item[0] for item in valid)
             top = [item for item in valid if item[0] == max_generation]
-            # item layout: (generation, path, chain, pending, forks,
-            # initial_balance, syncs, trust_sources, allowlist, audit_events,
-            # expired_records, audit_checkpoint, audit_repair)
-            reference = self._canonical_view(
-                top[0][2],
-                top[0][3],
-                top[0][4],
-                top[0][6],
-                top[0][7],
-                top[0][8],
-                top[0][9],
-                top[0][5],
-                top[0][11],
-            )
+
+            def view_of(item: tuple) -> str:
+                # item layout: (generation, path, chain, pending, forks,
+                # initial_balance, syncs, trust_sources, allowlist,
+                # audit_events, expired_records, audit_checkpoint,
+                # audit_repair, audit_signer, audit_signer_history,
+                # signer_migration)
+                # A not-yet-durable signer (legacy-snapshot migration) is
+                # deliberately excluded: it is generated fresh per parse and
+                # random, so it must never make two identical legacy
+                # snapshots look conflicting — exactly like the timestamped
+                # expiry backfill.
+                if item[15]:
+                    signer_view = None
+                    signer_history_view = None
+                else:
+                    signer_view = item[13]
+                    signer_history_view = item[14]
+                return self._canonical_view(
+                    item[2],
+                    item[3],
+                    item[4],
+                    item[6],
+                    item[7],
+                    item[8],
+                    item[9],
+                    item[5],
+                    item[11],
+                    signer_view,
+                    signer_history_view,
+                )
+
+            reference = view_of(top[0])
             for item in top[1:]:
-                if (
-                    self._canonical_view(
-                        item[2],
-                        item[3],
-                        item[4],
-                        item[6],
-                        item[7],
-                        item[8],
-                        item[9],
-                        item[5],
-                        item[11],
-                    )
-                    != reference
-                ):
+                if view_of(item) != reference:
                     paths = " vs ".join(item[1] for item in top)
                     raise StateRecoveryError(
                         directory,
@@ -322,6 +349,9 @@ class LedgerStore:
                 expired_records,
                 audit_checkpoint,
                 audit_repair,
+                audit_signer,
+                audit_signer_history,
+                signer_migration,
             ) = winner
 
             if os.path.abspath(winner_path) != main_abs:
@@ -355,6 +385,8 @@ class LedgerStore:
             self.allowlist = allowlist
             self.audit_events = audit_events
             self.audit_checkpoint = audit_checkpoint
+            self.audit_signer = audit_signer
+            self.audit_signer_history = audit_signer_history
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -365,11 +397,11 @@ class LedgerStore:
             self.rebuild_derived()
             self._cleanup_candidates(directory)
             # Persist the reconciled state (pruned records/forks + backfilled
-            # events + legacy hash-chain completion) atomically so the next
-            # restart never re-derives or duplicates anything; with nothing to
-            # reconcile no write happens and the recovered generation is kept
-            # byte-for-byte.
-            if backfilled or audit_repair:
+            # events + legacy hash-chain completion + legacy signer migration)
+            # atomically so the next restart never re-derives or duplicates
+            # anything; with nothing to reconcile no write happens and the
+            # recovered generation is kept byte-for-byte.
+            if backfilled or audit_repair or signer_migration:
                 self.save()
 
     def _discover_candidates(self, directory: str) -> list[str]:
@@ -401,6 +433,8 @@ class LedgerStore:
         audit_events: list[dict] | None = None,
         initial_balance: int | None = None,
         audit_checkpoint: dict | None = None,
+        audit_signer: dict | None = None,
+        audit_signer_history: list[dict] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -409,7 +443,9 @@ class LedgerStore:
         endowment describe a different replay judgment and must conflict. The
         audit checkpoint participates too: two same-generation snapshots with
         the same events but a different log head disagree about the audited
-        state and must conflict.
+        state and must conflict. The current audit checkpoint signer and its
+        public-key history likewise participate: a rotated or tampered key at
+        the same generation is a conflict.
         """
         sync_records = [
             {
@@ -443,6 +479,8 @@ class LedgerStore:
                 "audit_events": audit_events or [],
                 "audit_checkpoint": audit_checkpoint
                 or {"event_id": 0, "event_hash": "0" * 64},
+                "audit_signer": audit_signer,
+                "audit_signer_history": audit_signer_history or [],
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -499,6 +537,9 @@ class LedgerStore:
         list[dict],
         list[tuple[str, str, dict]],
         dict,
+        bool,
+        dict,
+        list[dict],
         bool,
     ]:
         """Strictly validate one decoded snapshot.
@@ -672,6 +713,11 @@ class LedgerStore:
         audit_checkpoint, audit_repair = self._assess_audit_chain(
             data, audit_events, path
         )
+        audit_signer, audit_signer_history, signer_migration = (
+            self._parse_persisted_audit_signer(
+                data, path, audit_events, audit_repair
+            )
+        )
         syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
         )
@@ -698,6 +744,9 @@ class LedgerStore:
             expired_records,
             audit_checkpoint,
             audit_repair,
+            audit_signer,
+            audit_signer_history,
+            signer_migration,
         )
 
     @staticmethod
@@ -899,6 +948,195 @@ class LedgerStore:
         return allowlist
 
     @staticmethod
+    def _generate_audit_signer_v1() -> tuple[dict, list[dict]]:
+        """Create the first audit checkpoint signer (version 1, activated at 0)."""
+        private_hex, public_hex = crypto.generate_keypair_hex()
+        signer = {
+            "version": 1,
+            "private_key": private_hex,
+            "public_key": public_hex,
+            "activated_event_id": 0,
+        }
+        history = [
+            {
+                "key_version": 1,
+                "public_key": public_hex,
+                "activated_event_id": 0,
+            }
+        ]
+        return signer, history
+
+    def _parse_persisted_audit_signer(
+        self,
+        data: dict,
+        path: str,
+        audit_events: list[dict],
+        audit_repair: bool,
+    ) -> tuple[dict, list[dict], bool]:
+        """Strictly parse the current audit signer and its public-key history.
+
+        Returns ``(signer, history, needs_signer_migration)``. A current
+        snapshot must persist a well-formed ``audit_signer`` (positive
+        integer version, valid 64-hex private/public keys with the public key
+        derived from the private key, a non-negative activation event id) and
+        an ``audit_signer_history`` list ordered by ascending key_version,
+        starting at version 1 (activated_event_id 0) and including the current
+        key last. Every rotated key's activation event id must point at the
+        matching ``audit_signer_rotated`` event and the event's public key
+        must agree.
+
+        A snapshot written before signer authentication carries neither
+        section; it is migrated exactly once on the unique winning snapshot
+        (``needs_signer_migration`` is True), exactly like the legacy
+        unlinked audit log. A present-but-malformed signer section is
+        corruption and fails recovery.
+        """
+        signer_raw = data.get("audit_signer")
+        history_raw = data.get("audit_signer_history")
+        if signer_raw is None and history_raw is None:
+            # Legacy snapshot predating checkpoint authentication. It is
+            # migrated once, by load(), after the unique winner is chosen.
+            signer, history = self._generate_audit_signer_v1()
+            return signer, history, True
+        if not isinstance(signer_raw, dict):
+            raise StateRecoveryError(path, "'audit_signer' must be an object")
+        if not isinstance(history_raw, list) or not history_raw:
+            raise StateRecoveryError(
+                path, "'audit_signer_history' must be a non-empty list"
+            )
+
+        version = signer_raw.get("version")
+        private_key = signer_raw.get("private_key")
+        public_key = signer_raw.get("public_key")
+        activated = signer_raw.get("activated_event_id")
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise StateRecoveryError(
+                path, "audit_signer.version must be a positive integer"
+            )
+        if not crypto.is_private_hex64(private_key):
+            raise StateRecoveryError(
+                path, "audit_signer.private_key must be 64 lowercase hex chars"
+            )
+        if not crypto.is_hex64(public_key):
+            raise StateRecoveryError(
+                path, "audit_signer.public_key must be 64 lowercase hex chars"
+            )
+        if crypto.public_key_from_private_hex(private_key) != public_key:
+            raise StateRecoveryError(
+                path, "audit_signer public key does not match its private key"
+            )
+        if isinstance(activated, bool) or not isinstance(activated, int) or activated < 0:
+            raise StateRecoveryError(
+                path, "audit_signer.activated_event_id must be a non-negative integer"
+            )
+        if activated > len(audit_events):
+            raise StateRecoveryError(
+                path, "audit_signer.activated_event_id is beyond the audit log"
+            )
+        signer = {
+            "version": version,
+            "private_key": private_key,
+            "public_key": public_key,
+            "activated_event_id": activated,
+        }
+
+        history: list[dict] = []
+        previous_version = 0
+        previous_activated = -1
+        for entry in history_raw:
+            if not isinstance(entry, dict):
+                raise StateRecoveryError(
+                    path, "audit_signer_history entries must be objects"
+                )
+            entry_version = entry.get("key_version")
+            entry_public = entry.get("public_key")
+            entry_activated = entry.get("activated_event_id")
+            if (
+                isinstance(entry_version, bool)
+                or not isinstance(entry_version, int)
+                or entry_version != previous_version + 1
+            ):
+                raise StateRecoveryError(
+                    path, "audit_signer_history key_version values must be "
+                    "consecutive starting at 1"
+                )
+            if not crypto.is_hex64(entry_public):
+                raise StateRecoveryError(
+                    path, "audit_signer_history public_key must be 64 hex chars"
+                )
+            if (
+                isinstance(entry_activated, bool)
+                or not isinstance(entry_activated, int)
+                or entry_activated < 0
+                or entry_activated < previous_activated
+                or entry_activated > len(audit_events)
+            ):
+                raise StateRecoveryError(
+                    path, "audit_signer_history activated_event_id is invalid"
+                )
+            history.append(
+                {
+                    "key_version": entry_version,
+                    "public_key": entry_public,
+                    "activated_event_id": entry_activated,
+                }
+            )
+            previous_version = entry_version
+            previous_activated = entry_activated
+
+        if history[0]["key_version"] != 1 or history[0]["activated_event_id"] != 0:
+            raise StateRecoveryError(
+                path, "audit_signer_history must start with key_version 1 "
+                "activated at event 0"
+            )
+        last = history[-1]
+        if (
+            last["key_version"] != version
+            or last["public_key"] != public_key
+            or last["activated_event_id"] != activated
+        ):
+            raise StateRecoveryError(
+                path, "audit_signer_history must end with the current audit_signer"
+            )
+
+        # Cross-check every rotated key (versions 2+) against its
+        # audit_signer_rotated event. Version 1 activates at the empty log.
+        for entry in history:
+            if entry["key_version"] == 1:
+                continue
+            if entry["activated_event_id"] < 1:
+                raise StateRecoveryError(
+                    path,
+                    f"audit signer version {entry['key_version']} must activate "
+                    f"at an event id >= 1",
+                )
+            activation_event = audit_events[entry["activated_event_id"] - 1]
+            if activation_event.get("kind") != EVENT_AUDIT_SIGNER_ROTATED:
+                raise StateRecoveryError(
+                    path,
+                    f"audit signer version {entry['key_version']} activation "
+                    f"event {entry['activated_event_id']} is not an "
+                    f"audit_signer_rotated event",
+                )
+            if activation_event.get("key_version") != entry["key_version"]:
+                raise StateRecoveryError(
+                    path,
+                    f"audit signer version {entry['key_version']} activation "
+                    f"event records version {activation_event.get('key_version')}",
+                )
+            if activation_event.get("public_key") != entry["public_key"]:
+                raise StateRecoveryError(
+                    path,
+                    f"audit signer version {entry['key_version']} public key "
+                    f"does not match its rotation event",
+                )
+
+        # When the log itself is a legacy (unlinked) log there cannot be any
+        # rotation events; such a snapshot is still fully consistent (the
+        # signer section was written by current code), so no signer migration.
+        return signer, history, False
+
+    @staticmethod
     def _parse_persisted_audit_events(raw: object, path: str) -> list[dict]:
         """Strictly parse the append-only audit event log.
 
@@ -946,6 +1184,27 @@ class LedgerStore:
                 raise StateRecoveryError(path, f"audit event {event_id} needs a kind")
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 raise StateRecoveryError(path, f"audit event {event_id} needs a numeric 'at'")
+            if kind == EVENT_AUDIT_SIGNER_ROTATED:
+                # A rotation event permanently records the new key version and
+                # public key; the signer history is cross-checked against these.
+                signer_version = event.get("key_version")
+                signer_public = event.get("public_key")
+                if (
+                    isinstance(signer_version, bool)
+                    or not isinstance(signer_version, int)
+                    or signer_version < 2
+                ):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} (audit_signer_rotated) needs a "
+                        f"key_version >= 2",
+                    )
+                if not crypto.is_hex64(signer_public):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} (audit_signer_rotated) has an "
+                        f"invalid public_key",
+                    )
             if kind in sync_kinds:
                 source = event.get("source")
                 request_id = event.get("request_id")
@@ -1279,6 +1538,11 @@ class LedgerStore:
                 "audit_checkpoint does not match the audit log head; refusing "
                 "to persist an inconsistent snapshot"
             )
+        if self.audit_signer is None:
+            raise RuntimeError(
+                "audit signer is not initialized; refusing to persist a "
+                "snapshot without a checkpoint authentication key"
+            )
         data = {
             "state": {
                 "version": STATE_VERSION,
@@ -1293,6 +1557,11 @@ class LedgerStore:
             "index": dict(next_index),
             "accounts": next_accounts,
             "audit_checkpoint": dict(self.audit_checkpoint),
+            # The current checkpoint signer (private key included; the state
+            # file is the node's secret store) and the append-only public-key
+            # history are part of every atomic snapshot.
+            "audit_signer": dict(self.audit_signer),
+            "audit_signer_history": [dict(entry) for entry in self.audit_signer_history],
         }
         # Only persist a forks section when candidates exist so a chain with
         # no forks keeps the canonical snapshot layout; loads default to [].
@@ -1626,6 +1895,56 @@ class LedgerStore:
         self.audit_events.append(event)
         self.audit_checkpoint = audit.make_checkpoint(self.audit_events)
         return event
+
+    # -- audit checkpoint signer ---------------------------------------------
+
+    def make_checkpoint_auth(self, genesis_hash: str) -> dict:
+        """Sign the current checkpoint with the current audit signer.
+
+        Returns the export field ``{"key_version", "signature"}``: the
+        signature is Ed25519 over SHA-256 of the sorted compact UTF-8 JSON of
+        ``{genesis_hash, checkpoint, key_version}``. Caller must hold the
+        lock. Raises RuntimeError when the signer is not initialized.
+        """
+        if self.audit_signer is None:
+            raise RuntimeError("audit signer is not initialized")
+        return audit.make_checkpoint_auth(
+            genesis_hash,
+            self.audit_checkpoint,
+            self.audit_signer["version"],
+            self.audit_signer["private_key"],
+        )
+
+    def install_new_audit_signer(
+        self, private_key_hex: str, activated_event_id: int
+    ) -> dict:
+        """Install a freshly generated/rotated checkpoint signer in memory.
+
+        Derives the public key, assigns the next key_version, records the
+        activation event id (the id of the accompanying
+        ``audit_signer_rotated`` event) and appends the new public key to the
+        immutable history. Does not save; the caller persists the event, the
+        signer and the history in one atomic write and restores the old signer
+        on failure. Caller must hold the lock.
+        """
+        if self.audit_signer is None:
+            raise RuntimeError("audit signer is not initialized")
+        public_key = crypto.public_key_from_private_hex(private_key_hex)
+        new_version = self.audit_signer["version"] + 1
+        self.audit_signer = {
+            "version": new_version,
+            "private_key": private_key_hex,
+            "public_key": public_key,
+            "activated_event_id": activated_event_id,
+        }
+        self.audit_signer_history.append(
+            {
+                "key_version": new_version,
+                "public_key": public_key,
+                "activated_event_id": activated_event_id,
+            }
+        )
+        return dict(self.audit_signer)
 
     def truncate_audit_events(self, count: int) -> None:
         """Remove the last ``count`` appended events and reset the checkpoint.

@@ -50,6 +50,7 @@ EVENT_SOURCE_REVOKED = "source_revoked"
 EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
+EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 
 
 def _parse_height(height: object) -> int | None:
@@ -1303,7 +1304,10 @@ class LedgerService:
         ``genesis_hash`` always pins the fixed canonical genesis block;
         ``sources`` contains only active, unexpired entries in the light
         client's shape ``{public_key, expires_at}``; the keyless
-        ``allowlist`` is preserved verbatim.
+        ``allowlist`` is preserved verbatim; ``audit_signers`` lists every
+        audit checkpoint signer key (current key last) in ascending
+        ``key_version`` order as ``{key_version, public_key,
+        activated_event_id}`` — the first version is activated at event 0.
         """
         with self.store.lock:
             now = time.time()
@@ -1319,10 +1323,83 @@ class LedgerService:
                 "genesis_hash": self.store.chain[0].block_hash,
                 "sources": sources,
                 "allowlist": dict(self.store.allowlist),
+                "audit_signers": [dict(entry) for entry in self.store.audit_signer_history],
+            }
+
+    # -- audit checkpoint signer rotation -------------------------------------
+
+    def rotate_audit_signer(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/audit/signer/rotate — rotate the audit Ed25519 signer.
+
+        Request body ``{"private_key", "expected_version"}``: ``private_key``
+        must be exactly 64 lowercase hex characters (an Ed25519 seed) and
+        ``expected_version`` a positive integer. A malformed body is 400 and a
+        stale ``expected_version`` is 409. On success the new key is installed,
+        its public key is appended to the immutable history and an
+        ``audit_signer_rotated`` event is appended — all in one atomic write
+        with the advanced generation. Returns 200 with
+        ``{"version", "public_key"}`` (the request's private key is never
+        echoed back).
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        if "private_key" not in payload or "expected_version" not in payload:
+            return 400, {
+                "error": "missing field: private_key and expected_version are required"
+            }
+        private_key = payload["private_key"]
+        expected_version = payload["expected_version"]
+        if not crypto.is_private_hex64(private_key):
+            return 400, {
+                "error": "private_key must be 64 lowercase hex characters"
+            }
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 1
+        ):
+            return 400, {"error": "expected_version must be a positive integer"}
+
+        with self.store.lock:
+            current = self.store.audit_signer
+            if current is None:
+                # Defensive: every store initializes a signer on creation.
+                return 400, {"error": "audit signer is not initialized"}
+            if current["version"] != expected_version:
+                return 409, {
+                    "error": "expected_version does not match the current signer version"
+                }
+            new_public = crypto.public_key_from_private_hex(private_key)
+            # Install the new key and append its rotation event together; the
+            # event id is the new key's activation point, and both are rolled
+            # back if the atomic write fails.
+            old_signer = dict(current)
+            old_history = [dict(entry) for entry in self.store.audit_signer_history]
+            event = self.store.append_audit_event(
+                EVENT_AUDIT_SIGNER_ROTATED,
+                {
+                    "key_version": current["version"] + 1,
+                    "public_key": new_public,
+                },
+            )
+            new_signer = self.store.install_new_audit_signer(
+                private_key, event["event_id"]
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Restore the previous signer, its history and drop the event
+                # so memory matches the last durably committed snapshot.
+                self.store.audit_signer = old_signer
+                self.store.audit_signer_history = old_history
+                self.store.truncate_audit_events(1)
+                raise
+            return 200, {
+                "version": new_signer["version"],
+                "public_key": new_signer["public_key"],
             }
 
     # -- audit log ------------------------------------------------------------
-
     AUDIT_DEFAULT_LIMIT = 50
     AUDIT_MAX_LIMIT = 200
 
@@ -1386,7 +1463,12 @@ class LedgerService:
         * ``anchor_hash`` — the hash immediately preceding the page's first
           event (64 zeroes at cursor 0; the head at cursor == total);
         * ``checkpoint`` — the current ``{event_id, event_hash}`` log head
-          (``{0, "0"*64}`` for an empty log), included on every page.
+          (``{0, "0"*64}`` for an empty log), included on every page;
+        * ``checkpoint_auth`` — ``{key_version, signature}``: the current
+          audit signer's Ed25519 signature over SHA-256 of the sorted compact
+          UTF-8 JSON of ``{genesis_hash, checkpoint, key_version}``. Every
+          page of one export carries the identical value, binding the pages
+          together and to the genesis anchor.
 
         ``cursor == total`` returns an empty last page (its anchor is the log
         head so the final page matches the checkpoint); ``cursor > total`` is
@@ -1422,11 +1504,17 @@ class LedgerService:
             else:
                 anchor_hash = events[cursor - 1]["event_hash"]
             next_cursor = cursor + limit if cursor + limit < total else None
+            genesis_hash = self.store.chain[0].block_hash
+            # One signature is computed over the current checkpoint and copied
+            # onto every page, so all pages of an export are cryptographically
+            # bound to the same checkpoint and signer.
+            checkpoint_auth = self.store.make_checkpoint_auth(genesis_hash)
             body = {
                 "items": page,
                 "total": total,
                 "next_cursor": next_cursor,
                 "anchor_hash": anchor_hash,
                 "checkpoint": dict(self.store.audit_checkpoint),
+                "checkpoint_auth": checkpoint_auth,
             }
         return 200, body

@@ -74,6 +74,15 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.register_trust_source(payload)
                 self._send_json(status, body)
+            elif path == "/v1/audit/signer/rotate":
+                # POST /v1/audit/signer/rotate — rotate the audit Ed25519
+                # checkpoint signer ({"private_key", "expected_version"}).
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.rotate_audit_signer(payload)
+                self._send_json(status, body)
             elif (
                 path.startswith("/v1/trust/sources/")
                 and (path.endswith("/rotate") or path.endswith("/revoke"))
