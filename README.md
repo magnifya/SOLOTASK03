@@ -101,6 +101,18 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `cursor == total` 返回空页，`cursor > total` 返回 `400`，没有更多结果时
   `next_cursor` 为 `null`。每个 item 含
   `{source, request_id, tip_hash, height, length, status, expires_at}`。
+- **生命周期历史**：`GET /v1/forks/sync/history` 按事件列出
+  `sync_received` / `sync_adopted` / `sync_expired` 历史，支持 `source`、
+  `tip_hash`（须为 64 位小写十六进制，格式错误 `400`，未知 tip 返回空页）、
+  `kind`（仅三种同步事件，其他值 `400`）、`min_height`、`max_height`、
+  `limit`（默认 50，范围 1–200）、`cursor`（默认 0）。数值参数必须是首位非 0
+  的十进制（`0` 合法），符号、小数、空白与**重复参数**均 `400`；
+  `min_height > max_height` 与 `cursor > total` 返回 `400`，`cursor == total`
+  返回空页。结果按 `(height, tip_hash, source, request_id, event_id)` 升序，
+  返回 `{items, total, next_cursor}`；每个 item 含 `{event_id, kind, at,
+  source, request_id, tip_hash, height, length, status, expires_at}`。摘要
+  （height/length/status）在接收时冻结：采用、过期或之后 canonical 链的变化
+  都不改写历史行。
 - **串行化与采用**：同步接收、审计查询与候选采用共用同一把锁串行化。采用规则
   不变（最长链优先、同长取最小 `tip_hash`），在一次原子写入中换链、递增
   `generation` 并重建索引：旧链独有的已确认交易去重回池，旧链 pending 末块与

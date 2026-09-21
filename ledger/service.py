@@ -448,19 +448,29 @@ class LedgerService:
             self.store.forks.pop(tip_hash)
             self.store.replace_chain(fork)
             # An adopted synced tip keeps its sync records (queryable until
-            # expiry); record the adoption once per provenance entry.
+            # expiry); record the adoption once per provenance entry. The
+            # event carries the reception-time summary frozen on the record
+            # (adoption must not rewrite it); a legacy record without it
+            # falls back to the adopted candidate's own descriptor, which is
+            # exactly the summary frozen at reception.
             adopted_keys = sorted(
                 key
                 for key, rec in self.store.syncs.items()
                 if rec["tip_hash"] == tip_hash
             )
+            fallback = self._fork_summary(fork)
             for rec_source, request_id in adopted_keys:
+                rec = self.store.syncs[(rec_source, request_id)]
                 self.store.append_audit_event(
                     EVENT_SYNC_ADOPTED,
                     {
                         "source": rec_source,
                         "request_id": request_id,
                         "tip_hash": tip_hash,
+                        "height": rec.get("height", fallback["height"]),
+                        "length": rec.get("length", fallback["length"]),
+                        "status": rec.get("status", fallback["status"]),
+                        "expires_at": rec["expires_at"],
                     },
                 )
             try:
@@ -554,17 +564,19 @@ class LedgerService:
                 removed_forks[tip] = fork
         # Record one permanent expiry event per removed sync record. A tip
         # already adopted onto the canonical chain still gets its event: the
-        # record's expiry is auditable even though the chain is untouched.
+        # record's expiry is auditable even though the chain is untouched. The
+        # event carries the summary frozen at reception, never a recomputed one.
         for (rec_source, request_id), rec in sorted(removed.items()):
-            self.store.append_audit_event(
-                EVENT_SYNC_EXPIRED,
-                {
-                    "source": rec_source,
-                    "request_id": request_id,
-                    "tip_hash": rec["tip_hash"],
-                    "expires_at": rec["expires_at"],
-                },
-            )
+            payload = {
+                "source": rec_source,
+                "request_id": request_id,
+                "tip_hash": rec["tip_hash"],
+                "expires_at": rec["expires_at"],
+            }
+            for field in ("height", "length", "status"):
+                if rec.get(field) is not None:
+                    payload[field] = rec[field]
+            self.store.append_audit_event(EVENT_SYNC_EXPIRED, payload)
         try:
             self.store.save()
         except BaseException:
@@ -728,10 +740,15 @@ class LedgerService:
                 }
 
             self.store.forks[tip_hash] = fork
+            # Freeze the reception-time tip summary onto both the record and
+            # the audit event: later adoption or expiry must never rewrite it.
             self.store.syncs[key] = {
                 "tip_hash": tip_hash,
                 "expires_at": expires_at,
                 "fingerprint": fingerprint,
+                "height": summary["height"],
+                "length": summary["length"],
+                "status": summary["status"],
             }
             self.store.append_audit_event(
                 EVENT_SYNC_RECEIVED,
@@ -739,6 +756,9 @@ class LedgerService:
                     "source": source,
                     "request_id": request_id,
                     "tip_hash": tip_hash,
+                    "height": summary["height"],
+                    "length": summary["length"],
+                    "status": summary["status"],
                     "expires_at": expires_at,
                 },
             )
@@ -830,6 +850,154 @@ class LedgerService:
         next_cursor = cursor + limit if cursor + limit < total else None
         return 200, {"items": items, "total": total, "next_cursor": next_cursor}
 
+
+    # Audit event kinds that make up the sync lifecycle history.
+    SYNC_HISTORY_KINDS = (EVENT_SYNC_RECEIVED, EVENT_SYNC_ADOPTED, EVENT_SYNC_EXPIRED)
+
+    def list_fork_sync_history(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/forks/sync/history — paginated sync lifecycle history.
+
+        One row per sync_received / sync_adopted / sync_expired audit event.
+        Filters (AND-combined): ``source`` (exact), ``tip_hash`` (64 lowercase
+        hex; a malformed value is 400, an unknown one an empty page), ``kind``
+        (only the three sync kinds; anything else is 400), ``min_height`` and
+        ``max_height``. ``limit`` defaults to 50 and must be 1-200, ``cursor``
+        defaults to 0. Every numeric value must be a plain decimal without
+        leading zeros, signs, fractions or whitespace, and a repeated
+        parameter is rejected by the route. ``min_height > max_height`` and
+        ``cursor > total`` are 400; ``cursor == total`` returns an empty page.
+        Rows are ordered by ``(height, tip_hash, source, request_id,
+        event_id)``; each item carries ``event_id, kind, at, source,
+        request_id, tip_hash, height, length, status, expires_at`` with the
+        summary frozen at reception (adoption or expiry never rewrites it).
+        """
+        source = params.get("source")
+        if source is not None and (not isinstance(source, str) or not source):
+            return 400, {"error": "source must be a non-empty string"}
+        tip_hash = params.get("tip_hash")
+        if tip_hash is not None and not crypto.is_hex64(tip_hash):
+            return 400, {"error": "tip_hash must be 64 lowercase hex characters"}
+        kind = params.get("kind")
+        if kind is not None and kind not in self.SYNC_HISTORY_KINDS:
+            return 400, {"error": "kind must be one of sync_received, sync_adopted, sync_expired"}
+
+        min_height = None
+        if params.get("min_height") is not None:
+            min_height = _parse_decimal(params["min_height"])
+            if min_height is None:
+                return 400, {"error": "min_height must be a non-negative decimal"}
+        max_height = None
+        if params.get("max_height") is not None:
+            max_height = _parse_decimal(params["max_height"])
+            if max_height is None:
+                return 400, {"error": "max_height must be a non-negative decimal"}
+        if min_height is not None and max_height is not None and min_height > max_height:
+            return 400, {"error": "min_height must not exceed max_height"}
+
+        limit = self.SYNC_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.SYNC_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 200"}
+            limit = parsed
+        cursor = 0
+        if params.get("cursor") is not None:
+            parsed = _parse_decimal(params["cursor"])
+            if parsed is None:
+                return 400, {"error": "cursor must be a non-negative decimal"}
+            cursor = parsed
+
+        with self.store.lock:
+            # Sweep expired syncs first so their expiry events are visible on
+            # the same page that observes the removal.
+            self._prune_expired_syncs()
+            # Legacy events (and records) may predate the frozen summary:
+            # precompute per-lifecycle fallbacks from sibling events and live
+            # records so old rows still resolve their reception-time summary.
+            group_fields: dict[tuple, dict] = {}
+            for event in self.store.audit_events:
+                if event.get("kind") not in self.SYNC_HISTORY_KINDS:
+                    continue
+                group_key = (
+                    event.get("source"),
+                    event.get("request_id"),
+                    event.get("tip_hash"),
+                )
+                fields = group_fields.setdefault(group_key, {})
+                for field in ("height", "length", "status", "expires_at"):
+                    if fields.get(field) is None and event.get(field) is not None:
+                        fields[field] = event[field]
+            record_fields: dict[tuple, dict] = {}
+            for (rec_source, request_id), rec in self.store.syncs.items():
+                record_fields[(rec_source, request_id, rec["tip_hash"])] = rec
+
+            rows: list[dict] = []
+            for event in self.store.audit_events:
+                event_kind = event.get("kind")
+                if event_kind not in self.SYNC_HISTORY_KINDS:
+                    continue
+                if kind is not None and event_kind != kind:
+                    continue
+                if source is not None and event.get("source") != source:
+                    continue
+                event_tip = event.get("tip_hash")
+                if tip_hash is not None and event_tip != tip_hash:
+                    continue
+                group_key = (event.get("source"), event.get("request_id"), event_tip)
+                fallbacks = record_fields.get(group_key, {})
+                descriptor = self._tip_descriptor(event_tip) if event_tip else None
+                resolved: dict = {}
+                for field in ("height", "length", "status"):
+                    value = event.get(field)
+                    if value is None:
+                        value = fallbacks.get(field)
+                    if value is None:
+                        value = group_fields.get(group_key, {}).get(field)
+                    if value is None and descriptor is not None:
+                        value = descriptor.get(field)
+                    resolved[field] = value
+                expires_at = event.get("expires_at")
+                if expires_at is None:
+                    expires_at = fallbacks.get("expires_at")
+                if expires_at is None:
+                    expires_at = group_fields.get(group_key, {}).get("expires_at")
+                if resolved["height"] is None:
+                    # Unresolvable legacy row: never guess history metadata.
+                    continue
+                if min_height is not None and resolved["height"] < min_height:
+                    continue
+                if max_height is not None and resolved["height"] > max_height:
+                    continue
+                rows.append(
+                    {
+                        "event_id": event["event_id"],
+                        "kind": event_kind,
+                        "at": event["at"],
+                        "source": event.get("source"),
+                        "request_id": event.get("request_id"),
+                        "tip_hash": event_tip,
+                        "height": resolved["height"],
+                        "length": resolved["length"],
+                        "status": resolved["status"],
+                        "expires_at": expires_at,
+                    }
+                )
+
+        rows.sort(
+            key=lambda row: (
+                row["height"],
+                row["tip_hash"],
+                row["source"],
+                row["request_id"],
+                row["event_id"],
+            )
+        )
+        total = len(rows)
+        if cursor > total:
+            return 400, {"error": "cursor is beyond the result set"}
+        items = rows[cursor : cursor + limit]
+        next_cursor = cursor + limit if cursor + limit < total else None
+        return 200, {"items": items, "total": total, "next_cursor": next_cursor}
 
     # -- transaction index ----------------------------------------------------
 

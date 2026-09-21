@@ -145,6 +145,25 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 }
                 status, body = service.list_fork_syncs(params)
                 self._send_json(status, body)
+            elif path == "/v1/forks/sync/history":
+                # GET /v1/forks/sync/history?source=&tip_hash=&kind=&min_height=&max_height=&limit=&cursor=
+                # A repeated known parameter is a 400, never a silent first-wins.
+                raw_params = parse_qs(query, keep_blank_values=True)
+                known = (
+                    "source",
+                    "tip_hash",
+                    "kind",
+                    "min_height",
+                    "max_height",
+                    "limit",
+                    "cursor",
+                )
+                if any(len(raw_params[key]) > 1 for key in known if key in raw_params):
+                    self._send_json(400, {"error": "duplicate query parameter"})
+                    return
+                params = {key: values[0] for key, values in raw_params.items()}
+                status, body = service.list_fork_sync_history(params)
+                self._send_json(status, body)
             elif path == "/v1/index/transactions":
                 # GET /v1/index/transactions?tx_id=&account=&height=&limit=&cursor=
                 params = {
