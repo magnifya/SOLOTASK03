@@ -7,7 +7,11 @@ import json
 import re
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 
 def canonical_message(sender: str, recipient: str, amount: int) -> bytes:
@@ -27,6 +31,52 @@ def sha256_hex(data: bytes) -> str:
 def compute_tx_id(message: bytes) -> str:
     """SHA-256 hex digest of the canonical transaction message."""
     return sha256_hex(message)
+
+
+def generate_private_key() -> str:
+    """Generate a fresh Ed25519 private seed as 64 lowercase hex chars."""
+    return Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.Raw,
+        serialization.PrivateFormat.Raw,
+        serialization.NoEncryption(),
+    ).hex()
+
+
+def derive_public_key(private_key_hex: str) -> str | None:
+    """Derive the 64-hex Ed25519 public key from a 64-hex private seed.
+
+    Returns None for malformed hex or a wrong-length seed rather than raising,
+    so callers can treat every malformed key uniformly as a 400.
+    """
+    try:
+        seed = bytes.fromhex(private_key_hex)
+    except ValueError:
+        return None
+    if len(seed) != 32:
+        return None
+    private_key = Ed25519PrivateKey.from_private_bytes(seed)
+    return _public_hex(private_key)
+
+
+def _public_hex(private_key: Ed25519PrivateKey) -> str:
+    return private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+
+
+def sign_message(private_key_hex: str, message: bytes) -> str | None:
+    """Sign ``message`` with an Ed25519 seed (64 hex chars); hex signature.
+
+    Returns None for a malformed private key rather than raising.
+    """
+    try:
+        seed = bytes.fromhex(private_key_hex)
+    except ValueError:
+        return None
+    if len(seed) != 32:
+        return None
+    private_key = Ed25519PrivateKey.from_private_bytes(seed)
+    return private_key.sign(message).hex()
 
 
 def verify_signature(public_key_hex: str, message: bytes, signature_hex: str) -> bool:
@@ -77,6 +127,9 @@ def merkle_root(tx_ids: list[str]) -> str:
 # A SHA-256 digest rendered as 64 lowercase hexadecimal characters.
 _HEX64_RE = re.compile(r"[0-9a-f]{64}")
 
+# A 64-byte Ed25519 signature rendered as 128 lowercase hex characters.
+_HEX128_RE = re.compile(r"[0-9a-f]{128}")
+
 # Maximum Merkle depth we accept: 64 sibling levels already cover trees with up
 # to 2**64 leaves, so a longer sibling path is necessarily malformed.
 MAX_MERKLE_DEPTH = 64
@@ -89,6 +142,11 @@ def _is_hex64(value: object) -> bool:
 def is_hex64(value: object) -> bool:
     """True iff ``value`` is a 64-char lowercase SHA-256 hex string."""
     return _is_hex64(value)
+
+
+def is_hex128(value: object) -> bool:
+    """True iff ``value`` is a 128-char lowercase Ed25519 signature hex string."""
+    return isinstance(value, str) and _HEX128_RE.fullmatch(value) is not None
 
 
 def merkle_proof(tx_ids: list[str], index: int) -> list[dict]:

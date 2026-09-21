@@ -66,6 +66,15 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_fork_sync(payload)
                 self._send_json(status, body)
+            elif path == "/v1/audit/signer/rotate":
+                # POST /v1/audit/signer/rotate — rotate the Ed25519 key that
+                # authenticates audit export checkpoints.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.rotate_audit_signer(payload)
+                self._send_json(status, body)
             elif path == "/v1/trust/sources":
                 # POST /v1/trust/sources — register a trusted source.
                 ok, payload = self._read_json()

@@ -358,8 +358,12 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
     full export, in order), read from ``FILE`` or standard input when the
     argument is ``-``. Prints a single JSON line:
     ``{"ok": true, "checkpoint": {...}}`` on success or
-    ``{"ok": false, "error": "input"|"integrity"}`` on failure, and exits
-    0/1 respectively.
+    ``{"ok": false, "error": "input"|"integrity"|"auth"}`` on failure, and
+    exits 0/1 respectively.
+
+    Without ``--trust`` only the hash chain is checked. With a trust document
+    its genesis anchor and ``audit_signers`` additionally authenticate every
+    page's ``checkpoint_auth`` signature and bind the pages to one another.
     """
     from .audit import verify_export
 
@@ -373,9 +377,27 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
         # Unreadable or non-JSON input is an input error.
         body = {"ok": False, "error": "input"}
     else:
-        body = verify_export(document)
+        trust = None
+        if args.trust is not None:
+            try:
+                with open(args.trust, "r", encoding="utf-8") as fh:
+                    trust = json.load(fh)
+            except (OSError, ValueError, UnicodeDecodeError):
+                body = {"ok": False, "error": "input"}
+                print(json.dumps(body, sort_keys=True, ensure_ascii=False))
+                return 1
+        body = verify_export(document, trust)
     print(json.dumps(body, sort_keys=True, ensure_ascii=False))
     return 0 if body.get("ok") is True else 1
+
+
+def cmd_audit_signer_rotate(args: argparse.Namespace) -> int:
+    status, body = _request(
+        "POST",
+        f"{args.base_url}/v1/audit/signer/rotate",
+        {"private_key": args.private_key, "expected_version": args.expected_version},
+    )
+    return _emit(status, body)
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -593,7 +615,29 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE|-",
         help="audit export JSON file, or - to read the document from stdin",
     )
+    p_audit_verify.add_argument(
+        "--trust",
+        help="optional local trust JSON file (genesis_hash + audit_signers); "
+        "when given, checkpoint_auth signatures are additionally verified",
+    )
     p_audit_verify.set_defaults(func=cmd_audit_verify)
+
+    p_audit_signer = sub.add_parser(
+        "audit-signer-rotate",
+        help="rotate the Ed25519 key authenticating audit export checkpoints",
+    )
+    p_audit_signer.add_argument(
+        "--private-key",
+        required=True,
+        help="new Ed25519 private seed (64 lowercase hex characters)",
+    )
+    p_audit_signer.add_argument(
+        "--expected-version",
+        required=True,
+        type=int,
+        help="current signer version (conflict 409 if stale)",
+    )
+    p_audit_signer.set_defaults(func=cmd_audit_signer_rotate)
 
     return parser
 

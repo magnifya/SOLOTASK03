@@ -146,10 +146,14 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `status=revoked` 并返回 `200`，对已撤销来源以记录版本重复撤销是幂等的
   （仍 `200`，不产生第二条事件）。已撤销来源不能再轮换。
 - **信任文档**：`GET /v1/trust` 返回离线验证所需的
-  `{"genesis_hash","sources","allowlist"}`：`genesis_hash` 固定锚定 canonical
-  创世块；`sources[source] = {public_key, expires_at}` 只包含**未过期且未撤销**
-  的来源（`expires_at <= now` 即剔除）；持久化的 `allowlist[source] =
-  expires_at` 原样保留。该文档可直接作为 `ledger verify --trust` 的输入。
+  `{"genesis_hash","sources","allowlist","audit_signers"}`：`genesis_hash` 固定
+  锚定 canonical 创世块；`sources[source] = {public_key, expires_at}` 只包含
+  **未过期且未撤销**的来源（`expires_at <= now` 即剔除）；持久化的
+  `allowlist[source] = expires_at` 原样保留；`audit_signers` 按 `version`
+  升序列出节点曾经持有的**全部**审计检查点签名公钥，每项
+  `{version, public_key, activated_event_id}`，首版 `activated_event_id` 为
+  `0`。该文档可直接作为 `ledger verify --trust` 的输入，其 `genesis_hash`
+  与 `audit_signers` 也供 `ledger audit-verify --trust` 使用。
 - **审计查询**：`GET /v1/audit/events` 支持 `source`、`kind`、`cursor`、
   `limit`（默认 50，范围 1–200）过滤；数值参数必须是首位非 0 的十进制
   （`0` 合法），非法值 `400`。事件按 `event_id` 升序分页，返回
@@ -166,25 +170,44 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 - **审计导出**：`GET /v1/audit/export` 的 `cursor`/`limit` 分页语义与
   `/v1/audit/events` 完全一致（但面向整条日志、不接受 source/kind 过滤）；
   任何查询参数重复出现返回 `400`。返回
-  `{items,total,next_cursor,anchor_hash,checkpoint}`：`items` 按 `event_id`
-  升序且每个事件含 `prev_hash`/`event_hash`；`anchor_hash` 是本页首条事件的
-  前一哈希（`cursor=0` 为 64 个 0；`cursor=total` 的空末页为当前链头），
-  `checkpoint` 是导出时刻的日志检查点，每页都带。
+  `{items,total,next_cursor,anchor_hash,checkpoint,checkpoint_auth}`：`items`
+  按 `event_id` 升序且每个事件含 `prev_hash`/`event_hash`；`anchor_hash` 是
+  本页首条事件的前一哈希（`cursor=0` 为 64 个 0；`cursor=total` 的空末页为
+  当前链头），`checkpoint` 是导出时刻的日志检查点，每页都带；
+  `checkpoint_auth = {key_version, signature}`：把
+  `{genesis_hash, checkpoint, key_version}` 序列化为 key 排序、紧凑分隔符的
+  UTF-8 JSON，取其 SHA-256 32 字节摘要，再用**当前审计签名私钥**做 Ed25519
+  签名。同一份导出的各页钉住同一检查点、携带同一 `checkpoint_auth`。
+- **检查点签名密钥轮换**：节点首次创建时生成版本 1 的 Ed25519 审计检查点
+  密钥（首版在事件 `0` 激活）。`POST /v1/audit/signer/rotate` 请求体
+  `{"private_key", "expected_version"}`，其中 `private_key` 为 64 位小写
+  十六进制私钥种子（公钥由其推导）；私钥非法/字段缺失 `400`，
+  `expected_version` 与当前版本不符 `409`；成功 `200` 返回
+  `{"version","public_key"}`，在同一原子落盘内追加一条
+  `audit_signer_rotated` 事件（携带新版本号与新公钥）、切到新密钥，并永久
+  保留历史公钥。此后每次审计变化都以当前私钥签名当前检查点。
 - **事件覆盖**：信任变更记录 `source_registered` / `source_rotated` /
   `source_revoked`；节点间同步记录 `sync_received`（接收）、
   `sync_adopted`（候选被采用，按来源同步记录逐条登记）与 `sync_expired`
-  （过期清理，包含已采用上链的 tip——只留审计记录、canonical 链不动）。
-  事件一旦写入永不删除：候选**采用或过期之后仍可按 source/kind 分页查询**。
+  （过期清理，包含已采用上链的 tip——只留审计记录、canonical 链不动）；
+  审计检查点密钥轮换记录 `audit_signer_rotated`（携带新版本号与新公钥，
+  其事件 id 即新密钥的 `activated_event_id`）。事件一旦写入永不删除：候选
+  **采用或过期之后仍可按 source/kind 分页查询**。
 - **恢复语义**：信任注册表、allowlist 与审计流是权威配置而非可丢弃缓存，
   快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；`event_id`
   必须从 1 起连续无重复；每条 `prev_hash`/`event_hash` 必须重算一致，
-  `audit_checkpoint` 必须钉住真实链头）。任一错配，或同代快照在这些区段
-  （含检查点）上内容冲突，都抛出 `ledger.store.StateRecoveryError`，绝不静默
-  新建链。写于哈希链特性之前的旧快照（事件无两哈希字段、无检查点）在唯一
-  胜者选定后一次性补齐整链与检查点并原子保存，再次重启不再改写；停机期间
-  到期/授权失效记录补写的 `sync_expired` 也在同一修复中完成链接。补写只在
-  同代冲突判定之后对唯一胜出快照执行，因此冲突比较始终基于持久化内容，
-  重放恢复也不会改变判定。
+  `audit_checkpoint` 必须钉住真实链头）。审计检查点签名者同样严格校验：
+  存储的私钥必须能推导出对应公钥，签名者历史版本必须自 1 起连续、首版在
+  事件 0 激活、激活事件 id 升序，当前签名者必须等于最新历史条目，版本 1
+  之后的每个版本都必须由一条 id/version/public_key 完全对应的
+  `audit_signer_rotated` 事件激活（不得有孤立事件），并用存储私钥对恢复出
+  的检查点重新签名验证。任一错配，或同代快照在这些区段（含检查点与签名者
+  历史）上内容冲突，都抛出 `ledger.store.StateRecoveryError`，绝不静默新建
+  链。写于哈希链/检查点认证特性之前的**无签名旧快照**（无签名者区段）只在
+  唯一胜者选定后一次性生成版本 1 密钥、补齐整链与检查点并原子保存，再次
+  重启不再改写；停机期间到期/授权失效记录补写的 `sync_expired` 也在同一
+  修复中完成链接。补写只在同代冲突判定之后对唯一胜出快照执行，因此冲突
+  比较始终基于持久化内容，重放恢复也不会改变判定。
 
 ## 交易索引
 
@@ -208,8 +231,9 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
   导出五字段文档）；`proofs` 为 `{height, proof}` 列表，`proof` 即
   `/proof/` 接口返回的 `{height, tx_id, index, merkle_root, block_hash,
   siblings}` 文档；`signature` 可选，为 Ed25519 签名的十六进制。
-- **trust**：`{genesis_hash, sources, allowlist}`。`genesis_hash` 锚定创世块；
-  `sources[source] = {public_key, expires_at}`；
+- **trust**：`{genesis_hash, sources, allowlist}`（`GET /v1/trust` 还会带
+  `audit_signers`，轻客户端束验证忽略该额外字段）。`genesis_hash` 锚定创世
+  块；`sources[source] = {public_key, expires_at}`；
   `allowlist[source] = expires_at`。
 - **来源与签名**：`source` 必须受信（在 `sources` 或 `allowlist` 中）且未过期
   （束、来源、allowlist 三处的 `expires_at` 逐一检查，`<= now` 即过期）。
@@ -258,10 +282,23 @@ tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`e
 
 输出恒为**单行 JSON**：成功 `{"ok": true, "checkpoint": {event_id,
 event_hash}}`，进程退出码 0；失败
-`{"ok": false, "error": "input"|"integrity"}`，退出码 1。`input` 表示输入
-无法读取/不是 JSON、或文档结构字段缺失/类型非法；`integrity` 表示锚点、
-连续编号、任一哈希链接、分页计数或末页检查点不一致。`audit-verify` 不发起
-任何网络请求。
+`{"ok": false, "error": "input"|"integrity"|"auth"}`，退出码 1。`input`
+表示输入无法读取/不是 JSON、或文档结构字段缺失/类型非法；`integrity`
+表示锚点、连续编号、任一哈希链接、分页计数或末页检查点不一致。
+`audit-verify` 不发起任何网络请求。
+
+**带信任文档的检查点认证（可选）**：追加 `--trust trust.json`（即
+`GET /v1/trust` 的输出）后，除上述哈希链核验外还核对检查点签名：信任
+文档的 `genesis_hash` 必须有效，`audit_signers` 必须自版本 1 起连续、首版
+`activated_event_id` 为 0；每一页都必须携带同一
+`checkpoint_auth = {key_version, signature}` 并钉住同一检查点；
+`key_version` 必须命中一个在该检查点事件 id 处（或之前）已激活的签名者，
+且 Ed25519 签名必须用该版本公钥验过——先把
+`{genesis_hash, checkpoint, key_version}` 序列化为排序紧凑 UTF-8 JSON 再取
+SHA-256 摘要作为签名消息。
+缺省（不给 `--trust`）行为完全不变；提供信任文档时，缺签名、未知/未激活
+密钥版本、跨页认证不一致、创世锚不符或签名验不过均返回新增的 `auth`，
+而链本身被篡改仍返回 `input`/`integrity`。
 
 ## 实现说明
 
@@ -269,14 +306,14 @@ event_hash}}`，进程退出码 0；失败
 
 | 文件 | 职责 |
 | --- | --- |
-| `ledger/crypto.py` | Ed25519 验签、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
+| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，以及导出页的离线核验（锚点、连续编号、哈希、末页检查点） |
-| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist 与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、信任文档、审计分页、哈希锚定导出与同步事件登记 |
+| `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、末页检查点、可选信任文档下的检查点认证） |
+| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / `trust add|rotate|revoke|export` / `audit` / `audit-export` / 离线 `verify` / 离线 `audit-verify` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / `trust add|rotate|revoke|export` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -446,12 +483,17 @@ python -m ledger.cli trust export > trust.json
 # 只增审计事件流（source/kind/cursor/limit；信任变更与同步接收/采用/过期均可查）
 python -m ledger.cli audit [--source node-2] [--kind source_registered] [--cursor N] [--limit N]
 
+# 轮换审计检查点签名密钥（64 位小写十六进制私钥种子；公钥自动推导）
+python -m ledger.cli audit-signer-rotate --private-key <64-hex-seed> --expected-version 1
+
 # 哈希锚定审计导出与离线校验（audit-verify 不连接服务端；- 从标准输入读取页或多页数组）
 python -m ledger.cli audit-export [--cursor N] [--limit N] > audit-page.json
 python -m ledger.cli audit-verify audit-page.json
 cat audit-page.json | python -m ledger.cli audit-verify -
 # -> 成功单行 {"ok":true,"checkpoint":{"event_id":N,"event_hash":"..."}} 退出 0；
 #    失败单行 {"ok":false,"error":"input"|"integrity"} 退出 1
+# 给 --trust 还会核对创世锚、密钥版本与 Ed25519 检查点签名（失败新增 "auth"）
+python -m ledger.cli audit-verify audit-page.json --trust trust.json
 
 # 离线轻客户端验证（不连接服务端；--bundle - 从标准输入读取束 JSON）
 python -m ledger.cli verify --bundle bundle.json --trust trust.json
@@ -477,4 +519,5 @@ python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
+python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI
 ```

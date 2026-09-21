@@ -50,6 +50,7 @@ EVENT_SOURCE_REVOKED = "source_revoked"
 EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
+EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 
 
 def _parse_height(height: object) -> int | None:
@@ -1303,7 +1304,11 @@ class LedgerService:
         ``genesis_hash`` always pins the fixed canonical genesis block;
         ``sources`` contains only active, unexpired entries in the light
         client's shape ``{public_key, expires_at}``; the keyless
-        ``allowlist`` is preserved verbatim.
+        ``allowlist`` is preserved verbatim; ``audit_signers`` lists every
+        checkpoint key ever held in ascending version order as
+        ``{version, public_key, activated_event_id}`` (version 1 is activated
+        at event 0), so offline audit export verification can pick the key
+        that signed each checkpoint.
         """
         with self.store.lock:
             now = time.time()
@@ -1315,16 +1320,96 @@ class LedgerService:
                     "public_key": rec["public_key"],
                     "expires_at": rec["expires_at"],
                 }
+            audit_signers = [dict(entry) for entry in self.store.audit_signer_history]
             return 200, {
                 "genesis_hash": self.store.chain[0].block_hash,
                 "sources": sources,
                 "allowlist": dict(self.store.allowlist),
+                "audit_signers": audit_signers,
             }
 
     # -- audit log ------------------------------------------------------------
 
     AUDIT_DEFAULT_LIMIT = 50
     AUDIT_MAX_LIMIT = 200
+
+    def rotate_audit_signer(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/audit/signer/rotate — install a new Ed25519 checkpoint key.
+
+        The body carries ``private_key`` (64 lowercase hex characters — the
+        Ed25519 seed) and ``expected_version`` (the current key version).
+        Malformed input returns 400 and a stale ``expected_version`` returns
+        409. On success the new key version is derived from the seed, an
+        ``audit_signer_rotated`` event records the new version and public key,
+        and the key, the event and the refreshed checkpoint are persisted in
+        one atomic write (200), returning ``{"version", "public_key"}``. Old
+        public keys are retained in the signer history so historical
+        checkpoints stay verifiable.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in ("private_key", "expected_version"):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+        private_key = payload["private_key"]
+        expected_version = payload["expected_version"]
+        if not crypto.is_hex64(private_key):
+            return 400, {
+                "error": "field 'private_key' must be 64 lowercase hex characters"
+            }
+        public_key = crypto.derive_public_key(private_key)
+        if public_key is None:
+            return 400, {
+                "error": "field 'private_key' must be 64 lowercase hex characters"
+            }
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 1
+        ):
+            return 400, {"error": "field 'expected_version' must be a positive integer"}
+        with self.store.lock:
+            current = self.store.audit_signer
+            if current is None:
+                # load() mints/migrates a key for every node, so a live store
+                # always has a current signer.
+                return 409, {"error": "audit signer is not initialized"}
+            if current["version"] != expected_version:
+                return 409, {
+                    "error": "expected_version does not match the current signer version"
+                }
+            new_version = current["version"] + 1
+            old_signer = dict(current)
+            history_length = len(self.store.audit_signer_history)
+            event = self.store.append_audit_event(
+                EVENT_AUDIT_SIGNER_ROTATED,
+                {"version": new_version, "public_key": public_key},
+            )
+            new_signer = {
+                "version": new_version,
+                "private_key": private_key,
+                "public_key": public_key,
+                "activated_event_id": event["event_id"],
+            }
+            self.store.audit_signer = new_signer
+            self.store.audit_signer_history.append(
+                {
+                    "version": new_version,
+                    "public_key": public_key,
+                    "activated_event_id": event["event_id"],
+                }
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Roll the key, the history entry and its audit event back
+                # together so a failed write never leaves a rotated key
+                # without its event.
+                self.store.audit_signer = old_signer
+                del self.store.audit_signer_history[history_length:]
+                self.store.truncate_audit_events(1)
+                raise
+            return 200, {"version": new_version, "public_key": public_key}
 
     def list_audit_events(self, params: dict) -> tuple[int, dict]:
         """GET /v1/audit/events — paginated append-only audit log.
@@ -1386,7 +1471,10 @@ class LedgerService:
         * ``anchor_hash`` — the hash immediately preceding the page's first
           event (64 zeroes at cursor 0; the head at cursor == total);
         * ``checkpoint`` — the current ``{event_id, event_hash}`` log head
-          (``{0, "0"*64}`` for an empty log), included on every page.
+          (``{0, "0"*64}`` for an empty log), included on every page;
+        * ``checkpoint_auth`` — ``{key_version, signature}`` binding that
+          checkpoint (and the genesis anchor) under the current audit signer;
+          the same envelope is returned on every page of one export.
 
         ``cursor == total`` returns an empty last page (its anchor is the log
         head so the final page matches the checkpoint); ``cursor > total`` is
@@ -1428,5 +1516,9 @@ class LedgerService:
                 "next_cursor": next_cursor,
                 "anchor_hash": anchor_hash,
                 "checkpoint": dict(self.store.audit_checkpoint),
+                # One fresh signature over the current head on every request;
+                # every page fetched in the same export binds the identical
+                # checkpoint and therefore the same verifiable envelope.
+                "checkpoint_auth": self.store.sign_checkpoint(),
             }
         return 200, body

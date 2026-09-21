@@ -419,7 +419,7 @@ class ExportServiceTests(unittest.TestCase):
         events = self.svc.store.audit_events
         status, page = self.svc.export_audit_events({"limit": "2", "cursor": "0"})
         self.assertEqual(status, 200)
-        self.assertEqual(set(page), {"items", "total", "next_cursor", "anchor_hash", "checkpoint"})
+        self.assertEqual(set(page), {"items", "total", "next_cursor", "anchor_hash", "checkpoint", "checkpoint_auth"})
         self.assertEqual(page["total"], 3)
         self.assertEqual([e["event_id"] for e in page["items"]], [1, 2])
         self.assertEqual(page["anchor_hash"], audit.ZERO_HASH)

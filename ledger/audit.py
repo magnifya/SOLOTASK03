@@ -14,6 +14,13 @@ event: a fresh/empty log checks at ``{0, "0"*64}``. Offline verification walks
 one or more exported pages, checking each page anchor, the dense event ids and
 every link, and requires the final page's last event (or the empty log) to
 match its checkpoint.
+
+A page may additionally carry ``checkpoint_auth`` — an Ed25519 signature over
+``SHA256(sorted-compact UTF-8 JSON of {genesis_hash, checkpoint,
+key_version})``. ``verify_export(document, trust)`` only checks that envelope
+when a trust document (``genesis_hash`` plus a version-ascending
+``audit_signers`` list) is supplied; authentication failures then use the
+``auth`` error category.
 """
 from __future__ import annotations
 
@@ -32,6 +39,7 @@ HASH_FIELDS = ("prev_hash", "event_hash")
 # Public offline-verification error categories.
 ERR_INPUT = "input"
 ERR_INTEGRITY = "integrity"
+ERR_AUTH = "auth"
 
 
 class AuditChainError(ValueError):
@@ -106,6 +114,62 @@ def make_checkpoint(events: list[dict]) -> dict:
     return {"event_id": 0, "event_hash": ZERO_HASH}
 
 
+# Fields of a page's checkpoint authentication envelope.
+AUTH_FIELDS = ("key_version", "signature")
+
+
+def checkpoint_auth_object(
+    genesis_hash: str, checkpoint: dict, key_version: int
+) -> dict:
+    """The exact JSON object covered by a checkpoint authentication signature.
+
+    ``{"genesis_hash", "checkpoint": {"event_id", "event_hash"},
+    "key_version"}`` — the genesis anchor pins the deployment, the checkpoint
+    pins the audit log head and the key version selects the verifying public
+    key.
+    """
+    return {
+        "genesis_hash": genesis_hash,
+        "checkpoint": {
+            "event_id": checkpoint["event_id"],
+            "event_hash": checkpoint["event_hash"],
+        },
+        "key_version": key_version,
+    }
+
+
+def checkpoint_auth_bytes(auth_object: dict) -> bytes:
+    """Sorted-key compact UTF-8 JSON of a checkpoint authentication object."""
+    return json.dumps(
+        auth_object, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def sign_checkpoint_auth(
+    private_key_hex: str, genesis_hash: str, checkpoint: dict, key_version: int
+) -> str:
+    """Ed25519-sign SHA-256 of the canonical checkpoint authentication object.
+
+    Returns the 128-hex signature, or None when the private key is malformed.
+    """
+    auth_object = checkpoint_auth_object(genesis_hash, checkpoint, key_version)
+    digest = hashlib.sha256(checkpoint_auth_bytes(auth_object)).digest()
+    return crypto.sign_message(private_key_hex, digest)
+
+
+def verify_checkpoint_auth(
+    public_key_hex: str,
+    genesis_hash: str,
+    checkpoint: dict,
+    key_version: int,
+    signature_hex: str,
+) -> bool:
+    """Verify one checkpoint authentication signature. Never raises."""
+    auth_object = checkpoint_auth_object(genesis_hash, checkpoint, key_version)
+    digest = hashlib.sha256(checkpoint_auth_bytes(auth_object)).digest()
+    return crypto.verify_signature(public_key_hex, digest, signature_hex)
+
+
 def validate_event_chain(events: object) -> None:
     """Strictly validate a persisted event list's dense ids and hash links.
 
@@ -168,7 +232,7 @@ def validate_checkpoint(checkpoint: object, events: list[dict]) -> None:
         raise AuditChainError("audit_checkpoint.event_hash does not match the log head")
 
 
-def verify_export(document: object) -> dict:
+def verify_export(document: object, trust: object = None) -> dict:
     """Offline-verify one audit export page or an ordered list of pages.
 
     A page has the server shape
@@ -178,13 +242,26 @@ def verify_export(document: object) -> dict:
     pair must recompute, pagination counters must be self-consistent and the
     last page's tail must equal its checkpoint.
 
+    When ``trust`` is None (the default) no authentication is attempted and
+    the behaviour is unchanged. When a trust document is supplied it must
+    carry ``genesis_hash`` and a version-ascending ``audit_signers`` list
+    (``{version, public_key, activated_event_id}``); every page must then
+    carry the same ``checkpoint_auth`` envelope
+    (``{key_version, signature}``) binding the same checkpoint, the key
+    version must be known and activated at or before the checkpoint, and the
+    Ed25519 signature over
+    ``SHA256(sorted-compact UTF-8 JSON of {genesis_hash, checkpoint,
+    key_version})`` must verify against that version's public key.
+
     Returns ``{"ok": True, "checkpoint": {...}}`` or
-    ``{"ok": False, "error": "input" | "integrity"}``. Never raises for
-    malformed input.
+    ``{"ok": False, "error": "input" | "integrity" | "auth"}``. Never raises
+    for malformed input.
     """
     try:
         pages = _coerce_pages(document)
         checkpoint = _verify_pages(pages)
+        if trust is not None:
+            _verify_checkpoint_auth(pages, checkpoint, trust)
     except _VerifyError as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
@@ -300,3 +377,96 @@ def _verify_pages(pages: list[dict]) -> dict:
     ):
         raise _VerifyError(ERR_INTEGRITY)
     return dict(last_checkpoint)
+
+
+def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:
+    """Strictly parse a trust document's genesis anchor and audit signers.
+
+    Returns ``(genesis_hash, {version: {public_key, activated_event_id}})``.
+    Versions must be dense and ascending starting at 1 and the first
+    ``activated_event_id`` must be 0. Any defect is an input error.
+    """
+    if not isinstance(trust, dict):
+        raise _VerifyError(ERR_INPUT)
+    genesis_hash = trust.get("genesis_hash")
+    if not crypto.is_hex64(genesis_hash):
+        raise _VerifyError(ERR_INPUT)
+    raw_signers = trust.get("audit_signers")
+    if not isinstance(raw_signers, list) or not raw_signers:
+        raise _VerifyError(ERR_INPUT)
+    signers: dict[int, dict] = {}
+    for position, entry in enumerate(raw_signers):
+        if not isinstance(entry, dict):
+            raise _VerifyError(ERR_INPUT)
+        version = entry.get("version")
+        public_key = entry.get("public_key")
+        activated = entry.get("activated_event_id")
+        if not _is_plain_int(version) or version != position + 1:
+            raise _VerifyError(ERR_INPUT)
+        if not crypto.is_hex64(public_key):
+            raise _VerifyError(ERR_INPUT)
+        if not _is_plain_int(activated) or activated < 0:
+            raise _VerifyError(ERR_INPUT)
+        if position == 0 and activated != 0:
+            raise _VerifyError(ERR_INPUT)
+        signers[version] = {
+            "public_key": public_key,
+            "activated_event_id": activated,
+        }
+    return genesis_hash, signers
+
+
+def _verify_checkpoint_auth(
+    pages: list[dict], checkpoint: dict, trust: object
+) -> None:
+    """Verify the Ed25519 checkpoint authentication carried by every page.
+
+    Every page must carry the same ``checkpoint_auth`` envelope
+    (``{key_version, signature}``) and pin the same checkpoint; the key
+    version must identify a signer already activated at or before the
+    checkpoint and the signature must verify over
+    ``SHA256(sorted-compact UTF-8 JSON of {genesis_hash, checkpoint,
+    key_version})`` under the trust document's anchor. Structural defects are
+    input errors; missing, unknown-version, cross-page-inconsistent or
+    cryptographically invalid authentication is an auth error; a page whose
+    checkpoint differs from the verified head is an integrity error.
+    """
+    genesis_hash, signers = _parse_trust_signers(trust)
+    envelopes: list[object] = []
+    for page in pages:
+        if page.get("checkpoint") != checkpoint:
+            # Two pages of one export must pin the same log head.
+            raise _VerifyError(ERR_INTEGRITY)
+        envelope = page.get("checkpoint_auth")
+        if envelope is None:
+            raise _VerifyError(ERR_AUTH)
+        if not isinstance(envelope, dict):
+            raise _VerifyError(ERR_INPUT)
+        key_version = envelope.get("key_version")
+        signature = envelope.get("signature")
+        if not _is_plain_int(key_version) or key_version < 1:
+            raise _VerifyError(ERR_INPUT)
+        if not isinstance(signature, str) or not crypto.is_hex128(signature):
+            raise _VerifyError(ERR_INPUT)
+        envelopes.append({"key_version": key_version, "signature": signature})
+
+    first = envelopes[0]
+    for envelope in envelopes[1:]:
+        if envelope != first:
+            raise _VerifyError(ERR_AUTH)
+
+    signer = signers.get(first["key_version"])
+    if signer is None:
+        raise _VerifyError(ERR_AUTH)
+    # A signer can only authenticate a checkpoint taken at or after the event
+    # that activated its key.
+    if checkpoint["event_id"] < signer["activated_event_id"]:
+        raise _VerifyError(ERR_AUTH)
+    if not verify_checkpoint_auth(
+        signer["public_key"],
+        genesis_hash,
+        checkpoint,
+        first["key_version"],
+        first["signature"],
+    ):
+        raise _VerifyError(ERR_AUTH)
