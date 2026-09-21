@@ -28,13 +28,11 @@ transaction in an empty ledger could never be accepted.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 
 from . import crypto
 from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
-from .store import TRUST_ACTIVE, TRUST_REVOKED, LedgerStore
+from .store import TRUST_ACTIVE, TRUST_REVOKED, LedgerStore, fingerprint_blocks
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
 
@@ -78,11 +76,16 @@ def _parse_decimal(value: object) -> int | None:
 class LedgerService:
     def __init__(self, store: LedgerStore, initial_balance: int = DEFAULT_INITIAL_BALANCE) -> None:
         self.store = store
-        self.initial_balance = initial_balance
-        # Record the endowment convention so persisted fork replay checks and
-        # recovery use the same value the service was configured with.
-        if self.store.initial_balance is None:
-            self.store.initial_balance = initial_balance
+        # A balance recorded in (and recovered from) the snapshot is the sole
+        # replay/balance parameter: the store already adopted it on load, so a
+        # restart launched with a different --initial-balance reaches the same
+        # verdicts and balances. The constructor value only seeds a brand-new
+        # chain whose store has no recorded endowment yet.
+        if store.initial_balance is None:
+            store.initial_balance = initial_balance
+            self.initial_balance = initial_balance
+        else:
+            self.initial_balance = store.initial_balance
 
     # -- transactions -------------------------------------------------------
 
@@ -512,13 +515,10 @@ class LedgerService:
     def _candidate_fingerprint(blocks_raw: list) -> str:
         """Stable content fingerprint of a candidate's raw block list.
 
-        Used to decide whether a same-key retry carries the same candidate
-        content. Key order and whitespace are normalized so two documents that
-        serialize the same blocks identically compare equal.
+        Delegates to the store-level helper so delivery-time and recovery-time
+        fingerprinting can never diverge.
         """
-        return hashlib.sha256(
-            json.dumps(blocks_raw, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
+        return fingerprint_blocks(blocks_raw)
 
     def _prune_expired_syncs(self) -> list[str]:
         """Sweep expired sync records and persist the sweep atomically.
@@ -686,7 +686,14 @@ class LedgerService:
                             "error": f"candidate field {field!r} does not match the blocks"
                         }
             tip_hash = fork[-1].block_hash
-            fingerprint = self._candidate_fingerprint(blocks_raw)
+            # Fingerprint the *canonicalized* blocks rather than the raw
+            # request bytes: persistence stores to_dict() output, and recovery
+            # re-fingerprints exactly those persisted blocks, so the two can
+            # never disagree over key order or whitespace. A genuine content
+            # change (different amount/recipient/...) still changes the digest.
+            fingerprint = self._candidate_fingerprint(
+                [block.to_dict() for block in fork]
+            )
 
             if existing is not None:
                 # A retry on a live key is idempotent only when it carries the

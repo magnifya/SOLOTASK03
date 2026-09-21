@@ -385,4 +385,5 @@ python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/4
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录但审计历史逐字保留、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
+python tests/recovery_context_test.py  # 恢复上下文一致性：initial_balance 作为唯一重放参数、同代快照余额冲突、来源交错变更、已采用 tip 过期、指纹/tip 篡改剪除、失败恢复与并发读取
 ```

@@ -31,6 +31,7 @@ class-wide recovery lock serializes startup scans against in-flight writes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -59,6 +60,26 @@ TRUST_REVOKED = "revoked"
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
 SNAPSHOT_PREFIX = ".ledger-"
+
+# Endowment used for fork replay only when a snapshot carries no
+# ``state.initial_balance`` of its own (older snapshots). It is a fixed default,
+# deliberately independent of the constructor argument: on recovery the
+# snapshot's recorded balance is the sole replay parameter, so starting the
+# process with a different --initial-balance never changes a fork's legality.
+DEFAULT_ENDOWMENT = 1_000_000
+
+
+def fingerprint_blocks(blocks_raw: list) -> str:
+    """Stable content fingerprint of a candidate's raw block list.
+
+    Key order and whitespace are normalized so two documents that serialize
+    the same blocks identically compare equal. Shared by the sync submit path
+    and recovery-time re-verification so the fingerprint definition cannot
+    drift.
+    """
+    return hashlib.sha256(
+        json.dumps(blocks_raw, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
 
 class StateRecoveryError(ValueError):
@@ -185,6 +206,7 @@ class LedgerStore:
                 top[0][2],
                 top[0][3],
                 top[0][4],
+                top[0][5],
                 top[0][6],
                 top[0][7],
                 top[0][8],
@@ -196,6 +218,7 @@ class LedgerStore:
                         item[2],
                         item[3],
                         item[4],
+                        item[5],
                         item[6],
                         item[7],
                         item[8],
@@ -244,10 +267,11 @@ class LedgerStore:
             self.allowlist = allowlist
             self.audit_events = audit_events
             self.generation = generation
-            # Prefer the endowment recorded by the writer; fall back to the
-            # value this instance was constructed with, and finally to the
-            # service default, so older snapshots without the field still
-            # validate fork replays against the configured endowment.
+            # The recovered snapshot's recorded endowment is authoritative: it
+            # is the sole parameter used to replay persisted forks and to
+            # report balances. The constructor argument only ever applies to a
+            # freshly created chain (or to old snapshots lacking the field,
+            # handled during parsing via the fixed default).
             if winner_init_balance is not None:
                 self.initial_balance = winner_init_balance
             self.rebuild_derived()
@@ -276,12 +300,18 @@ class LedgerStore:
         chain: list[Block],
         pending: dict[str, Transaction],
         forks: dict[str, list[Block]],
+        initial_balance: int | None = None,
         syncs: dict[tuple[str, str], dict] | None = None,
         trust_sources: dict[str, dict] | None = None,
         allowlist: dict[str, int] | None = None,
         audit_events: list[dict] | None = None,
     ) -> str:
-        """Order-independent canonical content hash for conflict detection."""
+        """Order-independent canonical content hash for conflict detection.
+
+        The recorded ``initial_balance`` is part of the authoritative state:
+        two same-generation snapshots that differ in it describe different
+        replay/balance conventions and must conflict, not be treated as twins.
+        """
         sync_records = [
             {
                 "source": key[0],
@@ -298,6 +328,7 @@ class LedgerStore:
         ]
         return json.dumps(
             {
+                "initial_balance": initial_balance,
                 "chain": [block.to_dict() for block in chain],
                 "pending": [pending[tx_id].to_dict() for tx_id in sorted(pending)],
                 "forks": [
@@ -500,14 +531,24 @@ class LedgerStore:
         ):
             fail("state.tip_status does not match the chain tip")
 
-        forks = self._parse_persisted_forks(data.get("forks", []), chain)
+        # The snapshot's recorded endowment is the sole replay parameter for
+        # persisted fork validation — never the constructor's value, so a
+        # restart launched with a different --initial-balance reaches the same
+        # legality verdict. Snapshots written before the field existed fall
+        # back to the fixed default endowment.
+        replay_endowment = (
+            initial_balance if initial_balance is not None else DEFAULT_ENDOWMENT
+        )
+        forks, fork_raw_blocks = self._parse_persisted_forks(
+            data.get("forks", []), chain, replay_endowment
+        )
         # The trust registry is authoritative configuration and must be parsed
         # before the sync records, whose sources are re-authorized against it.
         trust_sources = self._parse_persisted_trust_sources(
             data.get("trust_sources", []), path
         )
         syncs, synced_tips = self._parse_persisted_syncs(
-            data.get("syncs", []), forks, chain, trust_sources
+            data.get("syncs", []), forks, chain, fork_raw_blocks, trust_sources
         )
         # A fork brought in only by a sync record loses its right to exist once
         # that record is gone (expired/unauthorized/invalid on restart):
@@ -653,25 +694,30 @@ class LedgerStore:
         syncs_raw: object,
         forks: dict[str, list[Block]],
         canonical_chain: list[Block],
+        fork_raw_blocks: dict[str, list] | None = None,
         trust_sources: dict[str, dict] | None = None,
     ) -> tuple[dict[tuple[str, str], dict], set[str]]:
         """Parse persisted sync records, dropping unusable ones on restart.
 
         A record is kept only when it is structurally valid, has not yet
         expired, its source is still an active, unexpired entry of the
-        persistent trust registry, and its tip references either a surviving
-        candidate fork or a block on the canonical chain (a synced candidate
-        may have been adopted). Records whose source is unknown, revoked or
-        registry-expired, and records pointing at neither surviving location,
-        are stale orphans and are pruned; invalid records are silently dropped
-        rather than failing recovery of the canonical chain. The historical
-        sync_received/sync_adopted/sync_expired audit events are never touched
-        by this pruning. Also returns the set of every tip any sync record
-        claims provenance for (including dropped ones), so the caller can drop
-        forks that only a pruned sync kept alive.
+        persistent trust registry, and its candidate still verifies: an
+        unadopted record must reference a surviving candidate fork and its
+        stored fingerprint must recompute from exactly the raw blocks that
+        survived revalidation, while an adopted record references a block hash
+        on the independently verified canonical chain and never alters that
+        chain. Records whose source is unknown, revoked or registry-expired,
+        expired records, and records whose candidate or fingerprint no longer
+        verifies are stale orphans and are pruned; invalid records are silently
+        dropped rather than failing recovery of the canonical chain. The
+        historical sync_received/sync_adopted/sync_expired audit events are
+        never touched by this pruning. Also returns the set of every tip any
+        sync record claims provenance for (including dropped ones), so the
+        caller can drop forks that only a pruned sync kept alive.
         """
         if not isinstance(syncs_raw, list):
             return {}, set()
+        fork_raw_blocks = fork_raw_blocks or {}
         now = time.time()
         trust_sources = trust_sources or {}
         canonical_hashes = {block.block_hash for block in canonical_chain}
@@ -715,7 +761,16 @@ class LedgerStore:
                 or trusted["expires_at"] <= now
             ):
                 continue
-            if tip_hash not in forks and tip_hash not in canonical_hashes:
+            if tip_hash in forks:
+                # Unadopted candidate: the stored fingerprint must recompute
+                # from the raw blocks that survived fork revalidation, so
+                # tampering with either the record or the fork invalidates
+                # the pair and both are pruned together.
+                if fingerprint_blocks(fork_raw_blocks.get(tip_hash, [])) != fingerprint:
+                    continue
+            elif tip_hash not in canonical_hashes:
+                # Neither a surviving candidate fork nor an adopted canonical
+                # tip: an orphaned record with nothing left to point at.
                 continue
             key = (source, request_id)
             if key in syncs:
@@ -1056,26 +1111,34 @@ class LedgerStore:
         tip. Raises ValueError with a descriptive reason on any defect.
         """
         endowment = (
-            self.initial_balance if self.initial_balance is not None else 1_000_000
+            self.initial_balance if self.initial_balance is not None else DEFAULT_ENDOWMENT
         )
         return self._parse_verified_chain(blocks_raw, endowment)
 
     def _parse_persisted_forks(
-        self, forks_raw: object, canonical_chain: list[Block]
-    ) -> dict[str, list[Block]]:
+        self,
+        forks_raw: object,
+        canonical_chain: list[Block],
+        endowment: int,
+    ) -> tuple[dict[str, list[Block]], dict[str, list]]:
         """Parse persisted candidate forks, dropping invalid ones on restart.
 
         Every stored fork is re-validated exactly like a fresh submission
         (genesis connection, hashes, Merkle roots, signatures, uniqueness,
-        replay). A fork that no longer validates is silently discarded rather
-        than failing recovery of the canonical chain. Recovery of the canonical
-        chain itself remains strict and still raises StateRecoveryError.
+        replay against ``endowment``). A fork that no longer validates is
+        silently discarded rather than failing recovery of the canonical
+        chain. Recovery of the canonical chain itself remains strict and still
+        raises StateRecoveryError.
+
+        Returns both the parsed forks (keyed by tip hash) and the surviving
+        forks' raw ``blocks`` lists (same keying), so sync records can be
+        re-fingerprinted against exactly the bytes that survived validation.
         """
         if not isinstance(forks_raw, list):
-            return {}
-        endowment = self.initial_balance if self.initial_balance is not None else 1_000_000
+            return {}, {}
         genesis = canonical_chain[0]
         forks: dict[str, list[Block]] = {}
+        fork_raw_blocks: dict[str, list] = {}
         for entry in forks_raw:
             try:
                 fork = self._parse_verified_chain(entry, endowment, genesis)
@@ -1088,8 +1151,10 @@ class LedgerStore:
             # canonical block hash) is never also stored as a candidate.
             if any(tip_hash == block.block_hash for block in canonical_chain):
                 continue
-            forks.setdefault(tip_hash, fork)
-        return forks
+            if tip_hash not in forks:
+                forks[tip_hash] = fork
+                fork_raw_blocks[tip_hash] = entry
+        return forks, fork_raw_blocks
 
     def replace_chain(self, new_chain: list[Block]) -> None:
         """Atomically adopt a fork: swap the canonical chain, reconcile the
