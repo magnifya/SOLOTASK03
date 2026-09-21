@@ -762,26 +762,37 @@ class LedgerStore:
             status=STATUS_CONFIRMED,
         )
 
+    def _compute_derived(self) -> tuple[dict[str, int], dict[str, dict]]:
+        """Build the confirmed-only transaction index and account activity.
+
+        Pending blocks are excluded: only confirmed blocks contribute to
+        balances and to the tx_id -> height index. Pure: it returns fresh
+        dicts and never mutates store state, so callers can compute a
+        prospective view and publish it only after a successful write.
+        """
+        tx_index: dict[str, int] = {}
+        accounts: dict[str, dict] = {}
+        for block in self.chain:
+            if block.status != STATUS_CONFIRMED:
+                continue
+            for tx in block.transactions:
+                tx_index[tx.tx_id] = block.height
+                for account in (tx.sender, tx.recipient):
+                    entry = accounts.setdefault(
+                        account, {"sent": 0, "received": 0, "transactions": []}
+                    )
+                    entry["transactions"].append(tx.tx_id)
+                accounts[tx.sender]["sent"] += tx.amount
+                accounts[tx.recipient]["received"] += tx.amount
+        return tx_index, accounts
+
     def rebuild_derived(self) -> None:
         """Rebuild the confirmed-only transaction index and account activity.
 
         Pending blocks are excluded: only confirmed blocks contribute to
         balances and to the tx_id -> height index.
         """
-        self.tx_index = {}
-        self.accounts = {}
-        for block in self.chain:
-            if block.status != STATUS_CONFIRMED:
-                continue
-            for tx in block.transactions:
-                self.tx_index[tx.tx_id] = block.height
-                for account in (tx.sender, tx.recipient):
-                    entry = self.accounts.setdefault(
-                        account, {"sent": 0, "received": 0, "transactions": []}
-                    )
-                    entry["transactions"].append(tx.tx_id)
-                self.accounts[tx.sender]["sent"] += tx.amount
-                self.accounts[tx.recipient]["received"] += tx.amount
+        self.tx_index, self.accounts = self._compute_derived()
 
     def save(self) -> None:
         """Atomically persist chain, state, pending set, index and accounts.
@@ -794,7 +805,13 @@ class LedgerStore:
         ``generation`` is advanced only after the promotion succeeds, so every
         *successful* atomic write corresponds to exactly one generation.
         """
-        self.rebuild_derived()
+        # Compute the prospective confirmed-only views WITHOUT publishing them:
+        # they describe the *post-write* chain and must not become visible in
+        # memory until the promotion succeeds. A failure anywhere below leaves
+        # ``self.tx_index``/``self.accounts`` describing the last durably
+        # committed chain, which is exactly the state the caller's own rollback
+        # restores the rest of the fields to.
+        next_index, next_accounts = self._compute_derived()
         next_generation = self.generation + 1
         data = {
             "state": {
@@ -807,8 +824,8 @@ class LedgerStore:
             },
             "chain": [block.to_dict() for block in self.chain],
             "pending": [tx.to_dict() for tx in self.pending.values()],
-            "index": dict(self.tx_index),
-            "accounts": self.accounts,
+            "index": dict(next_index),
+            "accounts": next_accounts,
         }
         # Only persist a forks section when candidates exist so a chain with
         # no forks keeps the canonical snapshot layout; loads default to [].
@@ -863,6 +880,11 @@ class LedgerStore:
                 os.replace(tmp_path, self.path)
                 promoted = True
                 self._fsync_dir(directory)
+                # Promotion is durable: now publish the prospective derived
+                # views and advance the generation, together and last, so a
+                # successful write is the only thing that changes memory.
+                self.tx_index = next_index
+                self.accounts = next_accounts
                 self.generation = next_generation
             finally:
                 if not promoted and os.path.exists(tmp_path):
