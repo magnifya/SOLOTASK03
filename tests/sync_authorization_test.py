@@ -363,6 +363,27 @@ class RestartReauthorizationTests(_ServiceCase):
             list(range(1, len(reopened_events) + 1)),
         )
 
+    def _assert_prefix_plus_expiry(
+        self, before, *, tip, source="node-1", request_id="req-1"
+    ) -> dict:
+        """The durable history survives verbatim, followed by exactly one
+        backfilled sync_expired event with a dense, continuing event_id and
+        the full lifecycle payload. Returns the backfilled event."""
+        events = [dict(e) for e in self.reopened.audit_events]
+        self.assertEqual(events[: len(before)], before)
+        self.assertEqual(len(events), len(before) + 1)
+        event = events[-1]
+        self.assertEqual(event["kind"], "sync_expired")
+        self.assertEqual(event["event_id"], len(before) + 1)
+        self.assertEqual(event["source"], source)
+        self.assertEqual(event["request_id"], request_id)
+        self.assertEqual(event["tip_hash"], tip)
+        self.assertIn("expires_at", event)
+        self.assertEqual(
+            [e["event_id"] for e in events], list(range(1, len(events) + 1))
+        )
+        return event
+
     def _reopen(self) -> LedgerStore:
         self.reopened = LedgerStore(self.state_path, initial_balance=1000)
         return self.reopened
@@ -380,11 +401,13 @@ class RestartReauthorizationTests(_ServiceCase):
         # The pending sync record and its delivered candidate are gone...
         self.assertNotIn(("node-1", "req-1"), reopened.syncs)
         self.assertNotIn(tip, reopened.forks)
-        # ...while the registration/reception/revocation history is unchanged.
-        self._assert_events_verbatim(before)
+        # ...the registration/reception/revocation history survives verbatim,
+        # followed by exactly one backfilled sync_expired for the record whose
+        # authorization lapsed while the process was down.
+        self._assert_prefix_plus_expiry(before, tip=tip)
         self.assertEqual(
             [e["kind"] for e in reopened.audit_events],
-            ["source_registered", "sync_received", "source_revoked"],
+            ["source_registered", "sync_received", "source_revoked", "sync_expired"],
         )
         svc2 = LedgerService(reopened, initial_balance=1000)
         self.assertEqual(svc2.list_fork_syncs({})[1]["total"], 0)
@@ -392,6 +415,18 @@ class RestartReauthorizationTests(_ServiceCase):
         _, page = svc2.list_audit_events({"kind": "sync_received"})
         self.assertEqual(page["total"], 1)
         self.assertEqual(page["items"][0]["tip_hash"], tip)
+        # The backfilled expiry is queryable too...
+        _, expired_page = svc2.list_audit_events({"kind": "sync_expired"})
+        self.assertEqual(expired_page["total"], 1)
+        self.assertEqual(expired_page["items"][0]["tip_hash"], tip)
+        # ...and a second restart neither duplicates the event nor advances the
+        # generation (nothing left to reconcile).
+        generation_after = reopened.generation
+        reopened_again = self._reopen()
+        self.assertEqual(
+            [e["kind"] for e in reopened_again.audit_events].count("sync_expired"), 1
+        )
+        self.assertEqual(reopened_again.generation, generation_after)
 
     def test_restart_keeps_record_when_source_still_active(self) -> None:
         # Rotation advances the version but keeps the same source active: the
@@ -422,7 +457,10 @@ class RestartReauthorizationTests(_ServiceCase):
         reopened = self._reopen()
         self.assertNotIn((source, "req-1"), reopened.syncs)
         self.assertNotIn(tip, reopened.forks)
-        self._assert_events_verbatim(before)
+        # The registry entry expiring while down backfills one sync_expired
+        # event; the durable history before it survives verbatim and the
+        # event_id sequence stays dense.
+        self._assert_prefix_plus_expiry(before, tip=tip, source=source)
 
     def test_restart_drops_record_when_registry_entry_missing(self) -> None:
         # Simulate a snapshot whose trust entry vanished while the sync record
@@ -444,7 +482,10 @@ class RestartReauthorizationTests(_ServiceCase):
         reopened = self._reopen()
         self.assertNotIn(("node-1", "req-1"), reopened.syncs)
         self.assertNotIn(tip, reopened.forks)
-        self._assert_events_verbatim(before)
+        # A source that vanished from the registry invalidates the record while
+        # down: the record is pruned and one sync_expired is backfilled, while
+        # the prior event log is retained verbatim with dense event_ids.
+        self._assert_prefix_plus_expiry(before, tip=tip)
 
     def test_restart_adopted_tip_keeps_chain_and_history_after_revoke(self) -> None:
         # Canonical confirmed block 1 (A->B 10).
@@ -475,19 +516,27 @@ class RestartReauthorizationTests(_ServiceCase):
         self.assertEqual(reopened.tip_hash(), tip)
         # ...the invalidated sync record is gone...
         self.assertNotIn(("node-1", "req-1"), reopened.syncs)
-        # ...and the full received+adopted history survives verbatim.
-        self._assert_events_verbatim(before)
+        # ...the full received+adopted history survives verbatim, followed by
+        # the backfilled expiry event (canonical chain still unchanged).
+        self._assert_prefix_plus_expiry(before, tip=tip)
         self.assertEqual(
             [e["kind"] for e in reopened.audit_events],
-            ["source_registered", "sync_received", "sync_adopted", "source_revoked"],
+            [
+                "source_registered",
+                "sync_received",
+                "sync_adopted",
+                "source_revoked",
+                "sync_expired",
+            ],
         )
         svc2 = LedgerService(reopened, initial_balance=1000)
         # The sync list returns no expired/invalidated record...
         self.assertEqual(svc2.list_fork_syncs({})[1]["total"], 0)
-        # ...but all three sync lifecycle events stay queryable by kind.
+        # ...but all sync lifecycle events stay queryable by kind.
         for kind, expect in (
             ("sync_received", 1),
             ("sync_adopted", 1),
+            ("sync_expired", 1),
         ):
             _, page = svc2.list_audit_events({"kind": kind})
             self.assertEqual(page["total"], expect, kind)
@@ -517,6 +566,113 @@ class RestartReauthorizationTests(_ServiceCase):
         _, page = svc2.list_audit_events({"kind": "sync_expired"})
         self.assertEqual(page["total"], 1)
         self.assertEqual(page["items"][0]["tip_hash"], tip)
+
+    def test_restart_request_deadline_backfills_expiry_while_source_active(self) -> None:
+        # The source stays fully authorized; only the *request's* deadline
+        # elapsed while the process was down. That still reconciles the record
+        # and backfills exactly one sync_expired event.
+        self.assertEqual(self.register("node-1")[0], 201)
+        doc = self.candidate(self.block(amount=9))
+        status, body = self.sync(doc, expires_at=int(time.time()) + 3600)
+        self.assertEqual(status, 201)
+        tip = body["tip_hash"]
+        generation_before = self.store.generation
+        before = self._events_snapshot()
+
+        with open(self.state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        past = int(time.time()) - 5
+        data["syncs"][0]["expires_at"] = past
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+        reopened = self._reopen()
+        self.assertNotIn(("node-1", "req-1"), reopened.syncs)
+        self.assertNotIn(tip, reopened.forks)
+        event = self._assert_prefix_plus_expiry(before, tip=tip)
+        self.assertEqual(event["expires_at"], past)
+        # The reconciliation is persisted atomically and advances generation.
+        self.assertEqual(reopened.generation, generation_before + 1)
+
+    def test_restart_backfills_multiple_expiries_dense_and_sorted(self) -> None:
+        # Two independent sources deliver two different candidates; both lose
+        # authorization (revoked) while down. Each record gets one event,
+        # appended in (source, request_id) order with a dense id run.
+        self.assertEqual(self.register("node-1")[0], 201)
+        self.assertEqual(self.register("node-2", KEY_B)[0], 201)
+        doc1 = self.candidate(self.block(amount=1))
+        st, body1 = self.sync(doc1, source="node-1", request_id="r1")
+        self.assertEqual(st, 201, body1)
+        doc2 = self.candidate(self.block(amount=2, recipient=self.C))
+        st, body2 = self.sync(doc2, source="node-2", request_id="r2")
+        self.assertEqual(st, 201, body2)
+        self.assertEqual(self.revoke("node-1", 1)[0], 200)
+        self.assertEqual(
+            self.svc.revoke_trust_source("node-2", {"expected_version": 1})[0], 200
+        )
+        before = self._events_snapshot()
+
+        reopened = self._reopen()
+        self.assertEqual(reopened.syncs, {})
+        self.assertNotIn(body1["tip_hash"], reopened.forks)
+        self.assertNotIn(body2["tip_hash"], reopened.forks)
+        events = [dict(e) for e in reopened.audit_events]
+        self.assertEqual(events[: len(before)], before)
+        backfilled = events[len(before):]
+        self.assertEqual([e["kind"] for e in backfilled], ["sync_expired"] * 2)
+        self.assertEqual(
+            [(e["source"], e["request_id"]) for e in backfilled],
+            [("node-1", "r1"), ("node-2", "r2")],
+        )
+        self.assertEqual(
+            [e["tip_hash"] for e in backfilled],
+            [body1["tip_hash"], body2["tip_hash"]],
+        )
+        self.assertEqual(
+            [e["event_id"] for e in events], list(range(1, len(events) + 1))
+        )
+        for e in backfilled:
+            self.assertIn("expires_at", e)
+
+    def test_restart_with_durable_expiry_event_backfills_nothing(self) -> None:
+        # A sync_expired event for the identity is already durable while the
+        # expired record is still in the snapshot (a crash interrupted the
+        # cleanup). Recovery must not add a second event and must not rewrite.
+        self.assertEqual(self.register("node-1")[0], 201)
+        doc = self.candidate(self.block(amount=3))
+        status, body = self.sync(doc, expires_at=int(time.time()) + 3600)
+        self.assertEqual(status, 201)
+        tip = body["tip_hash"]
+        past = int(time.time()) - 5
+
+        with open(self.state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["syncs"][0]["expires_at"] = past
+        data["audit_events"].append(
+            {
+                "event_id": 3,
+                "kind": "sync_expired",
+                "at": 1.0,
+                "source": "node-1",
+                "request_id": "req-1",
+                "tip_hash": tip,
+                "expires_at": past,
+            }
+        )
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+        generation_before = self.store.generation
+        reopened = self._reopen()
+        kinds = [e["kind"] for e in reopened.audit_events]
+        self.assertEqual(kinds, ["source_registered", "sync_received", "sync_expired"])
+        self.assertEqual(
+            [e["event_id"] for e in reopened.audit_events], [1, 2, 3]
+        )
+        # Record and fork are still reconciled away, but no new write happened.
+        self.assertNotIn(("node-1", "req-1"), reopened.syncs)
+        self.assertNotIn(tip, reopened.forks)
+        self.assertEqual(reopened.generation, generation_before)
 
 
 class SaveFailureRollbackTests(_ServiceCase):

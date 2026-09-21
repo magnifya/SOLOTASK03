@@ -11,7 +11,10 @@ cursor == total -> empty page and cursor > total -> 400), expiry-driven
 removal of the delivered candidate, serialization against adoption, adoption
 of a winning synced fork (longest chain / smallest tip hash, atomic swap,
 old-chain confirmed txs returning to the mempool while pending txs stay out),
-restart re-validation/expiry handling, and the HTTP + CLI surfaces.
+restart re-validation/expiry handling (records expiring while down are pruned
+and each gets one deduplicated, densely-id'd sync_expired backfilled and
+persisted atomically; a second restart does not repeat it), and the HTTP +
+CLI surfaces.
 
 Run: python3 tests/fork_sync_test.py
 """
@@ -432,10 +435,11 @@ class ForkSyncServiceTests(unittest.TestCase):
         )
         # Manually install an already-expired durable record + fork to simulate
         # a snapshot whose expiry elapsed while the process was down.
+        dead_exp = int(time.time()) - 10
         self.store.forks[dead_tip] = [self.genesis, dead]
         self.store.syncs[("s2", "dead")] = {
             "tip_hash": dead_tip,
-            "expires_at": int(time.time()) - 10,
+            "expires_at": dead_exp,
             "fingerprint": "x",
         }
         self.store.save()
@@ -444,6 +448,32 @@ class ForkSyncServiceTests(unittest.TestCase):
         self.assertNotIn(dead_tip, reopened.forks)  # fork dropped with the sync
         self.assertNotIn(("s2", "dead"), reopened.syncs)
         self.assertIn(("s1", "live"), reopened.syncs)
+        # The record whose request deadline elapsed while down gets exactly one
+        # backfilled sync_expired (the placeholder fingerprint is irrelevant:
+        # expiry reconciliation precedes content verification), with the full
+        # lifecycle payload and a dense event_id; the live record gets none.
+        expired = [
+            e for e in reopened.audit_events if e["kind"] == "sync_expired"
+        ]
+        self.assertEqual(len(expired), 1, [e["kind"] for e in reopened.audit_events])
+        event = expired[0]
+        self.assertEqual(event["source"], "s2")
+        self.assertEqual(event["request_id"], "dead")
+        self.assertEqual(event["tip_hash"], dead_tip)
+        self.assertEqual(event["expires_at"], dead_exp)
+        self.assertEqual(
+            [e["event_id"] for e in reopened.audit_events],
+            list(range(1, len(reopened.audit_events) + 1)),
+        )
+        # A second restart neither duplicates the event nor rewrites.
+        generation_after = reopened.generation
+        reopened_again = LedgerStore(self.state_path, initial_balance=1000)
+        self.assertEqual(
+            [e["kind"] for e in reopened_again.audit_events].count("sync_expired"), 1
+        )
+        self.assertEqual(reopened_again.generation, generation_after)
+        self.assertIn(live_tip, reopened_again.forks)
+        self.assertIn(("s1", "live"), reopened_again.syncs)
 
     # -- idempotency / conflict ---------------------------------------------
 

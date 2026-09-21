@@ -26,8 +26,16 @@ Derived data (index/accounts) is *rebuilt* from the chain on every load and
 every save — pending blocks are excluded, so a restart never resurrects
 unconfirmed transactions into balances. Persisted fork candidates are
 re-validated on startup and invalid ones are dropped, while canonical-chain
-invalidity remains fatal. A re-entrant lock serializes all updates, and a
-class-wide recovery lock serializes startup scans against in-flight writes.
+invalidity remains fatal. Persisted sync records are re-verified on restart:
+records still unexpired whose source stays active and unexpired survive;
+records whose own deadline elapsed or whose source is unknown/revoked/
+registry-expired while the process was down are pruned (their non-adopted
+forks removed; an adopted tip never changes the canonical chain) and each
+gets exactly one deduplicated sync_expired audit event backfilled after the
+durable history, persisted in one atomic write. Other staleness (a dangling
+tip or a content-fingerprint mismatch) is a silent prune with no event.
+A re-entrant lock serializes all updates, and a class-wide recovery lock
+serializes startup scans against in-flight writes.
 """
 from __future__ import annotations
 
@@ -56,6 +64,10 @@ STATE_VERSION = 6
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
 TRUST_REVOKED = "revoked"
+
+# Audit event kinds are owned by the store layer (recovery emits them too);
+# service.EVENT_* constants mirror these literal values.
+EVENT_SYNC_EXPIRED = "sync_expired"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -176,6 +188,7 @@ class LedgerStore:
                         parsed[6],
                         parsed[7],
                         parsed[8],
+                        parsed[9],
                     )
                 )
 
@@ -236,6 +249,7 @@ class LedgerStore:
                 trust_sources,
                 allowlist,
                 audit_events,
+                expired_records,
             ) = winner
 
             if os.path.abspath(winner_path) != main_abs:
@@ -244,6 +258,13 @@ class LedgerStore:
                 os.replace(winner_path, self.path)
                 self._fsync_dir(directory)
 
+            # Reconcile records that expired or lost authorization while the
+            # process was down, once, on the single winning snapshot: append
+            # deduplicated sync_expired events with ids continuing after the
+            # durable history. Doing this after same-generation conflict
+            # detection keeps that comparison based on durable content (the
+            # backfill carries a current timestamp).
+            backfilled = self._backfill_expired_events(audit_events, expired_records)
             self.chain = chain
             self.pending = pending
             self.forks = forks
@@ -260,6 +281,12 @@ class LedgerStore:
                 self.initial_balance = winner_init_balance
             self.rebuild_derived()
             self._cleanup_candidates(directory)
+            # Persist the reconciled state (pruned records/forks + backfilled
+            # events) atomically so the next restart never re-derives or
+            # duplicates the events; with nothing to backfill no write happens
+            # and the recovered generation is kept byte-for-byte.
+            if backfilled:
+                self.save()
 
     def _discover_candidates(self, directory: str) -> list[str]:
         """List the main file and sibling .ledger-* snapshots (if any)."""
@@ -377,6 +404,7 @@ class LedgerStore:
         dict[str, dict],
         dict[str, int],
         list[dict],
+        list[tuple[str, str, dict]],
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -537,7 +565,16 @@ class LedgerStore:
         trust_sources = self._parse_persisted_trust_sources(
             data.get("trust_sources", []), path
         )
-        syncs, synced_tips = self._parse_persisted_syncs(
+        # Parse the durable append-only audit log verbatim. It must NOT be
+        # mutated here: same-generation snapshot conflict detection compares
+        # parsed audit events, and a time-dependent backfill would make two
+        # byte-identical snapshots look conflicting. The expired-record
+        # reconciliation returned below is applied once, by load(), to the
+        # single winning snapshot.
+        audit_events = self._parse_persisted_audit_events(
+            data.get("audit_events", []), path
+        )
+        syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
         )
         # A fork brought in only by a sync record loses its right to exist once
@@ -550,9 +587,6 @@ class LedgerStore:
         for tip in synced_tips - live_tips - canonical_hashes:
             forks.pop(tip, None)
         allowlist = self._parse_persisted_allowlist(data.get("allowlist", {}), path)
-        audit_events = self._parse_persisted_audit_events(
-            data.get("audit_events", []), path
-        )
         return (
             chain,
             pending,
@@ -563,7 +597,48 @@ class LedgerStore:
             trust_sources,
             allowlist,
             audit_events,
+            expired_records,
         )
+
+    @staticmethod
+    def _backfill_expired_events(
+        audit_events: list[dict],
+        expired_records: list[tuple[str, str, dict]],
+    ) -> int:
+        """Append one sync_expired event per down-time-expired sync record.
+
+        Mirrors the runtime sweep exactly: records are processed in
+        ``(source, request_id)`` order, each gets a dense event_id continuing
+        after the durable history, and events are deduplicated against any
+        already-durable sync_expired identity (source, request_id, tip_hash)
+        so a crash between backfill and promotion can never record an expiry
+        twice. Returns the number of events appended. Mutates ``audit_events``
+        in place.
+        """
+        existing_expiry = {
+            (event.get("source"), event.get("request_id"), event.get("tip_hash"))
+            for event in audit_events
+            if event.get("kind") == EVENT_SYNC_EXPIRED
+        }
+        backfilled = 0
+        for source, request_id, rec in sorted(expired_records):
+            identity = (source, request_id, rec["tip_hash"])
+            if identity in existing_expiry:
+                continue
+            audit_events.append(
+                {
+                    "event_id": len(audit_events) + 1,
+                    "kind": EVENT_SYNC_EXPIRED,
+                    "at": time.time(),
+                    "source": source,
+                    "request_id": request_id,
+                    "tip_hash": rec["tip_hash"],
+                    "expires_at": rec["expires_at"],
+                }
+            )
+            existing_expiry.add(identity)
+            backfilled += 1
+        return backfilled
 
     @staticmethod
     def _parse_persisted_trust_sources(
@@ -685,26 +760,30 @@ class LedgerStore:
         forks: dict[str, list[Block]],
         canonical_chain: list[Block],
         trust_sources: dict[str, dict] | None = None,
-    ) -> tuple[dict[tuple[str, str], dict], set[str]]:
+    ) -> tuple[dict[tuple[str, str], dict], list[tuple[str, str, dict]], set[str]]:
         """Parse persisted sync records, dropping unusable ones on restart.
 
         A record is kept only when it is structurally valid, has not yet
         expired, its source is still an active, unexpired entry of the
         persistent trust registry, and its tip references either a surviving
         candidate fork or a block on the canonical chain (a synced candidate
-        may have been adopted). Records whose source is unknown, revoked or
-        registry-expired, records pointing at neither surviving location, and
-        records whose ``tip_hash``/``expires_at``/``request_id`` fingerprint no
-        longer matches the delivered candidate are stale orphans and are
-        pruned; invalid records are silently dropped rather than failing
-        recovery of the canonical chain. The historical
-        sync_received/sync_adopted/sync_expired audit events are never touched
-        by this pruning. Also returns the set of every tip any sync record
-        claims provenance for (including dropped ones), so the caller can drop
-        forks that only a pruned sync kept alive.
+        may have been adopted). Records that expire while the process is down,
+        or whose source is unknown/revoked/registry-expired, are pruned and
+        additionally returned as ``expired_records`` (each as
+        ``(source, request_id, {tip_hash, expires_at, fingerprint})``) so the
+        caller backfills one sync_expired audit event per record — mirroring
+        the runtime sweep. Other staleness (malformed structure, a record
+        pointing at neither surviving location, or a fingerprint that no
+        longer matches the delivered candidate) is a silent orphan prune with
+        no event; duplicated keys keep the first copy. Invalid records are
+        silently dropped rather than failing recovery of the canonical chain.
+        The historical sync_received/sync_adopted/sync_expired audit events
+        are never touched by this pruning. Also returns the set of every tip
+        any sync record claims provenance for (including dropped ones), so the
+        caller can drop forks that only a pruned sync kept alive.
         """
         if not isinstance(syncs_raw, list):
-            return {}, set()
+            return {}, [], set()
         now = time.time()
         trust_sources = trust_sources or {}
         # Map every canonical block hash to the chain prefix ending there:
@@ -716,6 +795,7 @@ class LedgerStore:
             prefix = prefix + [block.to_dict()]
             canonical_prefixes[block.block_hash] = prefix
         syncs: dict[tuple[str, str], dict] = {}
+        expired_records: list[tuple[str, str, dict]] = []
         synced_tips: set[str] = set()
         for rec_raw in syncs_raw:
             if not isinstance(rec_raw, dict):
@@ -734,26 +814,36 @@ class LedgerStore:
             # Provenance is recorded even for dropped records: it proves the
             # matching fork must not outlive the sync that delivered it.
             synced_tips.add(tip_hash)
-            if (
-                isinstance(expires_at, bool)
-                or not isinstance(expires_at, int)
-                or expires_at <= now
-            ):
+            record = {
+                "tip_hash": tip_hash,
+                "expires_at": expires_at,
+                "fingerprint": fingerprint,
+            }
+            if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+                # Malformed deadline: a structurally broken record, silently
+                # pruned (no lifecycle event is attributable to it).
                 continue
-            if not isinstance(fingerprint, str) or not fingerprint:
-                continue
+            expired_deadline = expires_at <= now
             # Re-authorization on restart: the trust decision recorded at
             # delivery is re-checked against the current registry. A source
             # rotated away, revoked or expired since then invalidates its
             # pending records; historical audit events stay queryable.
             trusted = trust_sources.get(source)
-            if (
-                trusted is None
-                or trusted.get("status") != TRUST_ACTIVE
-                or not isinstance(trusted.get("expires_at"), int)
-                or isinstance(trusted.get("expires_at"), bool)
-                or trusted["expires_at"] <= now
-            ):
+            auth_ok = (
+                trusted is not None
+                and trusted.get("status") == TRUST_ACTIVE
+                and isinstance(trusted.get("expires_at"), int)
+                and not isinstance(trusted.get("expires_at"), bool)
+                and trusted["expires_at"] > now
+            )
+            if expired_deadline or not auth_ok:
+                # Deadline elapsed or authorization lost while down: reconcile
+                # exactly like the runtime sweep and backfill sync_expired,
+                # regardless of the content fingerprint (the lifecycle event
+                # is identified by source/request_id/tip/expires_at).
+                expired_records.append((source, request_id, record))
+                continue
+            if not isinstance(fingerprint, str) or not fingerprint:
                 continue
             # Re-resolve the delivered candidate (a surviving fork, or the
             # canonical prefix for an adopted tip) and recompute its content
@@ -777,7 +867,7 @@ class LedgerStore:
                 "expires_at": expires_at,
                 "fingerprint": fingerprint,
             }
-        return syncs, synced_tips
+        return syncs, expired_records, synced_tips
 
     @staticmethod
     def _candidate_fingerprint(blocks_raw: list) -> str:

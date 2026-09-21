@@ -86,8 +86,14 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   分叉一并移除（已采用上链的 tip 只留审计记录、不影响 canonical 链）。元数据与
   候选在**同一次原子写入**中落盘；重启时重验全部候选并丢弃过期或失效记录，
   **并按当前信任注册表重新校验每条记录的来源授权**——来源未知、已撤销或注册已
-  过期的记录连同其候选一并丢弃（已采用 tip 仅保留审计历史），历史审计事件逐字
-  保留、`event_id` 不间断。
+  过期的记录连同其候选一并丢弃（已采用 tip 仅移除元数据，canonical 链不动）。
+  **停机期间到期或授权失效的每条记录，恢复时在持久化审计历史之后补写恰好一条
+  `sync_expired`**（`event_id` 紧随其后连续编号、保留
+  source/request_id/tip_hash/expires_at 字段，并按 `(source, request_id)`
+  排序）；已持久化过 `sync_expired` 的记录不再补写（崩溃重试不重复），补写结果
+  随调和后的记录/分叉在**同一次原子写入**落盘。指纹不符或 tip 无处解析等其他
+  失效仍静默丢弃、不产生事件。历史 `sync_received`/`sync_adopted`/`sync_expired`
+  事件逐字保留、`event_id` 从 1 起不间断。
 - **审计查询**：`GET /v1/forks/sync` 支持 `source`、`min_height`、`max_height`、
   `limit`（默认 50，范围 1–200）、`cursor`（默认 0）。数值参数必须是首位非 0 的
   十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。结果按
@@ -139,7 +145,9 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 - **恢复语义**：信任注册表、allowlist 与审计流是权威配置而非可丢弃缓存，
   快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；`event_id`
   必须从 1 起连续无重复）。任一损坏，或同代快照在这些区段上内容冲突，都抛出
-  `ledger.store.StateRecoveryError`，绝不静默新建链。
+  `ledger.store.StateRecoveryError`，绝不静默新建链。停机期间到期/授权失效记录
+  的 `sync_expired` 补写只在同代冲突判定之后、对唯一胜出快照执行一次，补写结果
+  原子落盘；因此冲突比较始终基于持久化内容，重放恢复也不会改变判定。
 
 ## 交易索引
 
@@ -382,7 +390,7 @@ python tests/recovery_test.py         # generation、多区块一致性、快照
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
-python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录但审计历史逐字保留、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
+python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 ```

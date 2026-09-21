@@ -12,12 +12,17 @@ These lock in the rules from the recovery-consistency task:
   endowment differences alone are enough.
 * On restart every surviving sync record's candidate, tip summary, expiry,
   request fingerprint and source authorization are re-verified: unexpired,
-  still-active records survive; expired, revoked, unauthorized, candidate-less
-  or fingerprint-mismatched unadopted records are removed together with their
-  fork, while an adopted tip never alters the canonical chain and only the
-  sync_received/sync_adopted/sync_expired audit history is retained.
-* ``event_id`` starts at 1 and is dense; audit events are preserved verbatim
-  across such pruning.
+  still-active records survive; records whose deadline elapsed or whose
+  source became unknown/revoked/registry-expired while the process was down
+  are removed together with their fork, and each gets exactly one
+  sync_expired audit event backfilled (dense event_id, full lifecycle
+  payload, deduplicated against any durable expiry event, persisted
+  atomically). An adopted tip never alters the canonical chain; only its
+  expired metadata is removed while the sync_received/sync_adopted/
+  sync_expired history is retained. Other staleness (candidate-less or
+  fingerprint-mismatched records) is a silent prune with no new event.
+* ``event_id`` starts at 1 and is dense; the durable audit prefix is
+  preserved verbatim across such reconciliation.
 
 Run: python3 tests/recovery_consistency_test.py
 """
@@ -298,19 +303,45 @@ class SyncRecoveryReverificationTests(unittest.TestCase):
         # The adopted canonical tip is untouched.
         self.assertEqual(reopened.tip_hash(), tip)
         self.assertNotIn(("node-1", "req-1"), reopened.syncs)
-        # Only the lifecycle history remains, verbatim and dense.
-        self.assertEqual([dict(e) for e in reopened.audit_events], before)
+        # The durable lifecycle history survives verbatim, followed by exactly
+        # one backfilled sync_expired (the record is both expired and
+        # unauthorized, but deduplicated to a single event).
+        self.assertEqual([dict(e) for e in reopened.audit_events[: len(before)]], before)
         kinds = [e["kind"] for e in reopened.audit_events]
         self.assertEqual(
             kinds,
-            ["source_registered", "sync_received", "sync_adopted", "source_revoked"],
+            [
+                "source_registered",
+                "sync_received",
+                "sync_adopted",
+                "source_revoked",
+                "sync_expired",
+            ],
+        )
+        expired = reopened.audit_events[-1]
+        self.assertEqual(expired["tip_hash"], tip)
+        self.assertEqual(expired["source"], "node-1")
+        self.assertEqual(expired["request_id"], "req-1")
+        self.assertIn("expires_at", expired)
+        self.assertEqual(
+            [e["event_id"] for e in reopened.audit_events],
+            list(range(1, len(kinds) + 1)),
         )
         svc2 = LedgerService(reopened, initial_balance=1000)
         self.assertEqual(svc2.list_fork_syncs({})[1]["total"], 0)
-        for kind in ("sync_received", "sync_adopted"):
+        for kind in ("sync_received", "sync_adopted", "sync_expired"):
             _, page = svc2.list_audit_events({"kind": kind})
-            self.assertEqual(page["total"], 1)
-            self.assertEqual(page["items"][0]["tip_hash"], tip)
+            self.assertEqual(page["total"], 1, kind)
+            self.assertEqual(page["items"][0]["tip_hash"], tip, kind)
+        # A second restart neither duplicates the backfilled event nor writes
+        # again (generation stable).
+        generation_after = reopened.generation
+        reopened_again = LedgerStore(self.path, initial_balance=1000)
+        self.assertEqual(
+            [e["kind"] for e in reopened_again.audit_events].count("sync_expired"), 1
+        )
+        self.assertEqual(reopened_again.generation, generation_after)
+        self.assertEqual(reopened_again.tip_hash(), tip)
 
 
 class CorruptAuthoritativeSectionTests(unittest.TestCase):
