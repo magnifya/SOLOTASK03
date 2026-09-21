@@ -146,6 +146,54 @@ class StateMachineServiceTests(unittest.TestCase):
         # Genesis is already confirmed -> idempotent 200, never an error.
         self.assertEqual(self.svc.confirm_block(0)[0], 200)
 
+    def test_failed_confirm_save_restores_derived_views(self) -> None:
+        # A save that fails *after* the derived views were rebuilt (e.g. the
+        # atomic promotion itself dies) must roll memory back to exactly the
+        # pre-confirm state: pending tip, untouched tx_index/accounts and
+        # balances, and a disk file that never changed.
+        from unittest import mock
+
+        tx_id = self.submit(self.ka, self.A, self.B, 100)
+        block = self.mine()
+        store = self.svc.store
+        tx_index_before = dict(store.tx_index)
+        accounts_before = {
+            k: dict(v, transactions=list(v["transactions"]))
+            for k, v in store.accounts.items()
+        }
+        generation_before = store.generation
+        with open(self.state_path, encoding="utf-8") as fh:
+            disk_before = json.load(fh)
+
+        with mock.patch("ledger.store.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.svc.confirm_block(block["height"])
+
+        # The block is pending again and every derived view is back to the
+        # pre-confirm state: the unconfirmed transactions must not leak into
+        # the confirmed-only index, accounts or balances.
+        self.assertEqual(store.tip().status, "pending")
+        self.assertEqual(store.tx_index, tx_index_before)
+        self.assertEqual(store.accounts, accounts_before)
+        self.assertEqual(store.generation, generation_before)
+        self.assertNotIn(tx_id, store.tx_index)
+        self.assertEqual(self.svc.get_account(self.A)[0], 404)
+        self.assertEqual(self.svc.reported_balance(self.A), 900)
+        self.assertEqual(self.svc.reported_balance(self.B), 1000)
+        with open(self.state_path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), disk_before)
+
+        # Persistence recovering lets the confirm go through exactly once.
+        self.assertEqual(self.svc.confirm_block(block["height"])[0], 200)
+        self.assertEqual(store.tx_index[tx_id], block["height"])
+        _, acc_a = self.svc.get_account(self.A)
+        self.assertEqual(acc_a["balance"], 900)
+        # Restart sees the same confirmed state.
+        reopened = LedgerService(LedgerStore(self.state_path), initial_balance=1000)
+        self.assertEqual(reopened.store.tx_index, store.tx_index)
+        _, acc_a2 = reopened.get_account(self.A)
+        self.assertEqual(acc_a2["balance"], 900)
+
     def test_rollback_restores_transactions_deduped(self) -> None:
         tx1 = self.submit(self.ka, self.A, self.B, 100)
         tx2 = self.submit(self.ka, self.A, self.B, 200)

@@ -792,8 +792,15 @@ class LedgerStore:
         the fsync and the promotion leaves the snapshot behind, where the
         startup scan finds it as a recovery candidate. The in-memory
         ``generation`` is advanced only after the promotion succeeds, so every
-        *successful* atomic write corresponds to exactly one generation.
+        *successful* atomic write corresponds to exactly one generation. The
+        derived views rebuilt below are likewise only kept when the promotion
+        succeeds: a failed write restores the pre-save ``tx_index``/``accounts``
+        so memory keeps matching the last durably committed state.
         """
+        # Snapshot the derived views before rebuilding them, so a failed write
+        # can roll memory back to exactly the pre-save state.
+        previous_tx_index = self.tx_index
+        previous_accounts = self.accounts
         self.rebuild_derived()
         next_generation = self.generation + 1
         data = {
@@ -844,36 +851,44 @@ class LedgerStore:
         if self.audit_events:
             data["audit_events"] = list(self.audit_events)
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
-        os.makedirs(directory, exist_ok=True)
-        # Hold the class-wide recovery lock while a .ledger-* snapshot exists
-        # on disk, so a concurrent in-process LedgerStore construction cannot
-        # scan a half-written promotion.
-        with self._recovery_lock:
-            fd, tmp_path = tempfile.mkstemp(
-                prefix=SNAPSHOT_PREFIX,
-                suffix=f".gen{next_generation}",
-                dir=directory,
-            )
-            promoted = False
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(data, fh, ensure_ascii=False, sort_keys=True)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(tmp_path, self.path)
-                promoted = True
-                self._fsync_dir(directory)
-                self.generation = next_generation
-            finally:
-                if not promoted and os.path.exists(tmp_path):
-                    # Promotion never happened: drop the half-written candidate so
-                    # it cannot masquerade as a recoverable snapshot. A candidate
-                    # written and fsynced *before* a crash during replace survives
-                    # precisely because that crash skips this cleanup.
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
+        try:
+            os.makedirs(directory, exist_ok=True)
+            # Hold the class-wide recovery lock while a .ledger-* snapshot exists
+            # on disk, so a concurrent in-process LedgerStore construction cannot
+            # scan a half-written promotion.
+            with self._recovery_lock:
+                fd, tmp_path = tempfile.mkstemp(
+                    prefix=SNAPSHOT_PREFIX,
+                    suffix=f".gen{next_generation}",
+                    dir=directory,
+                )
+                promoted = False
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump(data, fh, ensure_ascii=False, sort_keys=True)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp_path, self.path)
+                    promoted = True
+                    self._fsync_dir(directory)
+                    self.generation = next_generation
+                finally:
+                    if not promoted and os.path.exists(tmp_path):
+                        # Promotion never happened: drop the half-written candidate so
+                        # it cannot masquerade as a recoverable snapshot. A candidate
+                        # written and fsynced *before* a crash during replace survives
+                        # precisely because that crash skips this cleanup.
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+        except BaseException:
+            # The write never completed: restore the pre-save derived views so
+            # memory keeps matching the last durably committed state (the
+            # generation was likewise never advanced).
+            self.tx_index = previous_tx_index
+            self.accounts = previous_accounts
+            raise
 
     @staticmethod
     def _fsync_dir(directory: str) -> None:
