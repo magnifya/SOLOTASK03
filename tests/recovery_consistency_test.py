@@ -298,19 +298,113 @@ class SyncRecoveryReverificationTests(unittest.TestCase):
         # The adopted canonical tip is untouched.
         self.assertEqual(reopened.tip_hash(), tip)
         self.assertNotIn(("node-1", "req-1"), reopened.syncs)
-        # Only the lifecycle history remains, verbatim and dense.
-        self.assertEqual([dict(e) for e in reopened.audit_events], before)
+        # The pre-downtime history survives verbatim; the record lapsed both
+        # by deadline and by de-authorization while down, so exactly one
+        # sync_expired event is back-filled, keeping event_id dense.
+        events = [dict(e) for e in reopened.audit_events]
+        self.assertEqual(events[: len(before)], before)
+        tail = events[len(before) :]
+        self.assertEqual(len(tail), 1)
+        self.assertEqual(tail[0]["kind"], "sync_expired")
+        self.assertEqual(tail[0]["event_id"], len(before) + 1)
+        self.assertEqual(tail[0]["tip_hash"], tip)
+        self.assertEqual(
+            tail[0]["expires_at"],
+            next(e["expires_at"] for e in before if e["kind"] == "sync_received"),
+        )
         kinds = [e["kind"] for e in reopened.audit_events]
         self.assertEqual(
             kinds,
-            ["source_registered", "sync_received", "sync_adopted", "source_revoked"],
+            [
+                "source_registered",
+                "sync_received",
+                "sync_adopted",
+                "source_revoked",
+                "sync_expired",
+            ],
+        )
+        self.assertEqual(
+            [e["event_id"] for e in reopened.audit_events],
+            list(range(1, len(events) + 1)),
         )
         svc2 = LedgerService(reopened, initial_balance=1000)
         self.assertEqual(svc2.list_fork_syncs({})[1]["total"], 0)
-        for kind in ("sync_received", "sync_adopted"):
+        for kind in ("sync_received", "sync_adopted", "sync_expired"):
             _, page = svc2.list_audit_events({"kind": kind})
             self.assertEqual(page["total"], 1)
             self.assertEqual(page["items"][0]["tip_hash"], tip)
+
+    def test_multiple_sources_backfill_one_event_each_on_restart(self) -> None:
+        # Three sources deliver three distinct candidates while trusted. While
+        # the process is down: s1's request deadline elapses, s2 is revoked,
+        # s3 stays valid. On restart exactly one sync_expired per lapsed record
+        # is back-filled (in (source, request_id) order), s3 survives, and a
+        # second restart neither duplicates nor advances the generation.
+        self.assertRegister(
+            self.svc.register_trust_source(
+                {"source": "s2", "public_key": "b" * 64, "expires_at": FUTURE}
+            )
+        )
+        self.assertRegister(
+            self.svc.register_trust_source(
+                {"source": "s3", "public_key": "c" * 64, "expires_at": FUTURE}
+            )
+        )
+        far_future = int(time.time()) + 10_000
+
+        def deliver(source, request_id, amount, expires_at):
+            status, body = self.svc.submit_fork_sync(
+                {
+                    "source": source,
+                    "request_id": request_id,
+                    "expires_at": expires_at,
+                    "candidate": fork_doc(self.genesis, self._block(amount=amount)),
+                }
+            )
+            assert status == 201, body
+            return body["tip_hash"]
+
+        t1 = deliver("node-1", "r1", 11, int(time.time()) + 1)
+        t2 = deliver("s2", "r2", 12, far_future)
+        t3 = deliver("s3", "r3", 13, far_future)
+        self.assertEqual(
+            self.svc.revoke_trust_source("s2", {"expected_version": 1})[0], 200
+        )
+        gen_before = self.store.generation
+        time.sleep(1.1)  # node-1 deadline elapses while "down"
+
+        reopened = LedgerStore(self.path, initial_balance=1000)
+        # Only the still-valid s3 record and its candidate survive.
+        self.assertNotIn(("node-1", "r1"), reopened.syncs)
+        self.assertNotIn(("s2", "r2"), reopened.syncs)
+        self.assertIn(("s3", "r3"), reopened.syncs)
+        self.assertNotIn(t1, reopened.forks)
+        self.assertNotIn(t2, reopened.forks)
+        self.assertIn(t3, reopened.forks)
+        # One back-filled expiry per lapsed record, sorted by (source, rid).
+        tail = [e for e in reopened.audit_events if e["kind"] == "sync_expired"]
+        self.assertEqual(
+            [(e["source"], e["request_id"], e["tip_hash"]) for e in tail],
+            [("node-1", "r1", t1), ("s2", "r2", t2)],
+        )
+        self.assertEqual(
+            [e["event_id"] for e in reopened.audit_events],
+            list(range(1, len(reopened.audit_events) + 1)),
+        )
+        self.assertEqual(reopened.generation, gen_before + 1)
+        # The back-fill is durable.
+        disk = read_json(self.path)
+        self.assertEqual(
+            sum(1 for e in disk["audit_events"] if e["kind"] == "sync_expired"), 2
+        )
+        self.assertEqual(disk["state"]["generation"], reopened.generation)
+        # A second restart neither duplicates nor re-saves.
+        gen_after = reopened.generation
+        reopened2 = LedgerStore(self.path, initial_balance=1000)
+        self.assertEqual(
+            sum(1 for e in reopened2.audit_events if e["kind"] == "sync_expired"), 2
+        )
+        self.assertEqual(reopened2.generation, gen_after)
 
 
 class CorruptAuthoritativeSectionTests(unittest.TestCase):
