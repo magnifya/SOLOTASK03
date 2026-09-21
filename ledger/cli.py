@@ -1,6 +1,6 @@
 """Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain, adopt, export, index, sync and syncs
-subcommands.
+rollback, status, candidates, chain, adopt, export, index, sync, syncs and
+sync-history subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -243,6 +243,26 @@ def cmd_syncs(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_sync_history(args: argparse.Namespace) -> int:
+    filters = {
+        "source": args.source,
+        "tip_hash": args.tip_hash,
+        "kind": args.kind,
+        "min_height": args.min_height,
+        "max_height": args.max_height,
+        "cursor": args.cursor,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/forks/sync/history"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     filters = {
         "tx_id": args.tx_id,
@@ -431,6 +451,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_syncs.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_syncs.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_syncs.set_defaults(func=cmd_syncs)
+
+    p_sync_history = sub.add_parser(
+        "sync-history", help="audit-list the full sync lifecycle event history"
+    )
+    p_sync_history.add_argument("--source", help="filter by originating node identifier")
+    p_sync_history.add_argument(
+        "--tip-hash", help="filter by synced candidate tip hash (64 hex chars)"
+    )
+    p_sync_history.add_argument(
+        "--kind",
+        help="filter by lifecycle kind: sync_received, sync_adopted or "
+        "sync_expired (invalid values are rejected by the server with 400)",
+    )
+    p_sync_history.add_argument("--min-height", help="minimum frozen tip height (decimal)")
+    p_sync_history.add_argument("--max-height", help="maximum frozen tip height (decimal)")
+    p_sync_history.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_sync_history.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
+    p_sync_history.set_defaults(func=cmd_sync_history)
 
     p_index = sub.add_parser(
         "index", help="query the confirmed-chain transaction index"

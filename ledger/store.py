@@ -26,7 +26,11 @@ Derived data (index/accounts) is *rebuilt* from the chain on every load and
 every save — pending blocks are excluded, so a restart never resurrects
 unconfirmed transactions into balances. Persisted fork candidates are
 re-validated on startup and invalid ones are dropped, while canonical-chain
-invalidity remains fatal. Persisted sync records are re-verified on restart:
+invalidity remains fatal. Each surviving sync record carries the tip summary
+(height/length/status) frozen at reception; a persisted frozen summary that
+disagrees with the re-resolved candidate invalidates the record, while a
+snapshot predating the feature is repaired from its candidate. Persisted sync
+records are re-verified on restart:
 records still unexpired whose source stays active and unexpired survive;
 records whose own deadline elapsed or whose source is unknown/revoked/
 registry-expired while the process was down are pruned (their non-adopted
@@ -63,7 +67,7 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 6
+STATE_VERSION = 7
 
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
@@ -72,6 +76,7 @@ TRUST_REVOKED = "revoked"
 # Audit event kinds are owned by the store layer (recovery emits them too);
 # service.EVENT_* constants mirror these literal values.
 EVENT_SYNC_RECEIVED = "sync_received"
+EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
@@ -82,6 +87,49 @@ SNAPSHOT_PREFIX = ".ledger-"
 # state.initial_balance was recorded; mirrors service.DEFAULT_INITIAL_BALANCE
 # without importing the service layer (which imports this module).
 DEFAULT_INITIAL_BALANCE = 1_000_000
+
+
+class SyncSummary:
+    """Resolve the frozen tip descriptor (height/length/status) for a synced
+    candidate during recovery, from either a surviving fork or a canonical
+    chain prefix.
+    """
+
+    @staticmethod
+    def from_blocks_raw(tip_hash: str, blocks_raw: list[dict]) -> dict | None:
+        """Build the descriptor for an already-resolved raw block list whose
+        last block hash must equal ``tip_hash``.
+        """
+        if not blocks_raw:
+            return None
+        tip = blocks_raw[-1]
+        if tip.get("block_hash") != tip_hash:
+            return None
+        return {
+            "height": tip["height"],
+            "length": len(blocks_raw),
+            "status": tip["status"],
+        }
+
+    @classmethod
+    def from_locations(
+        cls,
+        tip_hash: str,
+        forks: dict[str, list[Block]],
+        canonical_chain: list[Block],
+    ) -> dict | None:
+        """Resolve a descriptor among surviving forks first, then canonical
+        blocks (the delivered fork may since have been adopted).
+        """
+        fork = forks.get(tip_hash)
+        if fork is not None:
+            return cls.from_blocks_raw(tip_hash, [block.to_dict() for block in fork])
+        prefix: list[dict] = []
+        for block in canonical_chain:
+            prefix.append(block.to_dict())
+            if block.block_hash == tip_hash:
+                return cls.from_blocks_raw(tip_hash, prefix)
+        return None
 
 
 class StateRecoveryError(ValueError):
@@ -335,6 +383,9 @@ class LedgerStore:
                 "tip_hash": rec["tip_hash"],
                 "expires_at": rec["expires_at"],
                 "fingerprint": rec["fingerprint"],
+                "height": rec.get("height"),
+                "length": rec.get("length"),
+                "status": rec.get("status"),
             }
             for key, rec in sorted((syncs or {}).items())
         ]
@@ -646,17 +697,23 @@ class LedgerStore:
             identity = (source, request_id, rec["tip_hash"])
             if identity in covered:
                 continue
-            audit_events.append(
-                {
-                    "event_id": len(audit_events) + 1,
-                    "kind": EVENT_SYNC_EXPIRED,
-                    "at": time.time(),
-                    "source": source,
-                    "request_id": request_id,
-                    "tip_hash": rec["tip_hash"],
-                    "expires_at": rec["expires_at"],
-                }
-            )
+            event = {
+                "event_id": len(audit_events) + 1,
+                "kind": EVENT_SYNC_EXPIRED,
+                "at": time.time(),
+                "source": source,
+                "request_id": request_id,
+                "tip_hash": rec["tip_hash"],
+                "expires_at": rec["expires_at"],
+            }
+            # Freeze the delivered summary when recovery could resolve it;
+            # records in snapshots older than the frozen-summary feature may
+            # not carry one, in which case the history query resolves live.
+            if rec.get("height") is not None:
+                event["height"] = rec["height"]
+                event["length"] = rec.get("length")
+                event["status"] = rec.get("status")
+            audit_events.append(event)
             covered.add(identity)
             backfilled += 1
         return backfilled
@@ -744,13 +801,27 @@ class LedgerStore:
 
         Every event is a JSON object carrying an integer ``at`` timestamp and a
         string ``kind``; ``event_id`` values must be exactly 1..N with no gaps
-        or duplicates, since the id is the event's permanent audit position.
-        Payload fields beyond those three are retained verbatim.
+        or duplicates, since the id is the event's permanent audit position
+        (which also fixes the log's total ordering). Payload fields beyond
+        those three are retained verbatim.
+
+        The historical sync lifecycle events additionally have their provenance
+        metadata validated: ``sync_received`` / ``sync_adopted`` /
+        ``sync_expired`` must carry a non-empty ``source`` and ``request_id``
+        and a 64-char lowercase hex ``tip_hash``; an ``expires_at`` and the
+        frozen tip summary (``height`` / ``length`` / ``status``) are checked
+        when present — older snapshots' adopted events predate those fields, so
+        missing ones are accepted but malformed ones are corruption.
         """
         if raw is None:
             return []
         if not isinstance(raw, list):
             raise StateRecoveryError(path, "'audit_events' must be a list")
+        sync_kinds = {
+            EVENT_SYNC_RECEIVED,
+            EVENT_SYNC_ADOPTED,
+            EVENT_SYNC_EXPIRED,
+        }
         events: list[dict] = []
         for i, event in enumerate(raw):
             if not isinstance(event, dict):
@@ -772,6 +843,62 @@ class LedgerStore:
                 raise StateRecoveryError(path, f"audit event {event_id} needs a kind")
             if isinstance(at, bool) or not isinstance(at, (int, float)):
                 raise StateRecoveryError(path, f"audit event {event_id} needs a numeric 'at'")
+            if kind in sync_kinds:
+                source = event.get("source")
+                request_id = event.get("request_id")
+                tip_hash = event.get("tip_hash")
+                if not isinstance(source, str) or not source:
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) needs a source"
+                    )
+                if not isinstance(request_id, str) or not request_id:
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) needs a request_id"
+                    )
+                if not crypto.is_hex64(tip_hash):
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) has an invalid tip_hash"
+                    )
+                expires_at = event.get("expires_at")
+                if expires_at is not None and (
+                    isinstance(expires_at, bool) or not isinstance(expires_at, int)
+                ):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) expires_at must be an integer",
+                    )
+                height = event.get("height")
+                if height is not None and (
+                    isinstance(height, bool) or not isinstance(height, int) or height < 0
+                ):
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) has an invalid height"
+                    )
+                length = event.get("length")
+                if length is not None and (
+                    isinstance(length, bool) or not isinstance(length, int) or length < 1
+                ):
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) has an invalid length"
+                    )
+                status = event.get("status")
+                if status is not None and status not in (
+                    STATUS_PENDING,
+                    STATUS_CONFIRMED,
+                ):
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) has invalid status"
+                    )
+                # The three frozen summary fields travel together: a partially
+                # frozen event is an inconsistent write and is corruption.
+                summary_fields = (height, length, status)
+                if any(field is not None for field in summary_fields) and any(
+                    field is None for field in summary_fields
+                ):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) has a partial frozen summary",
+                    )
             events.append(dict(event))
         return events
 
@@ -832,6 +959,28 @@ class LedgerStore:
                 continue
             if not crypto.is_hex64(tip_hash):
                 continue
+            # The frozen tip summary is optional for snapshots written before
+            # it was persisted; when present it must be structurally sound.
+            frozen_height = rec_raw.get("height")
+            frozen_length = rec_raw.get("length")
+            frozen_status = rec_raw.get("status")
+            if frozen_height is not None and (
+                isinstance(frozen_height, bool)
+                or not isinstance(frozen_height, int)
+                or frozen_height < 0
+            ):
+                continue
+            if frozen_length is not None and (
+                isinstance(frozen_length, bool)
+                or not isinstance(frozen_length, int)
+                or frozen_length < 1
+            ):
+                continue
+            if frozen_status is not None and frozen_status not in (
+                STATUS_PENDING,
+                STATUS_CONFIRMED,
+            ):
+                continue
             # Provenance is recorded even for dropped records: it proves the
             # matching fork must not outlive the sync that delivered it.
             synced_tips.add(tip_hash)
@@ -839,6 +988,9 @@ class LedgerStore:
                 "tip_hash": tip_hash,
                 "expires_at": expires_at,
                 "fingerprint": fingerprint,
+                "height": frozen_height,
+                "length": frozen_length,
+                "status": frozen_status,
             }
             if isinstance(expires_at, bool) or not isinstance(expires_at, int):
                 # Malformed deadline: a structurally broken record, silently
@@ -861,7 +1013,16 @@ class LedgerStore:
                 # Deadline elapsed or authorization lost while down: reconcile
                 # exactly like the runtime sweep and backfill sync_expired,
                 # regardless of the content fingerprint (the lifecycle event
-                # is identified by source/request_id/tip/expires_at).
+                # is identified by source/request_id/tip/expires_at). Best
+                # effort: freeze the summary from the surviving candidate when
+                # the snapshot predates frozen summaries, so the backfilled
+                # history row stays truthfully ordered.
+                if frozen_height is None:
+                    descriptor = SyncSummary.from_locations(
+                        tip_hash, forks, canonical_chain
+                    )
+                    if descriptor is not None:
+                        record.update(descriptor)
                 expired_records.append((source, request_id, record))
                 continue
             if not isinstance(fingerprint, str) or not fingerprint:
@@ -880,6 +1041,21 @@ class LedgerStore:
                 continue
             if self._candidate_fingerprint(blocks_raw) != fingerprint:
                 continue
+            # Verify the frozen summary metadata against the re-resolved
+            # candidate: like a fingerprint mismatch, a tampered summary
+            # invalidates the record silently (no lifecycle event), while a
+            # legacy record without the frozen fields is repaired from the
+            # candidate it references.
+            descriptor = SyncSummary.from_blocks_raw(tip_hash, blocks_raw)
+            if descriptor is None:
+                continue
+            if frozen_height is not None and (
+                frozen_height != descriptor["height"]
+                or frozen_length != descriptor["length"]
+                or frozen_status != descriptor["status"]
+            ):
+                continue
+            record.update(descriptor)
             key = (source, request_id)
             if key in syncs:
                 continue
@@ -887,6 +1063,9 @@ class LedgerStore:
                 "tip_hash": tip_hash,
                 "expires_at": expires_at,
                 "fingerprint": fingerprint,
+                "height": descriptor["height"],
+                "length": descriptor["length"],
+                "status": descriptor["status"],
             }
         return syncs, expired_records, synced_tips
 
@@ -1019,6 +1198,9 @@ class LedgerStore:
                     "tip_hash": rec["tip_hash"],
                     "expires_at": rec["expires_at"],
                     "fingerprint": rec["fingerprint"],
+                    "height": rec.get("height"),
+                    "length": rec.get("length"),
+                    "status": rec.get("status"),
                 }
                 for key, rec in sorted(self.syncs.items())
             ]
