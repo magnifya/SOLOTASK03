@@ -634,6 +634,93 @@ class RestartReauthorizationTests(_ServiceCase):
         for e in backfilled:
             self.assertIn("expires_at", e)
 
+    def test_restart_backfill_not_deduped_across_lifecycles(self) -> None:
+        # A reused (source, request_id) key opens a second lifecycle with
+        # content identical to the first (same candidate and even the same
+        # expires_at). When the second lifecycle is also reconciled away on
+        # restart, its sync_expired must be appended even though every
+        # payload field matches the first lifecycle's durable event.
+        source = "cycled"
+        # The registry entry is short-lived; the sync record itself is not.
+        self.assertEqual(
+            self.register(source, KEY_A, int(time.time()) + 1)[0], 201
+        )
+        doc = self.candidate(self.block(amount=7))
+        record_expiry = int(time.time()) + 3600
+        status, body = self.sync(doc, source=source, expires_at=record_expiry)
+        self.assertEqual(status, 201, body)
+        tip = body["tip_hash"]
+        time.sleep(1.1)  # registry entry expires while the process is "down"
+
+        # Restart #1: the registry lapse reconciles the first lifecycle away
+        # and backfills exactly one sync_expired for it.
+        reopened = self._reopen()
+        self.assertNotIn((source, "req-1"), reopened.syncs)
+        self.assertNotIn(tip, reopened.forks)
+        expiries = [e for e in reopened.audit_events if e["kind"] == "sync_expired"]
+        self.assertEqual(len(expiries), 1)
+
+        # Rotate the source back to active, then resubmit the identical key,
+        # candidate and expires_at: a brand-new lifecycle (201 with a fresh
+        # sync_received), never a replay of the expired one.
+        svc2 = LedgerService(reopened, initial_balance=1000)
+        self.assertEqual(
+            svc2.rotate_trust_source(
+                source,
+                {
+                    "public_key": KEY_B,
+                    "expires_at": int(time.time()) + 1,
+                    "expected_version": 1,
+                },
+            )[0],
+            200,
+        )
+        status, body2 = svc2.submit_fork_sync(
+            {
+                "source": source,
+                "request_id": "req-1",
+                "expires_at": record_expiry,
+                "candidate": doc,
+            }
+        )
+        self.assertEqual(status, 201, body2)
+        self.assertEqual(body2["tip_hash"], tip)
+        self.assertEqual(body2["expires_at"], record_expiry)
+        time.sleep(1.1)  # registry entry expires again while "down"
+
+        # Restart #2: the second lifecycle is reconciled away too. Its
+        # sync_expired MUST be appended even though source, request_id,
+        # tip_hash and expires_at are all identical to the first event.
+        reopened2 = self._reopen()
+        self.assertNotIn((source, "req-1"), reopened2.syncs)
+        self.assertNotIn(tip, reopened2.forks)
+        expiries2 = [
+            e for e in reopened2.audit_events if e["kind"] == "sync_expired"
+        ]
+        self.assertEqual(len(expiries2), 2)
+        first, second = expiries2
+        for field in ("source", "request_id", "tip_hash", "expires_at"):
+            self.assertEqual(first[field], second[field], field)
+        self.assertNotEqual(first["event_id"], second["event_id"])
+        self.assertEqual(
+            [e["event_id"] for e in reopened2.audit_events],
+            list(range(1, len(reopened2.audit_events) + 1)),
+        )
+        # Both lifecycles' receptions and both expiries stay queryable.
+        svc3 = LedgerService(reopened2, initial_balance=1000)
+        _, received = svc3.list_audit_events({"kind": "sync_received"})
+        self.assertEqual(received["total"], 2)
+        _, expired = svc3.list_audit_events({"kind": "sync_expired"})
+        self.assertEqual(expired["total"], 2)
+        # A third restart backfills nothing and does not write again.
+        generation_after = reopened2.generation
+        reopened3 = self._reopen()
+        self.assertEqual(
+            [e for e in reopened3.audit_events if e["kind"] == "sync_expired"],
+            expiries2,
+        )
+        self.assertEqual(reopened3.generation, generation_after)
+
     def test_restart_with_durable_expiry_event_backfills_nothing(self) -> None:
         # A sync_expired event for the identity is already durable while the
         # expired record is still in the snapshot (a crash interrupted the

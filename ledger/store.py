@@ -31,8 +31,12 @@ records still unexpired whose source stays active and unexpired survive;
 records whose own deadline elapsed or whose source is unknown/revoked/
 registry-expired while the process was down are pruned (their non-adopted
 forks removed; an adopted tip never changes the canonical chain) and each
-gets exactly one deduplicated sync_expired audit event backfilled after the
-durable history, persisted in one atomic write. Other staleness (a dangling
+gets exactly one sync_expired audit event backfilled after the durable
+history, persisted in one atomic write. The backfill deduplicates only
+within the record's current lifecycle (a durable sync_expired newer than
+the key's latest sync_received), so a reused (source, request_id) key's
+new lifecycle is always audited even when every field matches a previous
+lifecycle's event. Other staleness (a dangling
 tip or a content-fingerprint mismatch) is a silent prune with no event.
 A re-entrant lock serializes all updates, and a class-wide recovery lock
 serializes startup scans against in-flight writes.
@@ -67,6 +71,7 @@ TRUST_REVOKED = "revoked"
 
 # Audit event kinds are owned by the store layer (recovery emits them too);
 # service.EVENT_* constants mirror these literal values.
+EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_EXPIRED = "sync_expired"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
@@ -609,21 +614,37 @@ class LedgerStore:
 
         Mirrors the runtime sweep exactly: records are processed in
         ``(source, request_id)`` order, each gets a dense event_id continuing
-        after the durable history, and events are deduplicated against any
-        already-durable sync_expired identity (source, request_id, tip_hash)
-        so a crash between backfill and promotion can never record an expiry
-        twice. Returns the number of events appended. Mutates ``audit_events``
-        in place.
+        after the durable history, and every *lifecycle removal* gets its own
+        event. Deduplication is lifecycle-aware, never identity-based across
+        lifecycles: a durable sync_expired covers the persisted record only
+        when it sits after the latest sync_received for the same
+        ``(source, request_id)`` key — i.e. it belongs to the record's
+        current lifecycle (the crash-interrupted-cleanup case). An expiry
+        event from an *earlier* lifecycle of a reused key never suppresses
+        the new lifecycle's event, even when source, request_id, tip_hash
+        and expires_at are all identical. Returns the number of events
+        appended. Mutates ``audit_events`` in place.
         """
-        existing_expiry = {
-            (event.get("source"), event.get("request_id"), event.get("tip_hash"))
-            for event in audit_events
-            if event.get("kind") == EVENT_SYNC_EXPIRED
-        }
+        # Position of the latest sync_received per key: it opens the
+        # lifecycle every later event of that key belongs to.
+        last_received: dict[tuple[object, object], int] = {}
+        for index, event in enumerate(audit_events):
+            if event.get("kind") == EVENT_SYNC_RECEIVED:
+                last_received[(event.get("source"), event.get("request_id"))] = index
+        # Identities already expired *within their current lifecycle*.
+        covered: set[tuple[object, object, object]] = set()
+        for index, event in enumerate(audit_events):
+            if event.get("kind") != EVENT_SYNC_EXPIRED:
+                continue
+            key = (event.get("source"), event.get("request_id"))
+            if index > last_received.get(key, -1):
+                covered.add((key[0], key[1], event.get("tip_hash")))
         backfilled = 0
-        for source, request_id, rec in sorted(expired_records):
+        for source, request_id, rec in sorted(
+            expired_records, key=lambda item: (item[0], item[1])
+        ):
             identity = (source, request_id, rec["tip_hash"])
-            if identity in existing_expiry:
+            if identity in covered:
                 continue
             audit_events.append(
                 {
@@ -636,7 +657,7 @@ class LedgerStore:
                     "expires_at": rec["expires_at"],
                 }
             )
-            existing_expiry.add(identity)
+            covered.add(identity)
             backfilled += 1
         return backfilled
 
