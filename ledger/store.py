@@ -501,20 +501,23 @@ class LedgerStore:
             fail("state.tip_status does not match the chain tip")
 
         forks = self._parse_persisted_forks(data.get("forks", []), chain)
+        # The trust registry is authoritative configuration and must be parsed
+        # before the sync records, whose sources are re-authorized against it.
+        trust_sources = self._parse_persisted_trust_sources(
+            data.get("trust_sources", []), path
+        )
         syncs, synced_tips = self._parse_persisted_syncs(
-            data.get("syncs", []), forks, chain
+            data.get("syncs", []), forks, chain, trust_sources
         )
         # A fork brought in only by a sync record loses its right to exist once
-        # that record is gone (expired/invalid on restart): without this, the
-        # independently-persisted fork would resurrect as a never-expiring
-        # candidate. Direct submissions carry no sync record and are untouched.
+        # that record is gone (expired/unauthorized/invalid on restart):
+        # without this, the independently-persisted fork would resurrect as a
+        # never-expiring candidate. Direct submissions carry no sync record and
+        # are untouched.
         live_tips = {rec["tip_hash"] for rec in syncs.values()}
         canonical_hashes = {block.block_hash for block in chain}
         for tip in synced_tips - live_tips - canonical_hashes:
             forks.pop(tip, None)
-        trust_sources = self._parse_persisted_trust_sources(
-            data.get("trust_sources", []), path
-        )
         allowlist = self._parse_persisted_allowlist(data.get("allowlist", {}), path)
         audit_events = self._parse_persisted_audit_events(
             data.get("audit_events", []), path
@@ -650,21 +653,27 @@ class LedgerStore:
         syncs_raw: object,
         forks: dict[str, list[Block]],
         canonical_chain: list[Block],
+        trust_sources: dict[str, dict] | None = None,
     ) -> tuple[dict[tuple[str, str], dict], set[str]]:
         """Parse persisted sync records, dropping unusable ones on restart.
 
-        A record is kept only when it is structurally valid and has not yet
-        expired. Its tip must reference either a surviving candidate fork or a
-        block on the canonical chain (a synced candidate may have been adopted);
-        records pointing at neither are stale orphans and are pruned. Invalid
-        or expired records are silently dropped rather than failing recovery of
-        the canonical chain. Also returns the set of every tip any sync record
-        claims provenance for (including expired ones), so the caller can drop
-        forks that only an expired sync kept alive.
+        A record is kept only when it is structurally valid, has not yet
+        expired, its source is still an active, unexpired entry of the
+        persistent trust registry, and its tip references either a surviving
+        candidate fork or a block on the canonical chain (a synced candidate
+        may have been adopted). Records whose source is unknown, revoked or
+        registry-expired, and records pointing at neither surviving location,
+        are stale orphans and are pruned; invalid records are silently dropped
+        rather than failing recovery of the canonical chain. The historical
+        sync_received/sync_adopted/sync_expired audit events are never touched
+        by this pruning. Also returns the set of every tip any sync record
+        claims provenance for (including dropped ones), so the caller can drop
+        forks that only a pruned sync kept alive.
         """
         if not isinstance(syncs_raw, list):
             return {}, set()
         now = time.time()
+        trust_sources = trust_sources or {}
         canonical_hashes = {block.block_hash for block in canonical_chain}
         syncs: dict[tuple[str, str], dict] = {}
         synced_tips: set[str] = set()
@@ -682,7 +691,7 @@ class LedgerStore:
                 continue
             if not crypto.is_hex64(tip_hash):
                 continue
-            # Provenance is recorded even for expired records: it proves the
+            # Provenance is recorded even for dropped records: it proves the
             # matching fork must not outlive the sync that delivered it.
             synced_tips.add(tip_hash)
             if (
@@ -692,6 +701,19 @@ class LedgerStore:
             ):
                 continue
             if not isinstance(fingerprint, str) or not fingerprint:
+                continue
+            # Re-authorization on restart: the trust decision recorded at
+            # delivery is re-checked against the current registry. A source
+            # rotated away, revoked or expired since then invalidates its
+            # pending records; historical audit events stay queryable.
+            trusted = trust_sources.get(source)
+            if (
+                trusted is None
+                or trusted.get("status") != TRUST_ACTIVE
+                or not isinstance(trusted.get("expires_at"), int)
+                or isinstance(trusted.get("expires_at"), bool)
+                or trusted["expires_at"] <= now
+            ):
                 continue
             if tip_hash not in forks and tip_hash not in canonical_hashes:
                 continue

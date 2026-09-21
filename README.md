@@ -67,18 +67,27 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `{"source","request_id","expires_at","candidate"}`：`source` 是来源节点标识，
   `request_id` 是该来源作用域内的幂等键，`expires_at` 是 Unix 秒过期时刻，
   `candidate` 按现有导出格式（五字段文档，也接受 `{"blocks":[...]}` 或裸块数组）。
-  节点对候选按既有规则**全量重验**：canonical 创世块逐字节一致、高度连续、
+  **新请求先过来源授权闸门**：`source` 必须在持久化信任注册表中存在、`status`
+  仍为 `active` 且其注册 `expires_at` 晚于当前时刻；未知、已撤销或注册已过期的
+  来源一律返回 `403`，此时不检查候选、不落任何状态。仅在授权通过后，节点才对
+  候选按既有规则**全量重验**：canonical 创世块逐字节一致、高度连续、
   `prev_hash` 相连、重算 `block_hash` 与 Merkle 根、逐笔校验 `tx_id` 与 Ed25519
   签名、`tx_id` 全链唯一且块内升序、按初始余额重放不超支、仅允许末块 `pending`，
   导出文档自带的摘要字段也会逐一核对。成功 `201` 返回
-  `{tip_hash, height, length, status, expires_at}`；请求已过期返回 `410`；
-  字段格式或候选校验失败返回 `400`。
-- **幂等与冲突**：同一 `source` + `request_id` 重试时，候选内容相同则返回
-  `200` 与**首次的原结果**（含原 `expires_at`）；内容不同返回 `409`；
-  候选 `tip_hash` 与 canonical 或任一已存候选重复也返回 `409`。
+  `{tip_hash, height, length, status, expires_at}`。状态码优先级：字段格式错误
+  `400` → 来源未授权 `403` → 字段合法但请求 `expires_at` 不晚于当前时刻 `410`
+  → 候选整链/摘要校验失败 `400` → tip 与 canonical 或已存候选重复 `409`。
+- **幂等与冲突**：同一 `source` + `request_id` 且记录未过期的重试**豁免授权
+  检查**：即使该来源此后已轮换、撤销或注册过期，候选内容相同仍返回 `200` 与
+  **首次的原结果**（含原 `expires_at`）；内容不同返回 `409`；篡改摘要字段仍按
+  新请求重算并返回 `400`；候选 `tip_hash` 与 canonical 或任一已存候选重复也
+  返回 `409`。
 - **过期处理**：同步带来的候选只在记录未过期期间存活；一旦过期，记录与其候选
   分叉一并移除（已采用上链的 tip 只留审计记录、不影响 canonical 链）。元数据与
-  候选在**同一次原子写入**中落盘；重启时重验全部候选并丢弃过期或失效记录。
+  候选在**同一次原子写入**中落盘；重启时重验全部候选并丢弃过期或失效记录，
+  **并按当前信任注册表重新校验每条记录的来源授权**——来源未知、已撤销或注册已
+  过期的记录连同其候选一并丢弃（已采用 tip 仅保留审计历史），历史审计事件逐字
+  保留、`event_id` 不间断。
 - **审计查询**：`GET /v1/forks/sync` 支持 `source`、`min_height`、`max_height`、
   `limit`（默认 50，范围 1–200）、`cursor`（默认 0）。数值参数必须是首位非 0 的
   十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。结果按
@@ -275,8 +284,9 @@ curl -s -X POST localhost:8080/v1/forks/<tip-hash>/adopt
 curl -s localhost:8080/v1/forks/<tip-hash>/export
 # -> 200 {"tip_hash":"...","height":N,"length":N+1,"status":"...","blocks":[...]}
 
-# 节点间同步：推送他节点候选（201；相同 source+request_id 同内容重试 200，
-# 内容不同/tip 重复 409，过期 410，格式或校验失败 400）
+# 节点间同步：推送他节点候选（来源须先 trust add 注册且仍 active 未过期，否则 403；
+# 201；相同 source+request_id 同内容重试 200（即使来源事后轮换/撤销仍回放原结果），
+# 内容不同 409，请求过期 410，格式或校验失败 400）
 curl -s -X POST localhost:8080/v1/forks/sync \
   -H 'Content-Type: application/json' \
   -d '{"source":"node-2","request_id":"req-7","expires_at":1800000000,"candidate":{...export 文档...}}'
@@ -372,6 +382,7 @@ python tests/recovery_test.py         # generation、多区块一致性、快照
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
+python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录但审计历史逐字保留、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 ```

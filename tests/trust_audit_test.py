@@ -102,6 +102,12 @@ class TrustAuditServiceTests(unittest.TestCase):
             {"source": source, "public_key": key_hex, "expires_at": expires_at}
         )
 
+    def _ensure_sync_trust(self, source: str) -> None:
+        # Sync deliveries require an active trusted source. The first call
+        # records a source_registered audit event; re-posts are idempotent.
+        status, body = self.register(source, KEY_A, FUTURE)
+        self.assertIn(status, (200, 201), body)
+
     # -- registration --------------------------------------------------------
 
     def test_register_creates_version_1_active_with_event(self) -> None:
@@ -270,6 +276,7 @@ class TrustAuditServiceTests(unittest.TestCase):
         candidate = make_fork(self.genesis, [self.genesis, block])
         if expires_at is None:
             expires_at = int(time.time()) + 3600
+        self._ensure_sync_trust(source)
         return self.svc.submit_fork_sync(
             {
                 "source": source,
@@ -296,7 +303,11 @@ class TrustAuditServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         _, audit = self.svc.list_audit_events({"source": "node-2"})
         kinds = [e["kind"] for e in audit["items"]]
-        self.assertEqual(kinds, ["sync_received", "sync_adopted"])
+        # The source's own registration event also carries source="node-2";
+        # the sync events follow in append order and remain queryable.
+        self.assertEqual(
+            kinds, ["source_registered", "sync_received", "sync_adopted"]
+        )
         # Still queryable after adoption, by kind and source.
         _, adopted = self.svc.list_audit_events({"kind": "sync_adopted"})
         self.assertEqual(adopted["total"], 1)
@@ -350,12 +361,22 @@ class TrustAuditServiceTests(unittest.TestCase):
         self.assertEqual(rec["status"], "revoked")
         self.assertEqual(rec["public_key"], KEY_B)
         kinds = [e["kind"] for e in reopened.audit_events]
+        # node-1 lifecycle, then node-2's registration (the sync authorization
+        # gate) followed by its sync_received event.
         self.assertEqual(
             kinds,
-            ["source_registered", "source_rotated", "source_revoked", "sync_received"],
+            [
+                "source_registered",
+                "source_rotated",
+                "source_revoked",
+                "source_registered",
+                "sync_received",
+            ],
         )
         # event_ids are dense 1..N
-        self.assertEqual([e["event_id"] for e in reopened.audit_events], [1, 2, 3, 4])
+        self.assertEqual([e["event_id"] for e in reopened.audit_events], [1, 2, 3, 4, 5])
+        # The live node-2 sync record survives the restart re-authorization.
+        self.assertIn(("node-2", "req-1"), reopened.syncs)
 
     def test_corrupt_trust_section_fails_recovery(self) -> None:
         self.register()

@@ -84,6 +84,28 @@ class ForkSyncServiceTests(unittest.TestCase):
         self.ka, self.A = keypair()
         self.kb, self.B = keypair()
         self.kc, self.C = keypair()
+        # Sources used through the sync() helper are registered as active,
+        # far-future trusted sources. Tests for the authorization gate register
+        # (or deliberately leave unregistered) sources by hand.
+        self._trusted: set[str] = set()
+        self._trust_seq = 0
+
+    def _trust(self, source: str, *, expires_at: int | None = None) -> None:
+        if source in self._trusted and expires_at is None:
+            return
+        self._trust_seq += 1
+        key_hex = format(0x1000 + self._trust_seq, "064x")
+        status, body = self.svc.register_trust_source(
+            {
+                "source": source,
+                "public_key": key_hex,
+                "expires_at": int(time.time()) + 10_000_000
+                if expires_at is None
+                else expires_at,
+            }
+        )
+        self.assertIn(status, (200, 201), body)
+        self._trusted.add(source)
 
     def block1(self, to=None, amount=10, *, status="confirmed") -> Block:
         return Block.create(
@@ -97,6 +119,7 @@ class ForkSyncServiceTests(unittest.TestCase):
              expires_at=None, blocks_key="candidate"):
         if expires_at is None:
             expires_at = int(time.time()) + 3600
+        self._trust(source)
         body = {
             "source": source,
             "request_id": request_id,
@@ -180,6 +203,9 @@ class ForkSyncServiceTests(unittest.TestCase):
     def test_envelope_field_types_400(self) -> None:
         block = self.block1()
         cand = make_fork(self.genesis, [self.genesis, block])
+        # Register "n" so that the past-expiry and malformed-candidate cases
+        # reach their own checks past the authorization gate.
+        self._trust("n")
         base = {"request_id": "r", "expires_at": int(time.time()) + 10,
                 "candidate": cand}
         for bad_source in ("", 1, None, []):
@@ -342,6 +368,7 @@ class ForkSyncServiceTests(unittest.TestCase):
 
     def test_expired_request_is_410(self) -> None:
         block = self.block1()
+        self._trust("node-1")
         past = int(time.time()) - 1
         status, body = self.sync(
             make_fork(self.genesis, [self.genesis, block]), expires_at=past
@@ -639,6 +666,15 @@ class ForkSyncHttpTests(unittest.TestCase):
         cls.thread.start()
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
         cls.genesis = cls.service.store.chain[0]
+        # Sync submissions require an active trusted source.
+        status, _ = cls.service.register_trust_source(
+            {
+                "source": "http-node",
+                "public_key": "a" * 64,
+                "expires_at": int(time.time()) + 10_000_000,
+            }
+        )
+        assert status in (200, 201), status
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -734,6 +770,15 @@ class ForkSyncCliTests(unittest.TestCase):
         cls.thread.start()
         cls.base_url = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
         cls.genesis = cls.service.store.chain[0]
+        # Sync submissions require an active trusted source.
+        status, _ = cls.service.register_trust_source(
+            {
+                "source": "cli-node",
+                "public_key": "b" * 64,
+                "expires_at": int(time.time()) + 10_000_000,
+            }
+        )
+        assert status in (200, 201), status
 
     @classmethod
     def tearDownClass(cls) -> None:

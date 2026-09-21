@@ -595,17 +595,30 @@ class LedgerService:
         """POST /v1/forks/sync — receive a candidate chain from another node.
 
         The request carries ``source``, ``request_id``, ``expires_at`` (Unix
-        seconds) and ``candidate`` (an export-format fork document). The
-        candidate is re-validated exactly like a direct candidate submission
-        (canonical genesis, consecutive heights and prev_hash linkage,
-        recomputed block hashes and Merkle roots, tx_id and Ed25519 signatures,
-        unique ascending tx_ids, endowment replay, pending-only-at-tip).
+        seconds) and ``candidate`` (an export-format fork document).
 
-        Returns 201 with ``{tip_hash, height, length, status, expires_at}``.
-        An expired request returns 410; malformed fields or a failing chain
-        validation return 400. A retry with the same source + request_id and
-        identical content replays the original result as 200; the same key with
-        different content, or a duplicate tip already known, returns 409.
+        Authorization. A *new* source+request_id pair is accepted only when the
+        source is registered in the persistent trust registry with status
+        ``active`` and an ``expires_at`` still in the future. An unknown,
+        revoked or registry-expired source is rejected 403 before the candidate
+        is examined. A retry on a still-live recorded key bypasses the registry
+        check entirely: the recorded result must keep replaying even after the
+        source has since been rotated, revoked or expired.
+
+        After authorization (and only then) the candidate is re-validated
+        exactly like a direct candidate submission (canonical genesis,
+        consecutive heights and prev_hash linkage, recomputed block hashes and
+        Merkle roots, tx_id and Ed25519 signatures, unique ascending tx_ids,
+        endowment replay, pending-only-at-tip).
+
+        Status precedence: malformed envelope fields are 400; an unauthorized
+        source is 403; a well-formed new request whose ``expires_at`` is not
+        later than now is 410; a well-formed but failing candidate chain (or a
+        tampered candidate summary) is 400. Returns 201 on first acceptance
+        with ``{tip_hash, height, length, status, expires_at}``. A retry with
+        the same source + request_id and identical content replays the original
+        result as 200; the same key with different content returns 409, as does
+        a duplicate tip already known.
         """
         if not isinstance(payload, dict):
             return 400, {"error": "request body must be a JSON object"}
@@ -635,12 +648,27 @@ class LedgerService:
             key = (source, request_id)
             existing = self.store.syncs.get(key)
 
-            # A new delivery whose deadline already passed is rejected before
-            # the chain is examined. A retry on a still-live key skips this:
-            # replaying a recorded request must stay idempotent even when the
-            # client echoes an expires_at that has since elapsed.
-            if existing is None and expires_at <= time.time():
-                return 410, {"error": "sync request has expired"}
+            if existing is None:
+                # Authorization gate for new deliveries only: the source must
+                # be an active, unexpired entry of the persistent trust
+                # registry. Unknown, revoked or registry-expired sources are
+                # refused 403 before the candidate is examined. A retry on a
+                # still-live key skips this, so a recorded result keeps
+                # replaying even after the source has since been rotated,
+                # revoked or expired.
+                now = time.time()
+                trusted = self.store.trust_sources.get(source)
+                if (
+                    trusted is None
+                    or trusted["status"] != TRUST_ACTIVE
+                    or trusted["expires_at"] <= now
+                ):
+                    return 403, {"error": "source is not an active trusted source"}
+                # The request's own deadline is checked next, still before the
+                # candidate chain is examined: a well-formed request whose
+                # expiry is not later than now is gone (410).
+                if expires_at <= now:
+                    return 410, {"error": "sync request has expired"}
 
             # Re-validate the whole candidate chain and recompute the tip
             # summary BEFORE any idempotency decision: a request whose supplied
