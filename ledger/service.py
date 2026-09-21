@@ -78,11 +78,16 @@ def _parse_decimal(value: object) -> int | None:
 class LedgerService:
     def __init__(self, store: LedgerStore, initial_balance: int = DEFAULT_INITIAL_BALANCE) -> None:
         self.store = store
-        self.initial_balance = initial_balance
-        # Record the endowment convention so persisted fork replay checks and
-        # recovery use the same value the service was configured with.
-        if self.store.initial_balance is None:
-            self.store.initial_balance = initial_balance
+        # The snapshot-recorded endowment is the only balance-replay / balance
+        # reporting parameter: a recovered store already knows its endowment, so
+        # restarting with a different --initial-balance must not change any
+        # legality or reported balance. Only a brand-new store (no recorded
+        # value) adopts the constructor argument.
+        if store.initial_balance is None:
+            store.initial_balance = initial_balance
+            self.initial_balance = initial_balance
+        else:
+            self.initial_balance = store.initial_balance
 
     # -- transactions -------------------------------------------------------
 
@@ -686,7 +691,12 @@ class LedgerService:
                             "error": f"candidate field {field!r} does not match the blocks"
                         }
             tip_hash = fork[-1].block_hash
-            fingerprint = self._candidate_fingerprint(blocks_raw)
+            # Fingerprint the *canonicalized* parsed blocks, not the raw
+            # request list, so recovery (which re-parses the stored fork)
+            # recomputes an identical fingerprint regardless of insignificant
+            # serialization differences in the original submission.
+            canonical_blocks = [block.to_dict() for block in fork]
+            fingerprint = self._candidate_fingerprint(canonical_blocks)
 
             if existing is not None:
                 # A retry on a live key is idempotent only when it carries the
