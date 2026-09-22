@@ -140,6 +140,97 @@ class LedgerService:
                 raise
         return 202, {"tx_id": tx.tx_id}
 
+    def get_transaction(self, tx_id: object) -> tuple[int, dict]:
+        """GET /v1/transactions/{tx_id} — one transaction receipt.
+
+        The lookup covers the canonical chain and the mempool only; candidate
+        forks are never exposed. A ``tx_id`` that is not exactly 64 lowercase
+        hex characters, or one nothing holds, returns 404.
+
+        A mempool transaction is reported ``pending`` with ``height``,
+        ``block_hash`` and ``index`` all null. A transaction packed into the
+        unconfirmed tip block is ``pending`` too, anchored at that block with
+        its 0-based in-block index. A transaction in a confirmed block is
+        ``confirmed``. Every receipt is built from the stored signed
+        transaction: the id is recomputed from its canonical message (never
+        taken from an index or a fork-side cache) and the fields are strictly
+        re-typed (non-empty strings, a positive non-boolean integer amount),
+        so adoption, rollback and restart can only ever surface the current
+        canonical/pending state.
+        """
+        if not crypto.is_hex64(tx_id):
+            return 404, {"error": "transaction not found"}
+        with self.store.lock:
+            # Canonical chain first: confirmed blocks, then at most one
+            # pending tip. The stored signed transaction is the sole source
+            # for the receipt, and its id is recomputed rather than trusted
+            # from any lookup key.
+            for block in self.store.chain:
+                for index, tx in enumerate(block.transactions):
+                    if tx.tx_id != tx_id:
+                        continue
+                    if not self._is_receipt_tx_well_typed(tx):
+                        return 404, {"error": "transaction not found"}
+                    status = (
+                        STATUS_CONFIRMED
+                        if block.status == STATUS_CONFIRMED
+                        else STATUS_PENDING
+                    )
+                    return 200, self._transaction_receipt(
+                        tx, status, block.height, block.block_hash, index
+                    )
+            # Still unpacked in the mempool.
+            tx = self.store.pending.get(tx_id)
+            if tx is not None:
+                if not self._is_receipt_tx_well_typed(tx):
+                    return 404, {"error": "transaction not found"}
+                return 200, self._transaction_receipt(
+                    tx, STATUS_PENDING, None, None, None
+                )
+            return 404, {"error": "transaction not found"}
+
+    @staticmethod
+    def _is_receipt_tx_well_typed(tx: Transaction) -> bool:
+        """Strict receipt-time type check of a stored signed transaction.
+
+        Every stored transaction already passed these checks at submission
+        (and again during snapshot recovery); the re-check guarantees a
+        receipt can never serialize a value that violates the response
+        contract, even if an in-memory invariant were broken.
+        """
+        return (
+            isinstance(tx.sender, str)
+            and bool(tx.sender)
+            and isinstance(tx.recipient, str)
+            and bool(tx.recipient)
+            and isinstance(tx.amount, int)
+            and not isinstance(tx.amount, bool)
+            and tx.amount > 0
+            and isinstance(tx.signature, str)
+            and bool(tx.signature)
+        )
+
+    @staticmethod
+    def _transaction_receipt(
+        tx: Transaction,
+        status: str,
+        height: int | None,
+        block_hash: str | None,
+        index: int | None,
+    ) -> dict:
+        """The fixed nine-field receipt shape."""
+        return {
+            "tx_id": tx.tx_id,
+            "from": tx.sender,
+            "to": tx.recipient,
+            "amount": tx.amount,
+            "signature": tx.signature,
+            "status": status,
+            "height": height,
+            "block_hash": block_hash,
+            "index": index,
+        }
+
     # -- blocks -------------------------------------------------------------
 
     def mine_block(self) -> tuple[int, dict]:

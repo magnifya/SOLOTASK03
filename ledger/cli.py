@@ -1,4 +1,4 @@
-"""Command line interface: send, mine, block, account, proof, state-root,
+"""Command line interface: send, tx, mine, block, account, proof, state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, syncs, sync-history, audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
@@ -135,6 +135,14 @@ def cmd_mine(args: argparse.Namespace) -> int:
 def cmd_block(args: argparse.Namespace) -> int:
     status, body = _request(
         "GET", f"{args.base_url}/v1/blocks/{args.height}", None
+    )
+    return _emit(status, body)
+
+
+def cmd_tx(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.tx_id, safe="")
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/transactions/{quoted}", None
     )
     return _emit(status, body)
 
@@ -548,6 +556,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_block = sub.add_parser("block", help="fetch a block by height")
     p_block.add_argument("height", help="block height (0 = genesis)")
     p_block.set_defaults(func=cmd_block)
+
+    p_tx = sub.add_parser("tx", help="fetch a transaction receipt by tx_id")
+    p_tx.add_argument("tx_id", help="transaction id (64 lowercase hex characters)")
+    p_tx.set_defaults(func=cmd_tx)
 
     p_account = sub.add_parser("account", help="fetch an account")
     p_account.add_argument("account", help="account id (public key hex)")

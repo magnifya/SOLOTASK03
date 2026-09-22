@@ -329,6 +329,34 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 没有更多结果时为 `null`。每个 item 含
 `{tx_id, height, block_hash, index, from, to, amount}`。
 
+## 交易回执
+
+`GET /v1/transactions/{tx_id}` 返回单笔交易的回执。`tx_id` 必须恰好是 64 位
+**小写**十六进制（大写、长度不符或含其他字符均按非法处理）；非法 id 或交易
+不存在都返回 `404`。查询只面向 canonical 链与待处理集合，**不暴露候选分叉中的
+交易**。成功返回 `200` 与固定九字段（字段集与顺序固定）：
+
+```
+{tx_id, from, to, amount, signature, status, height, block_hash, index}
+```
+
+- `status` 只能是 `pending` 或 `confirmed`。
+- **内存池中的交易**：`pending`，且 `height`、`block_hash`、`index` 均为
+  `null`。
+- **已打包但未确认（pending 末块）的交易**：`pending`，返回该待定块的
+  `height`、`block_hash` 与块内从 0 起的 `index`（与块内按 tx_id 升序的顺序、
+  Merkle proof 的 index 一致）。
+- **已确认交易**：`confirmed`，字段锚定 canonical 上的已确认块。
+
+回滚后交易恢复内存池形态（`height`/`block_hash`/`index` 回到 `null`）；分叉
+采用使交易进入 canonical 时，旧链独有交易回池、被新链包含的交易锚定到新块，
+回执始终反映**最终**状态而不读取旧链缓存。回执一律由存储的签名交易重算
+`tx_id` 并严格复核类型：`from`/`to`/`signature` 为非空字符串、`amount` 为正
+整数（拒绝布尔等非整数）。回执不新增任何权威副本：重启时从 canonical 链、
+pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
+`StateRecoveryError`。查询与提交、打包、确认、回滚、采用、清理共用同一把锁，
+只反映已持久化的状态。
+
 ## 离线轻客户端验证
 
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
@@ -485,6 +513,10 @@ curl -s -X POST localhost:8080/v1/blocks
 # 查询
 curl -s localhost:8080/v1/blocks/0
 curl -s localhost:8080/v1/accounts/<pubkey-hex>
+# 交易回执（tx_id 必须 64 位小写十六进制；非法或不存在 404；只查 canonical 与待处理集合）
+curl -s localhost:8080/v1/transactions/<tx-id-hex>
+# -> 200 {"tx_id":"...","from":"...","to":"...","amount":N,"signature":"...",
+#         "status":"pending|confirmed","height":H|null,"block_hash":"...|null","index":I|null}
 # 账户状态根与账户状态包含证明（最高块 pending 时均 404；账户不在已确认集 404）
 curl -s localhost:8080/v1/state/root
 # -> {"state_root":"...","height":N,"block_hash":"...","account_count":K}
@@ -605,6 +637,7 @@ CLI 通过 HTTP 访问服务（默认 `http://127.0.0.1:8080`，可用 `--base-u
 python -m ledger.cli send --signing-key @alice.pem --to <recipient-pubkey-hex> --amount 100
 python -m ledger.cli mine
 python -m ledger.cli block 1
+python -m ledger.cli tx <tx-id-hex>
 python -m ledger.cli account <pubkey-hex>
 python -m ledger.cli proof 1 <tx-id-hex>
 python -m ledger.cli state-root                 # 锚定最高已确认块
