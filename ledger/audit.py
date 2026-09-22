@@ -245,7 +245,9 @@ def verify_export(document: object, trust: object = None) -> dict:
     When ``trust`` is None (the default) no authentication is attempted and
     the behaviour is unchanged. When a trust document is supplied it must
     carry ``genesis_hash`` and a version-ascending ``audit_signers`` list
-    (``{version, public_key, activated_event_id}``); every page must then
+    (``{version, public_key, activated_event_id}``) whose versions are dense
+    from 1, whose activation points strictly increase and never lie beyond
+    the verified checkpoint; every page must then
     carry the same ``checkpoint_auth`` envelope
     (``{key_version, signature}``) binding the same checkpoint, the key
     version must be known and activated at or before the checkpoint, and the
@@ -379,12 +381,16 @@ def _verify_pages(pages: list[dict]) -> dict:
     return dict(last_checkpoint)
 
 
-def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:
+def _parse_trust_signers(trust: object, checkpoint: dict) -> tuple[str, dict[int, dict]]:
     """Strictly parse a trust document's genesis anchor and audit signers.
 
     Returns ``(genesis_hash, {version: {public_key, activated_event_id}})``.
-    Versions must be dense and ascending starting at 1 and the first
-    ``activated_event_id`` must be 0. Any defect is an input error.
+    Versions must be dense and ascending starting at 1 (no gaps, no
+    reordering), the first ``activated_event_id`` must be 0, later
+    activations must be strictly increasing, and no signer may be activated
+    later than the checkpoint being verified — a trust document that
+    describes keys the exported log could not yet have used is not a valid
+    input for this export. Any defect is an input error.
     """
     if not isinstance(trust, dict):
         raise _VerifyError(ERR_INPUT)
@@ -395,6 +401,7 @@ def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:
     if not isinstance(raw_signers, list) or not raw_signers:
         raise _VerifyError(ERR_INPUT)
     signers: dict[int, dict] = {}
+    previous_activated = 0
     for position, entry in enumerate(raw_signers):
         if not isinstance(entry, dict):
             raise _VerifyError(ERR_INPUT)
@@ -409,6 +416,11 @@ def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:
             raise _VerifyError(ERR_INPUT)
         if position == 0 and activated != 0:
             raise _VerifyError(ERR_INPUT)
+        if position > 0 and activated <= previous_activated:
+            raise _VerifyError(ERR_INPUT)
+        if activated > checkpoint["event_id"]:
+            raise _VerifyError(ERR_INPUT)
+        previous_activated = activated
         signers[version] = {
             "public_key": public_key,
             "activated_event_id": activated,
@@ -426,12 +438,15 @@ def _verify_checkpoint_auth(
     version must identify a signer already activated at or before the
     checkpoint and the signature must verify over
     ``SHA256(sorted-compact UTF-8 JSON of {genesis_hash, checkpoint,
-    key_version})`` under the trust document's anchor. Structural defects are
-    input errors; missing, unknown-version, cross-page-inconsistent or
-    cryptographically invalid authentication is an auth error; a page whose
-    checkpoint differs from the verified head is an integrity error.
+    key_version})`` under the trust document's anchor. Structural defects in
+    the trust document — including signer version gaps or reordering,
+    activation points that regress or lie beyond the verified checkpoint —
+    are input errors; missing, unknown-version, not-yet-activated,
+    cross-page-inconsistent or cryptographically invalid authentication is
+    an auth error; a page whose checkpoint differs from the verified head is
+    an integrity error.
     """
-    genesis_hash, signers = _parse_trust_signers(trust)
+    genesis_hash, signers = _parse_trust_signers(trust, checkpoint)
     envelopes: list[object] = []
     for page in pages:
         if page.get("checkpoint") != checkpoint:

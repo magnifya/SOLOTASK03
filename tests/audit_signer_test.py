@@ -335,16 +335,34 @@ class ExportAuthOfflineTests(unittest.TestCase):
                                         "activated_event_id": 0}]}):
             self.assertEqual(audit.verify_export(page, bad)["error"], "input", bad)
 
-    def test_signer_activated_after_checkpoint_is_auth(self) -> None:
+    def test_signer_activated_after_checkpoint_is_input(self) -> None:
         # Rotate to v2 (activation event 1) then present a trust document whose
-        # v2 claims activation at an event id beyond the checkpoint.
+        # v2 claims activation at an event id beyond the verified checkpoint:
+        # the trust document itself is inconsistent with this export.
         self.svc.rotate_audit_signer(
             {"private_key": PRIV_B, "expected_version": 1}
         )
         _, page = self.svc.export_audit_events({})
         trust = self._trust()
         trust["audit_signers"][1]["activated_event_id"] = 99
-        self.assertEqual(audit.verify_export(page, trust)["error"], "auth")
+        self.assertEqual(audit.verify_export(page, trust)["error"], "input")
+
+    def test_signer_activation_regression_is_input(self) -> None:
+        # Two rotations (v2 at event 1, v3 at event 2); a trust document whose
+        # v3 claims an activation at or before v2's is malformed input.
+        self.svc.rotate_audit_signer(
+            {"private_key": PRIV_B, "expected_version": 1}
+        )
+        self.svc.rotate_audit_signer(
+            {"private_key": PRIV_A, "expected_version": 2}
+        )
+        _, page = self.svc.export_audit_events({})
+        for bad_activation in (0, 1):
+            trust = self._trust()
+            trust["audit_signers"][2]["activated_event_id"] = bad_activation
+            self.assertEqual(
+                audit.verify_export(page, trust)["error"], "input", bad_activation
+            )
 
     def test_old_key_cannot_authenticate_new_checkpoint(self) -> None:
         self.svc.rotate_audit_signer(
@@ -405,12 +423,13 @@ class RecoverySignerTests(unittest.TestCase):
         self.assertIn("audit_signer_rotated", ctx.exception.reason)
 
     def test_legacy_unsigned_snapshot_is_migrated_once(self) -> None:
-        # A current (hash-linked, checkpointed) snapshot that predates
-        # checkpoint auth simply carries no signer section: recovery mints v1
-        # on the unique winner and saves it atomically.
+        # A hash-linked, checkpointed snapshot whose state.version explicitly
+        # predates checkpoint auth carries no signer section: recovery mints
+        # v1 on the unique winner and saves it atomically.
         data = read_json(self.state_path)
         data["state"].pop("audit_signer", None)
         data["state"].pop("audit_signer_history", None)
+        data["state"]["version"] = 8
         # Drop the v2 rotation event too, so the migrated v1 has no dangling
         # history to reconcile (modeling a genuinely older snapshot).
         data["audit_events"] = []
@@ -430,6 +449,68 @@ class RecoverySignerTests(unittest.TestCase):
         self.assertEqual(
             again.audit_signer["public_key"], first_pub
         )
+
+    def test_current_version_snapshot_without_signer_fails_recovery(self) -> None:
+        # A snapshot at the current state.version whose signer sections were
+        # stripped must not be "migrated" (which would reset the key to a
+        # fresh version 1): recovery refuses it.
+        data = read_json(self.state_path)
+        data["state"].pop("audit_signer", None)
+        data["state"].pop("audit_signer_history", None)
+        write_json(self.state_path, data)
+        with self.assertRaises(StateRecoveryError) as ctx:
+            self._reopen()
+        self.assertIn("audit_signer", ctx.exception.reason)
+        self.assertIn(self.state_path, ctx.exception.reason)
+        # The failed recovery left the on-disk state untouched.
+        persisted = read_json(self.state_path)
+        self.assertNotIn("audit_signer", persisted["state"])
+
+    def test_missing_version_snapshot_without_signer_fails_recovery(self) -> None:
+        # No state.version at all: the snapshot cannot prove it predates
+        # checkpoint auth, so the missing signer sections are corruption.
+        data = read_json(self.state_path)
+        data["state"].pop("audit_signer", None)
+        data["state"].pop("audit_signer_history", None)
+        data["state"].pop("version", None)
+        write_json(self.state_path, data)
+        with self.assertRaises(StateRecoveryError):
+            self._reopen()
+
+    def test_current_version_snapshot_missing_one_signer_section_fails(self) -> None:
+        original = read_json(self.state_path)
+        for dropped in ("audit_signer", "audit_signer_history"):
+            data = json.loads(json.dumps(original))
+            data["state"].pop(dropped, None)
+            write_json(self.state_path, data)
+            with self.assertRaises(StateRecoveryError, msg=dropped):
+                self._reopen()
+
+    def test_legacy_version_snapshot_missing_one_signer_section_fails(self) -> None:
+        # Even a legacy state.version migrates only when *both* sections are
+        # absent; a half-present signer section is corruption.
+        original = read_json(self.state_path)
+        for dropped in ("audit_signer", "audit_signer_history"):
+            data = json.loads(json.dumps(original))
+            data["state"]["version"] = 8
+            data["state"].pop(dropped, None)
+            write_json(self.state_path, data)
+            with self.assertRaises(StateRecoveryError, msg=dropped):
+                self._reopen()
+
+    def test_equal_activation_ids_fail_recovery(self) -> None:
+        # Activation points must be strictly increasing. Rotate to v3, then
+        # flatten v3's activation onto v2's event id: the history check
+        # rejects the equality before any event matching runs.
+        self.svc.rotate_audit_signer(
+            {"private_key": PRIV_A, "expected_version": 2}
+        )
+        data = read_json(self.state_path)
+        data["state"]["audit_signer_history"][2]["activated_event_id"] = 1
+        write_json(self.state_path, data)
+        with self.assertRaises(StateRecoveryError) as ctx:
+            self._reopen()
+        self.assertIn("strictly increasing", ctx.exception.reason)
 
     def test_same_generation_signer_conflict_fails(self) -> None:
         data = read_json(self.state_path)
