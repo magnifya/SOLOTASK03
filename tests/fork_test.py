@@ -15,6 +15,7 @@ Run: python3 tests/fork_test.py
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -156,6 +157,39 @@ class ForkServiceTests(unittest.TestCase):
         bad_tx = Transaction(self.A, self.B, 10, "00" * 64)
         block = Block.create(1, self.genesis.block_hash, [bad_tx])
         self.assertEqual(self.submit([self.genesis, block])[0], 400)
+
+    def test_disguised_height_and_amount_types_are_400(self):
+        # Strings, floats and booleans must never be coerced into legal chain
+        # integers: the raw JSON value is judged first, so every disguise is a
+        # 400 and must not persist a fork or advance the generation.
+        block = Block.create(
+            1, self.genesis.block_hash, [tx_obj(self.ka, self.A, self.B, 10)]
+        )
+        good = [self.genesis.to_dict(), block.to_dict()]
+        generation_before = self.store.generation
+
+        def mutated(mutator) -> dict:
+            doc = {"blocks": copy.deepcopy(good)}
+            mutator(doc["blocks"])
+            return doc
+
+        bad_documents = (
+            # height disguises
+            mutated(lambda bl: bl[1].update(height="1")),
+            mutated(lambda bl: bl[1].update(height=1.0)),
+            mutated(lambda bl: bl[1].update(height=True)),
+            # amount disguises
+            mutated(lambda bl: bl[1]["transactions"][0].update(amount="10")),
+            mutated(lambda bl: bl[1]["transactions"][0].update(amount=10.0)),
+            mutated(lambda bl: bl[1]["transactions"][0].update(amount=True)),
+        )
+        for doc in bad_documents:
+            status, body = self.svc.submit_fork_candidate(doc)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(self.store.forks, {})
+            self.assertEqual(self.store.generation, generation_before)
+        # The un-coerced integer document still validates.
+        self.assertEqual(self.svc.submit_fork_candidate({"blocks": good})[0], 201)
 
     def test_tx_id_unique_and_ascending(self):
         t1 = tx_obj(self.ka, self.A, self.B, 10)
@@ -374,6 +408,66 @@ class ForkServiceTests(unittest.TestCase):
             json.dump(doc, fh)
         with self.assertRaises(StateRecoveryError):
             LedgerStore(self.state_path, initial_balance=1000)
+
+    def test_restart_disguised_canonical_types_raise_recovery_error(self):
+        # A string/float/boolean height or amount on the canonical chain must
+        # never be coerced into a loadable chain: recovery fails loudly with a
+        # StateRecoveryError carrying path and reason.
+        b1 = Block.create(1, self.genesis.block_hash, [tx_obj(self.ka, self.A, self.B, 10)])
+        self.store.chain.append(b1)
+        self.store.rebuild_derived()
+        self.store.save()
+        tamperings = (
+            lambda d: d["chain"][1].__setitem__("height", "1"),
+            lambda d: d["chain"][1].__setitem__("height", 1.0),
+            lambda d: d["chain"][1].__setitem__("height", True),
+            lambda d: d["chain"][1]["transactions"][0].__setitem__("amount", "10"),
+            lambda d: d["chain"][1]["transactions"][0].__setitem__("amount", 10.0),
+            lambda d: d["chain"][1]["transactions"][0].__setitem__("amount", True),
+        )
+        for tamper in tamperings:
+            with open(self.state_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            tamper(doc)
+            with open(self.state_path, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            with self.assertRaises(StateRecoveryError) as ctx:
+                LedgerStore(self.state_path, initial_balance=1000)
+            self.assertTrue(ctx.exception.path)
+            self.assertTrue(ctx.exception.reason)
+            # Re-write a clean snapshot for the next iteration.
+            self.store.save()
+
+    def test_restart_disguised_pending_type_raises_recovery_error(self):
+        # The pending (mempool) set is authoritative state too: a disguised
+        # amount there must raise rather than be coerced.
+        status, body = self.svc.submit_transaction(
+            tx_dict(self.ka, self.A, self.B, 10)
+        )
+        self.assertEqual(status, 202, body)
+        with open(self.state_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        doc["pending"][0]["amount"] = "10"
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        with self.assertRaises(StateRecoveryError) as ctx:
+            LedgerStore(self.state_path, initial_balance=1000)
+        self.assertIn("pending", ctx.exception.reason)
+
+    def test_restart_drops_candidate_with_disguised_types(self):
+        # Type-disguised values confined to a persisted *candidate* follow the
+        # normal cache rule: that candidate is dropped and the valid canonical
+        # chain is recovered untouched.
+        b1 = Block.create(1, self.genesis.block_hash, [tx_obj(self.ka, self.A, self.B, 10)])
+        tip = self.submit([self.genesis, b1])[1]["tip_hash"]
+        with open(self.state_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        doc["forks"][0][1]["transactions"][0]["amount"] = True
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        reopened = LedgerStore(self.state_path, initial_balance=1000)
+        self.assertEqual(reopened.forks, {})
+        self.assertEqual(reopened.tip_hash(), self.genesis.block_hash)
 
     def test_same_generation_conflicting_snapshots_raise(self):
         b1 = Block.create(1, self.genesis.block_hash, [tx_obj(self.ka, self.A, self.B, 10)])

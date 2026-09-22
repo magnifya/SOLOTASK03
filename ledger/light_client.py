@@ -143,6 +143,31 @@ def verify_bundle(bundle: object, trust: object, now: float | None = None) -> di
 # -- stage 1: shape -----------------------------------------------------------
 
 
+def _candidate_numeric_types_ok(blocks_raw: list) -> bool:
+    """Type-only pre-scan of a candidate's block heights and tx amounts.
+
+    Inspects the raw JSON values before any chain recomputation (and therefore
+    before trust or expiry checks). A present height or amount that is not a
+    plain JSON integer — a string, float or boolean — fails the scan. Missing
+    keys and non-object entries are left to the structural recomputation stage
+    rather than judged here.
+    """
+    for block_raw in blocks_raw:
+        if not isinstance(block_raw, dict):
+            continue
+        if "height" in block_raw and not _is_int(block_raw["height"]):
+            return False
+        txs_raw = block_raw.get("transactions")
+        if not isinstance(txs_raw, list):
+            continue
+        for raw_tx in txs_raw:
+            if isinstance(raw_tx, dict) and "amount" in raw_tx and not _is_int(
+                raw_tx["amount"]
+            ):
+                return False
+    return True
+
+
 def _validate_inputs(bundle: object, trust: object) -> tuple[str, object]:
     """Structural validation of bundle and trust.
 
@@ -167,6 +192,13 @@ def _validate_inputs(bundle: object, trust: object) -> tuple[str, object]:
     candidate = bundle["candidate"]
     blocks_raw = candidate.get("blocks") if isinstance(candidate, dict) else candidate
     if not isinstance(blocks_raw, list) or not blocks_raw:
+        raise _Failure(ERR_INPUT)
+    # Numeric *type* disguise (a string, float or boolean standing in for a
+    # block height or a transaction amount) is an input-format error, decided
+    # before trust/expiry/auth — mirroring the node's 400-before-403 ordering.
+    # Only the raw JSON value's type is judged here; content and missing keys
+    # remain integrity failures discovered during chain recomputation.
+    if not _candidate_numeric_types_ok(blocks_raw):
         raise _Failure(ERR_INPUT)
     if not isinstance(bundle["proofs"], list):
         raise _Failure(ERR_INPUT)
@@ -275,13 +307,22 @@ def _recompute_chain(candidate_raw: list, trust: dict) -> list[Block]:
         block_hash = block_raw.get("block_hash")
         status = block_raw.get("status")
         txs_raw = block_raw.get("transactions")
-        if not _is_int(height) or not isinstance(prev_hash, str):
+        if not isinstance(prev_hash, str):
+            raise _Failure(ERR_INTEGRITY)
+        # The raw JSON height must itself be a non-boolean integer: a present
+        # string ("1"), float (1.0) or boolean (true) is an input-type error and
+        # must never be coerced before judgment. A missing/null height, or a
+        # genuine integer that fails to line up, is a structural integrity
+        # failure instead.
+        if "height" in block_raw and not _is_int(height):
+            raise _Failure(ERR_INPUT)
+        if not _is_int(height):
+            raise _Failure(ERR_INTEGRITY)
+        if height < 0 or height != position:
             raise _Failure(ERR_INTEGRITY)
         if not crypto.is_hex64(merkle_root) or not crypto.is_hex64(block_hash):
             raise _Failure(ERR_INTEGRITY)
         if status not in ("pending", "confirmed") or not isinstance(txs_raw, list):
-            raise _Failure(ERR_INTEGRITY)
-        if height != position:
             raise _Failure(ERR_INTEGRITY)
         expected_prev = (
             GENESIS_PREV_HASH if position == 0 else blocks[position - 1].block_hash
@@ -312,7 +353,16 @@ def _recompute_chain(candidate_raw: list, trust: dict) -> list[Block]:
                 raise _Failure(ERR_INTEGRITY)
             if not isinstance(recipient, str) or not recipient:
                 raise _Failure(ERR_INTEGRITY)
-            if not _is_int(amount) or amount <= 0:
+            # The raw JSON amount must itself be a non-boolean integer: a
+            # present string ("100"), float (1.0) or boolean (true) is an
+            # input-type error, never coerced. A missing/null amount, or a typed
+            # integer that is zero or negative, is a structural/content
+            # integrity failure instead.
+            if "amount" in raw_tx and not _is_int(amount):
+                raise _Failure(ERR_INPUT)
+            if not _is_int(amount):
+                raise _Failure(ERR_INTEGRITY)
+            if amount <= 0:
                 raise _Failure(ERR_INTEGRITY)
             if not isinstance(signature, str) or not signature:
                 raise _Failure(ERR_INTEGRITY)

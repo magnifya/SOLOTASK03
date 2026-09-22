@@ -536,8 +536,38 @@ class InputTests(LightClientFixture):
         self.resign(bundle)
         self.assertEqual(
             verify_bundle(bundle, self.trust, now=NOW),
-            {"ok": False, "error": ERR_INTEGRITY},
+            {"ok": False, "error": ERR_INPUT},
         )
+
+    def test_disguised_numeric_types_are_input(self) -> None:
+        # Strings, floats and booleans must never be coerced into legal chain
+        # integers; each of these is an input-type failure, not integrity.
+        def clone() -> dict:
+            return json.loads(json.dumps(self.bundle()))
+
+        mutated = []
+        bundle = clone()
+        bundle["candidate"][1]["height"] = 1.0
+        mutated.append(("float height", bundle))
+        bundle = clone()
+        bundle["candidate"][1]["height"] = True
+        mutated.append(("bool height", bundle))
+        bundle = clone()
+        bundle["candidate"][1]["transactions"][0]["amount"] = "100"
+        mutated.append(("string amount", bundle))
+        bundle = clone()
+        bundle["candidate"][1]["transactions"][0]["amount"] = 100.0
+        mutated.append(("float amount", bundle))
+        bundle = clone()
+        bundle["candidate"][1]["transactions"][0]["amount"] = True
+        mutated.append(("bool amount", bundle))
+        for label, bad_bundle in mutated:
+            self.resign(bad_bundle)
+            self.assertEqual(
+                verify_bundle(bad_bundle, self.trust, now=NOW),
+                {"ok": False, "error": ERR_INPUT},
+                label,
+            )
 
 
 class CliTests(LightClientFixture):

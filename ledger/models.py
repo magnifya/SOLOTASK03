@@ -12,6 +12,30 @@ STATUS_CONFIRMED = "confirmed"
 BLOCK_STATUSES = (STATUS_PENDING, STATUS_CONFIRMED)
 
 
+def is_plain_int(value: object) -> bool:
+    """True only for a real JSON integer; booleans are rejected.
+
+    ``bool`` subclasses ``int`` in Python, so it must be excluded explicitly.
+    JSON floats and strings are never accepted: callers validate the *raw*
+    decoded value before any model construction, never after coercion.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def strict_nonneg_int(value: object, what: str) -> int:
+    """Return a non-boolean, non-negative integer from a raw JSON value."""
+    if not is_plain_int(value) or value < 0:
+        raise ValueError(f"{what} must be a non-negative integer")
+    return value
+
+
+def strict_pos_int(value: object, what: str) -> int:
+    """Return a non-boolean, strictly positive integer from a raw JSON value."""
+    if not is_plain_int(value) or value <= 0:
+        raise ValueError(f"{what} must be a positive integer")
+    return value
+
+
 @dataclass
 class Transaction:
     sender: str
@@ -39,10 +63,16 @@ class Transaction:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Transaction":
+        if not isinstance(data, dict):
+            raise ValueError("transaction must be a JSON object")
+        # Inspect the ORIGINAL JSON value: a string, float or boolean must be
+        # rejected outright rather than coerced via int() (which would let
+        # "100", 1.0 or True masquerade as a legal amount).
+        amount = strict_pos_int(data.get("amount"), "transaction amount")
         return cls(
             sender=data["from"],
             recipient=data["to"],
-            amount=int(data["amount"]),
+            amount=amount,
             signature=data["signature"],
         )
 
@@ -106,12 +136,14 @@ class Block:
     def from_dict(cls, data: dict) -> "Block":
         # State files written before the status machine existed have no
         # "status" key; every block in such a file was final, so they load
-        # as confirmed.
+        # as confirmed. The compatibility default must not extend to numeric
+        # coercion: height is checked on its raw JSON value first.
         status = data.get("status", STATUS_CONFIRMED)
         if status not in BLOCK_STATUSES:
             raise ValueError(f"unknown block status: {status}")
+        height = strict_nonneg_int(data.get("height"), "block height")
         return cls(
-            height=int(data["height"]),
+            height=height,
             prev_hash=data["prev_hash"],
             merkle_root=data["merkle_root"],
             block_hash=data["block_hash"],

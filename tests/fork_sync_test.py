@@ -20,6 +20,7 @@ Run: python3 tests/fork_sync_test.py
 """
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -299,6 +300,80 @@ class ForkSyncServiceTests(unittest.TestCase):
         status, retry = self.sync(doc, expires_at=exp + 999)
         self.assertEqual(status, 200)
         self.assertEqual(retry["tip_hash"], block.block_hash)
+
+    def test_disguised_candidate_types_are_400_without_any_write(self) -> None:
+        # A string/float/boolean height or amount inside the candidate is a 400
+        # reached only after the authorization gate, and must not write a fork,
+        # a sync record or an audit event nor advance the generation.
+        block = self.block1()
+        good = make_fork(self.genesis, [self.genesis, block])
+        self._trust("node-1")
+        base = {
+            "source": "node-1",
+            "expires_at": int(time.time()) + 3600,
+        }
+        mutations = (
+            lambda bl: bl[1].update(height="1"),
+            lambda bl: bl[1].update(height=1.0),
+            lambda bl: bl[1].update(height=True),
+            lambda bl: bl[1]["transactions"][0].update(amount="10"),
+            lambda bl: bl[1]["transactions"][0].update(amount=10.0),
+            lambda bl: bl[1]["transactions"][0].update(amount=True),
+        )
+        for index, mutate in enumerate(mutations):
+            doc = copy.deepcopy(good)
+            mutate(doc["blocks"])
+            body = dict(base, request_id=f"bad-{index}", candidate=doc)
+            forks_before = len(self.store.forks)
+            syncs_before = len(self.store.syncs)
+            events_before = len(self.store.audit_events)
+            generation_before = self.store.generation
+            status, resp = self.svc.submit_fork_sync(body)
+            self.assertEqual(status, 400, resp)
+            self.assertEqual(len(self.store.forks), forks_before)
+            self.assertEqual(len(self.store.syncs), syncs_before)
+            self.assertEqual(len(self.store.audit_events), events_before)
+            self.assertEqual(self.store.generation, generation_before)
+
+    def test_disguised_candidate_replay_same_key_is_400_not_200(self) -> None:
+        # Reusing a live source+request_id with a type-disguised document must
+        # not replay the cached 200: full re-validation runs first and returns
+        # 400. The identical document still replays 200 afterwards.
+        block = self.block1()
+        exp = int(time.time()) + 3600
+        doc = make_fork(self.genesis, [self.genesis, block])
+        self.assertEqual(self.sync(doc, request_id="idem", expires_at=exp)[0], 201)
+        for mutate in (
+            lambda bl: bl[1].update(height="1"),
+            lambda bl: bl[1]["transactions"][0].update(amount=True),
+        ):
+            forged = copy.deepcopy(doc)
+            mutate(forged["blocks"])
+            status, resp = self.sync(forged, request_id="idem", expires_at=exp)
+            self.assertEqual(status, 400, resp)
+        self.assertEqual(self.sync(doc, request_id="idem", expires_at=exp)[0], 200)
+
+    def test_restart_prunes_sync_record_with_disguised_candidate(self) -> None:
+        # A persisted sync record whose candidate gained a disguised numeric
+        # type is cache, not authority: on restart the record and its fork are
+        # silently pruned (no synthetic sync_expired), canonical is untouched.
+        block = self.block1()
+        doc = make_fork(self.genesis, [self.genesis, block])
+        self.assertEqual(
+            self.sync(doc, source="node-9", request_id="rx")[0], 201
+        )
+        with open(self.state_path, encoding="utf-8") as fh:
+            snapshot = json.load(fh)
+        snapshot["forks"][0][1]["transactions"][0]["amount"] = True
+        with open(self.state_path, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh)
+        reopened = LedgerStore(self.state_path, initial_balance=1000)
+        self.assertEqual(reopened.forks, {})
+        self.assertEqual(reopened.syncs, {})
+        self.assertEqual(reopened.tip_hash(), self.genesis.block_hash)
+        self.assertFalse(
+            any(e["kind"] == "sync_expired" for e in reopened.audit_events)
+        )
 
     def test_expiry_sweep_is_persisted_before_response(self) -> None:
         # A read (audit query) that triggers the lazy expiry sweep must remove
