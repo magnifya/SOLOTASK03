@@ -197,6 +197,10 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             elif path == "/v1/chain":
                 status, body = service.get_chain()
                 self._send_json(status, body)
+            elif path == "/v1/state/root":
+                # GET /v1/state/root — confirmed account-state tree anchor.
+                status, body = service.get_state_root()
+                self._send_json(status, body)
             elif path == "/v1/forks/sync/history":
                 # GET /v1/forks/sync/history?source=&tip_hash=&kind=&
                 # min_height=&max_height=&limit=&cursor=
@@ -250,11 +254,21 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     status, body = service.get_block(height)
                     self._send_json(status, body)
             elif path.startswith("/v1/accounts/"):
-                account = unquote(path[len("/v1/accounts/") :])
-                if not account:
+                remainder = path[len("/v1/accounts/") :]
+                if not remainder:
                     self._send_json(404, {"error": "account not found"})
                     return
-                status, body = service.get_account(account)
+                if remainder.endswith("/proof"):
+                    # GET /v1/accounts/{account}/proof
+                    encoded_account = remainder[: -len("/proof")]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    status, body = service.get_account_proof(account)
+                else:
+                    account = unquote(remainder)
+                    status, body = service.get_account(account)
                 self._send_json(status, body)
             else:
                 self._send_json(404, {"error": "not found"})

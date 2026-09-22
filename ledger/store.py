@@ -68,7 +68,7 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 9
+STATE_VERSION = 10
 
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
@@ -258,7 +258,7 @@ class LedgerStore:
                 # parsed = (chain, pending, generation, forks, initial_balance,
                 #           syncs, trust_sources, allowlist, audit_events,
                 #           expired_records, audit_checkpoint, audit_repair,
-                #           signer_state)
+                #           signer_state, recorded_state_root)
                 valid.append(
                     (
                         parsed[2],
@@ -275,6 +275,7 @@ class LedgerStore:
                         parsed[10],
                         parsed[11],
                         parsed[12],
+                        parsed[13],
                     )
                 )
 
@@ -288,7 +289,8 @@ class LedgerStore:
             top = [item for item in valid if item[0] == max_generation]
             # item layout: (generation, path, chain, pending, forks,
             # initial_balance, syncs, trust_sources, allowlist, audit_events,
-            # expired_records, audit_checkpoint, audit_repair, signer_state)
+            # expired_records, audit_checkpoint, audit_repair, signer_state,
+            # recorded_state_root)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -300,6 +302,7 @@ class LedgerStore:
                 top[0][5],
                 top[0][11],
                 top[0][13][1],
+                top[0][14],
             )
             for item in top[1:]:
                 if (
@@ -314,6 +317,7 @@ class LedgerStore:
                         item[5],
                         item[11],
                         item[13][1],
+                        item[14],
                     )
                     != reference
                 ):
@@ -346,7 +350,32 @@ class LedgerStore:
                 audit_checkpoint,
                 audit_repair,
                 signer_state,
+                recorded_state_root,
             ) = winner
+
+            # The single winning snapshot is the only one whose recorded
+            # account-state root is recomputed and pinned, after conflict
+            # detection. A mismatch is fatal corruption, never silently
+            # rewritten; a pre-feature snapshot (no state_root) is accepted.
+            if recorded_state_root is not None:
+                winner_endowment = (
+                    winner_init_balance
+                    if winner_init_balance is not None
+                    else (
+                        self.initial_balance
+                        if self.initial_balance is not None
+                        else DEFAULT_INITIAL_BALANCE
+                    )
+                )
+                recomputed_state_root, _ = self.state_root_for(
+                    chain, winner_endowment
+                )
+                if recomputed_state_root != recorded_state_root:
+                    raise StateRecoveryError(
+                        winner_path,
+                        "state.state_root does not match the recomputed "
+                        "account state",
+                    )
 
             if os.path.abspath(winner_path) != main_abs:
                 # The newest durable state only ever made it to a temp
@@ -440,6 +469,7 @@ class LedgerStore:
         initial_balance: int | None = None,
         audit_checkpoint: dict | None = None,
         audit_signer_history: list[dict] | None = None,
+        state_root: str | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -450,7 +480,10 @@ class LedgerStore:
         the same events but a different log head disagree about the audited
         state and must conflict. The audit signer history (version, public key,
         activation event) participates as well, so a checkpoint key that
-        differs between two same-generation snapshots is a conflict.
+        differs between two same-generation snapshots is a conflict. The
+        recorded account-state root participates too: a twin carrying a
+        different ``state_root`` describes a different confirmed state and is
+        a conflict rather than a quietly accepted alternative.
         """
         sync_records = [
             {
@@ -489,6 +522,7 @@ class LedgerStore:
                 "audit_checkpoint": audit_checkpoint
                 or {"event_id": 0, "event_hash": "0" * 64},
                 "audit_signer_history": audit_signer_history or [],
+                "state_root": state_root,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -547,6 +581,7 @@ class LedgerStore:
         dict,
         bool,
         tuple[dict | None, list[dict], bool],
+        str | None,
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -594,6 +629,11 @@ class LedgerStore:
             or initial_balance <= 0
         ):
             fail("state.initial_balance must be a positive integer")
+        recorded_state_root = state.get("state_root")
+        if recorded_state_root is not None and not crypto.is_hex64(
+            recorded_state_root
+        ):
+            fail("state.state_root must be 64 lowercase hex characters")
 
         chain: list[Block] = []
         seen_tx_ids: set[str] = set()
@@ -709,6 +749,12 @@ class LedgerStore:
                 if self.initial_balance is not None
                 else DEFAULT_INITIAL_BALANCE
             )
+        # Note: the recorded state_root is format-checked above but its
+        # recomputation against the confirmed chain is performed by load() on
+        # the single winning snapshot only, AFTER same-generation conflict
+        # detection. Two same-generation twins that disagree about the
+        # recorded endowment (and therefore the expected root) must be
+        # reported as a conflict, not as one invalid candidate.
 
         forks = self._parse_persisted_forks(
             data.get("forks", []), chain, replay_endowment
@@ -760,6 +806,7 @@ class LedgerStore:
             audit_checkpoint,
             audit_repair,
             signer_state,
+            recorded_state_root,
         )
 
     @staticmethod
@@ -1577,6 +1624,54 @@ class LedgerStore:
         """
         self.tx_index, self.accounts = self._compute_derived()
 
+    @staticmethod
+    def account_state_rows(
+        chain: list[Block], initial_balance: int
+    ) -> list[tuple[str, int, list[str]]]:
+        """Confirmed account-state rows ordered by ascending account id.
+
+        Only confirmed blocks contribute, so the result is independent of any
+        pending tip block. Each row is ``(account, confirmed_balance, T)``
+        where ``T`` is the account's confirmed transaction ids in their
+        original on-chain order.
+        """
+        activity: dict[str, dict] = {}
+        for block in chain:
+            if block.status != STATUS_CONFIRMED:
+                continue
+            for tx in block.transactions:
+                for account in (tx.sender, tx.recipient):
+                    entry = activity.setdefault(
+                        account, {"sent": 0, "received": 0, "transactions": []}
+                    )
+                    entry["transactions"].append(tx.tx_id)
+                activity[tx.sender]["sent"] += tx.amount
+                activity[tx.recipient]["received"] += tx.amount
+        return [
+            (
+                account,
+                initial_balance
+                + activity[account]["received"]
+                - activity[account]["sent"],
+                list(activity[account]["transactions"]),
+            )
+            for account in sorted(activity)
+        ]
+
+    def state_root_for(
+        self, chain: list[Block], initial_balance: int
+    ) -> tuple[str, list[str]]:
+        """Compute ``(state_root, leaves)`` for confirmed accounts in ascending
+        account order. The empty account set shares the empty Merkle root.
+        """
+        leaves = [
+            crypto.account_state_leaf(account, balance, transactions)
+            for account, balance, transactions in self.account_state_rows(
+                chain, initial_balance
+            )
+        ]
+        return crypto.account_state_root(leaves), leaves
+
     def save(self) -> None:
         """Atomically persist chain, state, pending set, index and accounts.
 
@@ -1596,6 +1691,17 @@ class LedgerStore:
         # restores the rest of the fields to.
         next_index, next_accounts = self._compute_derived()
         next_generation = self.generation + 1
+        # The account-state Merkle root covers confirmed accounts only. It is
+        # anchored to the highest block by the API; while a pending tip exists
+        # the state endpoints report 404, but the root itself is still
+        # persisted so recovery can recompute and compare it byte-for-byte
+        # (the confirmed account set is unchanged by a pending tip).
+        endowment = (
+            self.initial_balance
+            if self.initial_balance is not None
+            else DEFAULT_INITIAL_BALANCE
+        )
+        next_state_root, _ = self.state_root_for(self.chain, endowment)
         # The in-memory log, its hash head and checkpoint always move together:
         # refuse to persist a document where they disagree, since that could
         # never recover. Callers append through append_audit_event(), which
@@ -1637,6 +1743,9 @@ class LedgerStore:
                 "tip_hash": self.chain[-1].block_hash,
                 "tip_status": self.chain[-1].status,
                 "initial_balance": self.initial_balance,
+                # Confirmed-account Merkle root; recovery recomputes it from
+                # the validated confirmed chain and must get the same value.
+                "state_root": next_state_root,
             },
             "chain": [block.to_dict() for block in self.chain],
             "pending": [tx.to_dict() for tx in self.pending.values()],

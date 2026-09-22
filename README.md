@@ -263,6 +263,48 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   修复中完成链接。补写只在同代冲突判定之后对唯一胜出快照执行，因此冲突
   比较始终基于持久化内容，重放恢复也不会改变判定。
 
+## 账户状态 Merkle 证明
+
+每个**已确认**账户在状态树中按 `account` 升序占一个叶子，叶子与树根定义为：
+
+```
+leaf = sha256(utf8(canonical_json({"account": a, "balance": b, "confirmed_transactions": T})))
+```
+
+其中 `canonical_json` 用 `json.dumps(..., sort_keys=True, ensure_ascii=False,
+separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔、非 ASCII 原样
+输出），`T` 是该账户已确认交易 id 的**链上原序列表**（块内按 tx_id 升序），
+`b` 是已确认余额。树根沿用交易 Merkle 的配对规则：每层
+`sha256(left_hex + right_hex)`，奇数节点与自身配对，空账户集根为
+`sha256(b"")`。叶子顺序只由 `account` 升序决定。
+
+- **状态根**：`GET /v1/state/root` 返回
+  `{state_root, height, block_hash, account_count}`，锚定**最高块**。当最高块
+  为 pending 时（状态尚未最终化）返回 `404`；此时已确认账户集本身不变，但
+  不对外发布锚点。
+- **账户证明**：`GET /v1/accounts/{account}/proof` 返回账户三元组
+  `{account, balance, confirmed_transactions}` 加上
+  `{index, state_root, height, block_hash, siblings}`：`index` 是账户在
+  account 升序中的 0-based 位置；`siblings` 自叶向根排列，每项
+  `{direction: left|right, hash}`（64 位小写十六进制，direction 表示兄弟节点
+  相对路径节点的方位）。最高块 pending 或账户不在已确认账户集时返回 `404`。
+- **离线验证**：`ledger.crypto.verify_account_proof(proof, expected_root,
+  expected_height, expected_hash) -> bool` 从 proof 的账户三元组**重算
+  leaf**，沿 siblings 重算到根，并核对：重算根同时等于 proof 的
+  `state_root` 与 `expected_root`，`height == expected_height`，
+  `block_hash == expected_hash`。任何非法 hash、非法 direction、非法/越界
+  index、被篡改的 leaf（balance/account/T 任一不符）或锚点不符都返回
+  `False` 而不抛异常；奇数层自我配对的幻像槽位（左兄弟等于当前节点）也判为
+  非法。
+- **快照与恢复**：每次原子快照在 `state.state_root` 记录已确认账户树根（与
+  链、generation 同一文档）。恢复时只对**唯一胜出快照**在同代冲突判定之后
+  按该快照记录的初始余额重算状态根；重算值与记录不符即抛
+  `ledger.store.StateRecoveryError(path, reason)`，绝不静默改写或新建链。
+  同代孪生快照若 `state_root` 不同也属于冲突。该特性之前的旧快照（无
+  state_root 字段）仍可加载。
+- **CLI**：`state-root` 与 `state-proof <account>` 两个子命令，输出与 HTTP
+  响应字段一致的单行 JSON。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
@@ -360,14 +402,14 @@ SHA-256 摘要作为签名消息。
 
 | 文件 | 职责 |
 | --- | --- |
-| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明 |
+| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -429,6 +471,12 @@ curl -s -X POST localhost:8080/v1/blocks
 # 查询
 curl -s localhost:8080/v1/blocks/0
 curl -s localhost:8080/v1/accounts/<pubkey-hex>
+# 账户状态根与账户状态包含证明（最高块 pending 时均 404；账户不在已确认集 404）
+curl -s localhost:8080/v1/state/root
+# -> {"state_root":"...","height":N,"block_hash":"...","account_count":K}
+curl -s localhost:8080/v1/accounts/<pubkey-hex>/proof
+# -> {"account":"...","balance":...,"confirmed_transactions":[...],"index":I,
+#     "state_root":"...","height":N,"block_hash":"...","siblings":[{direction,hash}...]}
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
 
@@ -541,6 +589,8 @@ python -m ledger.cli mine
 python -m ledger.cli block 1
 python -m ledger.cli account <pubkey-hex>
 python -m ledger.cli proof 1 <tx-id-hex>
+python -m ledger.cli state-root
+python -m ledger.cli state-proof <pubkey-hex>
 python -m ledger.cli status 1
 python -m ledger.cli confirm 1
 python -m ledger.cli rollback 1
@@ -600,6 +650,7 @@ cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
 python -m compileall -q ledger   # 编译检查
 python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
+python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验

@@ -304,6 +304,70 @@ class LedgerService:
                 "confirmed_transactions": list(entry["transactions"]),
             }
 
+    # -- account state Merkle tree -------------------------------------------
+
+    def _state_tree(self) -> tuple[list[tuple[str, int, list[str]]], list[str], str]:
+        """Build the confirmed account rows (ascending account), their leaves
+        and the Merkle root, all from the confirmed chain under the current
+        endowment. Caller must hold the store lock.
+        """
+        rows = self.store.account_state_rows(self.store.chain, self.initial_balance)
+        leaves = [
+            crypto.account_state_leaf(account, balance, transactions)
+            for account, balance, transactions in rows
+        ]
+        return rows, leaves, crypto.account_state_root(leaves)
+
+    def get_state_root(self) -> tuple[int, dict]:
+        """GET /v1/state/root anchored to the highest block.
+
+        The tree covers confirmed accounts sorted by ascending account. A
+        pending chain tip anchors nothing yet, so the endpoint returns 404
+        until the tip is confirmed.
+        """
+        with self.store.lock:
+            tip = self.store.tip()
+            if tip.status != STATUS_CONFIRMED:
+                return 404, {"error": "chain tip is pending confirmation"}
+            rows, _leaves, root = self._state_tree()
+            return 200, {
+                "state_root": root,
+                "height": tip.height,
+                "block_hash": tip.block_hash,
+                "account_count": len(rows),
+            }
+
+    def get_account_proof(self, account: str) -> tuple[int, dict]:
+        """GET /v1/accounts/{account}/proof — an inclusion proof in the
+        account-state tree anchored to the highest (confirmed) block.
+
+        Returns 404 while a pending tip exists or for an account absent from
+        the confirmed account set.
+        """
+        with self.store.lock:
+            tip = self.store.tip()
+            if tip.status != STATUS_CONFIRMED:
+                return 404, {"error": "chain tip is pending confirmation"}
+            rows, leaves, root = self._state_tree()
+            index = next(
+                (i for i, (name, _b, _t) in enumerate(rows) if name == account),
+                None,
+            )
+            if index is None:
+                return 404, {"error": "account not found"}
+            account_name, balance, transactions = rows[index]
+            siblings = crypto.merkle_proof(leaves, index)
+            return 200, {
+                "account": account_name,
+                "balance": balance,
+                "confirmed_transactions": transactions,
+                "index": index,
+                "state_root": root,
+                "height": tip.height,
+                "block_hash": tip.block_hash,
+                "siblings": siblings,
+            }
+
     def confirmed_balance(self, account: str) -> int:
         """Balance from confirmed blocks only."""
         entry = self.store.accounts.get(account)

@@ -234,3 +234,144 @@ def verify_merkle_proof(
         return True
     except (TypeError, ValueError):
         return False
+
+
+# -- account state Merkle tree ----------------------------------------------
+
+
+def account_state_leaf(
+    account: str, balance: int, confirmed_transactions: list[str]
+) -> str:
+    """SHA-256 leaf of one account's confirmed state.
+
+    The leaf is ``sha256(utf8(JSON))`` of the canonical compact JSON document
+    ``{"account":a,"balance":b,"confirmed_transactions":T}`` serialized with
+    ``sort_keys=True``, ``ensure_ascii=False`` and ``separators=(",",":")``.
+    ``T`` keeps its original (on-chain) order; ``sort_keys`` only orders the
+    three top-level keys.
+    """
+    document = {
+        "account": account,
+        "balance": balance,
+        "confirmed_transactions": confirmed_transactions,
+    }
+    raw = json.dumps(
+        document, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return sha256_hex(raw)
+
+
+def account_state_root(leaves: list[str]) -> str:
+    """Merkle root of account-state leaves ordered by ascending account.
+
+    Uses the same pairing rules as :func:`merkle_root` (hex-string pairs
+    hashed ``sha256(left + right)``, a lone odd node paired with itself); an
+    empty account set has the same root as an empty tx list.
+    """
+    return merkle_root(leaves)
+
+
+def verify_account_proof(
+    proof: object,
+    expected_root: object,
+    expected_height: object,
+    expected_hash: object,
+) -> bool:
+    """Verify an account-state Merkle proof offline.
+
+    Recomputes the account leaf from
+    ``{account, balance, confirmed_transactions}``, walks the leaf-to-root
+    ``siblings`` path, and requires the recomputed root to equal both the
+    proof's ``state_root`` and ``expected_root``, while ``height`` /
+    ``block_hash`` anchor the tree to the expected confirmed tip. Every
+    malformed input — a non-64-char lowercase hex hash or anchor, an illegal
+    direction, an illegal index, a malformed leaf/balance/transaction list, a
+    path inconsistent with the index, excessive depth — returns False rather
+    than raising.
+    """
+    try:
+        if not isinstance(proof, dict):
+            return False
+        account = proof.get("account")
+        balance = proof.get("balance")
+        transactions = proof.get("confirmed_transactions")
+        index = proof.get("index")
+        state_root = proof.get("state_root")
+        height = proof.get("height")
+        block_hash = proof.get("block_hash")
+        siblings = proof.get("siblings")
+
+        if not isinstance(account, str) or not account:
+            return False
+        if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
+            return False
+        if not isinstance(transactions, list):
+            return False
+        if any(not _is_hex64(tx_id) for tx_id in transactions):
+            return False
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            return False
+        if not isinstance(height, bool) and isinstance(height, int):
+            if height < 0:
+                return False
+        else:
+            return False
+        if not _is_hex64(state_root):
+            return False
+        if not _is_hex64(block_hash) or not _is_hex64(expected_hash):
+            return False
+        if not _is_hex64(expected_root):
+            return False
+        if not isinstance(siblings, list) or len(siblings) > MAX_MERKLE_DEPTH:
+            return False
+
+        # The leaf is always recomputed from the proof's own triple; a
+        # client-supplied leaf value is never trusted.
+        depth = len(siblings)
+        # A depth-D path addresses one of 2**D leaf slots; a single-leaf tree
+        # (D == 0) can only ever be index 0. An index outside that range is
+        # illegal regardless of any hashes the caller supplies.
+        if index >= (1 << depth):
+            return False
+        current = account_state_leaf(account, balance, transactions)
+        position = index
+        for item in siblings:
+            if not isinstance(item, dict):
+                return False
+            direction = item.get("direction")
+            sibling_hash = item.get("hash")
+            if not _is_hex64(sibling_hash):
+                return False
+            # The odd-node promotion pairs the last (even-positioned) node
+            # with a copy of itself, so a genuine self-pair always points at a
+            # right sibling. A left sibling equal to the current node addresses
+            # the phantom duplicate slot, which is never a real account.
+            if direction == "left" and sibling_hash == current:
+                return False
+            # The path must agree with the index: at every level an even
+            # position is the left child (sibling on its right) and an odd
+            # position the right child.
+            if direction == "left":
+                if position % 2 == 0:
+                    return False
+                pair = sibling_hash + current
+            elif direction == "right":
+                if position % 2 == 1:
+                    return False
+                pair = current + sibling_hash
+            else:
+                return False
+            current = sha256_hex(pair.encode("ascii"))
+            position //= 2
+
+        if not hmac.compare_digest(current, state_root):
+            return False
+        if not hmac.compare_digest(current, expected_root):
+            return False
+        if height != expected_height:
+            return False
+        if not hmac.compare_digest(block_hash, expected_hash):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
