@@ -12,8 +12,8 @@ Every audit event carries two SHA-256 links:
 ``audit_checkpoint`` is ``{"event_id", "event_hash"}`` pinning the latest
 event: a fresh/empty log checks at ``{0, "0"*64}``. Offline verification walks
 one or more exported pages, checking each page anchor, the dense event ids and
-every link, and requires the final page's last event (or the empty log) to
-match its checkpoint.
+every link, and requires every page to pin the identical checkpoint with the
+final page's last event (or the empty log) matching it.
 
 A page may additionally carry ``checkpoint_auth`` — an Ed25519 signature over
 ``SHA256(sorted-compact UTF-8 JSON of {genesis_hash, checkpoint,
@@ -237,10 +237,11 @@ def verify_export(document: object, trust: object = None) -> dict:
 
     A page has the server shape
     ``{items, total, next_cursor, anchor_hash, checkpoint}``. Every page
-    anchor must equal the running predecessor hash, item event ids must be
-    dense and consecutive across pages, every ``prev_hash``/``event_hash``
-    pair must recompute, pagination counters must be self-consistent and the
-    last page's tail must equal its checkpoint.
+    must pin the identical checkpoint, each page anchor must equal the
+    running predecessor hash, item event ids must be dense and consecutive
+    across pages, every ``prev_hash``/``event_hash`` pair must recompute,
+    pagination counters must be self-consistent and the last page's tail
+    must equal that shared checkpoint.
 
     When ``trust`` is None (the default) no authentication is attempted and
     the behaviour is unchanged. When a trust document is supplied it must
@@ -317,10 +318,10 @@ def _parse_page_shape(page: object) -> dict:
 
 
 def _verify_pages(pages: list[dict]) -> dict:
-    """Walk every page in order; return the last page's checkpoint on success."""
+    """Walk every page in order; return the shared checkpoint on success."""
     running_id = 0
     running_hash = ZERO_HASH
-    last_checkpoint: dict | None = None
+    first_checkpoint: dict | None = None
     for page in pages:
         page = _parse_page_shape(page)
         items = page["items"]
@@ -328,6 +329,12 @@ def _verify_pages(pages: list[dict]) -> dict:
         next_cursor = page["next_cursor"]
         checkpoint = page["checkpoint"]
 
+        # Every page of one export pins the identical checkpoint; a replaced
+        # or regressed checkpoint on any page breaks the export as a whole.
+        if first_checkpoint is None:
+            first_checkpoint = checkpoint
+        elif checkpoint != first_checkpoint:
+            raise _VerifyError(ERR_INTEGRITY)
         # The export is unfiltered, so a page's total is the log length its
         # checkpoint was taken over.
         if checkpoint["event_id"] != total:
@@ -367,16 +374,15 @@ def _verify_pages(pages: list[dict]) -> dict:
         else:
             if not items or next_cursor != running_id or next_cursor >= total:
                 raise _VerifyError(ERR_INTEGRITY)
-        last_checkpoint = checkpoint
 
-    # The final page must end exactly on its checkpoint.
-    assert last_checkpoint is not None
+    # The final page must end exactly on the checkpoint every page pinned.
+    assert first_checkpoint is not None
     if (
-        running_id != last_checkpoint["event_id"]
-        or running_hash != last_checkpoint["event_hash"]
+        running_id != first_checkpoint["event_id"]
+        or running_hash != first_checkpoint["event_hash"]
     ):
         raise _VerifyError(ERR_INTEGRITY)
-    return dict(last_checkpoint)
+    return dict(first_checkpoint)
 
 
 def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:

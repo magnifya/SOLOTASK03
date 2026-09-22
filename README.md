@@ -386,13 +386,15 @@ tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`e
   必须等于前一条的 `event_hash`，且每条 `event_hash` 都按上面的规范重算；
 - 分页计数自洽：非空 `next_cursor` 恰好接续本页且小于 `total`，为 `null`
   时链头恰好到达 `total`；
+- **所有页**的 `checkpoint` 必须完全一致（同一份导出的每一页都钉住同一
+  检查点），且每页 `checkpoint.event_id` 等于该页 `total`；
 - **最后一页**的链尾（空日志则为 64 个 0）必须与其 `checkpoint` 完全匹配。
 
 输出恒为**单行 JSON**：成功 `{"ok": true, "checkpoint": {event_id,
 event_hash}}`，进程退出码 0；失败
 `{"ok": false, "error": "input"|"integrity"|"auth"}`，退出码 1。`input`
 表示输入无法读取/不是 JSON、或文档结构字段缺失/类型非法；`integrity`
-表示锚点、连续编号、任一哈希链接、分页计数或末页检查点不一致。
+表示锚点、连续编号、任一哈希链接、分页计数、跨页检查点或末页检查点不一致。
 `audit-verify` 不发起任何网络请求。
 
 **带信任文档的检查点认证（可选）**：追加 `--trust trust.json`（即
@@ -416,7 +418,7 @@ SHA-256 摘要作为签名消息。
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、末页检查点、可选信任文档下的检查点认证） |
+| `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |

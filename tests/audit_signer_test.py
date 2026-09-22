@@ -316,6 +316,44 @@ class ExportAuthOfflineTests(unittest.TestCase):
         }
         self.assertEqual(audit.verify_export([p1, forged], self._trust())["error"], "auth")
 
+    def test_cross_page_checkpoint_mismatch_is_integrity(self) -> None:
+        # Two pages of one export must pin the identical checkpoint even
+        # before any authentication envelope is considered: a replaced
+        # checkpoint on a non-final page is an integrity failure, with or
+        # without a trust document.
+        self.svc.register_trust_source(
+            {"source": "n1", "public_key": "a" * 64, "expires_at": FUTURE}
+        )
+        self.svc.register_trust_source(
+            {"source": "n2", "public_key": "b" * 64, "expires_at": FUTURE}
+        )
+        _, p1 = self.svc.export_audit_events({"limit": "1", "cursor": "0"})
+        _, p2 = self.svc.export_audit_events({"limit": "1", "cursor": "1"})
+        _, p3 = self.svc.export_audit_events({"cursor": "2"})
+        trust = self._trust()
+        self.assertTrue(audit.verify_export([p1, p2, p3], trust)["ok"])
+        forged = json.loads(json.dumps(p2))
+        forged["checkpoint"]["event_hash"] = "f" * 64
+        for document in ([p1, forged, p3],):
+            self.assertEqual(
+                audit.verify_export(document, trust)["error"], "integrity"
+            )
+            self.assertEqual(audit.verify_export(document)["error"], "integrity")
+
+    def test_pages_from_diverged_exports_is_integrity(self) -> None:
+        # Pages fetched across a log mutation pin different checkpoints and
+        # can never be stitched into one export.
+        _, p1 = self.svc.export_audit_events({})
+        self.svc.register_trust_source(
+            {"source": "n1", "public_key": "a" * 64, "expires_at": FUTURE}
+        )
+        _, p2 = self.svc.export_audit_events({"cursor": "1"})
+        self.assertNotEqual(p1["checkpoint"], p2["checkpoint"])
+        self.assertEqual(
+            audit.verify_export([p1, p2], self._trust())["error"], "integrity"
+        )
+        self.assertEqual(audit.verify_export([p1, p2])["error"], "integrity")
+
     def test_chain_tamper_still_integrity(self) -> None:
         _, page = self.svc.export_audit_events({})
         # Forge an event into an otherwise authenticated page.

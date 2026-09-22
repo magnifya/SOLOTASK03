@@ -500,6 +500,136 @@ class ExportHTTPTests(unittest.TestCase):
         self.assertEqual(status, 400)
 
 
+class OfflineMultiPageVerifyTests(unittest.TestCase):
+    """Offline multi-page verification: shared checkpoint, page order, anchors,
+    cursors and the terminal empty page — no server contact."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+        self.svc = LedgerService(
+            LedgerStore(os.path.join(self.tmp, "state.json"), initial_balance=1000),
+            initial_balance=1000,
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _register(self, n: int) -> None:
+        for i in range(n):
+            status, body = self.svc.register_trust_source(
+                {
+                    "source": f"n{i}",
+                    "public_key": format(i + 1, "064x"),
+                    "expires_at": FUTURE,
+                }
+            )
+            self.assertIn(status, (200, 201), body)
+
+    def _pages(self, limit: str = "1") -> list[dict]:
+        pages = []
+        cursor = "0"
+        while True:
+            status, page = self.svc.export_audit_events(
+                {"limit": limit, "cursor": cursor}
+            )
+            self.assertEqual(status, 200, page)
+            pages.append(page)
+            if page["next_cursor"] is None:
+                break
+            cursor = str(page["next_cursor"])
+        return pages
+
+    def test_empty_log_single_page_ok(self) -> None:
+        pages = self._pages()
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["items"], [])
+        expected = {"event_id": 0, "event_hash": audit.ZERO_HASH}
+        for document in (pages, pages[0]):
+            result = audit.verify_export(document)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["checkpoint"], expected)
+
+    def test_multi_page_and_terminal_empty_page_ok(self) -> None:
+        self._register(3)
+        pages = self._pages(limit="1")
+        self.assertEqual(len(pages), 3)
+        status, empty = self.svc.export_audit_events({"cursor": "3"})
+        self.assertEqual(status, 200)
+        self.assertEqual(empty["items"], [])
+        self.assertEqual(empty["checkpoint"], pages[-1]["checkpoint"])
+        result = audit.verify_export(pages + [empty])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["checkpoint"], pages[-1]["checkpoint"])
+
+    def test_every_page_pins_the_same_checkpoint(self) -> None:
+        self._register(3)
+        pages = self._pages(limit="2")
+        self.assertGreater(len(pages), 1)
+        for page in pages:
+            self.assertEqual(page["checkpoint"], pages[0]["checkpoint"])
+        self.assertTrue(audit.verify_export(pages)["ok"])
+
+    def test_middle_page_checkpoint_replaced_is_integrity(self) -> None:
+        self._register(3)
+        pages = self._pages(limit="1")
+        forged = json.loads(json.dumps(pages[1]))
+        forged["checkpoint"]["event_hash"] = "f" * 64
+        result = audit.verify_export([pages[0], forged, pages[2]])
+        self.assertEqual(result, {"ok": False, "error": "integrity"})
+        # A forged event_id that no longer matches the page's own total too.
+        forged = json.loads(json.dumps(pages[1]))
+        forged["checkpoint"]["event_id"] = 2
+        result = audit.verify_export([pages[0], forged, pages[2]])
+        self.assertEqual(result, {"ok": False, "error": "integrity"})
+
+    def test_first_page_checkpoint_replaced_is_integrity(self) -> None:
+        self._register(3)
+        pages = self._pages(limit="1")
+        forged = json.loads(json.dumps(pages[0]))
+        forged["checkpoint"] = {"event_id": 3, "event_hash": "0" * 64}
+        result = audit.verify_export([forged, pages[1], pages[2]])
+        self.assertEqual(result, {"ok": False, "error": "integrity"})
+
+    def test_swapped_pages_is_integrity(self) -> None:
+        self._register(3)
+        pages = self._pages(limit="1")
+        result = audit.verify_export([pages[1], pages[0], pages[2]])
+        self.assertEqual(result, {"ok": False, "error": "integrity"})
+
+    def test_cursor_break_is_integrity(self) -> None:
+        self._register(3)
+        pages = self._pages(limit="1")
+        forged = json.loads(json.dumps(pages[0]))
+        forged["next_cursor"] = 99
+        result = audit.verify_export([forged, pages[1], pages[2]])
+        self.assertEqual(result, {"ok": False, "error": "integrity"})
+        # A non-terminal page may not be empty.
+        forged = json.loads(json.dumps(pages[0]))
+        forged["items"] = []
+        forged["next_cursor"] = 0
+        result = audit.verify_export([forged, pages[1], pages[2]])
+        self.assertEqual(result, {"ok": False, "error": "integrity"})
+
+    def test_checkpoint_missing_or_wrong_type_is_input(self) -> None:
+        self._register(2)
+        pages = self._pages(limit="1")
+        missing = json.loads(json.dumps(pages))
+        del missing[0]["checkpoint"]
+        self.assertEqual(
+            audit.verify_export(missing), {"ok": False, "error": "input"}
+        )
+        wrong_type = json.loads(json.dumps(pages))
+        wrong_type[0]["checkpoint"] = "checkpoint"
+        self.assertEqual(
+            audit.verify_export(wrong_type), {"ok": False, "error": "input"}
+        )
+        wrong_field = json.loads(json.dumps(pages))
+        wrong_field[0]["checkpoint"]["event_id"] = "3"
+        self.assertEqual(
+            audit.verify_export(wrong_field), {"ok": False, "error": "input"}
+        )
+
+
 class AuditVerifyCLITests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp()
@@ -609,6 +739,30 @@ class AuditVerifyCLITests(unittest.TestCase):
         rc, line = self._cli("audit-verify", "-", stdin=json.dumps(pages))
         self.assertEqual(rc, 1)
         self.assertEqual(json.loads(line)["error"], "integrity")
+
+    def test_verify_cross_page_checkpoint_mismatch_is_integrity(self) -> None:
+        pages = self._fetch_pages()
+        self.assertGreater(len(pages), 1)
+        # Replace the checkpoint on a non-final page: every page of one
+        # export must pin the identical checkpoint.
+        pages[0]["checkpoint"]["event_hash"] = "f" * 64
+        rc, line = self._cli("audit-verify", "-", stdin=json.dumps(pages))
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(line), {"ok": False, "error": "integrity"})
+
+    def test_verify_terminal_empty_page_ok(self) -> None:
+        pages = self._fetch_pages()
+        rc, line = self._cli("audit-export", "--cursor", "2")
+        self.assertEqual(rc, 0, line)
+        empty = json.loads(line)
+        self.assertEqual(empty["items"], [])
+        pages.append(empty)
+        rc, line = self._cli("audit-verify", "-", stdin=json.dumps(pages))
+        self.assertEqual(rc, 0, line)
+        body = json.loads(line)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["checkpoint"], empty["checkpoint"])
+        self.assertEqual(len(line.splitlines()), 1)
 
     def test_verify_input_errors(self) -> None:
         rc, line = self._cli("audit-verify", "-", stdin="not json{")
