@@ -43,7 +43,7 @@ from ledger import audit, crypto
 from ledger.cli import main as cli_main
 from ledger.server import build_handler
 from ledger.service import LedgerService
-from ledger.store import LedgerStore, StateRecoveryError
+from ledger.store import LedgerStore, StateRecoveryError, STATE_VERSION
 
 FUTURE = 1_900_000_000
 PRIV_A = "11" * 32
@@ -357,6 +357,75 @@ class ExportAuthOfflineTests(unittest.TestCase):
         trust["audit_signers"] = [trust["audit_signers"][0]]
         self.assertEqual(audit.verify_export(page, trust)["error"], "auth")
 
+    def test_trust_version_gap_or_out_of_order_is_input(self) -> None:
+        _, page = self.svc.export_audit_events({})
+        good = self._trust()["audit_signers"]
+        v1 = good[0]
+        for bad_signers in (
+            [{"version": 2, "public_key": PUB_A, "activated_event_id": 0}],
+            [v1, {"version": 3, "public_key": PUB_B, "activated_event_id": 1}],
+            [v1, {"version": 2, "public_key": PUB_B, "activated_event_id": 0}],
+        ):
+            trust = {"genesis_hash": self._trust()["genesis_hash"],
+                     "audit_signers": bad_signers}
+            self.assertEqual(
+                audit.verify_export(page, trust)["error"], "input", bad_signers
+            )
+
+    def test_trust_activation_regression_is_input(self) -> None:
+        _, page = self.svc.export_audit_events({})
+        genesis = self._trust()["genesis_hash"]
+        # Equal activation ids are not strictly ascending; a later activation
+        # smaller than an earlier one is a regression. Both are input errors.
+        for activated in ((0, 0), (0, 5, 3)):
+            signers = [
+                {"version": i + 1, "public_key": "ab"[i % 2] * 64,
+                 "activated_event_id": act}
+                for i, act in enumerate(activated)
+            ]
+            trust = {"genesis_hash": genesis, "audit_signers": signers}
+            self.assertEqual(
+                audit.verify_export(page, trust)["error"], "input", activated
+            )
+
+    def test_unselected_signer_beyond_checkpoint_is_input(self) -> None:
+        # Rotate to v2 (activation event 1), then advance the log one more
+        # event without rotating the signer: exports stay signed by v2 at a
+        # checkpoint of event 2. A trust document that additionally lists a
+        # legitimate-looking v3 activated beyond that checkpoint is internally
+        # inconsistent with the verified head and is an input error — even
+        # though the selected v2 key itself is active and the signature is
+        # valid.
+        self.svc.rotate_audit_signer(
+            {"private_key": PRIV_B, "expected_version": 1}
+        )
+        self.svc.register_trust_source(
+            {"source": "n1", "public_key": "a" * 64, "expires_at": FUTURE}
+        )
+        _, page = self.svc.export_audit_events({})
+        self.assertEqual(page["checkpoint"]["event_id"], 2)
+        self.assertEqual(page["checkpoint_auth"]["key_version"], 2)
+        trust = self._trust()
+        trust["audit_signers"].append(
+            {"version": 3, "public_key": "c" * 64, "activated_event_id": 50}
+        )
+        self.assertEqual(audit.verify_export(page, trust)["error"], "input")
+
+    def test_selected_key_activated_after_checkpoint_stays_auth(self) -> None:
+        # Contrast with the case above: when the *selected* envelope key is
+        # the one activated beyond the checkpoint, the failure is auth (an
+        # unactivated key authenticating the page), not input.
+        self.svc.rotate_audit_signer(
+            {"private_key": PRIV_B, "expected_version": 1}
+        )
+        self.svc.register_trust_source(
+            {"source": "n1", "public_key": "a" * 64, "expires_at": FUTURE}
+        )
+        _, page = self.svc.export_audit_events({})
+        trust = self._trust()
+        trust["audit_signers"][1]["activated_event_id"] = 50
+        self.assertEqual(audit.verify_export(page, trust)["error"], "auth")
+
 
 class RecoverySignerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -405,10 +474,11 @@ class RecoverySignerTests(unittest.TestCase):
         self.assertIn("audit_signer_rotated", ctx.exception.reason)
 
     def test_legacy_unsigned_snapshot_is_migrated_once(self) -> None:
-        # A current (hash-linked, checkpointed) snapshot that predates
-        # checkpoint auth simply carries no signer section: recovery mints v1
-        # on the unique winner and saves it atomically.
+        # A genuinely pre-checkpoint-auth snapshot carries a schema version
+        # below 9 and no signer sections: recovery mints v1 on the unique
+        # winner and saves it atomically.
         data = read_json(self.state_path)
+        data["state"]["version"] = STATE_VERSION - 1
         data["state"].pop("audit_signer", None)
         data["state"].pop("audit_signer_history", None)
         # Drop the v2 rotation event too, so the migrated v1 has no dangling
@@ -430,6 +500,80 @@ class RecoverySignerTests(unittest.TestCase):
         self.assertEqual(
             again.audit_signer["public_key"], first_pub
         )
+
+    def _assert_recovery_rejected(self) -> None:
+        with self.assertRaises(StateRecoveryError) as ctx:
+            self._reopen()
+        self.assertEqual(
+            os.path.dirname(self.state_path), ctx.exception.path
+        )
+
+    def test_missing_version_without_signer_sections_fails(self) -> None:
+        # No state.version at all and both signer sections gone: never reset a
+        # schema-less snapshot to version 1.
+        data = read_json(self.state_path)
+        data["state"].pop("version", None)
+        data["state"].pop("audit_signer", None)
+        data["state"].pop("audit_signer_history", None)
+        write_json(self.state_path, data)
+        self._assert_recovery_rejected()
+        self.assertNotIn("audit_signer", read_json(self.state_path)["state"])
+
+    def test_current_version_without_signer_sections_fails(self) -> None:
+        # state.version >= 9 must carry the signer sections; their absence is
+        # corruption, not a migration trigger.
+        data = read_json(self.state_path)
+        data["state"]["version"] = STATE_VERSION
+        data["state"].pop("audit_signer", None)
+        data["state"].pop("audit_signer_history", None)
+        write_json(self.state_path, data)
+        self._assert_recovery_rejected()
+
+    def test_future_version_without_signer_sections_fails(self) -> None:
+        data = read_json(self.state_path)
+        data["state"]["version"] = STATE_VERSION + 5
+        data["state"].pop("audit_signer", None)
+        data["state"].pop("audit_signer_history", None)
+        write_json(self.state_path, data)
+        self._assert_recovery_rejected()
+
+    def test_old_version_missing_one_section_fails(self) -> None:
+        # Even an old version cannot carry exactly one of the two sections.
+        original = read_json(self.state_path)
+        for removed in ("audit_signer", "audit_signer_history"):
+            data = json.loads(json.dumps(original))
+            data["state"]["version"] = STATE_VERSION - 1
+            data["state"].pop(removed, None)
+            write_json(self.state_path, data)
+            self._assert_recovery_rejected()
+            write_json(self.state_path, original)
+
+    def test_current_version_missing_one_section_fails(self) -> None:
+        original = read_json(self.state_path)
+        for removed in ("audit_signer", "audit_signer_history"):
+            data = json.loads(json.dumps(original))
+            data["state"].pop(removed, None)
+            write_json(self.state_path, data)
+            self._assert_recovery_rejected()
+            write_json(self.state_path, original)
+
+    def test_non_positive_state_version_fails(self) -> None:
+        original = read_json(self.state_path)
+        for bad_version in (0, -1, True, "9"):
+            data = json.loads(json.dumps(original))
+            data["state"]["version"] = bad_version
+            write_json(self.state_path, data)
+            self._assert_recovery_rejected()
+            write_json(self.state_path, original)
+
+    def test_non_strictly_ascending_activation_ids_fail(self) -> None:
+        # Two history entries sharing an activation id is corruption.
+        data = read_json(self.state_path)
+        data["state"]["audit_signer_history"][1]["activated_event_id"] = 0
+        data["state"]["audit_signer"]["activated_event_id"] = 0
+        write_json(self.state_path, data)
+        with self.assertRaises(StateRecoveryError):
+            self._reopen()
 
     def test_same_generation_signer_conflict_fails(self) -> None:
         data = read_json(self.state_path)

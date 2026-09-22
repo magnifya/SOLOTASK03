@@ -383,8 +383,9 @@ def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:
     """Strictly parse a trust document's genesis anchor and audit signers.
 
     Returns ``(genesis_hash, {version: {public_key, activated_event_id}})``.
-    Versions must be dense and ascending starting at 1 and the first
-    ``activated_event_id`` must be 0. Any defect is an input error.
+    Versions must be dense and ascending starting at 1, the first
+    ``activated_event_id`` must be 0 and later activation ids must be strictly
+    ascending. Any defect is an input error.
     """
     if not isinstance(trust, dict):
         raise _VerifyError(ERR_INPUT)
@@ -395,6 +396,7 @@ def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:
     if not isinstance(raw_signers, list) or not raw_signers:
         raise _VerifyError(ERR_INPUT)
     signers: dict[int, dict] = {}
+    previous_activated: int | None = None
     for position, entry in enumerate(raw_signers):
         if not isinstance(entry, dict):
             raise _VerifyError(ERR_INPUT)
@@ -407,8 +409,14 @@ def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:
             raise _VerifyError(ERR_INPUT)
         if not _is_plain_int(activated) or activated < 0:
             raise _VerifyError(ERR_INPUT)
-        if position == 0 and activated != 0:
+        if position == 0:
+            if activated != 0:
+                raise _VerifyError(ERR_INPUT)
+        elif activated <= previous_activated:
+            # A gap in versions is already rejected above; an activation id
+            # that retreats (or stands still) is likewise a malformed list.
             raise _VerifyError(ERR_INPUT)
+        previous_activated = activated
         signers[version] = {
             "public_key": public_key,
             "activated_event_id": activated,
@@ -458,6 +466,17 @@ def _verify_checkpoint_auth(
     signer = signers.get(first["key_version"])
     if signer is None:
         raise _VerifyError(ERR_AUTH)
+    # A trust document may not describe signer activations that lie beyond the
+    # checkpoint head it is meant to authenticate. The *selected* key's own
+    # activation beyond the head is reported as auth (an unactivated key
+    # version, matching the signed-envelope failure category); any other
+    # history entry beyond the head makes the document itself inconsistent
+    # with the verified checkpoint and is an input error.
+    for other_version, entry in signers.items():
+        if other_version == first["key_version"]:
+            continue
+        if entry["activated_event_id"] > checkpoint["event_id"]:
+            raise _VerifyError(ERR_INPUT)
     # A signer can only authenticate a checkpoint taken at or after the event
     # that activated its key.
     if checkpoint["event_id"] < signer["activated_event_id"]:

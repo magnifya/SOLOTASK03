@@ -570,6 +570,17 @@ class LedgerStore:
         # bool is an int subclass; reject it explicitly along with negatives.
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             fail("state.generation must be a non-negative integer")
+        # Schema version gating the one-time pre-checkpoint-auth migration: a
+        # snapshot written by current code always carries state.version >= 9,
+        # so a present signer section is mandatory there; only a snapshot whose
+        # version explicitly predates 9 may lack the signer sections at all.
+        state_version = state.get("version")
+        if state_version is not None and (
+            isinstance(state_version, bool)
+            or not isinstance(state_version, int)
+            or state_version < 1
+        ):
+            fail("state.version must be a positive integer")
         initial_balance = state.get("initial_balance")
         if initial_balance is not None and (
             isinstance(initial_balance, bool)
@@ -714,7 +725,7 @@ class LedgerStore:
             data, audit_events, path
         )
         signer_state = self._parse_persisted_audit_signer(
-            state, chain, audit_events, audit_checkpoint, path
+            state, chain, audit_events, audit_checkpoint, path, state_version
         )
         syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
@@ -811,23 +822,28 @@ class LedgerStore:
         audit_events: list[dict],
         audit_checkpoint: dict,
         path: str,
+        state_version: int | None,
     ) -> tuple[dict | None, list[dict], bool]:
         """Strictly validate the persisted Ed25519 audit checkpoint signer.
 
-        Returns ``(current_signer, history, needs_migration)``. A snapshot
-        written before checkpoint authentication carries no signer at all: it
-        is accepted for a one-time migration performed by load() on the unique
-        winner (mirroring the legacy hash-chain repair), and this returns
-        ``(None, [], True)``.
+        Returns ``(current_signer, history, needs_migration)``. The one-time
+        migration that mints a version 1 key is allowed *only* for a snapshot
+        whose ``state.version`` explicitly predates 9 and which carries neither
+        an ``audit_signer`` nor an ``audit_signer_history`` section. When the
+        version is absent (older than the version field itself is not a
+        claim current code ever writes) or is 9+, either section missing —
+        including exactly one of the two — is corruption and fails recovery;
+        the snapshot is never silently reset to version 1.
 
         A present signer section is strictly verified: the stored seed must
         derive the stored public key, the history versions must be dense from
-        1 with the first activated at event 0, the current record must equal
-        the latest history entry, every version past 1 must be activated by an
-        ``audit_signer_rotated`` event whose id, version and public key match,
-        no orphan rotation events may exist, and a signature produced by the
-        stored key over the current checkpoint must verify under its public
-        key. Any defect fails recovery.
+        1 with the first activated at event 0, later activation ids must be
+        strictly ascending and never past the checkpoint, the current record
+        must equal the latest history entry, every version past 1 must be
+        activated by an ``audit_signer_rotated`` event whose id, version and
+        public key match, no orphan rotation events may exist, and a signature
+        produced by the stored key over the current checkpoint must verify
+        under its public key. Any defect fails recovery.
         """
 
         def fail(reason: str) -> None:
@@ -835,10 +851,25 @@ class LedgerStore:
 
         raw = state.get("audit_signer")
         history_raw = state.get("audit_signer_history")
-        if raw is None:
-            if history_raw is not None:
+        if raw is None or history_raw is None:
+            # The two sections are a single unit on every current snapshot.
+            # Only an explicitly old-version snapshot (state.version < 9) may
+            # predate both; anything else is corruption, never a reset.
+            if raw is None and history_raw is not None:
                 fail("audit_signer_history present without an audit_signer")
-            return None, [], True
+            if history_raw is None and raw is not None:
+                fail("audit_signer present without an audit_signer_history")
+            if state_version is not None and state_version < STATE_VERSION:
+                return None, [], True
+            if state_version is None:
+                fail(
+                    "snapshot without a state.version is missing both "
+                    "audit_signer and audit_signer_history"
+                )
+            fail(
+                f"snapshot at state.version {state_version} is missing both "
+                "audit_signer and audit_signer_history"
+            )
         if not isinstance(raw, dict):
             fail("state.audit_signer must be an object")
         version = raw.get("version")
@@ -884,8 +915,8 @@ class LedgerStore:
                 fail("audit_signer_history activated_event_id must be non-negative")
             if position == 0 and h_activated != 0:
                 fail("the first audit signer must be activated at event 0")
-            if position > 0 and h_activated < history[-1]["activated_event_id"]:
-                fail("audit signer activation ids must be ascending")
+            if position > 0 and h_activated <= history[-1]["activated_event_id"]:
+                fail("audit signer activation ids must be strictly ascending")
             history.append(
                 {
                     "version": h_version,
