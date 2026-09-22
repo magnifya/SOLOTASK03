@@ -80,6 +80,8 @@ EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
 EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
+EVENT_ALLOWLIST_ADDED = "allowlist_added"
+EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -1156,6 +1158,7 @@ class LedgerStore:
             EVENT_SYNC_ADOPTED,
             EVENT_SYNC_EXPIRED,
         }
+        allowlist_kinds = {EVENT_ALLOWLIST_ADDED, EVENT_ALLOWLIST_REMOVED}
         events: list[dict] = []
         for i, event in enumerate(raw):
             if not isinstance(event, dict):
@@ -1232,6 +1235,20 @@ class LedgerStore:
                     raise StateRecoveryError(
                         path,
                         f"audit event {event_id} ({kind}) has a partial frozen summary",
+                    )
+            if kind in allowlist_kinds:
+                # Allowlist lifecycle events carry exactly their subject: a
+                # non-empty string source and a non-boolean integer expiry.
+                source = event.get("source")
+                expires_at = event.get("expires_at")
+                if not isinstance(source, str) or not source:
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) needs a source"
+                    )
+                if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) expires_at must be an integer",
                     )
             events.append(dict(event))
         return events
