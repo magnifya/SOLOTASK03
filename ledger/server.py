@@ -201,6 +201,12 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 # GET /v1/state/root — confirmed account-state tree anchor.
                 status, body = service.get_state_root()
                 self._send_json(status, body)
+            elif path.startswith("/v1/state/root/"):
+                # GET /v1/state/root/{height} — historical anchor at a
+                # confirmed block height.
+                height = unquote(path[len("/v1/state/root/") :])
+                status, body = service.get_state_root_at_height(height)
+                self._send_json(status, body)
             elif path == "/v1/forks/sync/history":
                 # GET /v1/forks/sync/history?source=&tip_hash=&kind=&
                 # min_height=&max_height=&limit=&cursor=
@@ -259,13 +265,24 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(404, {"error": "account not found"})
                     return
                 if remainder.endswith("/proof"):
-                    # GET /v1/accounts/{account}/proof
+                    # GET /v1/accounts/{account}/proof[?height=H] — repeated
+                    # query parameters are rejected 400 like the other strict
+                    # endpoints.
                     encoded_account = remainder[: -len("/proof")]
                     account = unquote(encoded_account)
                     if not encoded_account or not account:
                         self._send_json(404, {"error": "account not found"})
                         return
-                    status, body = service.get_account_proof(account)
+                    parsed = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) > 1 for values in parsed.values()):
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
+                        return
+                    params = {key: values[0] for key, values in parsed.items()}
+                    status, body = service.get_account_proof(
+                        account, params.get("height")
+                    )
                 else:
                     account = unquote(remainder)
                     status, body = service.get_account(account)

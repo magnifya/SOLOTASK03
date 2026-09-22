@@ -148,15 +148,20 @@ def cmd_account(args: argparse.Namespace) -> int:
 
 
 def cmd_state_root(args: argparse.Namespace) -> int:
-    status, body = _request("GET", f"{args.base_url}/v1/state/root", None)
+    url = f"{args.base_url}/v1/state/root"
+    if args.height is not None:
+        quoted = urllib.parse.quote(str(args.height), safe="")
+        url = f"{url}/{quoted}"
+    status, body = _request("GET", url, None)
     return _emit(status, body)
 
 
 def cmd_state_proof(args: argparse.Namespace) -> int:
     quoted = urllib.parse.quote(args.account, safe="")
-    status, body = _request(
-        "GET", f"{args.base_url}/v1/accounts/{quoted}/proof", None
-    )
+    url = f"{args.base_url}/v1/accounts/{quoted}/proof"
+    if args.height is not None:
+        url = f"{url}?{urllib.parse.urlencode({'height': args.height})}"
+    status, body = _request("GET", url, None)
     return _emit(status, body)
 
 
@@ -551,12 +556,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_state_root = sub.add_parser(
         "state-root", help="fetch the confirmed account-state Merkle root"
     )
+    p_state_root.add_argument(
+        "--height",
+        help="anchor to the confirmed block at this height instead of the tip",
+    )
     p_state_root.set_defaults(func=cmd_state_root)
 
     p_state_proof = sub.add_parser(
         "state-proof", help="fetch an account-state Merkle inclusion proof"
     )
     p_state_proof.add_argument("account", help="account id (public key hex)")
+    p_state_proof.add_argument(
+        "--height",
+        help="anchor to the confirmed block at this height instead of the tip",
+    )
     p_state_proof.set_defaults(func=cmd_state_proof)
 
     p_proof = sub.add_parser("proof", help="fetch a Merkle inclusion proof")

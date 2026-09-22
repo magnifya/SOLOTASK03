@@ -306,12 +306,14 @@ class LedgerService:
 
     # -- account state Merkle tree -------------------------------------------
 
-    def _state_tree(self) -> tuple[list[tuple[str, int, list[str]]], list[str], str]:
+    def _state_tree(
+        self, blocks: list[Block]
+    ) -> tuple[list[tuple[str, int, list[str]]], list[str], str]:
         """Build the confirmed account rows (ascending account), their leaves
-        and the Merkle root, all from the confirmed chain under the current
-        endowment. Caller must hold the store lock.
+        and the Merkle root, replaying the given canonical blocks under the
+        current endowment. Caller must hold the store lock.
         """
-        rows = self.store.account_state_rows(self.store.chain, self.initial_balance)
+        rows = self.store.account_state_rows(blocks, self.initial_balance)
         leaves = [
             crypto.account_state_leaf(account, balance, transactions)
             for account, balance, transactions in rows
@@ -329,7 +331,7 @@ class LedgerService:
             tip = self.store.tip()
             if tip.status != STATUS_CONFIRMED:
                 return 404, {"error": "chain tip is pending confirmation"}
-            rows, _leaves, root = self._state_tree()
+            rows, _leaves, root = self._state_tree(self.store.chain)
             return 200, {
                 "state_root": root,
                 "height": tip.height,
@@ -337,18 +339,68 @@ class LedgerService:
                 "account_count": len(rows),
             }
 
-    def get_account_proof(self, account: str) -> tuple[int, dict]:
-        """GET /v1/accounts/{account}/proof — an inclusion proof in the
-        account-state tree anchored to the highest (confirmed) block.
+    def get_state_root_at_height(self, height: object) -> tuple[int, dict]:
+        """GET /v1/state/root/{height} — the state tree anchored to a past
+        confirmed block.
 
-        Returns 404 while a pending tip exists or for an account absent from
-        the confirmed account set.
+        The height must be a plain unsigned decimal without leading zeros.
+        The state is deterministically recomputed by replaying the canonical
+        confirmed prefix genesis..height under the store lock; a pending tip
+        block never contributes. An unknown height, a malformed height, or a
+        height whose block is still pending returns 404.
         """
+        height_int = _parse_decimal(height) if isinstance(height, str) else None
+        if height_int is None:
+            return 404, {"error": "block not found"}
         with self.store.lock:
-            tip = self.store.tip()
-            if tip.status != STATUS_CONFIRMED:
-                return 404, {"error": "chain tip is pending confirmation"}
-            rows, leaves, root = self._state_tree()
+            block = self.store.block_at(height_int)
+            if block is None or block.status != STATUS_CONFIRMED:
+                return 404, {"error": "block not found"}
+            rows, _leaves, root = self._state_tree(
+                self.store.chain[: height_int + 1]
+            )
+            return 200, {
+                "state_root": root,
+                "height": block.height,
+                "block_hash": block.block_hash,
+                "account_count": len(rows),
+            }
+
+    def get_account_proof(
+        self, account: str, height: object = None
+    ) -> tuple[int, dict]:
+        """GET /v1/accounts/{account}/proof — an inclusion proof in the
+        account-state tree.
+
+        Without ``height`` the proof anchors to the highest (confirmed)
+        block, exactly as before; a pending tip returns 404. With
+        ``height`` the proof anchors to that historical confirmed block: the
+        value must be a plain unsigned decimal without leading zeros (a
+        malformed value returns 400), and the state is recomputed by
+        replaying the canonical confirmed prefix genesis..height under the
+        store lock. An unknown height or a height whose block is pending
+        returns 404, as does an account absent from the anchored confirmed
+        account set.
+        """
+        if height is not None:
+            height_int = _parse_decimal(height) if isinstance(height, str) else None
+            if height_int is None:
+                return 400, {"error": "height must be a non-negative decimal"}
+        else:
+            height_int = None
+        with self.store.lock:
+            if height_int is None:
+                anchor = self.store.tip()
+                if anchor.status != STATUS_CONFIRMED:
+                    return 404, {"error": "chain tip is pending confirmation"}
+            else:
+                block = self.store.block_at(height_int)
+                if block is None or block.status != STATUS_CONFIRMED:
+                    return 404, {"error": "block not found"}
+                anchor = block
+            rows, leaves, root = self._state_tree(
+                self.store.chain[: anchor.height + 1]
+            )
             index = next(
                 (i for i, (name, _b, _t) in enumerate(rows) if name == account),
                 None,
@@ -363,8 +415,8 @@ class LedgerService:
                 "confirmed_transactions": transactions,
                 "index": index,
                 "state_root": root,
-                "height": tip.height,
-                "block_hash": tip.block_hash,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
                 "siblings": siblings,
             }
 
