@@ -306,49 +306,99 @@ class LedgerService:
 
     # -- account state Merkle tree -------------------------------------------
 
-    def _state_tree(self) -> tuple[list[tuple[str, int, list[str]]], list[str], str]:
+    def _state_tree(
+        self, chain: list | None = None
+    ) -> tuple[list[tuple[str, int, list[str]]], list[str], str]:
         """Build the confirmed account rows (ascending account), their leaves
         and the Merkle root, all from the confirmed chain under the current
-        endowment. Caller must hold the store lock.
+        endowment. ``chain`` defaults to the whole canonical chain; a confirmed
+        prefix replays historical state deterministically. Caller must hold the
+        store lock.
         """
-        rows = self.store.account_state_rows(self.store.chain, self.initial_balance)
+        if chain is None:
+            chain = self.store.chain
+        rows = self.store.account_state_rows(chain, self.initial_balance)
         leaves = [
             crypto.account_state_leaf(account, balance, transactions)
             for account, balance, transactions in rows
         ]
         return rows, leaves, crypto.account_state_root(leaves)
 
-    def get_state_root(self) -> tuple[int, dict]:
-        """GET /v1/state/root anchored to the highest block.
+    def get_state_root(self, height: object = None) -> tuple[int, dict]:
+        """GET /v1/state/root and GET /v1/state/root/{height}.
 
-        The tree covers confirmed accounts sorted by ascending account. A
-        pending chain tip anchors nothing yet, so the endpoint returns 404
-        until the tip is confirmed.
+        Without a height the tree is anchored to the highest block. A pending
+        chain tip anchors nothing yet, so the endpoint returns 404 until the
+        tip is confirmed.
+
+        With a path height the state is replayed only from genesis through
+        that block: the height must be an unsigned decimal without leading
+        zeros (malformed heights are treated like any unknown path), the block
+        must exist on the canonical chain and be confirmed — an unknown,
+        non-canonical or pending height returns 404. The success body has
+        exactly the same four fields as the unanchored endpoint.
         """
         with self.store.lock:
-            tip = self.store.tip()
-            if tip.status != STATUS_CONFIRMED:
+            if height is None:
+                anchor = self.store.tip()
+            else:
+                # Strict unsigned decimal with no leading zeros, signs or
+                # whitespace; every malformed value is an unknown path (404).
+                height_int = _parse_decimal(height)
+                if height_int is None:
+                    return 404, {"error": "block not found"}
+                anchor = self.store.block_at(height_int)
+                if anchor is None:
+                    return 404, {"error": "block not found"}
+            if anchor.status != STATUS_CONFIRMED:
                 return 404, {"error": "chain tip is pending confirmation"}
-            rows, _leaves, root = self._state_tree()
+            prefix = self.store.chain if height is None else self.store.chain[: anchor.height + 1]
+            rows, _leaves, root = self._state_tree(prefix)
             return 200, {
                 "state_root": root,
-                "height": tip.height,
-                "block_hash": tip.block_hash,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
                 "account_count": len(rows),
             }
 
-    def get_account_proof(self, account: str) -> tuple[int, dict]:
+    def get_account_proof(
+        self, account: str, params: dict | None = None
+    ) -> tuple[int, dict]:
         """GET /v1/accounts/{account}/proof — an inclusion proof in the
-        account-state tree anchored to the highest (confirmed) block.
+        account-state tree.
 
-        Returns 404 while a pending tip exists or for an account absent from
-        the confirmed account set.
+        Without ``height`` the proof is anchored to the highest (confirmed)
+        block. With ``height=H`` the state is deterministically replayed from
+        the canonical confirmed prefix through that block only: the value must
+        be a plain non-negative decimal without leading zeros (a malformed or
+        repeated query parameter is 400), and an unknown/non-canonical/pending
+        anchor height is 404. Returns 404 while a pending tip anchors the
+        default view, or for an account absent from the (historical) confirmed
+        account set.
         """
+        height_raw: object = None
+        if params is not None:
+            height_raw = params.get("height")
+        anchor_height: int | None = None
+        if height_raw is not None:
+            anchor_height = _parse_decimal(height_raw)
+            if anchor_height is None:
+                return 400, {"error": "height must be a non-negative decimal"}
         with self.store.lock:
-            tip = self.store.tip()
-            if tip.status != STATUS_CONFIRMED:
+            if anchor_height is None:
+                anchor = self.store.tip()
+            else:
+                anchor = self.store.block_at(anchor_height)
+                if anchor is None:
+                    return 404, {"error": "anchor block not found"}
+            if anchor.status != STATUS_CONFIRMED:
                 return 404, {"error": "chain tip is pending confirmation"}
-            rows, leaves, root = self._state_tree()
+            prefix = (
+                self.store.chain
+                if anchor_height is None
+                else self.store.chain[: anchor.height + 1]
+            )
+            rows, leaves, root = self._state_tree(prefix)
             index = next(
                 (i for i, (name, _b, _t) in enumerate(rows) if name == account),
                 None,
@@ -363,8 +413,8 @@ class LedgerService:
                 "confirmed_transactions": transactions,
                 "index": index,
                 "state_root": root,
-                "height": tip.height,
-                "block_hash": tip.block_hash,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
                 "siblings": siblings,
             }
 

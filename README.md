@@ -282,12 +282,22 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `{state_root, height, block_hash, account_count}`，锚定**最高块**。当最高块
   为 pending 时（状态尚未最终化）返回 `404`；此时已确认账户集本身不变，但
   不对外发布锚点。
+- **历史高度状态根**：`GET /v1/state/root/{height}` 返回与无 height 接口
+  **完全相同**的四个字段，但状态只从创世重放到该已确认块（canonical 已确认
+  前缀）。`height` 必须是无符号十进制且无前导零（`0` 本身合法）；未知高度、
+  非 canonical 高度或该块为 pending 时返回 `404`。历史视图是只读重放：不计入
+  pending 收入，也不改变当前索引、余额与快照。
 - **账户证明**：`GET /v1/accounts/{account}/proof` 返回账户三元组
   `{account, balance, confirmed_transactions}` 加上
   `{index, state_root, height, block_hash, siblings}`：`index` 是账户在
   account 升序中的 0-based 位置；`siblings` 自叶向根排列，每项
   `{direction: left|right, hash}`（64 位小写十六进制，direction 表示兄弟节点
   相对路径节点的方位）。最高块 pending 或账户不在已确认账户集时返回 `404`。
+  可选查询参数 `?height=H` 按同样严格格式把 proof 锚定到历史已确认块：缺省
+  仍锚定最高已确认块；非法或重复参数返回 `400`，锚点未知/非 canonical/pending
+  返回 `404`，账户在该历史状态不存在也是 `404`。成功 proof 的
+  `height/block_hash/state_root/index/siblings` 全部对应 H，
+  `confirmed_transactions` 保持链上原序。
 - **离线验证**：`ledger.crypto.verify_account_proof(proof, expected_root,
   expected_height, expected_hash) -> bool` 从 proof 的账户三元组**重算
   leaf**，沿 siblings 重算到根，并核对：重算根同时等于 proof 的
@@ -295,15 +305,17 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `block_hash == expected_hash`。任何非法 hash、非法 direction、非法/越界
   index、被篡改的 leaf（balance/account/T 任一不符）或锚点不符都返回
   `False` 而不抛异常；奇数层自我配对的幻像槽位（左兄弟等于当前节点）也判为
-  非法。
+  非法。签名无需改变即可验证历史 proof——传入该高度的 root/height/block_hash
+  即可。
 - **快照与恢复**：每次原子快照在 `state.state_root` 记录已确认账户树根（与
   链、generation 同一文档）。恢复时只对**唯一胜出快照**在同代冲突判定之后
   按该快照记录的初始余额重算状态根；重算值与记录不符即抛
   `ledger.store.StateRecoveryError(path, reason)`，绝不静默改写或新建链。
   同代孪生快照若 `state_root` 不同也属于冲突。该特性之前的旧快照（无
   state_root 字段）仍可加载。
-- **CLI**：`state-root` 与 `state-proof <account>` 两个子命令，输出与 HTTP
-  响应字段一致的单行 JSON。
+- **CLI**：`state-root [--height H]` 与 `state-proof <account> [--height H]`
+  两个子命令，`--height` 缺省时行为与输出完全不变；提供时逐字转发对应历史
+  高度接口的单行 JSON 响应（含非 2xx 错误体）。
 
 ## 交易索引
 
@@ -474,9 +486,13 @@ curl -s localhost:8080/v1/accounts/<pubkey-hex>
 # 账户状态根与账户状态包含证明（最高块 pending 时均 404；账户不在已确认集 404）
 curl -s localhost:8080/v1/state/root
 # -> {"state_root":"...","height":N,"block_hash":"...","account_count":K}
+# 历史高度：仅重放创世..H 的已确认前缀（未知/非 canonical/pending 高度 -> 404）
+curl -s localhost:8080/v1/state/root/H
 curl -s localhost:8080/v1/accounts/<pubkey-hex>/proof
 # -> {"account":"...","balance":...,"confirmed_transactions":[...],"index":I,
 #     "state_root":"...","height":N,"block_hash":"...","siblings":[{direction,hash}...]}
+# 历史锚点（非法/重复 height -> 400；锚点不可用或账户当时不存在 -> 404）
+curl -s "localhost:8080/v1/accounts/<pubkey-hex>/proof?height=H"
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
 
@@ -589,8 +605,10 @@ python -m ledger.cli mine
 python -m ledger.cli block 1
 python -m ledger.cli account <pubkey-hex>
 python -m ledger.cli proof 1 <tx-id-hex>
-python -m ledger.cli state-root
+python -m ledger.cli state-root                 # 锚定最高已确认块
+python -m ledger.cli state-root --height H      # 历史已确认前缀
 python -m ledger.cli state-proof <pubkey-hex>
+python -m ledger.cli state-proof <pubkey-hex> --height H
 python -m ledger.cli status 1
 python -m ledger.cli confirm 1
 python -m ledger.cli rollback 1
@@ -651,6 +669,7 @@ python -m compileall -q ledger   # 编译检查
 python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
+python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验

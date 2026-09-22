@@ -197,6 +197,16 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             elif path == "/v1/chain":
                 status, body = service.get_chain()
                 self._send_json(status, body)
+            elif path.startswith("/v1/state/root/"):
+                # GET /v1/state/root/{height} — account-state tree anchored at
+                # a historical confirmed block; unknown/non-canonical/pending
+                # heights are 404.
+                height = unquote(path[len("/v1/state/root/") :])
+                if not height:
+                    self._send_json(404, {"error": "block not found"})
+                    return
+                status, body = service.get_state_root(height)
+                self._send_json(status, body)
             elif path == "/v1/state/root":
                 # GET /v1/state/root — confirmed account-state tree anchor.
                 status, body = service.get_state_root()
@@ -259,13 +269,22 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(404, {"error": "account not found"})
                     return
                 if remainder.endswith("/proof"):
-                    # GET /v1/accounts/{account}/proof
+                    # GET /v1/accounts/{account}/proof[?height=H]
                     encoded_account = remainder[: -len("/proof")]
                     account = unquote(encoded_account)
                     if not encoded_account or not account:
                         self._send_json(404, {"error": "account not found"})
                         return
-                    status, body = service.get_account_proof(account)
+                    # Repeated query parameters are rejected 400 like the other
+                    # strict endpoints before the service sees them.
+                    parsed = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) > 1 for values in parsed.values()):
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
+                        return
+                    params = {key: values[0] for key, values in parsed.items()}
+                    status, body = service.get_account_proof(account, params)
                 else:
                     account = unquote(remainder)
                     status, body = service.get_account(account)
