@@ -258,6 +258,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 def cmd_syncs(args: argparse.Namespace) -> int:
     filters = {
         "source": args.source,
+        "mode": args.mode,
         "min_height": args.min_height,
         "max_height": args.max_height,
         "cursor": args.cursor,
@@ -278,6 +279,7 @@ def cmd_sync_history(args: argparse.Namespace) -> int:
         "source": args.source,
         "tip_hash": args.tip_hash,
         "kind": args.kind,
+        "mode": args.mode,
         "min_height": args.min_height,
         "max_height": args.max_height,
         "cursor": args.cursor,
@@ -688,6 +690,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_syncs = sub.add_parser("syncs", help="audit-list received synced candidates")
     p_syncs.add_argument("--source", help="filter by originating node identifier")
+    p_syncs.add_argument(
+        "--mode",
+        help="transport mode filter: plain (default when omitted), attested "
+        "or all; other values are rejected by the server with 400",
+    )
     p_syncs.add_argument("--min-height", help="minimum tip height (decimal)")
     p_syncs.add_argument("--max-height", help="maximum tip height (decimal)")
     p_syncs.add_argument("--cursor", help="pagination offset (decimal, default 0)")
@@ -705,6 +712,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--kind",
         help="filter by lifecycle kind: sync_received, sync_adopted or "
         "sync_expired (invalid values are rejected by the server with 400)",
+    )
+    p_sync_history.add_argument(
+        "--mode",
+        help="transport mode filter: all (default when omitted), plain or "
+        "attested; other values are rejected by the server with 400",
     )
     p_sync_history.add_argument("--min-height", help="minimum frozen tip height (decimal)")
     p_sync_history.add_argument("--max-height", help="maximum frozen tip height (decimal)")

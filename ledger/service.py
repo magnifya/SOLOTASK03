@@ -37,6 +37,7 @@ from . import crypto
 from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
 from .store import (
     SYNC_MODE_ATTESTED,
+    SYNC_MODE_PLAIN,
     TRUST_ACTIVE,
     TRUST_REVOKED,
     LedgerStore,
@@ -1603,20 +1604,33 @@ class LedgerService:
             result["expires_at"] = expires_at
             return 201, result
 
+    SYNC_QUERY_MODES = (SYNC_MODE_PLAIN, SYNC_MODE_ATTESTED, "all")
+
     def list_fork_syncs(self, params: dict) -> tuple[int, dict]:
         """GET /v1/forks/sync — audit listing of received sync candidates.
 
-        Filters: ``source`` (exact), ``min_height`` and ``max_height``.
+        Filters: ``source`` (exact), ``min_height`` and ``max_height``, plus
+        the optional ``mode``: absent or ``plain`` lists only ordinary (plain
+        and range) sync records, ``attested`` lists only signature-attested
+        records and ``all`` merges both tables. Any other value is 400.
         ``limit`` defaults to 50 and must be 1-200; ``cursor`` defaults to 0.
         Every numeric value must be a plain decimal without leading zeros; a
         malformed value returns 400. Rows are ordered by
-        ``(height, tip_hash, source)``; ``cursor == total`` returns an empty
-        page, ``cursor > total`` returns 400. Each item carries
-        ``source, request_id, tip_hash, height, length, status, expires_at``.
+        ``(height, tip_hash, source, mode, request_id)``; ``cursor == total``
+        returns an empty page, ``cursor > total`` returns 400. Each item keeps
+        the historical seven fields
+        ``source, request_id, tip_hash, height, length, status, expires_at`` —
+        ``mode`` participates only in ordering/selection, never in the item.
         """
         source = params.get("source")
         if source is not None and (not isinstance(source, str) or not source):
             return 400, {"error": "source must be a non-empty string"}
+
+        mode = params.get("mode")
+        if mode is None:
+            mode = SYNC_MODE_PLAIN
+        if mode not in self.SYNC_QUERY_MODES:
+            return 400, {"error": "mode must be one of plain, attested, all"}
 
         min_height = None
         if params.get("min_height") is not None:
@@ -1646,19 +1660,27 @@ class LedgerService:
 
         with self.store.lock:
             self._prune_expired_syncs()
-            rows: list[dict] = []
-            for (rec_source, request_id), rec in self.store.syncs.items():
-                if source is not None and rec_source != source:
-                    continue
-                descriptor = self._tip_descriptor(rec["tip_hash"])
-                if descriptor is None:
-                    continue
-                if min_height is not None and descriptor["height"] < min_height:
-                    continue
-                if max_height is not None and descriptor["height"] > max_height:
-                    continue
-                rows.append(
-                    {
+            # The plain table (ordinary full/range syncs) and the attested
+            # table are separate idempotency namespaces; ``mode`` selects
+            # which participate in this listing.
+            tables: list[tuple[str, dict]] = []
+            if mode in (SYNC_MODE_PLAIN, "all"):
+                tables.append((SYNC_MODE_PLAIN, self.store.syncs))
+            if mode == SYNC_MODE_ATTESTED or mode == "all":
+                tables.append((SYNC_MODE_ATTESTED, self.store.attested_syncs))
+            rows: list[tuple[tuple, dict]] = []
+            for rec_mode, table in tables:
+                for (rec_source, request_id), rec in table.items():
+                    if source is not None and rec_source != source:
+                        continue
+                    descriptor = self._tip_descriptor(rec["tip_hash"])
+                    if descriptor is None:
+                        continue
+                    if min_height is not None and descriptor["height"] < min_height:
+                        continue
+                    if max_height is not None and descriptor["height"] > max_height:
+                        continue
+                    item = {
                         "source": rec_source,
                         "request_id": request_id,
                         "tip_hash": descriptor["tip_hash"],
@@ -1667,13 +1689,25 @@ class LedgerService:
                         "status": descriptor["status"],
                         "expires_at": rec["expires_at"],
                     }
-                )
+                    rows.append(
+                        (
+                            (
+                                descriptor["height"],
+                                descriptor["tip_hash"],
+                                rec_source,
+                                rec_mode,
+                                request_id,
+                            ),
+                            item,
+                        )
+                    )
 
-        rows.sort(key=lambda row: (row["height"], row["tip_hash"], row["source"]))
-        total = len(rows)
+        rows.sort(key=lambda entry: entry[0])
+        ordered = [item for _key, item in rows]
+        total = len(ordered)
         if cursor > total:
             return 400, {"error": "cursor is beyond the result set"}
-        items = rows[cursor : cursor + limit]
+        items = ordered[cursor : cursor + limit]
         next_cursor = cursor + limit if cursor + limit < total else None
         return 200, {"items": items, "total": total, "next_cursor": next_cursor}
 
@@ -1699,7 +1733,10 @@ class LedgerService:
         Filters (AND-combined): ``source`` (exact), ``tip_hash`` (exact, must
         be 64 lowercase hex characters — a malformed value is 400 while an
         unknown one simply yields an empty page), ``kind`` (one of the three
-        sync kinds; unknown 400), ``min_height`` / ``max_height``. ``limit``
+        sync kinds; unknown 400), ``mode`` (absent or ``all`` returns every
+        event; ``plain`` matches ordinary events including legacy rows with no
+        mode field; ``attested`` matches only ``mode:"attested"`` events; any
+        other value is 400), ``min_height`` / ``max_height``. ``limit``
         defaults to 50 and must be 1-200; ``cursor`` defaults to 0. Every
         numeric value must be a plain non-negative decimal with no leading
         zeros (except ``0`` itself); signs, whitespace, decimals and repeated
@@ -1721,6 +1758,16 @@ class LedgerService:
                 "error": "kind must be one of sync_received, sync_adopted, "
                 "sync_expired"
             }
+
+        # Optional transport-mode filter: absent or "all" returns every
+        # lifecycle event; "plain" matches ordinary events including legacy
+        # rows that carry no mode field at all; "attested" matches only events
+        # explicitly recorded with mode="attested". Any other value is 400.
+        mode = params.get("mode")
+        if mode is None:
+            mode = "all"
+        if mode not in self.SYNC_QUERY_MODES:
+            return 400, {"error": "mode must be one of plain, attested, all"}
 
         min_height = None
         if params.get("min_height") is not None:
@@ -1762,6 +1809,14 @@ class LedgerService:
                 if tip_hash is not None and event.get("tip_hash") != tip_hash:
                     continue
                 if kind is not None and event_kind != kind:
+                    continue
+                # Transport-mode filtering. Legacy events written before the
+                # attested mode existed have no mode field and therefore count
+                # as plain; mode="all" skips the check entirely.
+                event_is_attested = event.get("mode") == SYNC_MODE_ATTESTED
+                if mode == SYNC_MODE_PLAIN and event_is_attested:
+                    continue
+                if mode == SYNC_MODE_ATTESTED and not event_is_attested:
                     continue
                 # Prefer the summary frozen into the event when it was
                 # recorded. Events written before summaries were frozen fall

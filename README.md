@@ -95,17 +95,25 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   失效仍静默丢弃、不产生事件。历史 `sync_received`/`sync_adopted`/`sync_expired`
   事件逐字保留、`event_id` 从 1 起不间断。
 - **审计查询**：`GET /v1/forks/sync` 支持 `source`、`min_height`、`max_height`、
-  `limit`（默认 50，范围 1–200）、`cursor`（默认 0）。数值参数必须是首位非 0 的
-  十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。结果按
-  `(height, tip_hash, source)` 升序，返回 `{items, total, next_cursor}`；
+  `mode`、`limit`（默认 50，范围 1–200）、`cursor`（默认 0）。`mode` 为可选
+  传输模式过滤：缺省或 `plain` 只列普通同步（整链与增量区间）记录，`attested`
+  只列签名同步记录，`all` 合并两类；仅允许 `plain`、`attested`、`all`，非法值
+  或重复参数一律 `400`。数值参数必须是首位非 0 的
+  十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。合并
+  结果按 `(height, tip_hash, source, mode, request_id)` 升序稳定分页，返回
+  `{items, total, next_cursor}`；
   `cursor == total` 返回空页，`cursor > total` 返回 `400`，没有更多结果时
-  `next_cursor` 为 `null`。每个 item 含
-  `{source, request_id, tip_hash, height, length, status, expires_at}`。
+  `next_cursor` 为 `null`。每个 item 保留原七字段
+  `{source, request_id, tip_hash, height, length, status, expires_at}`，不含
+  `mode`。
 - **生命周期历史查询**：`GET /v1/forks/sync/history` 以只增审计历史为数据源，
-  每个同步生命周期的每个阶段一行。支持 `source`、`tip_hash`、`kind`、
+  每个同步生命周期的每个阶段一行。支持 `source`、`tip_hash`、`kind`、`mode`、
   `min_height`、`max_height`、`limit`（默认 50，范围 1–200）、`cursor`（默认
   0）。`tip_hash` 必须是 64 位小写十六进制：格式错误 `400`，未知值只返回空页；
   `kind` 只允许 `sync_received`、`sync_adopted`、`sync_expired`，未知值 `400`。
+  `mode` 缺省或 `all` 返回全量事件；`plain` 匹配普通事件（含没有 `mode` 字段
+  的旧事件——旧事件仍按既有字段输出、不新增字段）；`attested` 仅匹配
+  `mode="attested"` 的事件；非法或重复 `mode` 返回 `400`。
   数值参数必须是非负十进制字符串——除 `0` 外禁止前导零，符号、小数、空白及重复
   参数一律 `400`；`min_height > max_height` 或 `cursor > total` 也是 `400`，
   `cursor == total` 返回空页。结果按
@@ -572,12 +580,15 @@ curl -s -X POST localhost:8080/v1/forks/sync/range \
   -d '{"source":"node-2","request_id":"req-8","expires_at":1800000000,"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"}}'
 # -> 201 {"tip_hash":"...","height":4,"length":5,"status":"confirmed","expires_at":1800000000}
 
-# 同步审计查询（source/min_height/max_height/limit/cursor；非法数值 400）
-curl -s 'localhost:8080/v1/forks/sync?source=node-2&min_height=1&limit=50&cursor=0'
+# 同步审计查询（source/mode/min_height/max_height/limit/cursor；
+# mode 缺省或 plain 只列普通同步，attested 只列签名同步，all 合并；
+# 非法 mode、非法数值或重复参数均 400）
+curl -s 'localhost:8080/v1/forks/sync?source=node-2&mode=all&min_height=1&limit=50&cursor=0'
 # -> 200 {"items":[{source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
 
-# 同步生命周期历史（source/tip_hash/kind/min_height/max_height/limit/cursor；
-# tip_hash 或 kind 格式错误 400，未知 tip_hash 空页，非法数值或重复参数 400）
+# 同步生命周期历史（source/tip_hash/kind/mode/min_height/max_height/limit/cursor；
+# mode 缺省或 all 全量，plain 含无 mode 旧事件，attested 仅签名事件；
+# tip_hash 或 kind 格式错误 400，未知 tip_hash 空页，非法 mode/数值或重复参数 400）
 curl -s 'localhost:8080/v1/forks/sync/history?source=node-2&kind=sync_adopted&limit=50&cursor=0'
 # -> 200 {"items":[{event_id,kind,at,source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
 
@@ -660,8 +671,8 @@ python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N]
 
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
-python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
-python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--min-height N] [--max-height N] [--cursor N] [--limit N]
+python -m ledger.cli syncs [--source node-2] [--mode plain|attested|all] [--min-height N] [--max-height N] [--cursor N] [--limit N]
+python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--mode plain|attested|all] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 
 # 增量区间：chain-range 拉取（可把整页 JSON 直接交给 sync-range 推送，tip 自动派生）
 python -m ledger.cli chain-range --after-height 2 --after-hash <block-hash> [--limit 100]
@@ -712,6 +723,7 @@ python tests/export_index_test.py     # 分叉导出、导出格式候选重验�
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
+python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
