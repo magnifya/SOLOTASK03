@@ -886,8 +886,12 @@ class LedgerService:
         seconds), ``anchor`` (``{height, block_hash}`` naming the canonical
         block the range starts *after*), ``blocks`` (a non-empty list of
         complete blocks starting at the next height) and ``tip`` (the
-        five-field export-style summary ``{tip_hash, height, length, status}``
-        of the delivered chain; supplied fields are all re-checked).
+        mandatory closed summary ``{tip_hash, height, length, status}`` of the
+        delivered chain: exactly those four fields, a 64-hex tip_hash, a
+        non-boolean non-negative height, a non-boolean positive length and a
+        pending/confirmed status). Any structural, type or summary violation
+        is 400, decided BEFORE the source is authorized and before any
+        candidate, fork, sync record, audit event or generation is touched.
 
         A new request follows the full-sync order: envelope format validation
         (400), then the source authorization gate (403), then the request
@@ -898,17 +902,23 @@ class LedgerService:
         consecutive heights/prev_hash, recomputed block hashes and Merkle
         roots, tx_id/Ed25519 verification, global uniqueness and ordering,
         endowment replay, pending-only-at-tip); failure is 400, as is a
-        ``tip`` summary that does not recompute. A tip already known as the
+        ``tip`` summary that does not recompute (height must equal the last
+        block's height, length the assembled chain length including genesis,
+        status the last block's status). A tip already known as the
         canonical chain or a stored candidate is 409, mirroring full sync.
 
         Success stores the ASSEMBLED complete candidate (keyed by its tip hash)
         together with the sync record, the range content fingerprint
         (anchor + delivered tail only) and a ``sync_received`` event in one
         atomic write; 201 returns the same five fields as a full sync. A
-        same-key retry with identical content replays the first result as 200
-        even when the source has since rotated/revoked/expired OR the
-        receiver's canonical chain has since advanced — the retry is verified
-        standalone, never re-spliced; same key with different content is 409.
+        same-key retry on a live record first re-validates anchor, blocks and
+        the full tip STANDALONE (never re-spliced against the current
+        canonical chain): a malformed or tampered body fails 400 rather than
+        replaying the cached 200, identical content replays the original
+        frozen result as 200 with its original ``expires_at``, and any other
+        well-formed content conflicts 409. The replay is unaffected by the
+        source having rotated/revoked/expired, by the request deadline having
+        passed, or by the receiver's canonical chain having advanced.
         Longest-chain adoption, expiry, mempool return-to-pool and restart
         reconciliation then all operate on the stored assembled candidate
         exactly as for a full sync.
@@ -924,7 +934,7 @@ class LedgerService:
         expires_at = payload["expires_at"]
         anchor_raw = payload["anchor"]
         blocks_raw = payload["blocks"]
-        tip = payload.get("tip")
+        tip = payload["tip"]
 
         if not isinstance(source, str) or not source:
             return 400, {"error": "field 'source' must be a non-empty string"}
@@ -951,8 +961,33 @@ class LedgerService:
             return 400, {"error": "field 'blocks' must be a list"}
         if not blocks_raw:
             return 400, {"error": "field 'blocks' must be non-empty"}
-        if tip is not None and not isinstance(tip, dict):
+        # The tip summary is mandatory and closed: exactly the four fields
+        # tip_hash/height/length/status, each strictly typed. Any structural
+        # or type violation is 400 here, before the source is authorized and
+        # before any candidate, fork, sync record, audit event or generation
+        # is touched.
+        if not isinstance(tip, dict):
             return 400, {"error": "field 'tip' must be a JSON object"}
+        if set(tip) != {"tip_hash", "height", "length", "status"}:
+            return 400, {
+                "error": "tip must contain exactly tip_hash, height, length and status"
+            }
+        if not crypto.is_hex64(tip["tip_hash"]):
+            return 400, {"error": "tip.tip_hash must be 64 lowercase hex characters"}
+        if (
+            isinstance(tip["height"], bool)
+            or not isinstance(tip["height"], int)
+            or tip["height"] < 0
+        ):
+            return 400, {"error": "tip.height must be a non-negative integer"}
+        if (
+            isinstance(tip["length"], bool)
+            or not isinstance(tip["length"], int)
+            or tip["length"] < 1
+        ):
+            return 400, {"error": "tip.length must be a positive integer"}
+        if tip["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
+            return 400, {"error": "tip.status must be 'pending' or 'confirmed'"}
 
         with self.store.lock:
             self._prune_expired_syncs()
@@ -975,12 +1010,8 @@ class LedgerService:
                 except ValueError as exc:
                     return 400, {"error": str(exc)}
                 recomputed_tip = self._range_tip_summary(anchor, tail)
-                if tip is not None:
-                    for field in ("tip_hash", "height", "length", "status"):
-                        if field in tip and tip[field] != recomputed_tip[field]:
-                            return 400, {
-                                "error": f"tip field {field!r} does not match the blocks"
-                            }
+                if tip != recomputed_tip:
+                    return 400, {"error": "tip summary does not match the blocks"}
                 fingerprint = self.store.range_fingerprint(anchor, tail)
                 if fingerprint != existing["fingerprint"]:
                     return 409, {
@@ -1050,12 +1081,8 @@ class LedgerService:
             recomputed_tip = self._range_tip_summary(anchor, tail)
             if summary != recomputed_tip:
                 return 400, {"error": "range does not assemble onto the canonical chain"}
-            if tip is not None:
-                for field in ("tip_hash", "height", "length", "status"):
-                    if field in tip and tip[field] != recomputed_tip[field]:
-                        return 400, {
-                            "error": f"tip field {field!r} does not match the blocks"
-                        }
+            if tip != recomputed_tip:
+                return 400, {"error": "tip summary does not match the blocks"}
             fingerprint = self.store.range_fingerprint(anchor, tail)
             tip_hash = fork[-1].block_hash
 

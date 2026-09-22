@@ -349,6 +349,118 @@ class RangeServiceTests(unittest.TestCase):
         body["tip"] = {"tip_hash": "0" * 64}
         self.assertEqual(self.service.submit_fork_sync_range(body)[0], 400)
 
+    def test_tip_summary_contract(self) -> None:
+        tail = make_tail(
+            self.store.chain[1].block_hash, 2, [[(self.ka, self.A, self.B, 40)]]
+        )
+        good = self._range_payload(1, tail, request_id="t0")
+        good_tip = dict(good["tip"])
+        n = {"v": 0}
+
+        def variant(**changes) -> dict:
+            n["v"] += 1
+            body = json.loads(json.dumps(good))
+            body["request_id"] = f"t{n['v']}"
+            body.update(changes)
+            return body
+
+        def tip_variant(**tip_changes) -> dict:
+            tip = dict(good_tip)
+            tip.update(tip_changes)
+            return variant(tip=tip)
+
+        # The summary is closed: an extra field or a missing field is 400.
+        self.assertEqual(
+            self.service.submit_fork_sync_range(tip_variant(extra=1))[0], 400
+        )
+        for field in ("tip_hash", "height", "length", "status"):
+            tip = dict(good_tip)
+            del tip[field]
+            self.assertEqual(
+                self.service.submit_fork_sync_range(variant(tip=tip))[0],
+                400,
+                f"missing {field}",
+            )
+        # Strict per-field types and formats.
+        self.assertEqual(
+            self.service.submit_fork_sync_range(tip_variant(tip_hash="zz"))[0], 400
+        )
+        self.assertEqual(
+            self.service.submit_fork_sync_range(
+                tip_variant(tip_hash=good_tip["tip_hash"].upper())
+            )[0],
+            400,
+        )
+        for bad_height in (True, -1, 1.5, "2"):
+            self.assertEqual(
+                self.service.submit_fork_sync_range(tip_variant(height=bad_height))[0],
+                400,
+                f"height={bad_height!r}",
+            )
+        for bad_length in (True, 0, -1, 2.5, "3"):
+            self.assertEqual(
+                self.service.submit_fork_sync_range(tip_variant(length=bad_length))[0],
+                400,
+                f"length={bad_length!r}",
+            )
+        for bad_status in ("rolled_back", "PENDING", 1, None):
+            self.assertEqual(
+                self.service.submit_fork_sync_range(tip_variant(status=bad_status))[0],
+                400,
+                f"status={bad_status!r}",
+            )
+        # A well-formed but wrong summary value is 400 too.
+        self.assertEqual(
+            self.service.submit_fork_sync_range(tip_variant(height=99))[0], 400
+        )
+        self.assertEqual(
+            self.service.submit_fork_sync_range(tip_variant(length=99))[0], 400
+        )
+        self.assertEqual(
+            self.service.submit_fork_sync_range(tip_variant(status="pending"))[0], 400
+        )
+        # Structural violations are decided BEFORE source authorization and
+        # write nothing: an unknown source with a broken tip is 400, not 403.
+        gen = self.store.generation
+        n_forks, n_syncs, n_events = (
+            len(self.store.forks),
+            len(self.store.syncs),
+            len(self.store.audit_events),
+        )
+        body = tip_variant(source="ghost")
+        body["tip"] = {"tip_hash": "0" * 64}
+        self.assertEqual(self.service.submit_fork_sync_range(body)[0], 400)
+        self.assertEqual(self.store.generation, gen)
+        self.assertEqual(len(self.store.forks), n_forks)
+        self.assertEqual(len(self.store.syncs), n_syncs)
+        self.assertEqual(len(self.store.audit_events), n_events)
+        # The untampered payload is still accepted afterwards.
+        self.assertEqual(self.service.submit_fork_sync_range(variant())[0], 201)
+
+    def test_retry_validates_full_tip_before_replay(self) -> None:
+        tail = make_tail(
+            self.store.chain[1].block_hash, 2, [[(self.ka, self.A, self.B, 40)]]
+        )
+        payload = self._range_payload(1, tail, request_id="rt")
+        status, first = self.service.submit_fork_sync_range(payload)
+        self.assertEqual(status, 201)
+        # A retry whose tip lost a field or carries a tampered value is 400,
+        # never the cached 200.
+        for mutate in (
+            lambda tip: tip.pop("status"),
+            lambda tip: tip.update(height=tip["height"] + 1),
+            lambda tip: tip.update(length=tip["length"] + 1),
+            lambda tip: tip.update(status="pending"),
+            lambda tip: tip.update(tip_hash="0" * 64),
+        ):
+            bad = json.loads(json.dumps(payload))
+            mutate(bad["tip"])
+            self.assertEqual(self.service.submit_fork_sync_range(bad)[0], 400)
+        # The identical retry still replays the first result.
+        status, replay = self.service.submit_fork_sync_range(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, first)
+
     def test_duplicate_tip_conflicts(self) -> None:
         tail = make_tail(
             self.store.chain[1].block_hash, 2, [[(self.ka, self.A, self.B, 40)]]
