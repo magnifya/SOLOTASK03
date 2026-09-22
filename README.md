@@ -138,27 +138,37 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   pending 尾块同样可导出），至多 `limit` 个；`canonical` 是当前链描述符 S；
   `next_height` 是本页之后的下一高度，已到链尾时为 `null`。
 - **推送区间**：`POST /v1/forks/sync/range`，请求体
-  `{"source","request_id","expires_at","anchor","blocks","tip"}`。`anchor` 为
-  `{height,block_hash}`；`blocks` 非空，自锚点下一高度起连续；`tip` 是拼接后
-  整链的链尾摘要 `{tip_hash,height,length,status}`（`length` 含 canonical 前缀
-  与创世块）。**新请求**严格按既有顺序处理：字段格式错误 `400` → 来源未授权
-  `403` → 请求 `expires_at` 已到 `410` → 锚点高度/哈希与当前 canonical 不匹配
+  `{"source","request_id","expires_at","anchor","blocks","tip"}`，六项均
+  必填，`blocks` 必须非空。`anchor` 为 `{height,block_hash}`；`blocks`
+  自锚点下一高度起连续；**`tip` 为必填且只能含 `tip_hash`、`height`、
+  `length`、`status` 四字段**——缺字段或多字段一律拒绝。其中 `tip_hash`
+  必须是 64 位小写十六进制；`height` 必须是非布尔、非负整数且等于
+  `blocks` 末块高度；`length` 必须是非布尔正整数，等于拼接 canonical
+  前缀后的完整块数（含 canonical 前缀与创世块）；`status` 只能是
+  `pending` 或 `confirmed`，且等于末块状态。**结构、类型或摘要非法
+  一律 `400`，并在来源授权之前处理**：不检查候选、不写入 fork、sync
+  记录、审计事件，也不递增 generation。**新请求**严格按顺序处理：
+  字段结构/类型/`tip` 形态错误 `400` → 来源未授权 `403` → 请求
+  `expires_at` 已到 `410` → 锚点高度/哈希与当前 canonical 不匹配
   `409` → 拼接 canonical 前缀执行**现有整链重验**（创世一致、连续高度与
   prev_hash、重算 block_hash/Merkle 根、tx_id 与 Ed25519、全链唯一且块内升序、
-  初始余额重放不超支、仅末块可 pending）并逐一核对 `tip` 字段，失败 `400` →
-  tip 与 canonical 或已存候选重复 `409`。成功 `201` 返回与整链同步相同的五字段
-  `{tip_hash,height,length,status,expires_at}`。
+  初始余额重放不超支、仅末块可 pending）并把 `tip` 四字段与重算结果**逐一
+  精确核对**（末块高度、含创世的完整块数、末块状态任一不符即失败）`400` →
+  tip 与 canonical 或已存候选重复 `409`。成功 `201` 返回与整链同步相同的
+  五字段 `{tip_hash,height,length,status,expires_at}`。
 - **幂等与原子持久化**：同一 `source`+`request_id` 的存活记录重试时**豁免授权
-  与过期检查**，且不重新拼接、不依赖当前 canonical——只对请求自带的锚点与尾部
-  区块做独立重验（篡改 `tip`/区块仍返回 `400`，不回放缓存）：内容相同返回 `200`
-  与首次原结果（含原 `expires_at`），即使此后来源被轮换/撤销、canonical 已推进；
-  内容不同返回 `409`。首次成功时在**同一次原子写入**里保存**拼接后的完整候选**
-  （按 tip_hash 存入既有候选表）、同步记录、仅覆盖锚点+尾部的内容**指纹**与
-  `sync_received` 事件；写盘失败完整回滚候选、同步记录、审计事件与
-  `generation`。此后采用（最长链/最小 tip_hash）、旧链已确认交易去重回池、
-  pending 末块不入池、过期清理与重启调和全部直接作用于该完整候选，规则与整链
-  同步完全一致；重启按当前信任注册表重新授权，并用持久化的 range 载荷独立重算
-  指纹、核对存储候选恰为 canonical 前缀加该尾部，失配记录静默丢弃。
+  与过期检查**，且不重新拼接、不依赖当前 canonical——先对请求自带的锚点、尾部
+  区块**与完整 `tip` 四字段**独立重验（结构非法或篡改 `tip`/区块仍返回 `400`，
+  不回放缓存；回放不受来源失效、请求过期或 canonical 推进影响），再比较内容：
+  内容相同返回 `200` 与首次原结果（含原 `expires_at`），内容缺失或被篡改返回
+  `400`，其他合法但不同的内容返回 `409`。首次成功时在**同一次原子写入**里
+  保存**拼接后的完整候选**（按 tip_hash 存入既有候选表）、同步记录、仅覆盖
+  锚点+尾部的内容**指纹**与 `sync_received` 事件；写盘失败完整回滚候选、
+  同步记录、审计事件与 `generation`。此后采用（最长链/最小 tip_hash）、旧链
+  已确认交易去重回池、pending 末块不入池、过期清理与重启调和全部直接作用于
+  该完整候选，规则与整链同步完全一致；重启按当前信任注册表重新授权，并用
+  持久化的 range 载荷独立重算指纹、核对存储候选恰为 canonical 前缀加该尾部，
+  失配记录静默丢弃。
 
 ## 持久化来源信任与审计
 
@@ -530,9 +540,11 @@ python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 180000
 python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 
-# 增量区间：chain-range 拉取（可把整页 JSON 直接交给 sync-range 推送，tip 自动派生）
+# 增量区间：chain-range 拉取（整页 JSON 可直接交给 sync-range 推送，缺省 tip 自动补齐四字段）
 python -m ledger.cli chain-range --after-height 2 --after-hash <block-hash> [--limit 100]
 python -m ledger.cli sync-range --source node-2 --request-id req-8 --expires-at 1800000000 '{"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...}}'
+# 文档可省略 tip（由末块自动派生 tip_hash/height/length/status 四字段）；显式给出时
+# 必须是完整的四字段 tip 文档，缺字段或多字段会被服务端拒绝（非 2xx 输出单行 JSON 并退出 1）；
 # range 文档也可以是 chain-range 的整页输出，或用 - 从标准输入读取
 
 # 持久化来源信任：注册 / 轮换 / 撤销 / 导出 verify 信任文档
@@ -575,7 +587,7 @@ python tests/recovery_test.py         # generation、多区块一致性、快照
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
-python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
+python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 严格四字段 tip（授权前400）、状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、篡改tip即400、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）

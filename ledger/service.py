@@ -867,6 +867,39 @@ class LedgerService:
     # -- incremental inter-node range sync -----------------------------------
 
     @staticmethod
+    def _tip_summary_error(tip: object) -> str | None:
+        """Validate the strict four-field tip summary of a range delivery.
+
+        The tip must be an object carrying exactly ``tip_hash`` (64 lowercase
+        hex characters), ``height`` (a non-boolean non-negative integer),
+        ``length`` (a non-boolean positive integer counting every block of the
+        assembled chain, genesis included) and ``status`` (``pending`` or
+        ``confirmed``); a missing or extra field is rejected just like a
+        mistyped one. Returns an error message when invalid, else ``None``.
+        """
+        if not isinstance(tip, dict):
+            return "field 'tip' must be a JSON object"
+        allowed = ("tip_hash", "height", "length", "status")
+        keys = set(tip)
+        missing = [field for field in allowed if field not in tip]
+        if missing:
+            return f"tip is missing field(s): {', '.join(missing)}"
+        extra = sorted(keys - set(allowed))
+        if extra:
+            return f"tip contains unexpected field(s): {', '.join(extra)}"
+        if not crypto.is_hex64(tip["tip_hash"]):
+            return "tip.tip_hash must be 64 lowercase hex characters"
+        height = tip["height"]
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return "tip.height must be a non-negative integer (not boolean)"
+        length = tip["length"]
+        if isinstance(length, bool) or not isinstance(length, int) or length < 1:
+            return "tip.length must be a positive integer (not boolean)"
+        if tip["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
+            return "tip.status must be 'pending' or 'confirmed'"
+        return None
+
+    @staticmethod
     def _range_tip_summary(anchor: dict, tail: list) -> dict:
         """Recompute the delivered chain's tip descriptor from anchor + tail."""
         tip = tail[-1]
@@ -885,21 +918,31 @@ class LedgerService:
         The request carries ``source``, ``request_id``, ``expires_at`` (Unix
         seconds), ``anchor`` (``{height, block_hash}`` naming the canonical
         block the range starts *after*), ``blocks`` (a non-empty list of
-        complete blocks starting at the next height) and ``tip`` (the
-        five-field export-style summary ``{tip_hash, height, length, status}``
-        of the delivered chain; supplied fields are all re-checked).
+        complete blocks starting at the next height) and ``tip`` (the REQUIRED
+        strict four-field summary ``{tip_hash, height, length, status}`` of
+        the delivered chain: exactly those four keys, no more and no fewer;
+        ``tip_hash`` is 64 lowercase hex characters, ``height`` a non-boolean
+        non-negative integer, ``length`` a non-boolean positive integer
+        counting the assembled chain including the canonical prefix and
+        genesis, and ``status`` either ``pending`` or ``confirmed``). The tip
+        shape is fully validated before the authorization gate and every one
+        of its fields is re-checked against the recomputed tail.
 
-        A new request follows the full-sync order: envelope format validation
-        (400), then the source authorization gate (403), then the request
-        deadline (410). The anchor must then match the *current* canonical
-        chain: an unknown anchor height or a hash mismatch is a stale anchor
-        (409). The tail is prepended with the canonical prefix and put through
-        the existing whole-chain re-validation (genesis connection,
-        consecutive heights/prev_hash, recomputed block hashes and Merkle
-        roots, tx_id/Ed25519 verification, global uniqueness and ordering,
-        endowment replay, pending-only-at-tip); failure is 400, as is a
-        ``tip`` summary that does not recompute. A tip already known as the
-        canonical chain or a stored candidate is 409, mirroring full sync.
+        A new request follows the full-sync order: envelope/structure/type/
+        tip-shape validation (400, before any source check, with no candidate
+        inspection and no fork/sync/audit/generation writes), then the source
+        authorization gate (403), then the request deadline (410). The anchor
+        must then match the *current* canonical chain: an unknown anchor
+        height or a hash mismatch is a stale anchor (409). The tail is
+        prepended with the canonical prefix and put through the existing
+        whole-chain re-validation (genesis connection, consecutive heights/
+        prev_hash, recomputed block hashes and Merkle roots, tx_id/Ed25519
+        verification, global uniqueness and ordering, endowment replay,
+        pending-only-at-tip); failure is 400, as is a ``tip`` summary that
+        does not recompute exactly (including height == last block height,
+        length == assembled block count and status == last block status). A
+        tip already known as the canonical chain or a stored candidate is 409,
+        mirroring full sync.
 
         Success stores the ASSEMBLED complete candidate (keyed by its tip hash)
         together with the sync record, the range content fingerprint
@@ -924,7 +967,7 @@ class LedgerService:
         expires_at = payload["expires_at"]
         anchor_raw = payload["anchor"]
         blocks_raw = payload["blocks"]
-        tip = payload.get("tip")
+        tip = payload["tip"]
 
         if not isinstance(source, str) or not source:
             return 400, {"error": "field 'source' must be a non-empty string"}
@@ -951,8 +994,13 @@ class LedgerService:
             return 400, {"error": "field 'blocks' must be a list"}
         if not blocks_raw:
             return 400, {"error": "field 'blocks' must be non-empty"}
-        if tip is not None and not isinstance(tip, dict):
-            return 400, {"error": "field 'tip' must be a JSON object"}
+        # The strict four-field tip summary is fully validated BEFORE the
+        # authorization gate: a malformed, partial or augmented tip is 400
+        # regardless of the source, and no candidate inspection, fork write,
+        # sync record, audit event or generation bump takes place.
+        tip_error = self._tip_summary_error(tip)
+        if tip_error is not None:
+            return 400, {"error": tip_error}
 
         with self.store.lock:
             self._prune_expired_syncs()
@@ -975,12 +1023,14 @@ class LedgerService:
                 except ValueError as exc:
                     return 400, {"error": str(exc)}
                 recomputed_tip = self._range_tip_summary(anchor, tail)
-                if tip is not None:
-                    for field in ("tip_hash", "height", "length", "status"):
-                        if field in tip and tip[field] != recomputed_tip[field]:
-                            return 400, {
-                                "error": f"tip field {field!r} does not match the blocks"
-                            }
+                # The complete strict tip summary must be present (shape was
+                # enforced pre-lock) and recompute exactly from the delivered
+                # anchor and tail; a missing, tampered or augmented field fails
+                # 400 rather than replaying the cached 200.
+                if tip != recomputed_tip:
+                    return 400, {
+                        "error": "tip summary does not match the delivered blocks"
+                    }
                 fingerprint = self.store.range_fingerprint(anchor, tail)
                 if fingerprint != existing["fingerprint"]:
                     return 409, {
@@ -1050,12 +1100,11 @@ class LedgerService:
             recomputed_tip = self._range_tip_summary(anchor, tail)
             if summary != recomputed_tip:
                 return 400, {"error": "range does not assemble onto the canonical chain"}
-            if tip is not None:
-                for field in ("tip_hash", "height", "length", "status"):
-                    if field in tip and tip[field] != recomputed_tip[field]:
-                        return 400, {
-                            "error": f"tip field {field!r} does not match the blocks"
-                        }
+            # Every supplied tip field must equal the recomputed summary; the
+            # strict four-field shape was already enforced before
+            # authorization, so this is an exact full-summary comparison.
+            if tip != recomputed_tip:
+                return 400, {"error": "tip summary does not match the delivered blocks"}
             fingerprint = self.store.range_fingerprint(anchor, tail)
             tip_hash = fork[-1].block_hash
 

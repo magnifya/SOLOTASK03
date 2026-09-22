@@ -4,16 +4,19 @@ Covers GET /v1/chain/range (required after_height/after_hash, strict decimal
 and 64-hex formats, limit default 100 / range 1-500, repeated parameters 400,
 unknown anchor height 404, malformed anchor hash 400, anchor mismatch 409; the
 locked {anchor, blocks, canonical, next_height} response, paging via
-next_height and pending-tip export) and POST /v1/forks/sync/range (new-request
-precedence format 400 -> authorization 403 -> expiry 410 -> stale anchor 409
--> assembled whole-chain re-validation/tip check 400 -> duplicate tip 409;
-201 with the same five fields as a full sync; same-key identical-content
-retry 200 replaying the first result independently of later authorization or
-canonical advancement; malformed retry body 400; different content 409;
-assembled candidate adoption by the longest-chain rule; atomic save-failure
-rollback of candidate/record/event/generation; restart persistence,
-standalone fingerprint re-verification and tamper pruning) at the service,
-HTTP and CLI surfaces.
+next_height and pending-tip export) and POST /v1/forks/sync/range (required
+strict four-field tip {tip_hash,height,length,status}: missing/extra fields
+and bad types or enum values are 400 before the authorization gate with no
+state written; new-request precedence format 400 -> authorization 403 ->
+expiry 410 -> stale anchor 409 -> assembled whole-chain re-validation/full
+tip mismatch 400 -> duplicate tip 409; 201 with the same five fields as a
+full sync; same-key identical-content retry 200 replaying the first result
+independently of later authorization or canonical advancement; malformed or
+tip-tampered retry body 400; different content 409; assembled candidate
+adoption by the longest-chain rule; atomic save-failure rollback of
+candidate/record/event/generation; restart persistence, standalone
+fingerprint re-verification and tamper pruning) at the service, HTTP and CLI
+surfaces.
 
 Run: python3 tests/range_sync_test.py
 """
@@ -349,6 +352,127 @@ class RangeServiceTests(unittest.TestCase):
         body["tip"] = {"tip_hash": "0" * 64}
         self.assertEqual(self.service.submit_fork_sync_range(body)[0], 400)
 
+    def test_strict_tip_summary_shape_and_types(self) -> None:
+        tail = make_tail(
+            self.store.chain[1].block_hash, 2, [[(self.ka, self.A, self.B, 40)]]
+        )
+        end = tail[-1]
+        correct_tip = {
+            "tip_hash": end.block_hash,
+            "height": end.height,
+            "length": 1 + 1 + len(tail),
+            "status": end.status,
+        }
+        counter = {"v": 0}
+
+        def submit(tip=..., *, source: str = "node-x") -> int:
+            counter["v"] += 1
+            body = self._range_payload(
+                1, tail, request_id=f"s{counter['v']}", source=source, tip=correct_tip
+            )
+            if tip is ...:
+                del body["tip"]
+            else:
+                body["tip"] = tip
+            return self.service.submit_fork_sync_range(body)[0]
+
+        # Tip absent or not an object is 400 — even before authorization, so an
+        # unregistered source still gets 400 rather than 403.
+        self.assertEqual(submit(), 400)
+        self.assertEqual(submit(None), 400)
+        self.assertEqual(submit("tip"), 400)
+        self.assertEqual(submit([correct_tip]), 400)
+        self.assertEqual(submit(None, source="ghost"), 400)
+        self.assertEqual(submit(correct_tip, source="ghost"), 403)
+
+        # Each missing field is 400 (pre-authorization).
+        for removed in ("tip_hash", "height", "length", "status"):
+            partial = dict(correct_tip)
+            del partial[removed]
+            self.assertEqual(submit(partial), 400)
+            self.assertEqual(submit(partial, source="ghost"), 400)
+
+        # Any extra field is 400 (pre-authorization).
+        augmented = dict(correct_tip, extra=1)
+        self.assertEqual(submit(augmented), 400)
+        self.assertEqual(submit(augmented, source="ghost"), 400)
+
+        # tip_hash must be exactly 64 lowercase hex characters.
+        bad_hashes = ("z" * 64, "A" * 64, "0" * 63, "0" * 65, 123, True)
+        for bad in bad_hashes:
+            self.assertEqual(submit(dict(correct_tip, tip_hash=bad)), 400)
+
+        # height must be a non-boolean non-negative integer.
+        for bad in (True, False, -1, 1.0, "2", None):
+            self.assertEqual(submit(dict(correct_tip, height=bad)), 400)
+
+        # length must be a non-boolean positive integer.
+        for bad in (True, False, 0, -1, 2.0, "3"):
+            self.assertEqual(submit(dict(correct_tip, length=bad)), 400)
+
+        # status only allows pending/confirmed.
+        for bad in ("PENDING", "finalized", "", 0, True):
+            self.assertEqual(submit(dict(correct_tip, status=bad)), 400)
+
+        # A well-shaped summary whose values do not recompute from the blocks
+        # is 400 after the anchor/chain checks.
+        self.assertEqual(submit(dict(correct_tip, tip_hash="0" * 64)), 400)
+        self.assertEqual(submit(dict(correct_tip, height=end.height + 1)), 400)
+        self.assertEqual(submit(dict(correct_tip, length=correct_tip["length"] + 1)), 400)
+        self.assertEqual(submit(dict(correct_tip, status=STATUS_PENDING)), 400)
+
+        # All the rejections predate any state change: no candidate, record or
+        # audit event was written.
+        self.assertEqual(self.store.forks, {})
+        self.assertEqual(self.store.syncs, {})
+        sync_events = [
+            e for e in self.store.audit_events if e["kind"] == "sync_received"
+        ]
+        self.assertEqual(sync_events, [])
+
+        # The well-formed delivery still succeeds.
+        self.assertEqual(submit(correct_tip), 201)
+
+    def test_retry_independently_revalidates_full_tip(self) -> None:
+        tail = make_tail(
+            self.store.chain[1].block_hash,
+            2,
+            [[(self.ka, self.A, self.B, 40)], [(self.kb, self.B, self.A, 5)]],
+        )
+        payload = self._range_payload(1, tail, request_id="rt")
+        status, first = self.service.submit_fork_sync_range(payload)
+        self.assertEqual(status, 201)
+        end = tail[-1]
+        correct_tip = {
+            "tip_hash": end.block_hash,
+            "height": end.height,
+            "length": 1 + 1 + len(tail),
+            "status": end.status,
+        }
+        # A well-shaped tip with a single tampered value fails 400 standalone,
+        # never replaying the cached 200 or reaching the 409 content check.
+        for mutated in (
+            dict(correct_tip, tip_hash="0" * 64),
+            dict(correct_tip, height=end.height + 1),
+            dict(correct_tip, length=correct_tip["length"] - 1),
+            dict(correct_tip, status=STATUS_PENDING),
+        ):
+            bad = json.loads(json.dumps(payload))
+            bad["tip"] = mutated
+            self.assertEqual(self.service.submit_fork_sync_range(bad)[0], 400)
+        # Structural tip defects on a live key are likewise 400 (before the
+        # authorization and idempotency decisions).
+        bad = json.loads(json.dumps(payload))
+        del bad["tip"]["status"]
+        self.assertEqual(self.service.submit_fork_sync_range(bad)[0], 400)
+        bad = json.loads(json.dumps(payload))
+        bad["tip"]["extra"] = 1
+        self.assertEqual(self.service.submit_fork_sync_range(bad)[0], 400)
+        # The untouched retry still replays the original result as 200.
+        status, replay = self.service.submit_fork_sync_range(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, first)
+
     def test_duplicate_tip_conflicts(self) -> None:
         tail = make_tail(
             self.store.chain[1].block_hash, 2, [[(self.ka, self.A, self.B, 40)]]
@@ -584,6 +708,23 @@ class RangeHttpTests(unittest.TestCase):
         self.assertEqual(
             self.request("POST", "/v1/forks/sync/range", {"nope": True})[0], 400
         )
+        # A malformed or partial tip is 400 BEFORE the source gate: this
+        # unregistered source would otherwise get 403.
+        bad_shape = json.loads(json.dumps(payload))
+        del bad_shape["tip"]["status"]
+        self.assertEqual(
+            self.request("POST", "/v1/forks/sync/range", bad_shape)[0], 400
+        )
+        bad_extra = json.loads(json.dumps(payload))
+        bad_extra["tip"]["extra"] = 1
+        self.assertEqual(
+            self.request("POST", "/v1/forks/sync/range", bad_extra)[0], 400
+        )
+        bad_type = json.loads(json.dumps(payload))
+        bad_type["tip"] = False
+        self.assertEqual(
+            self.request("POST", "/v1/forks/sync/range", bad_type)[0], 400
+        )
 
 
 class RangeCliTests(unittest.TestCase):
@@ -679,6 +820,56 @@ class RangeCliTests(unittest.TestCase):
             "{not json",
         )
         self.assertEqual(rc, 1)
+
+    def test_sync_range_cli_explicit_tip_document(self) -> None:
+        genesis = self.service.store.chain[0]
+        tail = make_tail(
+            genesis.block_hash, 1, [[(self.ka, self.A, self.B, 7)]]
+        )
+        end = tail[-1]
+        # A document carrying the complete strict tip summary (plus unrelated
+        # page fields) is forwarded verbatim and accepted.
+        full_doc = json.dumps(
+            {
+                "anchor": {"height": 0, "block_hash": genesis.block_hash},
+                "blocks": [b.to_dict() for b in tail],
+                "canonical": {"height": 0},
+                "next_height": end.height,
+                "tip": {
+                    "tip_hash": end.block_hash,
+                    "height": end.height,
+                    "length": 2,
+                    "status": end.status,
+                },
+            }
+        )
+        rc, body = self.run_cli(
+            "sync-range",
+            "--source", "cli-x",
+            "--request-id", "tip1",
+            "--expires-at", str(self.exp),
+            full_doc,
+        )
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body["tip_hash"], end.block_hash)
+        # A partial explicit tip document cannot be completed by derivation
+        # (it is present) and is rejected as a single JSON line, exit 1.
+        partial_doc = json.dumps(
+            {
+                "anchor": {"height": 0, "block_hash": genesis.block_hash},
+                "blocks": [b.to_dict() for b in tail],
+                "tip": {"tip_hash": end.block_hash},
+            }
+        )
+        rc, err = self.run_cli(
+            "sync-range",
+            "--source", "cli-x",
+            "--request-id", "tip2",
+            "--expires-at", str(self.exp),
+            partial_doc,
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("error", err)
 
 
 if __name__ == "__main__":

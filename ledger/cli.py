@@ -290,7 +290,9 @@ def cmd_sync_range(args: argparse.Namespace) -> int:
         return _emit(400, {"error": f"invalid JSON range document: {exc}"})
     # The range document is {"anchor", "blocks"[, "tip"]}; a GET
     # /v1/chain/range page may be piped verbatim (its extra canonical/
-    # next_height fields are ignored).
+    # next_height fields are ignored). The server requires the strict
+    # four-field tip summary, so when the document omits one it is derived
+    # below; an explicitly provided tip document is forwarded verbatim.
     if not isinstance(document, dict):
         return _emit(400, {"error": "range document must be a JSON object"})
     anchor = document.get("anchor")
