@@ -1,6 +1,7 @@
 """Command line interface: send, tx, mine, block, account, proof, state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
-index, sync, syncs, sync-history, audit, audit-export, trust
+index, sync, sync-range, sync-attested, syncs, sync-history, chain-range,
+audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify subcommands.
 
@@ -16,6 +17,7 @@ produced signature can be passed instead with ``--from/--signature``. The
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -356,6 +358,48 @@ def cmd_sync_range(args: argparse.Namespace) -> int:
     status, body = _request("POST", f"{args.base_url}/v1/forks/sync/range", payload)
     return _emit(status, body)
 
+
+def cmd_sync_attested(args: argparse.Namespace) -> int:
+    try:
+        if args.candidate_json == "-":
+            candidate = json.loads(sys.stdin.read())
+        else:
+            candidate = json.loads(args.candidate_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON candidate: {exc}"})
+    # Preserve the candidate's original form (export object, {"blocks": [...]}
+    # wrapper or a bare block array): the signature is over the canonical
+    # message embedding exactly that parsed value.
+    if not isinstance(candidate, (dict, list)):
+        return _emit(400, {"error": "candidate must be a JSON object or array"})
+    document = {
+        "domain": "ledger-sync-v1",
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "candidate": candidate,
+    }
+    message = json.dumps(
+        document, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    # Sign the raw 32-byte SHA-256 digest with the 64-lowercase-hex Ed25519
+    # seed; the result is a 128-lowercase-hex signature.
+    signature = crypto.sign_message(
+        args.signing_key, hashlib.sha256(message).digest()
+    )
+    if signature is None:
+        return _emit(400, {"error": "signing key must be 64 lowercase hex characters"})
+    payload = {
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "candidate": candidate,
+        "signature": signature,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/forks/sync/attested", payload
+    )
+    return _emit(status, body)
 
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -705,6 +749,34 @@ def build_parser() -> argparse.ArgumentParser:
         "or - to read JSON from standard input",
     )
     p_sync_range.set_defaults(func=cmd_sync_range)
+
+    p_sync_attested = sub.add_parser(
+        "sync-attested",
+        help="push a signature-attested candidate chain from another node",
+    )
+    p_sync_attested.add_argument(
+        "--source", required=True, help="originating node identifier"
+    )
+    p_sync_attested.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync_attested.add_argument(
+        "--expires-at",
+        required=True,
+        type=int,
+        help="expiry as Unix seconds; an expired delivery is rejected 410",
+    )
+    p_sync_attested.add_argument(
+        "--signing-key",
+        required=True,
+        help="64 lowercase hex Ed25519 seed matching the source's registered key",
+    )
+    p_sync_attested.add_argument(
+        "candidate_json",
+        help="export document, {\"blocks\":[...]} object, a bare block array, "
+        "or - to read JSON from standard input",
+    )
+    p_sync_attested.set_defaults(func=cmd_sync_attested)
 
     p_index = sub.add_parser(
         "index", help="query the confirmed-chain transaction index"

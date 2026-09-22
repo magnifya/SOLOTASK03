@@ -35,7 +35,14 @@ import time
 from . import audit
 from . import crypto
 from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
-from .store import TRUST_ACTIVE, TRUST_REVOKED, LedgerStore
+from .store import (
+    SYNC_MODE_ATTESTED,
+    TRUST_ACTIVE,
+    TRUST_REVOKED,
+    LedgerStore,
+    attested_fingerprint,
+    attested_message,
+)
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
 
@@ -661,26 +668,34 @@ class LedgerService:
             # adopted tip summary is frozen from the adopted fork itself and
             # is never rewritten by later expiry.
             adopted_summary = self._fork_summary(fork)
-            adopted_keys = sorted(
-                key
-                for key, rec in self.store.syncs.items()
-                if rec["tip_hash"] == tip_hash
-            )
-            for rec_source, request_id in adopted_keys:
-                self.store.append_audit_event(
-                    EVENT_SYNC_ADOPTED,
-                    {
-                        "source": rec_source,
-                        "request_id": request_id,
-                        "tip_hash": tip_hash,
-                        "expires_at": self.store.syncs[
-                            (rec_source, request_id)
-                        ]["expires_at"],
-                        "height": adopted_summary["height"],
-                        "length": adopted_summary["length"],
-                        "status": adopted_summary["status"],
-                    },
+            # The adopted tip may have provenance entries in the plain table,
+            # the attested table, or both; each gets one adoption event.
+            adopted: list[tuple[str | None, tuple[str, str]]] = []
+            for skey in sorted(self.store.syncs):
+                if self.store.syncs[skey]["tip_hash"] == tip_hash:
+                    adopted.append((None, skey))
+            for skey in sorted(self.store.attested_syncs):
+                if self.store.attested_syncs[skey]["tip_hash"] == tip_hash:
+                    adopted.append((SYNC_MODE_ATTESTED, skey))
+            adopted_count = len(adopted)
+            for rec_mode, (rec_source, request_id) in adopted:
+                table = (
+                    self.store.attested_syncs
+                    if rec_mode is not None
+                    else self.store.syncs
                 )
+                payload = {
+                    "source": rec_source,
+                    "request_id": request_id,
+                    "tip_hash": tip_hash,
+                    "expires_at": table[(rec_source, request_id)]["expires_at"],
+                    "height": adopted_summary["height"],
+                    "length": adopted_summary["length"],
+                    "status": adopted_summary["status"],
+                }
+                if rec_mode is not None:
+                    payload["mode"] = rec_mode
+                self.store.append_audit_event(EVENT_SYNC_ADOPTED, payload)
             try:
                 self.store.save()
             except BaseException:
@@ -689,7 +704,7 @@ class LedgerService:
                 self.store.pending = old_pending
                 self.store.forks[tip_hash] = fork
                 self.store.rebuild_derived()
-                self.store.truncate_audit_events(len(adopted_keys))
+                self.store.truncate_audit_events(adopted_count)
                 raise
             return 200, self._fork_summary(fork)
 
@@ -819,38 +834,49 @@ class LedgerService:
     def _prune_expired_syncs(self) -> list[str]:
         """Sweep expired sync records and persist the sweep atomically.
 
-        A candidate received through a sync lives only while its record is
-        unexpired; on expiry both the record and its still-stored candidate fork
-        are dropped, together and in a single atomic save that advances the
-        generation. Candidates submitted directly (no sync record) never
-        expire, and an adopted tip is no longer in ``forks`` (it is on the
-        canonical chain), so its expiring audit record leaves the chain
-        untouched. If the write fails the pre-cleanup records and forks are
-        restored so no success is ever reported for an un-persisted sweep.
-        Caller must hold the store lock. Returns the pruned tip hashes.
+        Both the plain and the attested record tables are swept together in a
+        single atomic save that advances the generation. A candidate received
+        through a sync lives only while a referencing record is unexpired; on
+        expiry the record and its still-stored candidate fork are dropped
+        together. Candidates submitted directly (no sync record) never expire,
+        and an adopted tip is no longer in ``forks`` (it is on the canonical
+        chain), so its expiring audit record leaves the chain untouched. A
+        fork is dropped only when neither table still references it. If the
+        write fails the pre-cleanup records and forks are restored so no
+        success is ever reported for an un-persisted sweep. Caller must hold
+        the store lock. Returns the pruned tip hashes.
         """
-        expired_tips, removed = self.store.prune_syncs()
-        if not removed:
-            return expired_tips
+        plain_tips, plain_removed = self.store.prune_syncs()
+        attested_tips, attested_removed = self.store.prune_attested_syncs()
+        if not plain_removed and not attested_removed:
+            return plain_tips + attested_tips
+        expired_tips = plain_tips + attested_tips
         removed_forks: dict[str, list] = {}
         canonical_hashes = {block.block_hash for block in self.store.chain}
-        # The same tip could theoretically be referenced by another live
-        # record; only drop a fork nothing still points at.
+        # The same tip could be referenced by another live record in either
+        # table; only drop a fork nothing still points at.
         live_tips = {rec["tip_hash"] for rec in self.store.syncs.values()}
+        live_tips.update(
+            rec["tip_hash"] for rec in self.store.attested_syncs.values()
+        )
         for tip in expired_tips:
             if tip in canonical_hashes or tip in live_tips:
                 continue
             fork = self.store.forks.pop(tip, None)
             if fork is not None:
                 removed_forks[tip] = fork
-        # Record one permanent expiry event per removed sync record. A tip
-        # already adopted onto the canonical chain still gets its event: the
-        # record's expiry is auditable even though the chain is untouched. The
-        # event freezes the originally delivered summary.
-        for (rec_source, request_id), rec in sorted(removed.items()):
-            self.store.append_audit_event(
-                EVENT_SYNC_EXPIRED,
-                {
+
+        def append_expiry_events(
+            removed: dict[tuple[str, str], dict], mode: str | None
+        ) -> None:
+            # Record one permanent expiry event per removed sync record. A tip
+            # already adopted onto the canonical chain still gets its event:
+            # the record's expiry is auditable even though the chain is
+            # untouched. The event freezes the originally delivered summary.
+            # Attested records' events carry mode="attested"; plain records
+            # keep the historical shape with no mode.
+            for (rec_source, request_id), rec in sorted(removed.items()):
+                payload = {
                     "source": rec_source,
                     "request_id": request_id,
                     "tip_hash": rec["tip_hash"],
@@ -858,16 +884,25 @@ class LedgerService:
                     "height": rec.get("height"),
                     "length": rec.get("length"),
                     "status": rec.get("status"),
-                },
-            )
+                }
+                if mode is not None:
+                    payload["mode"] = mode
+                self.store.append_audit_event(EVENT_SYNC_EXPIRED, payload)
+
+        append_expiry_events(plain_removed, None)
+        append_expiry_events(attested_removed, SYNC_MODE_ATTESTED)
+        removed_count = len(plain_removed) + len(attested_removed)
         try:
             self.store.save()
         except BaseException:
             # Restore the pre-cleanup state: a failed write must neither leave
             # the records gone nor their candidates orphaned, nor the events
             # durably visible.
-            self.store.truncate_audit_events(len(removed))
-            self.store.restore_syncs(removed, removed_forks)
+            self.store.truncate_audit_events(removed_count)
+            self.store.restore_syncs(plain_removed, removed_forks)
+            self.store.restore_syncs(
+                attested_removed, {}, table=self.store.attested_syncs
+            )
             raise
         return expired_tips
 
@@ -1063,6 +1098,231 @@ class LedgerService:
                 # Roll back the candidate, its metadata and the audit event
                 # together so a failed write never leaves one without the others.
                 self.store.syncs.pop(key, None)
+                self.store.forks.pop(tip_hash, None)
+                self.store.truncate_audit_events(1)
+                raise
+
+            result = dict(summary)
+            result["expires_at"] = expires_at
+            return 201, result
+
+    # -- signature-attested inter-node sync ----------------------------------
+
+    def submit_fork_sync_attested(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/forks/sync/attested — receive a signed candidate chain.
+
+        The request carries ``source``, ``request_id``, ``expires_at`` (Unix
+        seconds), ``candidate`` (an export object, a ``{"blocks": [...]}``
+        wrapper or a bare block array, kept in its delivered original form)
+        and ``signature`` — exactly 128 lowercase hex characters. The signed
+        message is the README canonical JSON of
+        ``{domain:"ledger-sync-v1", source, request_id, expires_at,
+        candidate}``; the signature is an Ed25519 signature over the raw
+        32-byte SHA-256 digest of those bytes, made with the source's current
+        registered public key.
+
+        Status precedence for a NEW key: malformed envelope fields (including
+        a signature that is not 128 lowercase hex characters) are 400; an
+        unauthorized source (unknown, revoked or registry-expired) is 403; a
+        well-formed request whose ``expires_at`` is not later than now is 410;
+        a signature that does not verify under the source's CURRENT registered
+        key/version is 403; then the candidate chain (and any supplied export
+        summary) is fully re-validated exactly like a plain sync, failure 400;
+        a tip already known as canonical or a stored candidate is 409.
+
+        On success the frozen signing public key, its registry version, the
+        signature and the signed-message fingerprint (covering the candidate
+        in its signed original form plus the signature) are persisted
+        atomically with the candidate, the sync record and a
+        ``sync_received`` event carrying ``mode:"attested"``. A failed
+        signature verification performs no writes and leaves no candidate.
+
+        The attested idempotency key ``(source, request_id)`` is a separate
+        namespace from the plain sync endpoints. A same-key retry on a live
+        record first re-verifies the signature (against the frozen key, so a
+        later rotation/revocation does not change the answer) and re-validates
+        the candidate chain; a wrong signature is 403, the identical signed
+        content replays the original frozen result as 200 (with its original
+        ``expires_at``), and any other well-formed content conflicts 409. The
+        frozen-key replay is unaffected by later trust changes.
+
+        On a record's own expiry, or when the source loses authorization
+        before a restart, the record and its not-adopted candidate are removed
+        and a ``mode:"attested"`` ``sync_expired`` event is appended; the same
+        key can then start a new lifecycle. Restart re-verifies the message,
+        signature, frozen key/version and fingerprint: a mismatch only drops
+        the cached record (the canonical chain is untouched, audit history
+        stays continuous); expiry/authorization loss is reconciled exactly
+        like plain sync.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in ("source", "request_id", "expires_at", "candidate", "signature"):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+
+        source = payload["source"]
+        request_id = payload["request_id"]
+        expires_at = payload["expires_at"]
+        candidate = payload["candidate"]
+        signature = payload["signature"]
+
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "field 'source' must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "field 'request_id' must be a non-empty string"}
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+            return 400, {"error": "field 'expires_at' must be a Unix-seconds integer"}
+        if not crypto.is_hex128(signature):
+            return 400, {
+                "error": "field 'signature' must be 128 lowercase hex characters"
+            }
+        if isinstance(candidate, dict):
+            if not isinstance(candidate.get("blocks"), list):
+                return 400, {"error": "field 'candidate' must contain a 'blocks' list"}
+        elif not isinstance(candidate, list):
+            return 400, {"error": "field 'candidate' must contain a 'blocks' list"}
+
+        mode = SYNC_MODE_ATTESTED
+        with self.store.lock:
+            self._prune_expired_syncs()
+
+            key = (source, request_id)
+            existing = self.store.attested_syncs.get(key)
+
+            if existing is None:
+                # New delivery: the source must be an active, unexpired entry
+                # of the persistent trust registry before anything else is
+                # examined; unknown/revoked/registry-expired is 403.
+                now = time.time()
+                trusted = self.store.trust_sources.get(source)
+                if (
+                    trusted is None
+                    or trusted["status"] != TRUST_ACTIVE
+                    or trusted["expires_at"] <= now
+                ):
+                    return 403, {"error": "source is not an active trusted source"}
+                if expires_at <= now:
+                    return 410, {"error": "sync request has expired"}
+                signer_public_key = trusted["public_key"]
+                signer_version = trusted["version"]
+            else:
+                # A live-key replay verifies against the FROZEN key/version,
+                # never the current registry: the recorded answer must not
+                # change when the source is rotated, revoked or expired after
+                # first reception. The frozen attestation is always present
+                # for attested records.
+                signer_public_key = existing["attested"]["public_key"]
+                signer_version = existing["attested"]["version"]
+
+            # Verify the Ed25519 signature over the raw SHA-256 digest of the
+            # canonical signed message. This is before any candidate
+            # validation or write; a failed verification changes nothing.
+            message = attested_message(source, request_id, expires_at, candidate)
+            digest = hashlib.sha256(message).digest()
+            if not crypto.verify_signature(signer_public_key, digest, signature):
+                return 403, {"error": "attestation signature is invalid"}
+
+            # Full whole-chain re-validation of the signed candidate, exactly
+            # like a plain sync; the export summary fields of a five-field
+            # document are recomputed and checked too.
+            blocks_raw = self._candidate_blocks(candidate)
+            try:
+                fork = self.store.validate_fork_blocks(blocks_raw)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            summary = self._fork_summary(fork)
+            if isinstance(candidate, dict):
+                for field in ("tip_hash", "height", "length", "status"):
+                    if field in candidate and candidate[field] != summary[field]:
+                        return 400, {
+                            "error": f"candidate field {field!r} does not match the blocks"
+                        }
+            tip_hash = fork[-1].block_hash
+            fingerprint = attested_fingerprint(
+                source, request_id, expires_at, candidate, signature
+            )
+
+            if existing is not None:
+                # Same-key retry: the signature just verified over this exact
+                # message, so any difference in envelope/candidate/signature is
+                # different signed content → 409. Identical content replays the
+                # original frozen result as 200, with the original deadline.
+                if fingerprint != existing["fingerprint"]:
+                    return 409, {
+                        "error": "request_id already used with different content"
+                    }
+                descriptor = None
+                if existing.get("height") is not None:
+                    descriptor = {
+                        "tip_hash": existing["tip_hash"],
+                        "height": existing["height"],
+                        "length": existing["length"],
+                        "status": existing["status"],
+                    }
+                if descriptor is None:
+                    descriptor = self._tip_descriptor(existing["tip_hash"]) or {
+                        "tip_hash": existing["tip_hash"],
+                        "height": None,
+                        "length": None,
+                        "status": None,
+                    }
+                return 200, {
+                    "tip_hash": descriptor["tip_hash"],
+                    "height": descriptor.get("height"),
+                    "length": descriptor.get("length"),
+                    "status": descriptor.get("status"),
+                    "expires_at": existing["expires_at"],
+                }
+
+            if any(tip_hash == block.block_hash for block in self.store.chain):
+                return 409, {"error": "fork is identical to the canonical chain"}
+            if tip_hash in self.store.forks:
+                return 409, {
+                    "error": "candidate fork already exists",
+                    "tip_hash": tip_hash,
+                }
+
+            self.store.forks[tip_hash] = fork
+            self.store.attested_syncs[key] = {
+                "tip_hash": tip_hash,
+                "expires_at": expires_at,
+                "fingerprint": fingerprint,
+                "height": summary["height"],
+                "length": summary["length"],
+                "status": summary["status"],
+                # Freeze the attestation: the signing public key and its
+                # registry version at delivery, the signature and the
+                # candidate in the exact form that was signed. Same-key
+                # replays verify against the frozen key, independent of later
+                # trust changes; restart re-verifies message/signature/
+                # version/fingerprint and only drops the cache on mismatch.
+                "attested": {
+                    "public_key": signer_public_key,
+                    "version": signer_version,
+                    "signature": signature,
+                    "candidate": candidate,
+                },
+            }
+            self.store.append_audit_event(
+                EVENT_SYNC_RECEIVED,
+                {
+                    "mode": mode,
+                    "source": source,
+                    "request_id": request_id,
+                    "tip_hash": tip_hash,
+                    "expires_at": expires_at,
+                    "height": summary["height"],
+                    "length": summary["length"],
+                    "status": summary["status"],
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Roll back the candidate, its attested metadata and the audit
+                # event together: a failed write leaves nothing behind.
+                self.store.attested_syncs.pop(key, None)
                 self.store.forks.pop(tip_hash, None)
                 self.store.truncate_audit_events(1)
                 raise
@@ -1531,7 +1791,13 @@ class LedgerService:
                 # sync record when possible.
                 expires_at = event.get("expires_at")
                 if expires_at is None:
-                    live_rec = self.store.syncs.get(
+                    is_attested = event.get("mode") == SYNC_MODE_ATTESTED
+                    table = (
+                        self.store.attested_syncs
+                        if is_attested
+                        else self.store.syncs
+                    )
+                    live_rec = table.get(
                         (event.get("source"), event.get("request_id"))
                     )
                     if (
