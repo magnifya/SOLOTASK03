@@ -317,16 +317,41 @@ def _parse_page_shape(page: object) -> dict:
 
 
 def _verify_pages(pages: list[dict]) -> dict:
-    """Walk every page in order; return the last page's checkpoint on success."""
+    """Walk every page in order; return the shared checkpoint on success.
+
+    Every page of one export must pin the *same* checkpoint: a replaced or
+    page-dependent checkpoint is an integrity failure even without a trust
+    document. A page whose ``next_cursor`` is null terminates the export; the
+    cursor==total page (and any redundant, identical trailing empty terminal
+    page) is still accepted because it carries no items, stays pinned at the
+    head anchor and does not move the cursor. A page that carries items or a
+    non-null ``next_cursor`` after a terminal page is an ordering/cursor break
+    and is rejected (the pagination counters reject every other such shape).
+    """
     running_id = 0
     running_hash = ZERO_HASH
-    last_checkpoint: dict | None = None
+    shared_checkpoint: dict | None = None
+    saw_terminal = False
     for page in pages:
         page = _parse_page_shape(page)
         items = page["items"]
         total = page["total"]
         next_cursor = page["next_cursor"]
         checkpoint = page["checkpoint"]
+
+        # After a null-next_cursor terminal page the export is over. Only a
+        # redundant empty terminal page (no items, still null, anchored at the
+        # unchanged head) may follow; it neither advances the cursor nor moves
+        # the chain and therefore cannot hide truncation or extra events.
+        if saw_terminal and (items or next_cursor is not None):
+            raise _VerifyError(ERR_INTEGRITY)
+
+        # All pages of a single export are snapshotted at one log head, so
+        # their checkpoints must be byte-for-byte identical.
+        if shared_checkpoint is None:
+            shared_checkpoint = checkpoint
+        elif checkpoint != shared_checkpoint:
+            raise _VerifyError(ERR_INTEGRITY)
 
         # The export is unfiltered, so a page's total is the log length its
         # checkpoint was taken over.
@@ -364,19 +389,19 @@ def _verify_pages(pages: list[dict]) -> dict:
         if next_cursor is None:
             if running_id != total:
                 raise _VerifyError(ERR_INTEGRITY)
+            saw_terminal = True
         else:
             if not items or next_cursor != running_id or next_cursor >= total:
                 raise _VerifyError(ERR_INTEGRITY)
-        last_checkpoint = checkpoint
 
     # The final page must end exactly on its checkpoint.
-    assert last_checkpoint is not None
+    assert shared_checkpoint is not None
     if (
-        running_id != last_checkpoint["event_id"]
-        or running_hash != last_checkpoint["event_hash"]
+        running_id != shared_checkpoint["event_id"]
+        or running_hash != shared_checkpoint["event_hash"]
     ):
         raise _VerifyError(ERR_INTEGRITY)
-    return dict(last_checkpoint)
+    return dict(shared_checkpoint)
 
 
 def _parse_trust_signers(trust: object) -> tuple[str, dict[int, dict]]:

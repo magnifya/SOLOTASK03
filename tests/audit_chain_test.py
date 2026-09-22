@@ -622,5 +622,135 @@ class AuditVerifyCLITests(unittest.TestCase):
         self.assertEqual(json.loads(line)["error"], "input")
 
 
+class MultiPageVerifyTests(unittest.TestCase):
+    """Offline multi-page export verification: shared checkpoint across every
+    page, ordering/cursor breaks, empty log / single page / trailing empty
+    terminal page compatibility — all without a trust document."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+        self.svc = LedgerService(
+            LedgerStore(os.path.join(self.tmp, "state.json"), initial_balance=1000),
+            initial_balance=1000,
+        )
+        for i in range(3):
+            self.svc.register_trust_source(
+                {
+                    "source": f"n{i}",
+                    "public_key": format(i + 1, "064x"),
+                    "expires_at": FUTURE,
+                }
+            )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pages(self, limit: str = "1") -> list[dict]:
+        pages: list[dict] = []
+        cursor = "0"
+        while True:
+            status, page = self.svc.export_audit_events(
+                {"limit": limit, "cursor": cursor}
+            )
+            self.assertEqual(status, 200)
+            pages.append(page)
+            if page["next_cursor"] is None:
+                break
+            cursor = str(page["next_cursor"])
+        return pages
+
+    def test_empty_log_single_empty_page_verifies(self) -> None:
+        svc = LedgerService(
+            LedgerStore(os.path.join(self.tmp, "empty.json"), initial_balance=1000),
+            initial_balance=1000,
+        )
+        _, page = svc.export_audit_events({})
+        result = audit.verify_export(page)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            result["checkpoint"], {"event_id": 0, "event_hash": audit.ZERO_HASH}
+        )
+
+    def test_single_full_page_verifies(self) -> None:
+        _, page = self.svc.export_audit_events({})
+        result = audit.verify_export(page)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["checkpoint"], page["checkpoint"])
+
+    def test_multi_page_and_trailing_empty_terminal_verify(self) -> None:
+        pages = self._pages()
+        self.assertEqual([p["total"] for p in pages], [3, 3, 3])
+        result = audit.verify_export(pages)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["checkpoint"], pages[-1]["checkpoint"])
+        # A separately fetched cursor==total empty terminal page is accepted.
+        _, empty = self.svc.export_audit_events({"cursor": "3"})
+        self.assertEqual(empty["items"], [])
+        self.assertTrue(audit.verify_export(pages + [empty])["ok"])
+
+    def test_middle_page_checkpoint_replaced_is_integrity(self) -> None:
+        pages = self._pages()
+        forged = [dict(pages[0]), dict(pages[1]), dict(pages[2])]
+        # Same event_id (so total still lines up) but a substituted head hash.
+        forged[1]["checkpoint"] = {
+            "event_id": 3,
+            "event_hash": "f" * 64,
+        }
+        self.assertEqual(
+            audit.verify_export(forged)["error"], "integrity"
+        )
+
+    def test_missing_checkpoint_field_is_input(self) -> None:
+        pages = self._pages()
+        del pages[0]["checkpoint"]
+        self.assertEqual(audit.verify_export(pages)["error"], "input")
+
+    def test_checkpoint_wrong_type_is_input(self) -> None:
+        pages = self._pages()
+        pages[0]["checkpoint"] = [1, 2]
+        self.assertEqual(audit.verify_export(pages)["error"], "input")
+        pages2 = self._pages()
+        pages2[1]["checkpoint"] = {"event_id": "3", "event_hash": "a" * 64}
+        self.assertEqual(audit.verify_export(pages2)["error"], "input")
+
+    def test_page_order_break_is_integrity(self) -> None:
+        pages = self._pages()
+        # Swap two adjacent pages: the anchor no longer meets the running head.
+        swapped = [pages[0], pages[2], pages[1]]
+        self.assertEqual(audit.verify_export(swapped)["error"], "integrity")
+
+    def test_items_reordered_is_integrity(self) -> None:
+        _, page = self.svc.export_audit_events({"limit": "2", "cursor": "0"})
+        # Reverse the two items without touching links: id continuity breaks.
+        page["items"] = [dict(page["items"][1]), dict(page["items"][0])]
+        self.assertEqual(audit.verify_export(page)["error"], "integrity")
+
+    def test_event_id_gap_is_integrity(self) -> None:
+        pages = self._pages()
+        pages[0]["items"][0]["event_id"] = 2
+        self.assertEqual(audit.verify_export(pages)["error"], "integrity")
+
+    def test_cursor_break_is_integrity(self) -> None:
+        pages = self._pages()
+        # Pretend the first page points past the actual next position.
+        pages[0]["next_cursor"] = 3
+        self.assertEqual(audit.verify_export(pages)["error"], "integrity")
+
+    def test_content_page_after_terminal_is_integrity(self) -> None:
+        pages = self._pages()
+        # Duplicate the last content-bearing terminal page after itself.
+        self.assertEqual(audit.verify_export(pages + [dict(pages[-1])])["error"], "integrity")
+
+    def test_non_null_cursor_after_terminal_is_integrity(self) -> None:
+        pages = self._pages()
+        extra = dict(pages[-1])
+        extra["items"] = []
+        extra["next_cursor"] = 3
+        self.assertEqual(audit.verify_export(pages + [extra])["error"], "integrity")
+
+    def test_empty_document_is_input(self) -> None:
+        self.assertEqual(audit.verify_export([])["error"], "input")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
