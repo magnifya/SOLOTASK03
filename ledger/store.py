@@ -460,6 +460,11 @@ class LedgerStore:
                 "height": rec.get("height"),
                 "length": rec.get("length"),
                 "status": rec.get("status"),
+                # The range mode and its envelope fingerprint are part of the
+                # authoritative view: two same-generation snapshots that
+                # disagree on either are conflicting candidates.
+                "mode": rec.get("mode"),
+                "request_fingerprint": rec.get("request_fingerprint"),
             }
             for key, rec in sorted((syncs or {}).items())
         ]
@@ -1283,6 +1288,18 @@ class LedgerStore:
             tip_hash = rec_raw.get("tip_hash")
             expires_at = rec_raw.get("expires_at")
             fingerprint = rec_raw.get("fingerprint")
+            # Range deliveries carry mode="range" plus a fingerprint of the
+            # original request envelope (anchor + range blocks + tip). A record
+            # without the field is a legacy whole-chain delivery; any other
+            # mode value is an unrecognized record and is silently pruned.
+            mode = rec_raw.get("mode")
+            if mode is not None and mode != "range":
+                continue
+            request_fingerprint = rec_raw.get("request_fingerprint")
+            if mode == "range" and (
+                not isinstance(request_fingerprint, str) or not request_fingerprint
+            ):
+                continue
             if not isinstance(source, str) or not source:
                 continue
             if not isinstance(request_id, str) or not request_id:
@@ -1322,6 +1339,15 @@ class LedgerStore:
                 "length": frozen_length,
                 "status": frozen_status,
             }
+            # Carry the range mode/envelope fingerprint through expiry
+            # reconciliation and into the surviving record. The content
+            # fingerprint below is always recomputed against the *assembled*
+            # candidate chain stored in forks (or the canonical prefix for an
+            # adopted tip), never against today's canonical chain, so a range
+            # retry/adoption/expiry/restart never depends on a later chain.
+            if mode == "range":
+                record["mode"] = "range"
+                record["request_fingerprint"] = request_fingerprint
             if isinstance(expires_at, bool) or not isinstance(expires_at, int):
                 # Malformed deadline: a structurally broken record, silently
                 # pruned (no lifecycle event is attributable to it).
@@ -1389,7 +1415,7 @@ class LedgerStore:
             key = (source, request_id)
             if key in syncs:
                 continue
-            syncs[key] = {
+            surviving = {
                 "tip_hash": tip_hash,
                 "expires_at": expires_at,
                 "fingerprint": fingerprint,
@@ -1397,6 +1423,10 @@ class LedgerStore:
                 "length": descriptor["length"],
                 "status": descriptor["status"],
             }
+            if mode == "range":
+                surviving["mode"] = "range"
+                surviving["request_fingerprint"] = request_fingerprint
+            syncs[key] = surviving
         return syncs, expired_records, synced_tips
 
     @staticmethod
@@ -1573,6 +1603,19 @@ class LedgerStore:
                     "height": rec.get("height"),
                     "length": rec.get("length"),
                     "status": rec.get("status"),
+                    # Range deliveries additionally record their delivery mode
+                    # and the fingerprint of the original request envelope
+                    # (anchor + range blocks + tip), so an idempotent retry
+                    # after restart never depends on the then-current chain.
+                    # Whole-chain sync records omit both (legacy layout).
+                    **(
+                        {
+                            "mode": rec["mode"],
+                            "request_fingerprint": rec["request_fingerprint"],
+                        }
+                        if rec.get("mode") == "range"
+                        else {}
+                    ),
                 }
                 for key, rec in sorted(self.syncs.items())
             ]

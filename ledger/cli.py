@@ -226,6 +226,39 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_chain_range(args: argparse.Namespace) -> int:
+    filters = {
+        "after_height": args.after_height,
+        "after_hash": args.after_hash,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/chain/range"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
+def cmd_sync_range(args: argparse.Namespace) -> int:
+    try:
+        range_doc = json.loads(args.range_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON range document: {exc}"})
+    payload = {
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        **range_doc,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/forks/sync/range", payload
+    )
+    return _emit(status, body)
+
+
 def cmd_syncs(args: argparse.Namespace) -> int:
     filters = {
         "source": args.source,
@@ -482,6 +515,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_chain = sub.add_parser("chain", help="fetch the canonical chain and candidate forks")
     p_chain.set_defaults(func=cmd_chain)
 
+    p_chain_range = sub.add_parser(
+        "chain-range", help="fetch an incremental range after an anchor"
+    )
+    p_chain_range.add_argument(
+        "--after-height", help="anchor height (decimal, default: chain tip)"
+    )
+    p_chain_range.add_argument(
+        "--after-hash", help="anchor block hash (64 lowercase hex characters)"
+    )
+    p_chain_range.add_argument(
+        "--limit", help="maximum blocks to return (decimal, 1-500, default 100)"
+    )
+    p_chain_range.set_defaults(func=cmd_chain_range)
+
     p_adopt = sub.add_parser("adopt", help="adopt a candidate fork by tip hash")
     p_adopt.add_argument("tip_hash", help="candidate fork tip block hash")
     p_adopt.set_defaults(func=cmd_adopt)
@@ -508,6 +555,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="candidate fork: an export-format object or a blocks JSON array",
     )
     p_sync.set_defaults(func=cmd_sync)
+
+    p_sync_range = sub.add_parser(
+        "sync-range",
+        help="push an incremental range (anchor + blocks + tip) from another node",
+    )
+    p_sync_range.add_argument(
+        "--source", required=True, help="originating node identifier"
+    )
+    p_sync_range.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync_range.add_argument(
+        "--expires-at",
+        required=True,
+        type=int,
+        help="expiry as Unix seconds; an expired delivery is rejected 410",
+    )
+    p_sync_range.add_argument(
+        "range_json",
+        help='range document JSON: {"anchor":{height,block_hash},"blocks":[...],'
+        '"tip":{...}}',
+    )
+    p_sync_range.set_defaults(func=cmd_sync_range)
 
     p_syncs = sub.add_parser("syncs", help="audit-list received synced candidates")
     p_syncs.add_argument("--source", help="filter by originating node identifier")

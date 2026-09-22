@@ -716,7 +716,9 @@ class LedgerService:
             if existing is not None:
                 # A retry on a live key is idempotent only when it carries the
                 # identical candidate content; a changed body conflicts 409.
-                if fingerprint != existing["fingerprint"]:
+                # Range and whole-chain deliveries never share an idempotency
+                # key either, even when the assembled chains hash identically.
+                if existing.get("mode") == "range" or fingerprint != existing["fingerprint"]:
                     return 409, {
                         "error": "request_id already used with different content"
                     }
@@ -1017,6 +1019,287 @@ class LedgerService:
         items = rows[cursor : cursor + limit]
         next_cursor = cursor + limit if cursor + limit < total else None
         return 200, {"items": items, "total": total, "next_cursor": next_cursor}
+
+    # -- incremental range protocol -------------------------------------------
+
+    RANGE_DEFAULT_LIMIT = 100
+    RANGE_MAX_LIMIT = 500
+
+    def get_chain_range(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/chain/range — incremental range after an anchor block.
+
+        Query parameters: ``after_height`` and ``after_hash`` name the anchor
+        (the last block the caller already has); ``limit`` defaults to 100 and
+        must be 1-500. Numeric parameters must be plain non-negative decimals
+        without leading zeros (``0`` itself is legal) and ``after_hash`` must
+        be 64 lowercase hex characters; a malformed value or a repeated
+        parameter is rejected 400. An anchor height absent from the chain is
+        404; a well-formed hash that does not match the block at that height is
+        409. With no anchor given the current chain tip is used.
+
+        The response is built under the store lock and carries
+        ``{anchor, blocks, canonical, next_height}``: ``anchor`` is
+        ``{height, block_hash}`` of the anchor, ``blocks`` are the complete
+        blocks strictly after it (full transactions, including an exportable
+        pending tip), capped at ``limit`` and in ascending height order,
+        ``canonical`` is the current chain descriptor S, and ``next_height``
+        is the height just past the returned page or ``null`` once the range
+        reaches the tip.
+        """
+        after_height_raw = params.get("after_height")
+        after_hash = params.get("after_hash")
+
+        after_height: int | None = None
+        if after_height_raw is not None:
+            after_height = _parse_decimal(after_height_raw)
+            if after_height is None:
+                return 400, {"error": "after_height must be a non-negative decimal"}
+        if after_hash is not None and not crypto.is_hex64(after_hash):
+            return 400, {"error": "after_hash must be 64 lowercase hex characters"}
+
+        limit = self.RANGE_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.RANGE_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 500"}
+            limit = parsed
+
+        with self.store.lock:
+            chain = self.store.chain
+            if after_height_raw is None and after_hash is None:
+                # No anchor supplied: anchor on the current tip (a polling
+                # client that is already up to date gets an empty range).
+                anchor_block = chain[-1]
+            elif after_hash is not None and after_height_raw is None:
+                # Locate the anchor by hash alone; an unknown hash names no
+                # block on this chain, which is the same miss as a bad height.
+                anchor_block = next(
+                    (block for block in chain if block.block_hash == after_hash),
+                    None,
+                )
+                if anchor_block is None:
+                    return 404, {"error": "anchor block not found"}
+            else:
+                anchor_block = self.store.block_at(after_height)  # type: ignore[arg-type]
+                if anchor_block is None:
+                    return 404, {"error": "anchor block not found"}
+                if (
+                    after_hash is not None
+                    and anchor_block.block_hash != after_hash
+                ):
+                    return 409, {"error": "after_hash does not match the block at after_height"}
+
+            start = anchor_block.height + 1
+            page = chain[start : start + limit]
+            # The range reaches the tip exactly when the page covers every
+            # block after the anchor; otherwise the client continues from the
+            # height just past the returned page.
+            if start + len(page) >= len(chain):
+                next_height = None
+            else:
+                next_height = start + len(page)
+            return 200, {
+                "anchor": {
+                    "height": anchor_block.height,
+                    "block_hash": anchor_block.block_hash,
+                },
+                "blocks": [block.to_dict() for block in page],
+                "canonical": self._fork_summary(chain),
+                "next_height": next_height,
+            }
+
+    def submit_fork_sync_range(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/forks/sync/range — receive an incremental range push.
+
+        The body is ``{source, request_id, expires_at, anchor, blocks, tip}``:
+        ``anchor`` names the canonical block the range continues from
+        (``{height, block_hash}``), ``blocks`` is the non-empty list of full
+        blocks starting at the next height, and ``tip`` pins the delivered
+        tip (``{height, block_hash}``).
+
+        A new request follows the established precedence: envelope/format
+        errors are 400, an unauthorized source is 403, and a request whose
+        ``expires_at`` has passed is 410 — all before the range is examined.
+        The anchor must then match the current canonical chain (a stale or
+        mismatched anchor is 409). The canonical prefix through the anchor is
+        prepended to ``blocks`` and the assembled chain goes through the
+        existing whole-chain re-validation; the supplied ``tip`` is checked
+        against the recomputed tail. Every other error status mirrors whole
+        chain sync (invalid chain 400, duplicate tip 409). Success stores the
+        *assembled* candidate chain (so adoption, expiry cleanup and restart
+        reconciliation need no knowledge of the range split) together with its
+        fingerprints and returns 201 with the familiar five fields.
+
+        A retry on the same source + request_id is exempt from authorization,
+        expiry and anchor re-checks: byte-identical content replays the frozen
+        first result as 200 even after the source was rotated/revoked or the
+        canonical chain moved on; changed content is 409. The candidate, its
+        record, fingerprint and audit event are saved in one atomic write; a
+        failed write rolls all of them back and never spends a generation.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in ("source", "request_id", "expires_at", "anchor", "blocks", "tip"):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+
+        source = payload["source"]
+        request_id = payload["request_id"]
+        expires_at = payload["expires_at"]
+        anchor_raw = payload["anchor"]
+        blocks_raw = payload["blocks"]
+        tip_raw = payload["tip"]
+
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "field 'source' must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "field 'request_id' must be a non-empty string"}
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+            return 400, {"error": "field 'expires_at' must be a Unix-seconds integer"}
+        anchor = self._parse_range_point(anchor_raw, "anchor")
+        if anchor is None:
+            return 400, {
+                "error": "field 'anchor' must be {height: non-negative integer, "
+                "block_hash: 64 lowercase hex characters}"
+            }
+        tip = self._parse_range_point(tip_raw, "tip")
+        if tip is None:
+            return 400, {
+                "error": "field 'tip' must be {height: non-negative integer, "
+                "block_hash: 64 lowercase hex characters}"
+            }
+        if not isinstance(blocks_raw, list) or not blocks_raw:
+            return 400, {"error": "field 'blocks' must be a non-empty list"}
+
+        # Fingerprint the request content itself (anchor + delivered blocks +
+        # tip), independent of the canonical prefix it gets attached to: a
+        # same-key retry must replay without depending on the current chain.
+        request_fingerprint = self._candidate_fingerprint(
+            [anchor_raw, blocks_raw, tip_raw]
+        )
+
+        with self.store.lock:
+            self._prune_expired_syncs()
+
+            key = (source, request_id)
+            existing = self.store.syncs.get(key)
+            if existing is not None:
+                # Whole-chain and range deliveries never share an idempotency
+                # key; only another identical range delivery may replay.
+                if existing.get("mode") != "range":
+                    return 409, {
+                        "error": "request_id already used with different content"
+                    }
+                if existing.get("request_fingerprint") != request_fingerprint:
+                    return 409, {
+                        "error": "request_id already used with different content"
+                    }
+                return 200, {
+                    "tip_hash": existing["tip_hash"],
+                    "height": existing["height"],
+                    "length": existing["length"],
+                    "status": existing["status"],
+                    "expires_at": existing["expires_at"],
+                }
+
+            # New request: the same authorization gate and deadline check as
+            # whole-chain sync, both before the range is examined.
+            now = time.time()
+            trusted = self.store.trust_sources.get(source)
+            if (
+                trusted is None
+                or trusted["status"] != TRUST_ACTIVE
+                or trusted["expires_at"] <= now
+            ):
+                return 403, {"error": "source is not an active trusted source"}
+            if expires_at <= now:
+                return 410, {"error": "sync request has expired"}
+
+            # The anchor must match the current canonical chain: the height
+            # must exist and its block hash must agree. Anything else is a
+            # stale anchor (409), never a silent re-anchoring.
+            anchor_block = self.store.block_at(anchor["height"])
+            if anchor_block is None or anchor_block.block_hash != anchor["block_hash"]:
+                return 409, {"error": "anchor does not match the current canonical chain"}
+
+            # Prepend the canonical prefix through the anchor and run the
+            # existing whole-chain re-validation over the assembled chain.
+            # Validation enforces, among everything else, that the delivered
+            # blocks sit consecutively from anchor height + 1 (each parsed
+            # block's height must equal its array position).
+            prefix_raw = [
+                block.to_dict() for block in self.store.chain[: anchor["height"] + 1]
+            ]
+            full_blocks_raw = prefix_raw + blocks_raw
+            try:
+                fork = self.store.validate_fork_blocks(full_blocks_raw)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            tail = fork[-1]
+            if tail.height != tip["height"] or tail.block_hash != tip["block_hash"]:
+                return 400, {"error": "field 'tip' does not match the delivered blocks"}
+            summary = self._fork_summary(fork)
+            tip_hash = tail.block_hash
+            canonical_blocks = [block.to_dict() for block in fork]
+            fingerprint = self._candidate_fingerprint(canonical_blocks)
+
+            if any(tip_hash == block.block_hash for block in self.store.chain):
+                return 409, {"error": "fork is identical to the canonical chain"}
+            if tip_hash in self.store.forks:
+                return 409, {
+                    "error": "candidate fork already exists",
+                    "tip_hash": tip_hash,
+                }
+
+            self.store.forks[tip_hash] = fork
+            self.store.syncs[key] = {
+                "tip_hash": tip_hash,
+                "expires_at": expires_at,
+                "fingerprint": fingerprint,
+                "height": summary["height"],
+                "length": summary["length"],
+                "status": summary["status"],
+                "mode": "range",
+                "request_fingerprint": request_fingerprint,
+            }
+            self.store.append_audit_event(
+                EVENT_SYNC_RECEIVED,
+                {
+                    "source": source,
+                    "request_id": request_id,
+                    "tip_hash": tip_hash,
+                    "expires_at": expires_at,
+                    "height": summary["height"],
+                    "length": summary["length"],
+                    "status": summary["status"],
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Roll back the assembled candidate, its range record and the
+                # audit event together: a failed write changes nothing.
+                self.store.syncs.pop(key, None)
+                self.store.forks.pop(tip_hash, None)
+                self.store.truncate_audit_events(1)
+                raise
+
+            result = dict(summary)
+            result["expires_at"] = expires_at
+            return 201, result
+
+    @staticmethod
+    def _parse_range_point(value: object, name: str) -> dict | None:
+        """Strictly parse an ``{height, block_hash}`` anchor/tip descriptor."""
+        if not isinstance(value, dict):
+            return None
+        height = value.get("height")
+        block_hash = value.get("block_hash")
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return None
+        if not crypto.is_hex64(block_hash):
+            return None
+        return {"height": height, "block_hash": block_hash}
 
     # -- transaction index ----------------------------------------------------
 

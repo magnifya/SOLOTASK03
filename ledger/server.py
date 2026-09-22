@@ -66,6 +66,14 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_fork_sync(payload)
                 self._send_json(status, body)
+            elif path == "/v1/forks/sync/range":
+                # POST /v1/forks/sync/range — incremental range push.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.submit_fork_sync_range(payload)
+                self._send_json(status, body)
             elif path == "/v1/audit/signer/rotate":
                 # POST /v1/audit/signer/rotate — rotate the Ed25519 key that
                 # authenticates audit export checkpoints.
@@ -158,6 +166,19 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 self._send_json(status, body)
             elif path == "/v1/chain":
                 status, body = service.get_chain()
+                self._send_json(status, body)
+            elif path == "/v1/chain/range":
+                # GET /v1/chain/range?after_height=&after_hash=&limit=
+                # Incremental range export; like the other strict endpoints
+                # every repeated query parameter is rejected with 400.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.get_chain_range(params)
                 self._send_json(status, body)
             elif path == "/v1/forks/sync/history":
                 # GET /v1/forks/sync/history?source=&tip_hash=&kind=&

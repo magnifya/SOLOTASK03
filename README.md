@@ -124,6 +124,48 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `generation` 并重建索引：旧链独有的已确认交易去重回池，旧链 pending 末块与
   新链已含交易都不入池；已采用 tip 的同步记录继续可查询直到过期。
 
+## 增量区间协议
+
+整链同步之外，节点还支持只推送锚点之后的**增量区间**，两端接口与既有接口完全
+兼容（旧端点、旧快照格式不变）。
+
+- **导出区间**：`GET /v1/chain/range`，查询参数 `after_height`、`after_hash`、
+  `limit`（默认 100，范围 1–500）。锚点是调用方已有的最后一块；二者均省略时
+  以当前链尾为锚点（已同步到最新的轮询客户端得到空区间）。参数重复，或数值不是
+  首位非 0 的非负十进制（`0` 合法）、`after_hash` 不是 64 位小写十六进制，
+  一律 `400`；锚点高度不存在返回 `404`；高度存在但 `after_hash` 与该高度区块
+  不匹配返回 `409`。只给 `after_hash` 时按哈希定位锚点，未知哈希 `404`。
+  在同一把锁内返回
+  `{anchor:{height,block_hash}, blocks, canonical, next_height}`：`anchor`
+  是锚点区块，`blocks` 是锚点之后、升序排列且**不超过 `limit`** 的完整区块
+  （含每笔交易的完整文档；链尾为 pending 时该 pending 尾块同样可导出），
+  `canonical` 是当前链描述符 `S`，`next_height` 是本页之后下一高度，区间已到
+  链尾时为 `null`。
+- **接收区间**：`POST /v1/forks/sync/range`，请求体
+  `{source, request_id, expires_at, anchor, blocks, tip}`：`anchor` 为
+  `{height, block_hash}`，`blocks` 为从下一高度开始的**非空**完整区块列表，
+  `tip` 为 `{height, block_hash}`。新请求严格按既有顺序处理：字段格式错误
+  `400` → 来源未授权 `403` → 请求 `expires_at` 已过 `410`；之后要求 `anchor`
+  与当前 canonical 链一致（高度存在且哈希匹配），否则视为过时锚点 `409`。
+  节点把锚点（含）之前的 canonical 前缀拼到 `blocks` 前，对拼出的整链执行与
+  整链同步完全相同的重验（创世一致、高度连续、`prev_hash` 相连、重算
+  block_hash/Merkle、校验 tx_id 与 Ed25519 签名、tx_id 唯一且块内升序、初始
+  余额重放不超支、仅末块可 pending），并核对 `tip` 等于重算链尾；`blocks`
+  不从下一高度连续、任一块重验失败或 `tip` 不符均 `400`，tip 与 canonical 或
+  已存候选重复为 `409`。成功 `201` 返回既有的五个字段
+  `{tip_hash, height, length, status, expires_at}`。
+- **幂等与生命周期**：同一 `source` + `request_id` 的重试**豁免授权、过期与
+  锚点检查**：即使来源此后轮换/撤销/注册过期，或 canonical 链已前移、锚点不再
+  是当前区块，同内容重试仍返回 `200` 与冻结的首次结果；内容不同返回 `409`。
+  区间记录与整链记录共用键空间但互不可复用（即使拼出的整链指纹相同）。接收时
+  保存的是**拼接后的完整候选链**以及整链指纹，并额外记录投递模式与请求体
+  （anchor+blocks+tip）指纹，候选、同步记录、指纹与 `sync_received` 审计事件在
+  同一次原子写入中落盘——因此重试、采用、过期清理与重启重验都只依赖已保存的
+  候选，而不依赖此后的 canonical 链；写盘失败完整回滚候选、同步记录、审计事件
+  与 `generation`。之后的最长链采用、已确认交易回池、pending 尾块不入池、
+  过期清理（已采用 tip 仅留审计记录、canonical 不动）、停机到期/失权补写
+  `sync_expired` 等规则与整链同步完全一致。
+
 ## 持久化来源信任与审计
 
 轻客户端所需的信任文档不再靠手工维护：节点持久化保存**来源信任注册表**、
@@ -313,7 +355,7 @@ SHA-256 摘要作为签名消息。
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `adopt` / `export` / `index` / `sync` / `syncs` / `trust add|rotate|revoke|export` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -416,6 +458,18 @@ curl -s 'localhost:8080/v1/forks/sync?source=node-2&min_height=1&limit=50&cursor
 curl -s 'localhost:8080/v1/forks/sync/history?source=node-2&kind=sync_adopted&limit=50&cursor=0'
 # -> 200 {"items":[{event_id,kind,at,source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
 
+# 增量区间导出（after_height/after_hash 锚点，limit 默认100、1-500；
+# 参数重复/非法格式 400，锚点高度不存在 404，哈希与该高度区块不符 409）
+curl -s 'localhost:8080/v1/chain/range?after_height=5&after_hash=<block-hash>&limit=100'
+# -> 200 {"anchor":{"height":5,"block_hash":"..."},"blocks":[{...}],"canonical":{...},"next_height":null}
+
+# 增量区间同步推送（anchor 必须匹配当前 canonical；新请求 400→403→410→锚点409；
+# 201；同 source+request_id 同内容重试 200（豁免授权/过期/锚点检查），内容不同 409）
+curl -s -X POST localhost:8080/v1/forks/sync/range \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"node-2","request_id":"range-1","expires_at":1800000000,"anchor":{"height":5,"block_hash":"..."},"blocks":[{...}],"tip":{"height":6,"block_hash":"..."}}'
+# -> 201 {"tip_hash":"...","height":6,"length":7,"status":"...","expires_at":1800000000}
+
 # 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
@@ -472,6 +526,12 @@ python -m ledger.cli candidates '[{"height":0,...},{"height":1,...}]'
 python -m ledger.cli chain
 python -m ledger.cli adopt <tip-hash>
 
+# 增量区间：chain-range 拉取锚点之后的完整区块（limit 默认100、1-500）
+python -m ledger.cli chain-range --after-height 5 --after-hash <block-hash> --limit 100
+# sync-range 的位置参数是 {"anchor":{...},"blocks":[...],"tip":{...}} 区间文档 JSON
+python -m ledger.cli sync-range --source node-2 --request-id range-1 --expires-at 1800000000 \
+  '{"anchor":{"height":5,"block_hash":"..."},"blocks":[{...}],"tip":{"height":6,"block_hash":"..."}}'
+
 # 导出候选分叉与确认链交易索引
 python -m ledger.cli export <tip-hash>
 python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--cursor N] [--limit N]
@@ -523,6 +583,7 @@ python tests/export_index_test.py     # 分叉导出、导出格式候选重验�
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
+python tests/range_sync_test.py        # 增量区间协议：GET /v1/chain/range（锚点/默认链尾、严格格式 400、缺高度 404、哈希不符 409、limit 1-500、分页 next_height、pending 尾块导出）与 POST /v1/forks/sync/range（400/403/410 优先级、锚点匹配 canonical 409、拼接前缀整链重验与 tip 核对、201 五字段、同键同内容 200 回放（撤销/换链后仍回放）、内容/跨端点/重复 tip 409、原子落盘与失败回滚、最长链采用、过期、重启重验/失权补事件）与 HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
