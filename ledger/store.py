@@ -460,6 +460,10 @@ class LedgerStore:
                 "height": rec.get("height"),
                 "length": rec.get("length"),
                 "status": rec.get("status"),
+                # A range delivery's {anchor, blocks} payload participates in
+                # conflict detection: same-generation snapshots disagreeing
+                # about the delivered increment are a conflict.
+                "range": rec.get("range"),
             }
             for key, rec in sorted((syncs or {}).items())
         ]
@@ -1357,6 +1361,23 @@ class LedgerStore:
                 continue
             if not isinstance(fingerprint, str) or not fingerprint:
                 continue
+            # An incremental range delivery additionally persists its
+            # delivered {anchor, blocks} payload. Its fingerprint covers only
+            # that payload (never the assembled prefix), so the record stays
+            # re-verifiable independently of the current canonical chain:
+            # validate the tail standalone, recompute the range fingerprint,
+            # and confirm the resolved stored chain really is the canonical
+            # prefix plus exactly that tail. A structurally malformed or
+            # tampered range is a silent orphan prune with no event, exactly
+            # like a full-sync fingerprint mismatch.
+            range_raw = rec_raw.get("range")
+            range_info: tuple[dict, list[dict], list[Block]] | None = None
+            if range_raw is not None:
+                range_info = self._parse_persisted_range(
+                    range_raw, tip_hash
+                )
+                if range_info is None:
+                    continue
             # Re-resolve the delivered candidate (a surviving fork, or the
             # canonical prefix for an adopted tip) and recompute its content
             # fingerprint: a tampered tip summary, deadline or request body
@@ -1369,7 +1390,22 @@ class LedgerStore:
                 blocks_raw = canonical_prefixes.get(tip_hash)
             if blocks_raw is None:
                 continue
-            if self._candidate_fingerprint(blocks_raw) != fingerprint:
+            if range_info is not None:
+                range_anchor, range_blocks_raw, range_tail = range_info
+                if self.range_fingerprint(range_anchor, range_tail) != fingerprint:
+                    continue
+                anchor_height = range_anchor["height"]
+                if len(blocks_raw) <= anchor_height + 1:
+                    continue
+                stored_anchor = blocks_raw[anchor_height]
+                tail_raw = blocks_raw[anchor_height + 1 :]
+                if (
+                    stored_anchor.get("height") != anchor_height
+                    or stored_anchor.get("block_hash") != range_anchor["block_hash"]
+                    or tail_raw != range_blocks_raw
+                ):
+                    continue
+            elif self._candidate_fingerprint(blocks_raw) != fingerprint:
                 continue
             # Verify the frozen summary metadata against the re-resolved
             # candidate: like a fingerprint mismatch, a tampered summary
@@ -1386,18 +1422,55 @@ class LedgerStore:
             ):
                 continue
             record.update(descriptor)
+            if range_info is not None:
+                # Retain the range payload so later saves and same-key retries
+                # stay independent of the (possibly advanced) canonical chain.
+                record["range"] = {
+                    "anchor": dict(range_info[0]),
+                    "blocks": range_info[1],
+                }
             key = (source, request_id)
             if key in syncs:
                 continue
-            syncs[key] = {
-                "tip_hash": tip_hash,
-                "expires_at": expires_at,
-                "fingerprint": fingerprint,
-                "height": descriptor["height"],
-                "length": descriptor["length"],
-                "status": descriptor["status"],
-            }
+            syncs[key] = record
         return syncs, expired_records, synced_tips
+
+    @staticmethod
+    def _parse_persisted_range(
+        range_raw: object, tip_hash: str
+    ) -> tuple[dict, list[dict], list[Block]] | None:
+        """Parse and standalone-verify a persisted range delivery payload.
+
+        Returns ``(anchor, raw tail block dicts, parsed tail Blocks)`` or None
+        when the payload is malformed, the tail fails standalone verification
+        or its final block hash differs from the record's tip.
+        """
+        if not isinstance(range_raw, dict):
+            return None
+        anchor_raw = range_raw.get("anchor")
+        blocks_raw = range_raw.get("blocks")
+        if not isinstance(anchor_raw, dict):
+            return None
+        anchor_height = anchor_raw.get("height")
+        anchor_hash = anchor_raw.get("block_hash")
+        if (
+            isinstance(anchor_height, bool)
+            or not isinstance(anchor_height, int)
+            or anchor_height < 0
+        ):
+            return None
+        if not crypto.is_hex64(anchor_hash):
+            return None
+        anchor = {"height": anchor_height, "block_hash": anchor_hash}
+        if not isinstance(blocks_raw, list) or not blocks_raw:
+            return None
+        try:
+            tail = LedgerStore.validate_range_tail(anchor, blocks_raw)
+        except ValueError:
+            return None
+        if tail[-1].block_hash != tip_hash:
+            return None
+        return anchor, [block.to_dict() for block in tail], tail
 
     @staticmethod
     def _candidate_fingerprint(blocks_raw: list) -> str:
@@ -1561,7 +1634,10 @@ class LedgerStore:
                 for fork in sorted(self.forks.values(), key=lambda f: f[-1].block_hash)
             ]
         # Sync metadata is persisted in the same atomic document as the
-        # candidate chains it references.
+        # candidate chains it references. A range-sync record additionally
+        # stores its delivered {anchor, blocks} payload so same-key retries
+        # stay replayable (and re-verifiable) without re-splicing against a
+        # canonical chain that may have since advanced.
         if self.syncs:
             data["syncs"] = [
                 {
@@ -1573,6 +1649,11 @@ class LedgerStore:
                     "height": rec.get("height"),
                     "length": rec.get("length"),
                     "status": rec.get("status"),
+                    **(
+                        {"range": rec["range"]}
+                        if rec.get("range") is not None
+                        else {}
+                    ),
                 }
                 for key, rec in sorted(self.syncs.items())
             ]
@@ -1788,6 +1869,103 @@ class LedgerStore:
             self.initial_balance if self.initial_balance is not None else 1_000_000
         )
         return self._parse_verified_chain(blocks_raw, endowment)
+
+    @staticmethod
+    def validate_range_tail(anchor: dict, blocks_raw: object) -> list[Block]:
+        """Strictly verify an incremental range's delivered tail standalone.
+
+        Used both when a range delivery is first received and when range sync
+        records are re-verified on restart; it never splices in (or depends on)
+        the current canonical chain, so a same-key retry stays verifiable after
+        the receiver's canonical chain has advanced. The tail must be a
+        non-empty list of well-formed blocks whose heights start at
+        ``anchor.height + 1`` and stay consecutive, whose first ``prev_hash``
+        is the anchor hash (later ones linking internally), with
+        recomputed-correct Merkle roots and block hashes, valid Ed25519
+        signatures, tx_ids unique within the tail and ascending inside each
+        block, and pending status only on its final block. Endowment replay is
+        not part of this standalone check (it needs the canonical-prefix
+        balances and is run on the assembled chain at first reception).
+        Raises ValueError on any defect and returns the parsed tail Blocks.
+        """
+        if not isinstance(blocks_raw, list) or not blocks_raw:
+            raise ValueError("'blocks' must be a non-empty list")
+        tail: list[Block] = []
+        seen_tx_ids: set[str] = set()
+        expected_prev = anchor["block_hash"]
+        for i, block_raw in enumerate(blocks_raw):
+            if not isinstance(block_raw, dict):
+                raise ValueError(f"block at position {i} is not a JSON object")
+            try:
+                block = Block.from_dict(block_raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"block {i} is malformed: {exc}") from exc
+            expected_height = anchor["height"] + 1 + i
+            if isinstance(block.height, bool) or block.height != expected_height:
+                raise ValueError(
+                    f"block at position {i} has height {block.height}, "
+                    f"expected {expected_height}"
+                )
+            if block.prev_hash != expected_prev:
+                raise ValueError(f"block {i} has a mismatched prev_hash")
+            if block.status not in (STATUS_PENDING, STATUS_CONFIRMED):
+                raise ValueError(f"block {i} has unknown status {block.status!r}")
+            if i < len(blocks_raw) - 1 and block.status == STATUS_PENDING:
+                raise ValueError(f"pending block {i} is not the chain tip")
+            txs_raw = block_raw.get("transactions")
+            if not isinstance(txs_raw, list):
+                raise ValueError(f"block {i} transactions must be a list")
+            tx_ids: list[str] = []
+            for j, tx in enumerate(block.transactions):
+                LedgerStore._valid_tx_fields(tx)
+                if not crypto.verify_signature(tx.sender, tx.message, tx.signature):
+                    raise ValueError(
+                        f"block {i} transaction {j} has an invalid signature"
+                    )
+                stored_id = (
+                    txs_raw[j].get("tx_id") if isinstance(txs_raw[j], dict) else None
+                )
+                if stored_id != tx.tx_id:
+                    raise ValueError(
+                        f"block {i} transaction {j} has a mismatched tx_id"
+                    )
+                if tx.tx_id in seen_tx_ids:
+                    raise ValueError(
+                        f"duplicate transaction {tx.tx_id} in range delivery"
+                    )
+                seen_tx_ids.add(tx.tx_id)
+                tx_ids.append(tx.tx_id)
+            if tx_ids != sorted(tx_ids):
+                raise ValueError(f"block {i} transactions are not tx_id sorted")
+            if crypto.merkle_root(tx_ids) != block.merkle_root:
+                raise ValueError(f"block {i} Merkle root mismatch")
+            if (
+                compute_block_hash(block.height, block.prev_hash, block.merkle_root)
+                != block.block_hash
+            ):
+                raise ValueError(f"block {i} block_hash mismatch")
+            expected_prev = block.block_hash
+            tail.append(block)
+        return tail
+
+    @staticmethod
+    def range_fingerprint(anchor: dict, tail: list[Block]) -> str:
+        """SHA-256 content fingerprint of a delivered range (anchor + tail).
+
+        Covers exactly what the sender delivered — never the assembled
+        canonical prefix — so a same-key retry keeps matching after the
+        receiver's canonical chain has advanced.
+        """
+        payload = {
+            "anchor": {
+                "height": anchor["height"],
+                "block_hash": anchor["block_hash"],
+            },
+            "blocks": [block.to_dict() for block in tail],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
 
     def _parse_persisted_forks(
         self,

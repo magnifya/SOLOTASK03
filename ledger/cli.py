@@ -264,6 +264,73 @@ def cmd_sync_history(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_chain_range(args: argparse.Namespace) -> int:
+    filters = {
+        "after_height": args.after_height,
+        "after_hash": args.after_hash,
+        "limit": args.limit,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/chain/range"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body)
+
+
+def cmd_sync_range(args: argparse.Namespace) -> int:
+    try:
+        if args.range_json == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            document = json.loads(args.range_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON range document: {exc}"})
+    # The range document is {"anchor", "blocks"[, "tip"]}; a GET
+    # /v1/chain/range page may be piped verbatim (its extra canonical/
+    # next_height fields are ignored).
+    if not isinstance(document, dict):
+        return _emit(400, {"error": "range document must be a JSON object"})
+    anchor = document.get("anchor")
+    blocks = document.get("blocks")
+    if not isinstance(anchor, dict) or not isinstance(blocks, list):
+        return _emit(
+            400, {"error": "range document must contain an anchor object and a blocks list"}
+        )
+    payload = {
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "anchor": anchor,
+        "blocks": blocks,
+    }
+    tip = document.get("tip")
+    if tip is None and blocks:
+        # Derive the tip summary from the final delivered block so a plain
+        # range page (which carries no tip) can be pushed verbatim.
+        last = blocks[-1]
+        if isinstance(last, dict):
+            anchor_height = anchor.get("height")
+            length = (
+                anchor_height + 1 + len(blocks)
+                if isinstance(anchor_height, int) and not isinstance(anchor_height, bool)
+                else None
+            )
+            tip = {
+                "tip_hash": last.get("block_hash"),
+                "height": last.get("height"),
+                "length": length,
+                "status": last.get("status"),
+            }
+    if tip is not None:
+        payload["tip"] = tip
+    status, body = _request("POST", f"{args.base_url}/v1/forks/sync/range", payload)
+    return _emit(status, body)
+
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     filters = {
         "tx_id": args.tx_id,
@@ -534,6 +601,44 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_history.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_sync_history.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_sync_history.set_defaults(func=cmd_sync_history)
+
+    p_chain_range = sub.add_parser(
+        "chain-range",
+        help="fetch the canonical blocks after an anchor (incremental range)",
+    )
+    p_chain_range.add_argument(
+        "--after-height", required=True, help="anchor block height (decimal)"
+    )
+    p_chain_range.add_argument(
+        "--after-hash",
+        required=True,
+        help="anchor block hash (64 lowercase hex characters)",
+    )
+    p_chain_range.add_argument(
+        "--limit", help="page size (decimal, 1-500, default 100)"
+    )
+    p_chain_range.set_defaults(func=cmd_chain_range)
+
+    p_sync_range = sub.add_parser(
+        "sync-range",
+        help="push an incremental chain range received from another node",
+    )
+    p_sync_range.add_argument("--source", required=True, help="originating node identifier")
+    p_sync_range.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync_range.add_argument(
+        "--expires-at",
+        required=True,
+        type=int,
+        help="expiry as Unix seconds; an expired delivery is rejected 410",
+    )
+    p_sync_range.add_argument(
+        "range_json",
+        help='range document {"anchor","blocks"[,"tip"]}, a chain-range page, '
+        "or - to read JSON from standard input",
+    )
+    p_sync_range.set_defaults(func=cmd_sync_range)
 
     p_index = sub.add_parser(
         "index", help="query the confirmed-chain transaction index"

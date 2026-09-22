@@ -507,6 +507,79 @@ class LedgerService:
             body["blocks"] = [block.to_dict() for block in fork]
             return 200, body
 
+    # -- incremental chain ranges --------------------------------------------
+
+    RANGE_DEFAULT_LIMIT = 100
+    RANGE_MAX_LIMIT = 500
+
+    @staticmethod
+    def _anchor_descriptor(block: Block) -> dict:
+        """Public range anchor shape: {height, block_hash}."""
+        return {"height": block.height, "block_hash": block.block_hash}
+
+    def get_chain_range(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/chain/range — the canonical blocks strictly after an anchor.
+
+        Query parameters: ``after_height`` (a non-negative decimal anchor
+        height) and ``after_hash`` (the anchor block's hash, 64 lowercase hex
+        characters), both required, plus ``limit`` (default 100, range 1-500).
+        Every value must follow the strict decimal/hex format used by the
+        other query endpoints; a repeated parameter is rejected by the HTTP
+        layer.
+
+        Returns, under the store lock,
+        ``{anchor, blocks, canonical, next_height}``: ``anchor`` is
+        ``{height, block_hash}`` naming the block the page starts *after*;
+        ``blocks`` are the complete blocks following it (full documents
+        including transactions; a pending tip block is exported too), up to
+        ``limit``; ``canonical`` is the current chain descriptor S;
+        ``next_height`` is the height immediately after the returned page, or
+        ``null`` when the page already ends at the chain tip. A well-formed
+        but unknown anchor height returns 404; a malformed anchor hash returns
+        400; an anchor hash that does not match the block at that height
+        returns 409.
+        """
+        after_height_raw = params.get("after_height")
+        after_hash = params.get("after_hash")
+        if after_height_raw is None:
+            return 400, {"error": "missing parameter: after_height"}
+        if after_hash is None:
+            return 400, {"error": "missing parameter: after_hash"}
+        after_height = _parse_decimal(after_height_raw)
+        if after_height is None:
+            return 400, {"error": "after_height must be a non-negative decimal"}
+        if not crypto.is_hex64(after_hash):
+            return 400, {"error": "after_hash must be 64 lowercase hex characters"}
+        limit = self.RANGE_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.RANGE_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 500"}
+            limit = parsed
+
+        with self.store.lock:
+            anchor_block = self.store.block_at(after_height)
+            if anchor_block is None:
+                return 404, {"error": "anchor block not found"}
+            if after_hash is not None and after_hash != anchor_block.block_hash:
+                return 409, {
+                    "error": "after_hash does not match the block at after_height"
+                }
+            page = self.store.chain[
+                after_height + 1 : after_height + 1 + limit
+            ]
+            page_end_height = page[-1].height if page else anchor_block.height
+            if page_end_height < self.store.chain[-1].height:
+                next_height = page_end_height + 1
+            else:
+                next_height = None
+            return 200, {
+                "anchor": self._anchor_descriptor(anchor_block),
+                "blocks": [block.to_dict() for block in page],
+                "canonical": self._fork_summary(self.store.chain),
+                "next_height": next_height,
+            }
+
     # -- inter-node fork sync -------------------------------------------------
 
     SYNC_DEFAULT_LIMIT = 50
@@ -782,6 +855,251 @@ class LedgerService:
             except BaseException:
                 # Roll back the candidate, its metadata and the audit event
                 # together so a failed write never leaves one without the others.
+                self.store.syncs.pop(key, None)
+                self.store.forks.pop(tip_hash, None)
+                self.store.truncate_audit_events(1)
+                raise
+
+            result = dict(summary)
+            result["expires_at"] = expires_at
+            return 201, result
+
+    # -- incremental inter-node range sync -----------------------------------
+
+    @staticmethod
+    def _range_tip_summary(anchor: dict, tail: list) -> dict:
+        """Recompute the delivered chain's tip descriptor from anchor + tail."""
+        tip = tail[-1]
+        return {
+            "tip_hash": tip.block_hash,
+            "height": tip.height,
+            # The assembled length counts the canonical prefix (anchor height
+            # + 1 blocks) plus every delivered tail block.
+            "length": anchor["height"] + 1 + len(tail),
+            "status": tip.status,
+        }
+
+    def submit_fork_sync_range(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/forks/sync/range — receive an incremental chain range.
+
+        The request carries ``source``, ``request_id``, ``expires_at`` (Unix
+        seconds), ``anchor`` (``{height, block_hash}`` naming the canonical
+        block the range starts *after*), ``blocks`` (a non-empty list of
+        complete blocks starting at the next height) and ``tip`` (the
+        five-field export-style summary ``{tip_hash, height, length, status}``
+        of the delivered chain; supplied fields are all re-checked).
+
+        A new request follows the full-sync order: envelope format validation
+        (400), then the source authorization gate (403), then the request
+        deadline (410). The anchor must then match the *current* canonical
+        chain: an unknown anchor height or a hash mismatch is a stale anchor
+        (409). The tail is prepended with the canonical prefix and put through
+        the existing whole-chain re-validation (genesis connection,
+        consecutive heights/prev_hash, recomputed block hashes and Merkle
+        roots, tx_id/Ed25519 verification, global uniqueness and ordering,
+        endowment replay, pending-only-at-tip); failure is 400, as is a
+        ``tip`` summary that does not recompute. A tip already known as the
+        canonical chain or a stored candidate is 409, mirroring full sync.
+
+        Success stores the ASSEMBLED complete candidate (keyed by its tip hash)
+        together with the sync record, the range content fingerprint
+        (anchor + delivered tail only) and a ``sync_received`` event in one
+        atomic write; 201 returns the same five fields as a full sync. A
+        same-key retry with identical content replays the first result as 200
+        even when the source has since rotated/revoked/expired OR the
+        receiver's canonical chain has since advanced — the retry is verified
+        standalone, never re-spliced; same key with different content is 409.
+        Longest-chain adoption, expiry, mempool return-to-pool and restart
+        reconciliation then all operate on the stored assembled candidate
+        exactly as for a full sync.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in ("source", "request_id", "expires_at", "anchor", "blocks", "tip"):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+
+        source = payload["source"]
+        request_id = payload["request_id"]
+        expires_at = payload["expires_at"]
+        anchor_raw = payload["anchor"]
+        blocks_raw = payload["blocks"]
+        tip = payload.get("tip")
+
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "field 'source' must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "field 'request_id' must be a non-empty string"}
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+            return 400, {"error": "field 'expires_at' must be a Unix-seconds integer"}
+        if not isinstance(anchor_raw, dict):
+            return 400, {"error": "field 'anchor' must be a JSON object"}
+        anchor_height = anchor_raw.get("height")
+        anchor_hash = anchor_raw.get("block_hash")
+        if (
+            isinstance(anchor_height, bool)
+            or not isinstance(anchor_height, int)
+            or anchor_height < 0
+        ):
+            return 400, {"error": "anchor.height must be a non-negative integer"}
+        if not crypto.is_hex64(anchor_hash):
+            return 400, {
+                "error": "anchor.block_hash must be 64 lowercase hex characters"
+            }
+        anchor = {"height": anchor_height, "block_hash": anchor_hash}
+        if not isinstance(blocks_raw, list):
+            return 400, {"error": "field 'blocks' must be a list"}
+        if not blocks_raw:
+            return 400, {"error": "field 'blocks' must be non-empty"}
+        if tip is not None and not isinstance(tip, dict):
+            return 400, {"error": "field 'tip' must be a JSON object"}
+
+        with self.store.lock:
+            self._prune_expired_syncs()
+            key = (source, request_id)
+            existing = self.store.syncs.get(key)
+
+            if existing is not None:
+                # Idempotent replay on a live key. The tail is re-verified
+                # STANDALONE (never re-spliced against the current canonical
+                # chain) and its supplied tip summary recomputed BEFORE the
+                # idempotency decision — exactly like a full-sync retry, where
+                # a malformed/tampered body fails 400 rather than replaying the
+                # cached 200. Identical range content then replays the original
+                # frozen result as 200 even after the source has rotated,
+                # revoked or expired OR the receiver's canonical chain has
+                # advanced; changed content conflicts 409. The authorization
+                # gate is bypassed for retries.
+                try:
+                    tail = self.store.validate_range_tail(anchor, blocks_raw)
+                except ValueError as exc:
+                    return 400, {"error": str(exc)}
+                recomputed_tip = self._range_tip_summary(anchor, tail)
+                if tip is not None:
+                    for field in ("tip_hash", "height", "length", "status"):
+                        if field in tip and tip[field] != recomputed_tip[field]:
+                            return 400, {
+                                "error": f"tip field {field!r} does not match the blocks"
+                            }
+                fingerprint = self.store.range_fingerprint(anchor, tail)
+                if fingerprint != existing["fingerprint"]:
+                    return 409, {
+                        "error": "request_id already used with different content"
+                    }
+                descriptor = None
+                if existing.get("height") is not None:
+                    descriptor = {
+                        "tip_hash": existing["tip_hash"],
+                        "height": existing["height"],
+                        "length": existing["length"],
+                        "status": existing["status"],
+                    }
+                if descriptor is None:
+                    descriptor = self._tip_descriptor(existing["tip_hash"]) or {
+                        "tip_hash": existing["tip_hash"],
+                        "height": None,
+                        "length": None,
+                        "status": None,
+                    }
+                return 200, {
+                    "tip_hash": descriptor["tip_hash"],
+                    "height": descriptor.get("height"),
+                    "length": descriptor.get("length"),
+                    "status": descriptor.get("status"),
+                    "expires_at": existing["expires_at"],
+                }
+
+            # New delivery follows the full-sync order: authorization (403),
+            # then the request deadline (410), before the anchor or chain is
+            # examined.
+            now = time.time()
+            trusted = self.store.trust_sources.get(source)
+            if (
+                trusted is None
+                or trusted["status"] != TRUST_ACTIVE
+                or trusted["expires_at"] <= now
+            ):
+                return 403, {"error": "source is not an active trusted source"}
+            if expires_at <= now:
+                return 410, {"error": "sync request has expired"}
+
+            # The anchor must match the current canonical chain; an unknown
+            # height or a mismatched hash is a stale anchor (409).
+            anchor_block = self.store.block_at(anchor_height)
+            if anchor_block is None or anchor_block.block_hash != anchor_hash:
+                return 409, {"error": "anchor does not match the current canonical chain"}
+
+            # Splice the canonical prefix and run the existing whole-chain
+            # revalidation: blocks start at the next height and stay
+            # consecutive, prev_hash links onto the anchor, recomputed block
+            # hashes/Merkle roots, tx_id/Ed25519 verification, global
+            # uniqueness and block ordering, endowment replay, and
+            # pending-only-at-tip. Failure is 400.
+            assembled_raw = [
+                block.to_dict() for block in self.store.chain[: anchor_height + 1]
+            ]
+            assembled_raw.extend(
+                block_raw for block_raw in blocks_raw
+            )
+            try:
+                fork = self.store.validate_fork_blocks(assembled_raw)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            summary = self._fork_summary(fork)
+            tail = fork[anchor_height + 1 :]
+            recomputed_tip = self._range_tip_summary(anchor, tail)
+            if summary != recomputed_tip:
+                return 400, {"error": "range does not assemble onto the canonical chain"}
+            if tip is not None:
+                for field in ("tip_hash", "height", "length", "status"):
+                    if field in tip and tip[field] != recomputed_tip[field]:
+                        return 400, {
+                            "error": f"tip field {field!r} does not match the blocks"
+                        }
+            fingerprint = self.store.range_fingerprint(anchor, tail)
+            tip_hash = fork[-1].block_hash
+
+            if any(tip_hash == block.block_hash for block in self.store.chain):
+                return 409, {"error": "fork is identical to the canonical chain"}
+            if tip_hash in self.store.forks:
+                return 409, {
+                    "error": "candidate fork already exists",
+                    "tip_hash": tip_hash,
+                }
+
+            # Persist the ASSEMBLED candidate so adoption, expiry cleanup and
+            # restart never need to re-splice it against a later canonical,
+            # alongside the range payload and its range-content fingerprint.
+            self.store.forks[tip_hash] = fork
+            self.store.syncs[key] = {
+                "tip_hash": tip_hash,
+                "expires_at": expires_at,
+                "fingerprint": fingerprint,
+                "height": summary["height"],
+                "length": summary["length"],
+                "status": summary["status"],
+                "range": {
+                    "anchor": dict(anchor),
+                    "blocks": [block.to_dict() for block in tail],
+                },
+            }
+            self.store.append_audit_event(
+                EVENT_SYNC_RECEIVED,
+                {
+                    "source": source,
+                    "request_id": request_id,
+                    "tip_hash": tip_hash,
+                    "expires_at": expires_at,
+                    "height": summary["height"],
+                    "length": summary["length"],
+                    "status": summary["status"],
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Roll back the assembled candidate, its range record and the
+                # audit event together: a failed write changes nothing.
                 self.store.syncs.pop(key, None)
                 self.store.forks.pop(tip_hash, None)
                 self.store.truncate_audit_events(1)

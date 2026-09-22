@@ -59,6 +59,13 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_fork_candidate(payload)
                 self._send_json(status, body)
+            elif path == "/v1/forks/sync/range":
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.submit_fork_sync_range(payload)
+                self._send_json(status, body)
             elif path == "/v1/forks/sync":
                 ok, payload = self._read_json()
                 if not ok:
@@ -155,6 +162,19 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.export_audit_events(params)
+                self._send_json(status, body)
+            elif path == "/v1/chain/range":
+                # GET /v1/chain/range?after_height=&after_hash=&limit=
+                # Incremental canonical-chain page after an anchor. Repeated
+                # query parameters are rejected 400 like the strict endpoints.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.get_chain_range(params)
                 self._send_json(status, body)
             elif path == "/v1/chain":
                 status, body = service.get_chain()
