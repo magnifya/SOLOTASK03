@@ -1,6 +1,6 @@
 """Command line interface: send, tx, mine, block, account, proof, state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
-index, sync, syncs, sync-history, audit, audit-export, trust
+index, sync, sync-attested, syncs, sync-history, audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify subcommands.
 
@@ -250,6 +250,47 @@ def cmd_sync(args: argparse.Namespace) -> int:
         "candidate": candidate,
     }
     status, body = _request("POST", f"{args.base_url}/v1/forks/sync", payload)
+    return _emit(status, body)
+
+
+def cmd_sync_attested(args: argparse.Namespace) -> int:
+    """Push an attested (source-signed) candidate fork.
+
+    The candidate keeps its delivered form verbatim — a bare block array, a
+    ``{"blocks": [...]}`` wrapper or an export document — because the
+    attestation signature is made over that exact form. The source's 64-hex
+    Ed25519 seed signs the raw SHA-256 digest of the canonical message
+    ``{domain:"ledger-sync-v1", source, request_id, expires_at, candidate}``.
+    """
+    try:
+        candidate = json.loads(args.candidate_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON candidate: {exc}"})
+    # Unlike the plain `sync` command, the candidate is NOT re-wrapped: it is
+    # signed material and must reach the server byte-for-byte as parsed (a
+    # bare array stays a bare array).
+    seed = args.signing_key
+    if crypto.derive_public_key(seed) is None:
+        return _emit(
+            400,
+            {"error": "signing key must be a 64 lowercase hex Ed25519 seed"},
+        )
+    digest = crypto.attested_sync_digest(
+        args.source, args.request_id, args.expires_at, candidate
+    )
+    signature = crypto.sign_message(seed, digest)
+    if signature is None:
+        return _emit(400, {"error": "failed to sign the attested message"})
+    payload = {
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "candidate": candidate,
+        "signature": signature,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/forks/sync/attested", payload
+    )
     return _emit(status, body)
 
 
@@ -641,6 +682,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="candidate fork: an export-format object or a blocks JSON array",
     )
     p_sync.set_defaults(func=cmd_sync)
+
+    p_sync_attested = sub.add_parser(
+        "sync-attested",
+        help="push an attested (source Ed25519-signed) candidate fork",
+    )
+    p_sync_attested.add_argument(
+        "--source", required=True, help="originating node identifier"
+    )
+    p_sync_attested.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync_attested.add_argument(
+        "--expires-at",
+        required=True,
+        type=int,
+        help="expiry as Unix seconds; an expired delivery is rejected 410",
+    )
+    p_sync_attested.add_argument(
+        "--signing-key",
+        required=True,
+        help="source Ed25519 private seed (64 lowercase hex characters)",
+    )
+    p_sync_attested.add_argument(
+        "candidate_json",
+        help="candidate fork: an export-format object or a blocks JSON array",
+    )
+    p_sync_attested.set_defaults(func=cmd_sync_attested)
 
     p_syncs = sub.add_parser("syncs", help="audit-list received synced candidates")
     p_syncs.add_argument("--source", help="filter by originating node identifier")

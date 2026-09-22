@@ -160,6 +160,50 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   同步完全一致；重启按当前信任注册表重新授权，并用持久化的 range 载荷独立重算
   指纹、核对存储候选恰为 canonical 前缀加该尾部，失配记录静默丢弃。
 
+## 带签名（attested）候选链同步
+
+除基于来源注册表的普通同步外，还可要求来源对整份投递**数字签名**：
+
+- **接收带签名同步**：`POST /v1/forks/sync/attested`，请求 JSON 含
+  `{"source","request_id","expires_at","candidate","signature"}`。`candidate`
+  **保持投递原形**——导出五字段对象、`{"blocks":[...]}` 包装或裸块数组都可，
+  该原形是签名材料，服务端不重包。`signature` 必须恰好是 128 个**小写**
+  hex 字符（Ed25519 签名）。签名消息按 README `canonical_json`
+  （`sort_keys=True`、紧凑分隔符、`ensure_ascii=False`、UTF-8）构造
+  `{"domain":"ledger-sync-v1","source":...,"request_id":...,"expires_at":...,
+  "candidate":<投递原形>}`，对其取 **SHA-256 原始 32 字节摘要**再做 Ed25519
+  签名/验签。
+- **状态码优先级**：字段结构/类型错误（含 `signature` 非 128 位小写 hex）
+  `400` → 来源未在信任注册表 / 非 active / 注册已过期 `403` → 请求
+  `expires_at` 已到 `410` → 验签失败 `403` → 候选整链或自带摘要重验失败
+  `400` → tip 与 canonical 或已存候选重复 `409`。**验签失败绝不写入任何
+  状态**（不落候选、记录或审计事件、不消耗 generation）。
+- **成功语义**：`201` 返回与普通同步相同的五字段
+  `{tip_hash,height,length,status,expires_at}`。记录原子冻结**来源公钥、其
+  注册表版本、签名、以及「消息签名原形」的指纹**，与候选分叉和一条
+  `sync_received`（带 `mode:"attested"`）在**同一次原子写入**落盘；写盘失败
+  一并回滚。
+- **幂等键分域**：attested 记录与普通 `POST /v1/forks/sync` 记录使用相互独立
+  的 `(source, request_id)` 作用域，同键互不冲突。对存活的同键重试**先按
+  冻结的公钥重验签名**（来源此后轮换/撤销/注册过期均不影响——始终用首收时的
+  公钥）、再重验整链与自带摘要：签名错 `403`，签名与链均通过且整条签名信封
+  （原形 candidate + signature）相同则 `200` 回放首次原结果（含原
+  `expires_at`），否则 `409`。
+- **过期与授权失效**：记录自身到期，或重启时按当前信任注册表重新授权发现来源
+  未知/已撤销/注册过期时，删除该记录及**未被采用**的候选，追加一条带
+  `mode:"attested"` 的 `sync_expired`（已采用上链的 tip 只留审计记录，
+  canonical 链不动）；规则、去重、连续编号与原子落盘均与普通同步一致。清理后
+  同 `(source, request_id)` 键可重新新建。
+- **重启重验**：恢复时对每条存活的 attested 记录**重建消息签名原形**（保留的
+  candidate 逐字参与）、用冻结公钥重验签名、核对冻结的注册表版本与指纹，并重
+  算整链、确认存储候选恰为投递候选。任一失配**仅静默丢弃该缓存记录与其候选，
+  canonical 链不变**，也不产生生命周期事件；审计事件逐字保留、连续不断。
+- **采用**：attested 候选同样参与最长链/最小 tip_hash 比较；被采用时按来源记录
+  逐条登记 `sync_adopted`（带 `mode:"attested"`），其余采用/回池/过期规则不变。
+- **CLI**：`ledger sync-attested --source S --request-id R --expires-at E
+  --signing-key <64 位小写种子> '<候选 JSON 原形>'`；CLI 用该 64 位小写种子对
+  上述 canonical 消息的 SHA-256 摘要签名，candidate 原样上送（裸数组保持裸数组）。
+
 ## 持久化来源信任与审计
 
 轻客户端所需的信任文档不再靠手工维护：节点持久化保存**来源信任注册表**、
@@ -239,6 +283,9 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `source_revoked`；节点间同步记录 `sync_received`（接收）、
   `sync_adopted`（候选被采用，按来源同步记录逐条登记）与 `sync_expired`
   （过期清理，包含已采用上链的 tip——只留审计记录、canonical 链不动）；
+  经由 `POST /v1/forks/sync/attested` 的带签名投递，其这三类同步事件额外携带
+  `mode:"attested"`（普通同步事件无该字段），`mode` 也参与重启时的生命周期
+  去重，使普通/attested 两个幂等域各自连续；
   审计检查点密钥轮换记录 `audit_signer_rotated`（携带新版本号与新公钥，
   其事件 id 即新密钥的 `activated_event_id`）；keyless allowlist 的新增与
   删除记录 `allowlist_added` / `allowlist_removed`（均携带 `source` 与
@@ -447,11 +494,11 @@ SHA-256 摘要作为签名消息。
 | `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
-| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
+| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、普通与带签名（attested）同步记录（分幂等域、attested 冻结公钥/版本/签名/原形候选，重启重建消息重验签、失配仅丢缓存）、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与普通/增量区间/带签名（attested）同步接收及事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-attested` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -572,6 +619,16 @@ curl -s -X POST localhost:8080/v1/forks/sync/range \
   -d '{"source":"node-2","request_id":"req-8","expires_at":1800000000,"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"}}'
 # -> 201 {"tip_hash":"...","height":4,"length":5,"status":"confirmed","expires_at":1800000000}
 
+# 带签名（attested）同步：candidate 保持原形；signature 是对
+# canonical_json {domain:"ledger-sync-v1",source,request_id,expires_at,candidate}
+# 的 SHA-256 32 字节摘要的 Ed25519 签名（128 位小写 hex）。
+# 状态优先级：结构 400→未授权 403→过期 410→验签 403→链/摘要 400→重复 409；
+# 同 source+request_id 重试先按冻结公钥重验签：签错 403、相同 200、异内容 409。
+curl -s -X POST localhost:8080/v1/forks/sync/attested \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"node-2","request_id":"req-9","expires_at":1800000000,"candidate":{...原形...},"signature":"<128-hex>"}'
+# -> 201 {"tip_hash":"...","height":N,"length":N+1,"status":"...","expires_at":1800000000}
+
 # 同步审计查询（source/min_height/max_height/limit/cursor；非法数值 400）
 curl -s 'localhost:8080/v1/forks/sync?source=node-2&min_height=1&limit=50&cursor=0'
 # -> 200 {"items":[{source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
@@ -660,6 +717,8 @@ python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N]
 
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
+# 带签名同步：用来源 64 位小写私钥种子对原形 JSON 的 canonical 消息 SHA-256 摘要签名
+python -m ledger.cli sync-attested --source node-2 --request-id req-9 --expires-at 1800000000 --signing-key <64-hex-seed> '<export 文档或块数组 JSON 原形>'
 python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 

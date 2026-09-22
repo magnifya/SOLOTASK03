@@ -66,6 +66,13 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_fork_sync_range(payload)
                 self._send_json(status, body)
+            elif path == "/v1/forks/sync/attested":
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.submit_fork_sync_attested(payload)
+                self._send_json(status, body)
             elif path == "/v1/forks/sync":
                 ok, payload = self._read_json()
                 if not ok:

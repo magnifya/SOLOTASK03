@@ -28,6 +28,46 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# Domain separator for attested inter-node fork-sync messages. Binds an
+# attestation signature to this one protocol so a signature cannot be replayed
+# in a different context.
+ATTESTED_SYNC_DOMAIN = "ledger-sync-v1"
+
+
+def canonical_attested_message(
+    source: str, request_id: str, expires_at: int, candidate: object
+) -> bytes:
+    """Deterministic byte document covered by an attested-sync signature.
+
+    The message is the README ``canonical_json`` (sorted keys, compact
+    separators, non-ASCII emitted verbatim, UTF-8) of
+    ``{domain, source, request_id, expires_at, candidate}``. The candidate is
+    embedded exactly as delivered (an export object, a ``{"blocks": ...}``
+    wrapper or a bare block array), so a signer and verifier always agree on
+    the signed bytes regardless of incoming key order or whitespace.
+    """
+    document = {
+        "domain": ATTESTED_SYNC_DOMAIN,
+        "source": source,
+        "request_id": request_id,
+        "expires_at": expires_at,
+        "candidate": candidate,
+    }
+    return json.dumps(
+        document, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def attested_sync_digest(
+    source: str, request_id: str, expires_at: int, candidate: object
+) -> bytes:
+    """The raw 32-byte SHA-256 digest an attested-sync signature is made over."""
+    return hashlib.sha256(
+        canonical_attested_message(source, request_id, expires_at, candidate)
+    ).digest()
+
+
+
 def compute_tx_id(message: bytes) -> str:
     """SHA-256 hex digest of the canonical transaction message."""
     return sha256_hex(message)

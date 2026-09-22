@@ -40,7 +40,15 @@ history, persisted in one atomic write. The backfill deduplicates only
 within the record's current lifecycle (a durable sync_expired newer than
 the key's latest sync_received), so a reused (source, request_id) key's
 new lifecycle is always audited even when every field matches a previous
-lifecycle's event. Other staleness (a dangling
+lifecycle's event. Source-signed (attested) deliveries live in a separate
+``attested_syncs`` idempotency domain and additionally freeze the signing
+public key, its registry version, the signature and the candidate verbatim;
+restart rebuilds the exact signed message, re-verifies the signature
+against the FROZEN key (later rotation/revocation never enters it) and the
+content fingerprint, and drops a mismatching record/candidate silently
+(cache only — the canonical chain and audit history are untouched). Their
+sync_* events carry mode:"attested", which also separates lifecycle
+dedup from plain deliveries. Other staleness (a dangling
 tip or a content-fingerprint mismatch) is a silent prune with no event.
 A re-entrant lock serializes all updates, and a class-wide recovery lock
 serializes startup scans against in-flight writes.
@@ -82,6 +90,11 @@ EVENT_SYNC_EXPIRED = "sync_expired"
 EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 EVENT_ALLOWLIST_ADDED = "allowlist_added"
 EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
+EVENT_SOURCE_REGISTERED = "source_registered"
+EVENT_SOURCE_ROTATED = "source_rotated"
+
+# Lifecycle-mode marker for source-signed (attested) sync records/events.
+SYNC_MODE_ATTESTED = "attested"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -164,6 +177,14 @@ class LedgerStore:
         # candidate chain (kept in ``forks``) and a content fingerprint used
         # for same-key retry/idempotency checks.
         self.syncs: dict[tuple[str, str], dict] = {}
+        # Source-signed (attested) sync submissions, keyed by
+        # (source, request_id) in a SEPARATE idempotency domain from
+        # ``syncs``: a plain and an attested delivery sharing a key never
+        # collide. Each record freezes the signing public key, its registry
+        # version, the signature, the candidate verbatim and a fingerprint of
+        # the signed original form, so retries and restart recovery re-verify
+        # the exact signed message independently of later trust changes.
+        self.attested_syncs: dict[tuple[str, str], dict] = {}
         # Persistent source-trust registry keyed by source identifier. Each
         # record is {"public_key", "expires_at", "version", "status"}.
         self.trust_sources: dict[str, dict] = {}
@@ -233,6 +254,7 @@ class LedgerStore:
                 self.pending = {}
                 self.forks = {}
                 self.syncs = {}
+                self.attested_syncs = {}
                 self.trust_sources = {}
                 self.allowlist = {}
                 self.audit_events = []
@@ -256,9 +278,9 @@ class LedgerStore:
                     errors.append(exc)
                     continue
                 # parsed = (chain, pending, generation, forks, initial_balance,
-                #           syncs, trust_sources, allowlist, audit_events,
-                #           expired_records, audit_checkpoint, audit_repair,
-                #           signer_state, recorded_state_root)
+                #           syncs, attested_syncs, trust_sources, allowlist,
+                #           audit_events, expired_records, audit_checkpoint,
+                #           audit_repair, signer_state, recorded_state_root)
                 valid.append(
                     (
                         parsed[2],
@@ -276,6 +298,7 @@ class LedgerStore:
                         parsed[11],
                         parsed[12],
                         parsed[13],
+                        parsed[14],
                     )
                 )
 
@@ -288,9 +311,9 @@ class LedgerStore:
             max_generation = max(item[0] for item in valid)
             top = [item for item in valid if item[0] == max_generation]
             # item layout: (generation, path, chain, pending, forks,
-            # initial_balance, syncs, trust_sources, allowlist, audit_events,
-            # expired_records, audit_checkpoint, audit_repair, signer_state,
-            # recorded_state_root)
+            # initial_balance, syncs, attested_syncs, trust_sources, allowlist,
+            # audit_events, expired_records, audit_checkpoint, audit_repair,
+            # signer_state, recorded_state_root)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -299,10 +322,11 @@ class LedgerStore:
                 top[0][7],
                 top[0][8],
                 top[0][9],
+                top[0][10],
                 top[0][5],
-                top[0][11],
-                top[0][13][1],
-                top[0][14],
+                top[0][12],
+                top[0][14][1],
+                top[0][15],
             )
             for item in top[1:]:
                 if (
@@ -314,10 +338,11 @@ class LedgerStore:
                         item[7],
                         item[8],
                         item[9],
+                        item[10],
                         item[5],
-                        item[11],
-                        item[13][1],
-                        item[14],
+                        item[12],
+                        item[14][1],
+                        item[15],
                     )
                     != reference
                 ):
@@ -343,6 +368,7 @@ class LedgerStore:
                 forks,
                 winner_init_balance,
                 syncs,
+                attested_syncs,
                 trust_sources,
                 allowlist,
                 audit_events,
@@ -416,6 +442,7 @@ class LedgerStore:
             self.pending = pending
             self.forks = forks
             self.syncs = syncs
+            self.attested_syncs = attested_syncs
             self.trust_sources = trust_sources
             self.allowlist = allowlist
             self.audit_events = audit_events
@@ -463,6 +490,7 @@ class LedgerStore:
         pending: dict[str, Transaction],
         forks: dict[str, list[Block]],
         syncs: dict[tuple[str, str], dict] | None = None,
+        attested_syncs: dict[tuple[str, str], dict] | None = None,
         trust_sources: dict[str, dict] | None = None,
         allowlist: dict[str, int] | None = None,
         audit_events: list[dict] | None = None,
@@ -483,7 +511,9 @@ class LedgerStore:
         differs between two same-generation snapshots is a conflict. The
         recorded account-state root participates too: a twin carrying a
         different ``state_root`` describes a different confirmed state and is
-        a conflict rather than a quietly accepted alternative.
+        a conflict rather than a quietly accepted alternative. Attested sync
+        records (with their frozen key/signature/verbatim candidate) are part
+        of the view as well.
         """
         sync_records = [
             {
@@ -502,6 +532,23 @@ class LedgerStore:
             }
             for key, rec in sorted((syncs or {}).items())
         ]
+        attested_records = [
+            {
+                "source": key[0],
+                "request_id": key[1],
+                "tip_hash": rec["tip_hash"],
+                "expires_at": rec["expires_at"],
+                "fingerprint": rec["fingerprint"],
+                "public_key": rec.get("public_key"),
+                "key_version": rec.get("key_version"),
+                "signature": rec.get("signature"),
+                "candidate": rec.get("candidate"),
+                "height": rec.get("height"),
+                "length": rec.get("length"),
+                "status": rec.get("status"),
+            }
+            for key, rec in sorted((attested_syncs or {}).items())
+        ]
         trust_records = [
             {"source": source, **rec}
             for source, rec in sorted((trust_sources or {}).items())
@@ -516,6 +563,7 @@ class LedgerStore:
                     for tip in sorted(forks)
                 ],
                 "syncs": sync_records,
+                "attested_syncs": attested_records,
                 "trust_sources": trust_records,
                 "allowlist": dict(sorted((allowlist or {}).items())),
                 "audit_events": audit_events or [],
@@ -573,6 +621,7 @@ class LedgerStore:
         int,
         dict[str, list[Block]],
         int | None,
+        dict[tuple[str, str], dict],
         dict[tuple[str, str], dict],
         dict[str, dict],
         dict[str, int],
@@ -782,12 +831,29 @@ class LedgerStore:
         syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
         )
+        # Attested records are parsed before any sync-only fork pruning so a
+        # fork a surviving attested record still references is present; they
+        # re-verify their own signature/candidate/fingerprint independently.
+        replay_endowment_for_candidates = replay_endowment
+        attested_syncs, expired_attested, attested_tips = (
+            self._parse_persisted_attested_syncs(
+                data.get("attested_syncs", []),
+                forks,
+                chain,
+                trust_sources,
+                replay_endowment_for_candidates,
+            )
+        )
+        expired_records.extend(expired_attested)
+        synced_tips.update(attested_tips)
         # A fork brought in only by a sync record loses its right to exist once
         # that record is gone (expired/unauthorized/invalid on restart):
         # without this, the independently-persisted fork would resurrect as a
-        # never-expiring candidate. Direct submissions carry no sync record and
-        # are untouched.
+        # never-expiring candidate. Both idempotency domains count: a fork kept
+        # by a surviving attested record survives a pruned plain record, and
+        # vice versa. Direct submissions carry no sync record and are untouched.
         live_tips = {rec["tip_hash"] for rec in syncs.values()}
+        live_tips.update(rec["tip_hash"] for rec in attested_syncs.values())
         canonical_hashes = {block.block_hash for block in chain}
         for tip in synced_tips - live_tips - canonical_hashes:
             forks.pop(tip, None)
@@ -799,6 +865,7 @@ class LedgerStore:
             forks,
             initial_balance,
             syncs,
+            attested_syncs,
             trust_sources,
             allowlist,
             audit_events,
@@ -1047,37 +1114,55 @@ class LedgerStore:
         """Append one sync_expired event per down-time-expired sync record.
 
         Mirrors the runtime sweep exactly: records are processed in
-        ``(source, request_id)`` order, each gets a dense event_id continuing
-        after the durable history, and every *lifecycle removal* gets its own
-        event. Deduplication is lifecycle-aware, never identity-based across
-        lifecycles: a durable sync_expired covers the persisted record only
-        when it sits after the latest sync_received for the same
-        ``(source, request_id)`` key — i.e. it belongs to the record's
-        current lifecycle (the crash-interrupted-cleanup case). An expiry
-        event from an *earlier* lifecycle of a reused key never suppresses
-        the new lifecycle's event, even when source, request_id, tip_hash
-        and expires_at are all identical. Returns the number of events
-        appended. Mutates ``audit_events`` in place.
+        ``(source, request_id, mode)`` order, each gets a dense event_id
+        continuing after the durable history, and every *lifecycle removal*
+        gets its own event. Deduplication is lifecycle-aware, never
+        identity-based across lifecycles: a durable sync_expired covers the
+        persisted record only when it sits after the latest sync_received for
+        the same ``(source, request_id, mode)`` key — i.e. it belongs to the
+        record's current lifecycle (the crash-interrupted-cleanup case). The
+        mode separates plain and attested idempotency domains, so a plain and
+        attested delivery sharing a key each get their own event. An expiry
+        event from an *earlier* lifecycle of a reused key never suppresses the
+        new lifecycle's event, even when source, request_id, tip_hash and
+        expires_at are all identical. Returns the number of events appended.
+        Mutates ``audit_events`` in place.
         """
-        # Position of the latest sync_received per key: it opens the
-        # lifecycle every later event of that key belongs to.
-        last_received: dict[tuple[object, object], int] = {}
+        # Position of the latest sync_received per (source, request_id, mode):
+        # it opens the lifecycle every later event of that key+mode belongs to.
+        # The mode separates the two idempotency domains (plain and attested),
+        # so a plain and an attested delivery sharing a key never shadow each
+        # other's lifecycle.
+        def stored_mode(event: dict) -> str | None:
+            mode = event.get("mode")
+            return mode if mode == SYNC_MODE_ATTESTED else None
+
+        last_received: dict[tuple[object, object, object], int] = {}
         for index, event in enumerate(audit_events):
             if event.get("kind") == EVENT_SYNC_RECEIVED:
-                last_received[(event.get("source"), event.get("request_id"))] = index
+                last_received[
+                    (event.get("source"), event.get("request_id"), stored_mode(event))
+                ] = index
         # Identities already expired *within their current lifecycle*.
-        covered: set[tuple[object, object, object]] = set()
+        covered: set[tuple[object, object, object, object]] = set()
         for index, event in enumerate(audit_events):
             if event.get("kind") != EVENT_SYNC_EXPIRED:
                 continue
-            key = (event.get("source"), event.get("request_id"))
-            if index > last_received.get(key, -1):
-                covered.add((key[0], key[1], event.get("tip_hash")))
+            source = event.get("source")
+            request_id = event.get("request_id")
+            mode = stored_mode(event)
+            if index > last_received.get((source, request_id, mode), -1):
+                covered.add((source, request_id, mode, event.get("tip_hash")))
+
+        def mode_rank(rec: dict) -> int:
+            return 1 if rec.get("mode") == SYNC_MODE_ATTESTED else 0
+
         backfilled = 0
         for source, request_id, rec in sorted(
-            expired_records, key=lambda item: (item[0], item[1])
+            expired_records, key=lambda item: (item[0], item[1], mode_rank(item[2]))
         ):
-            identity = (source, request_id, rec["tip_hash"])
+            mode = rec.get("mode")
+            identity = (source, request_id, mode, rec["tip_hash"])
             if identity in covered:
                 continue
             event = {
@@ -1096,6 +1181,8 @@ class LedgerStore:
                 event["height"] = rec["height"]
                 event["length"] = rec.get("length")
                 event["status"] = rec.get("status")
+            if mode == SYNC_MODE_ATTESTED:
+                event["mode"] = SYNC_MODE_ATTESTED
             audit_events.append(event)
             covered.add(identity)
             backfilled += 1
@@ -1288,6 +1375,14 @@ class LedgerStore:
                     raise StateRecoveryError(
                         path,
                         f"audit event {event_id} ({kind}) has a partial frozen summary",
+                    )
+                # The lifecycle mode is optional; when present it must name the
+                # single defined mode (source-signed attested delivery).
+                mode = event.get("mode")
+                if mode is not None and mode != SYNC_MODE_ATTESTED:
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) has an unknown mode {mode!r}",
                     )
             elif kind in allowlist_kinds:
                 # The keyless allowlist is authoritative configuration (exactly
@@ -1546,6 +1641,219 @@ class LedgerStore:
         return anchor, [block.to_dict() for block in tail], tail
 
     @staticmethod
+    def _attested_fingerprint(
+        source: str,
+        request_id: str,
+        expires_at: int,
+        candidate: object,
+        signature: str,
+    ) -> str:
+        """Stable SHA-256 fingerprint of an attested signed envelope.
+
+        Mirrors ``LedgerService._attested_fingerprint`` so recovery can
+        re-check the persisted record without importing the service layer. The
+        candidate is embedded in its delivered (signed) form, so a re-wrapped
+        candidate yields a different fingerprint.
+        """
+        document = {
+            "domain": crypto.ATTESTED_SYNC_DOMAIN,
+            "source": source,
+            "request_id": request_id,
+            "expires_at": expires_at,
+            "candidate": candidate,
+            "signature": signature,
+        }
+        return hashlib.sha256(
+            json.dumps(document, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    def _parse_persisted_attested_syncs(
+        self,
+        syncs_raw: object,
+        forks: dict[str, list[Block]],
+        canonical_chain: list[Block],
+        trust_sources: dict[str, dict],
+        endowment: int,
+    ) -> tuple[dict[tuple[str, str], dict], list[tuple[str, str, dict]], set[str]]:
+        """Parse persisted source-signed (attested) sync records on restart.
+
+        Mirrors :meth:`_parse_persisted_syncs` for the separate attested
+        idempotency domain but adds cryptographic re-verification. A record
+        whose own deadline elapsed or whose source is unknown/revoked/
+        registry-expired while down is pruned and returned in
+        ``expired_records`` (its record carries ``mode: "attested"`` so the
+        backfilled ``sync_expired`` event is mode-tagged); an adopted tip only
+        loses metadata, never the canonical chain.
+
+        Every other staleness is a silent cache prune with NO lifecycle event:
+        malformed structure, a candidate that no longer validates, a stored
+        fork that is not exactly the delivered candidate, a frozen-summary
+        mismatch, a bad/missing public key or version, a signature that does
+        not verify against the FROZEN public key over the rebuilt canonical
+        message, or a fingerprint mismatch. Trust changes (rotation/revocation/
+        expiry) never invalidate an otherwise-live record's signature: the
+        signature is always checked against the key frozen at first reception.
+        Also returns every tip claimed (including dropped records) so forks
+        kept alive only by a pruned record are removed.
+        """
+        if not isinstance(syncs_raw, list):
+            return {}, [], set()
+        now = time.time()
+        canonical_prefixes: dict[str, list[dict]] = {}
+        prefix: list[dict] = []
+        for block in canonical_chain:
+            prefix = prefix + [block.to_dict()]
+            canonical_prefixes[block.block_hash] = prefix
+        genesis = canonical_chain[0]
+        syncs: dict[tuple[str, str], dict] = {}
+        expired_records: list[tuple[str, str, dict]] = []
+        synced_tips: set[str] = set()
+        for rec_raw in syncs_raw:
+            if not isinstance(rec_raw, dict):
+                continue
+            source = rec_raw.get("source")
+            request_id = rec_raw.get("request_id")
+            tip_hash = rec_raw.get("tip_hash")
+            expires_at = rec_raw.get("expires_at")
+            fingerprint = rec_raw.get("fingerprint")
+            public_key = rec_raw.get("public_key")
+            key_version = rec_raw.get("key_version")
+            signature = rec_raw.get("signature")
+            candidate = rec_raw.get("candidate")
+            if not isinstance(source, str) or not source:
+                continue
+            if not isinstance(request_id, str) or not request_id:
+                continue
+            if not crypto.is_hex64(tip_hash):
+                continue
+            frozen_height = rec_raw.get("height")
+            frozen_length = rec_raw.get("length")
+            frozen_status = rec_raw.get("status")
+            if frozen_height is not None and (
+                isinstance(frozen_height, bool)
+                or not isinstance(frozen_height, int)
+                or frozen_height < 0
+            ):
+                continue
+            if frozen_length is not None and (
+                isinstance(frozen_length, bool)
+                or not isinstance(frozen_length, int)
+                or frozen_length < 1
+            ):
+                continue
+            if frozen_status is not None and frozen_status not in (
+                STATUS_PENDING,
+                STATUS_CONFIRMED,
+            ):
+                continue
+            synced_tips.add(tip_hash)
+            record = {
+                "tip_hash": tip_hash,
+                "expires_at": expires_at,
+                "fingerprint": fingerprint,
+                "public_key": public_key,
+                "key_version": key_version,
+                "signature": signature,
+                "candidate": candidate,
+                "height": frozen_height,
+                "length": frozen_length,
+                "status": frozen_status,
+            }
+            if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+                continue
+            if not crypto.is_hex64(public_key):
+                continue
+            if (
+                isinstance(key_version, bool)
+                or not isinstance(key_version, int)
+                or key_version < 1
+            ):
+                continue
+            if not crypto.is_hex128(signature):
+                continue
+            # The candidate must keep one of the three delivered shapes.
+            candidate_blocks_raw = (
+                candidate.get("blocks") if isinstance(candidate, dict) else candidate
+            )
+            if not isinstance(candidate_blocks_raw, list):
+                continue
+            expired_deadline = expires_at <= now
+            trusted = trust_sources.get(source)
+            auth_ok = (
+                trusted is not None
+                and trusted.get("status") == TRUST_ACTIVE
+                and isinstance(trusted.get("expires_at"), int)
+                and not isinstance(trusted.get("expires_at"), bool)
+                and trusted["expires_at"] > now
+            )
+            if expired_deadline or not auth_ok:
+                # Own deadline elapsed or registration authorization lost while
+                # down: reconcile like the runtime sweep and backfill one
+                # mode-tagged sync_expired, regardless of the cryptographic
+                # re-check below (the lifecycle is over either way).
+                if frozen_height is None:
+                    descriptor = SyncSummary.from_locations(
+                        tip_hash, forks, canonical_chain
+                    )
+                    if descriptor is not None:
+                        record.update(descriptor)
+                record["mode"] = SYNC_MODE_ATTESTED
+                expired_records.append((source, request_id, record))
+                continue
+            # Independently re-validate the signed candidate (genesis, linkage,
+            # hashes, tx ids/signatures, uniqueness/order, replay, pending
+            # tip); a candidate that no longer validates drops the cache only.
+            try:
+                candidate_fork = self._parse_verified_chain(
+                    candidate_blocks_raw, endowment, genesis
+                )
+            except (ValueError, KeyError, TypeError):
+                continue
+            if candidate_fork[-1].block_hash != tip_hash:
+                continue
+            resolved_blocks: list[dict] | None = None
+            surviving_fork = forks.get(tip_hash)
+            if surviving_fork is not None:
+                resolved_blocks = [block.to_dict() for block in surviving_fork]
+            else:
+                resolved_blocks = canonical_prefixes.get(tip_hash)
+            if resolved_blocks is None:
+                continue
+            # The stored candidate must be exactly the delivered chain.
+            if resolved_blocks != [block.to_dict() for block in candidate_fork]:
+                continue
+            # Re-verify the signature against the FROZEN public key over the
+            # message rebuilt from the candidate verbatim; later trust changes
+            # never enter this check.
+            digest = crypto.attested_sync_digest(
+                source, request_id, expires_at, candidate
+            )
+            if not crypto.verify_signature(public_key, digest, signature):
+                continue
+            if (
+                self._attested_fingerprint(
+                    source, request_id, expires_at, candidate, signature
+                )
+                != fingerprint
+            ):
+                continue
+            descriptor = SyncSummary.from_blocks_raw(tip_hash, resolved_blocks)
+            if descriptor is None:
+                continue
+            if frozen_height is not None and (
+                frozen_height != descriptor["height"]
+                or frozen_length != descriptor["length"]
+                or frozen_status != descriptor["status"]
+            ):
+                continue
+            record.update(descriptor)
+            key = (source, request_id)
+            if key in syncs:
+                continue
+            syncs[key] = record
+        return syncs, expired_records, synced_tips
+
+    @staticmethod
     def _candidate_fingerprint(blocks_raw: list) -> str:
         """Stable SHA-256 content fingerprint of a candidate's raw block list.
 
@@ -1791,6 +2099,30 @@ class LedgerStore:
                     ),
                 }
                 for key, rec in sorted(self.syncs.items())
+            ]
+        # Source-signed (attested) sync records live in their own section and
+        # domain. Besides delivery metadata they freeze the signing public key
+        # and its registry version, the signature and the candidate VERBATIM
+        # (an export object, a {"blocks": ...} wrapper or a bare array):
+        # recovery must rebuild the exact signed message, whose candidate shape
+        # is signed material.
+        if self.attested_syncs:
+            data["attested_syncs"] = [
+                {
+                    "source": key[0],
+                    "request_id": key[1],
+                    "tip_hash": rec["tip_hash"],
+                    "expires_at": rec["expires_at"],
+                    "fingerprint": rec["fingerprint"],
+                    "public_key": rec["public_key"],
+                    "key_version": rec["key_version"],
+                    "signature": rec["signature"],
+                    "candidate": rec["candidate"],
+                    "height": rec.get("height"),
+                    "length": rec.get("length"),
+                    "status": rec.get("status"),
+                }
+                for key, rec in sorted(self.attested_syncs.items())
             ]
         # Persistent source-trust registry and the keyless allowlist are part
         # of the same atomic document as every state change they describe.
@@ -2299,5 +2631,43 @@ class LedgerStore:
         """
         for key, rec in removed.items():
             self.syncs.setdefault(key, rec)
+        for tip, fork in forks.items():
+            self.forks.setdefault(tip, fork)
+
+    def prune_attested_syncs(
+        self, now: float | None = None
+    ) -> tuple[list[str], dict[tuple[str, str], dict]]:
+        """Drop expired attested sync records in memory.
+
+        The attested-domain counterpart of :meth:`prune_syncs`. A record
+        expires once its own ``expires_at`` has passed (re-authorization loss
+        is only reconciled on restart). Returns the orphaned tip hashes and
+        every removed record so the caller can persist the sweep atomically and
+        restore it on a failed write. Does not save; the caller persists.
+        """
+        current = time.time() if now is None else now
+        expired_tips: list[str] = []
+        removed: dict[tuple[str, str], dict] = {}
+        for key in list(self.attested_syncs):
+            rec = self.attested_syncs[key]
+            if rec["expires_at"] <= current:
+                expired_tips.append(rec["tip_hash"])
+                removed[key] = rec
+                del self.attested_syncs[key]
+        return expired_tips, removed
+
+    def restore_attested_syncs(
+        self,
+        removed: dict[tuple[str, str], dict],
+        forks: dict[str, list[Block]],
+    ) -> None:
+        """Restore attested sync records/forks removed by a failed sweep.
+
+        The attested-domain counterpart of :meth:`restore_syncs`. Only records
+        still missing are re-inserted; forks are put back only when absent.
+        Caller must hold the lock.
+        """
+        for key, rec in removed.items():
+            self.attested_syncs.setdefault(key, rec)
         for tip, fork in forks.items():
             self.forks.setdefault(tip, fork)
