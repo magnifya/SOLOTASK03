@@ -94,15 +94,24 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   随调和后的记录/分叉在**同一次原子写入**落盘。指纹不符或 tip 无处解析等其他
   失效仍静默丢弃、不产生事件。历史 `sync_received`/`sync_adopted`/`sync_expired`
   事件逐字保留、`event_id` 从 1 起不间断。
-- **审计查询**：`GET /v1/forks/sync` 支持 `source`、`min_height`、`max_height`、
+- **审计查询**：`GET /v1/forks/sync` 支持可选 `mode`（缺省或 `plain` 只列
+  普通同步，`attested` 只列签名同步，`all` 合并两者；仅允许这三个值，非法值或
+  重复参数 `400`）以及 `source`、`min_height`、`max_height`、
   `limit`（默认 50，范围 1–200）、`cursor`（默认 0）。数值参数必须是首位非 0 的
-  十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。结果按
-  `(height, tip_hash, source)` 升序，返回 `{items, total, next_cursor}`；
-  `cursor == total` 返回空页，`cursor > total` 返回 `400`，没有更多结果时
-  `next_cursor` 为 `null`。每个 item 含
-  `{source, request_id, tip_hash, height, length, status, expires_at}`。
+  十进制（`0` 合法），非法值 `400`，`min_height > max_height` 也是 `400`。合并
+  结果按 `(height, tip_hash, source, mode, request_id)` 升序，返回
+  `{items, total, next_cursor}`；`cursor == total` 返回空页，
+  `cursor > total` 返回 `400`，没有更多结果时 `next_cursor` 为 `null`。每个
+  item 仍含原七字段
+  `{source, request_id, tip_hash, height, length, status, expires_at}`，不因
+  `mode` 增列。查询在同一把锁内先清理过期记录；未过期且已采用的记录仍可见，
+  过期只删记录/候选元数据并保留审计历史（已采用 tip 不动 canonical 链，且不重复
+  写 `sync_expired`）；两个传输模式同一 tip 互不删除、互不影响 canonical。
 - **生命周期历史查询**：`GET /v1/forks/sync/history` 以只增审计历史为数据源，
-  每个同步生命周期的每个阶段一行。支持 `source`、`tip_hash`、`kind`、
+  每个同步生命周期的每个阶段一行。支持可选 `mode`（缺省或 `all` 返回全量；
+  `plain` 匹配 mode 缺省或 `plain` 的旧/普通事件，`attested` 仅匹配
+  `mode=attested` 的签名同步事件；非法或重复 `mode` 返回 `400`；item 仍按
+  既有字段输出，不新增字段），以及 `source`、`tip_hash`、`kind`、
   `min_height`、`max_height`、`limit`（默认 50，范围 1–200）、`cursor`（默认
   0）。`tip_hash` 必须是 64 位小写十六进制：格式错误 `400`，未知值只返回空页；
   `kind` 只允许 `sync_received`、`sync_adopted`、`sync_expired`，未知值 `400`。
@@ -572,13 +581,15 @@ curl -s -X POST localhost:8080/v1/forks/sync/range \
   -d '{"source":"node-2","request_id":"req-8","expires_at":1800000000,"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"}}'
 # -> 201 {"tip_hash":"...","height":4,"length":5,"status":"confirmed","expires_at":1800000000}
 
-# 同步审计查询（source/min_height/max_height/limit/cursor；非法数值 400）
-curl -s 'localhost:8080/v1/forks/sync?source=node-2&min_height=1&limit=50&cursor=0'
+# 同步审计查询（mode 默认 plain；attested/all 合并，非法或重复参数 400；
+# source/min_height/max_height/limit/cursor 既有校验不变）
+curl -s 'localhost:8080/v1/forks/sync?mode=all&source=node-2&min_height=1&limit=50&cursor=0'
 # -> 200 {"items":[{source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
 
-# 同步生命周期历史（source/tip_hash/kind/min_height/max_height/limit/cursor；
+# 同步生命周期历史（mode 默认 all；plain 匹配旧/普通事件，attested 仅签名事件；
+# source/tip_hash/kind/min_height/max_height/limit/cursor；
 # tip_hash 或 kind 格式错误 400，未知 tip_hash 空页，非法数值或重复参数 400）
-curl -s 'localhost:8080/v1/forks/sync/history?source=node-2&kind=sync_adopted&limit=50&cursor=0'
+curl -s 'localhost:8080/v1/forks/sync/history?mode=attested&source=node-2&kind=sync_adopted&limit=50&cursor=0'
 # -> 200 {"items":[{event_id,kind,at,source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
 
 # 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
@@ -660,8 +671,8 @@ python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N]
 
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
-python -m ledger.cli syncs [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
-python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--min-height N] [--max-height N] [--cursor N] [--limit N]
+python -m ledger.cli syncs [--mode plain|attested|all] [--source node-2] [--min-height N] [--max-height N] [--cursor N] [--limit N]
+python -m ledger.cli sync-history [--mode plain|attested|all] [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 
 # 增量区间：chain-range 拉取（可把整页 JSON 直接交给 sync-range 推送，tip 自动派生）
 python -m ledger.cli chain-range --after-height 2 --after-hash <block-hash> [--limit 100]

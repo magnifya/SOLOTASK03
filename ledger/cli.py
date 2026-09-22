@@ -257,6 +257,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 def cmd_syncs(args: argparse.Namespace) -> int:
     filters = {
+        "mode": args.mode,
         "source": args.source,
         "min_height": args.min_height,
         "max_height": args.max_height,
@@ -275,6 +276,7 @@ def cmd_syncs(args: argparse.Namespace) -> int:
 
 def cmd_sync_history(args: argparse.Namespace) -> int:
     filters = {
+        "mode": args.mode,
         "source": args.source,
         "tip_hash": args.tip_hash,
         "kind": args.kind,
@@ -687,6 +689,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.set_defaults(func=cmd_sync)
 
     p_syncs = sub.add_parser("syncs", help="audit-list received synced candidates")
+    p_syncs.add_argument(
+        "--mode",
+        help="delivery mode: plain (default), attested or all (merged); "
+        "invalid values are rejected by the server with 400",
+    )
     p_syncs.add_argument("--source", help="filter by originating node identifier")
     p_syncs.add_argument("--min-height", help="minimum tip height (decimal)")
     p_syncs.add_argument("--max-height", help="maximum tip height (decimal)")
@@ -696,6 +703,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_sync_history = sub.add_parser(
         "sync-history", help="audit-list the full sync lifecycle event history"
+    )
+    p_sync_history.add_argument(
+        "--mode",
+        help="delivery mode: plain, attested or all (default; full history); "
+        "invalid values are rejected by the server with 400",
     )
     p_sync_history.add_argument("--source", help="filter by originating node identifier")
     p_sync_history.add_argument(

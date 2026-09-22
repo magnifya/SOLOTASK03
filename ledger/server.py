@@ -240,11 +240,16 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.list_fork_sync_history(params)
                 self._send_json(status, body)
             elif path == "/v1/forks/sync":
-                # GET /v1/forks/sync?source=&min_height=&max_height=&limit=&cursor=
-                params = {
-                    key: values[0]
-                    for key, values in parse_qs(query, keep_blank_values=True).items()
-                }
+                # GET /v1/forks/sync?mode=&source=&min_height=&max_height=
+                # &limit=&cursor= — repeated query parameters (including
+                # mode) are rejected 400 like the other strict endpoints.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.list_fork_syncs(params)
                 self._send_json(status, body)
             elif path == "/v1/index/transactions":
