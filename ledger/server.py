@@ -157,7 +157,17 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             path, _, query = self.path.partition("?")
-            if path == "/v1/trust":
+            if path.startswith("/v1/transactions/"):
+                # GET /v1/transactions/{tx_id} — a transaction receipt. A
+                # malformed (not 64 lowercase hex) or unknown tx_id is 404;
+                # only canonical-chain and mempool transactions are exposed.
+                tx_id = unquote(path[len("/v1/transactions/") :])
+                if not tx_id or "/" in tx_id:
+                    self._send_json(404, {"error": "transaction not found"})
+                    return
+                status, body = service.get_transaction_receipt(tx_id)
+                self._send_json(status, body)
+            elif path == "/v1/trust":
                 status, body = service.get_trust_document()
                 self._send_json(status, body)
             elif path == "/v1/audit/events":

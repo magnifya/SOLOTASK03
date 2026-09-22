@@ -329,6 +329,28 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 没有更多结果时为 `null`。每个 item 含
 `{tx_id, height, block_hash, index, from, to, amount}`。
 
+## 交易回执
+
+`GET /v1/transactions/{tx_id}` 返回单笔交易的回执。`tx_id` 必须是 64 位小写
+十六进制；格式非法或交易不存在都返回 `404`。查询只面向 **canonical 链**
+（已确认块与唯一可能的待定尾块）和**待处理集合**，候选分叉中的交易一律不暴露。
+成功返回 `200` 与固定九字段
+`{tx_id, from, to, amount, signature, status, height, block_hash, index}`，
+`status` 只可能是 `pending` 或 `confirmed`：
+
+- **内存池交易**：`status=pending`，`height`、`block_hash`、`index` 均为 `null`。
+- **已打包未确认交易**（位于待定尾块）：`status=pending`，`height`、`block_hash`
+  为待定块的高度与哈希，`index` 为块内从 0 起、随块内升序顺序的位置。
+- **已确认交易**：`status=confirmed`，三个字段锚定 canonical 已确认块。
+
+回滚待定尾块后，其中交易恢复内存池形态（三锚点字段回到 `null`）。分叉采用使
+交易进入 canonical、旧链独有交易回到内存池或被新链包含时，回执反映采用后的
+最终状态，不读取旧链缓存。回执中的 `tx_id` 由签名交易重算，并严格校验类型：
+`amount` 为正整数（拒绝 bool 等），`index` 为非负整数且与区块顺序一致。查询与
+提交、打包、确认、回滚、采用、清理共用同一把锁，只反映已持久化的状态；重启后
+从 canonical、pending 与待定尾块重建回执，不新增权威副本，快照损坏或冲突仍抛
+`StateRecoveryError`。命令行 `tx TX_ID` 转发该接口的单行 JSON，非 2xx 退出码为 1。
+
 ## 离线轻客户端验证
 
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
@@ -423,7 +445,7 @@ SHA-256 摘要作为签名消息。
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `tx` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -685,4 +707,5 @@ python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂�
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI
 python tests/strict_type_validation_test.py  # 跨入口严格类型校验：height/amount 的字符串/浮点/布尔伪装在候选分叉与同步入口 400（不写状态、不回放 200）、离线 verify 返回 input、canonical/pending 恢复抛 StateRecoveryError、持久化候选/同步记录按缓存规则丢弃、旧快照缺省 status 兼容
+python tests/transaction_receipt_test.py # 交易回执 GET /v1/transactions/{tx_id}（固定九字段、内存池/待定尾块/已确认三态与锚点、非法或不存在 404、回滚恢复内存池、分叉交易不暴露/采用后反映最终状态、重启重建）与 HTTP/CLI tx（非 2xx 退出 1）
 ```

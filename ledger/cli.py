@@ -1,5 +1,5 @@
 """Command line interface: send, mine, block, account, proof, state-root,
-state-proof, confirm, rollback, status, candidates, chain, adopt, export,
+state-proof, confirm, rollback, status, tx, candidates, chain, adopt, export,
 index, sync, syncs, sync-history, audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify subcommands.
@@ -189,6 +189,13 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     status, body = _request(
         "GET", f"{args.base_url}/v1/blocks/{args.height}/status", None
+    )
+    return _emit(status, body)
+
+
+def cmd_tx(args: argparse.Namespace) -> int:
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/transactions/{args.tx_id}", None
     )
     return _emit(status, body)
 
@@ -590,6 +597,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="fetch a block's confirm status")
     p_status.add_argument("height", help="block height")
     p_status.set_defaults(func=cmd_status)
+
+    p_tx = sub.add_parser("tx", help="fetch a transaction receipt")
+    p_tx.add_argument("tx_id", help="transaction id (64 lowercase hex characters)")
+    p_tx.set_defaults(func=cmd_tx)
 
     p_candidates = sub.add_parser(
         "candidates", help="submit a candidate fork from a blocks JSON array"

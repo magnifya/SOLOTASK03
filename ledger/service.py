@@ -291,6 +291,77 @@ class LedgerService:
                 "siblings": siblings,
             }
 
+    # -- transaction receipts -------------------------------------------------
+
+    @staticmethod
+    def _receipt(tx: Transaction, status: str, block: Block | None, index: int | None) -> dict:
+        """Build the fixed nine-field receipt. The tx_id is always the one
+        recomputed from the signed transaction, never a client-supplied value.
+        """
+        return {
+            "tx_id": tx.tx_id,
+            "from": tx.sender,
+            "to": tx.recipient,
+            "amount": tx.amount,
+            "signature": tx.signature,
+            "status": status,
+            "height": block.height if block is not None else None,
+            "block_hash": block.block_hash if block is not None else None,
+            "index": index,
+        }
+
+    def get_transaction_receipt(self, tx_id: object) -> tuple[int, dict]:
+        """GET /v1/transactions/{tx_id} — receipt for one transaction.
+
+        The lookup covers only the canonical chain (confirmed blocks plus the
+        single possible pending tip) and the mempool; candidate fork
+        transactions are never exposed. A malformed tx_id (not 64 lowercase
+        hex characters) or an unknown tx_id returns 404.
+
+        A mempool transaction is ``pending`` with height/block_hash/index all
+        null; a transaction packed into the unconfirmed tip is likewise
+        ``pending`` but anchored to that block's height/hash and its 0-based
+        in-block index; a confirmed-block transaction is ``confirmed``. The
+        receipt's tx_id is recomputed from the signed transaction and the
+        index matches the block's stored (ascending tx_id) order. The read
+        takes the shared store lock, so it reflects only persisted state.
+        """
+        if not crypto.is_hex64(tx_id):
+            return 404, {"error": "transaction not found"}
+        with self.store.lock:
+            # Canonical chain only: a pending block can only ever be the tip,
+            # so every non-tip match is confirmed. Stored fork candidates are
+            # deliberately never consulted.
+            for block in self.store.chain:
+                for index, tx in enumerate(block.transactions):
+                    if tx.tx_id != tx_id:
+                        continue
+                    # Strict re-validation of the persisted record: the id is
+                    # recomputed from the signed message, the amount must be a
+                    # positive integer and the index a plain non-negative int.
+                    if (
+                        isinstance(tx.amount, bool)
+                        or not isinstance(tx.amount, int)
+                        or tx.amount <= 0
+                        or isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index < 0
+                    ):
+                        return 404, {"error": "transaction not found"}
+                    if block.status == STATUS_CONFIRMED:
+                        return 200, self._receipt(tx, STATUS_CONFIRMED, block, index)
+                    return 200, self._receipt(tx, STATUS_PENDING, block, index)
+            tx = self.store.pending.get(tx_id)
+            if tx is not None:
+                if (
+                    isinstance(tx.amount, bool)
+                    or not isinstance(tx.amount, int)
+                    or tx.amount <= 0
+                ):
+                    return 404, {"error": "transaction not found"}
+                return 200, self._receipt(tx, STATUS_PENDING, None, None)
+        return 404, {"error": "transaction not found"}
+
     # -- accounts -----------------------------------------------------------
 
     def get_account(self, account: str) -> tuple[int, dict]:
