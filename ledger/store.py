@@ -68,7 +68,9 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 9
+# Version 10 adds the confirmed account-state Merkle root (state.state_root),
+# recomputed and cross-checked on every recovery.
+STATE_VERSION = 10
 
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
@@ -709,6 +711,24 @@ class LedgerStore:
                 if self.initial_balance is not None
                 else DEFAULT_INITIAL_BALANCE
             )
+
+        # state.state_root (schema v10+): mandatory on a current snapshot and
+        # always recomputed from the confirmed chain. A malformed value or any
+        # disagreement with the replay is snapshot corruption and fails
+        # recovery with the candidate path/reason — a fresh chain is never
+        # silently created. A legacy snapshot without the field is accepted.
+        stored_state_root = state.get("state_root")
+        if stored_state_root is None:
+            if state_version is not None and state_version >= STATE_VERSION:
+                fail("current-version snapshot is missing state.state_root")
+        else:
+            if not crypto.is_hex64(stored_state_root):
+                fail("state.state_root must be 64 lowercase hex characters")
+            recomputed_state_root = self._state_root_from_chain(
+                chain, replay_endowment
+            )
+            if recomputed_state_root != stored_state_root:
+                fail("state.state_root does not match the confirmed chain")
 
         forks = self._parse_persisted_forks(
             data.get("forks", []), chain, replay_endowment
@@ -1577,6 +1597,92 @@ class LedgerStore:
         """
         self.tx_index, self.accounts = self._compute_derived()
 
+    @staticmethod
+    def _state_root_from_chain(chain: list[Block], endowment: int) -> str:
+        """Recompute the account-state Merkle root straight from a chain.
+
+        Mirrors :meth:`_compute_derived` plus
+        :meth:`state_anchor_accounts`: pending blocks contribute nothing,
+        each confirmed account is reported with
+        ``endowment + received - sent`` and its chain-replay transaction ids,
+        and the leaves are taken in ascending-account order. Used by recovery
+        to re-derive the persisted ``state_root`` before the store's derived
+        views have been built.
+        """
+        derived: dict[str, dict] = {}
+        for block in chain:
+            if block.status != STATUS_CONFIRMED:
+                continue
+            for tx in block.transactions:
+                for account in (tx.sender, tx.recipient):
+                    entry = derived.setdefault(
+                        account,
+                        {"sent": 0, "received": 0, "transactions": []},
+                    )
+                    entry["transactions"].append(tx.tx_id)
+                derived[tx.sender]["sent"] += tx.amount
+                derived[tx.recipient]["received"] += tx.amount
+        accounts = [
+            (
+                name,
+                endowment + entry["received"] - entry["sent"],
+                list(entry["transactions"]),
+            )
+            for name, entry in derived.items()
+        ]
+        accounts.sort(key=lambda item: item[0])
+        return crypto.account_state_root(accounts)
+
+    def confirmed_anchor(self) -> Block:
+        """The highest confirmed block — the anchor of the account state tree.
+
+        The genesis block is always confirmed, so a confirmed anchor exists
+        even while a pending tip block is awaiting confirmation or rollback.
+        Caller must hold the lock.
+        """
+        for block in reversed(self.chain):
+            if block.status == STATUS_CONFIRMED:
+                return block
+        raise RuntimeError("chain has no confirmed block")
+
+    def state_anchor_accounts(
+        self,
+    ) -> tuple[Block, list[tuple[str, int, list[str]]]]:
+        """The state-tree anchor and confirmed accounts in account-ascending
+        order, each as ``(account, confirmed_balance, confirmed_transactions)``.
+
+        Only confirmed blocks contribute (the pending tip is excluded) and
+        the recorded endowment is used, so the result is identical on every
+        node replaying the same confirmed chain. Transaction ids keep their
+        chain-replay order. Caller must hold the lock.
+        """
+        anchor = self.confirmed_anchor()
+        endowment = (
+            self.initial_balance
+            if self.initial_balance is not None
+            else DEFAULT_INITIAL_BALANCE
+        )
+        accounts = [
+            (
+                name,
+                endowment + entry["received"] - entry["sent"],
+                list(entry["transactions"]),
+            )
+            for name, entry in self.accounts.items()
+        ]
+        accounts.sort(key=lambda item: item[0])
+        return anchor, accounts
+
+    def compute_state_root(self) -> str:
+        """Recompute the account-state Merkle root from confirmed blocks.
+
+        Pure derivation from the in-memory chain/derived views; the snapshot
+        writer records it and recovery compares it against the persisted
+        value. Caller must hold the lock.
+        """
+        _, accounts = self.state_anchor_accounts()
+        return crypto.account_state_root(accounts)
+
     def save(self) -> None:
         """Atomically persist chain, state, pending set, index and accounts.
 
@@ -1596,6 +1702,16 @@ class LedgerStore:
         # restores the rest of the fields to.
         next_index, next_accounts = self._compute_derived()
         next_generation = self.generation + 1
+        # The recorded state root is derived straight from the chain about to
+        # be persisted (not from self.accounts, which is only republished to
+        # next_accounts after the promotion succeeds), so a confirm-and-save
+        # records the root anchored at the newly confirmed tip.
+        endowment = (
+            self.initial_balance
+            if self.initial_balance is not None
+            else DEFAULT_INITIAL_BALANCE
+        )
+        next_state_root = self._state_root_from_chain(self.chain, endowment)
         # The in-memory log, its hash head and checkpoint always move together:
         # refuse to persist a document where they disagree, since that could
         # never recover. Callers append through append_audit_event(), which
@@ -1637,6 +1753,7 @@ class LedgerStore:
                 "tip_hash": self.chain[-1].block_hash,
                 "tip_status": self.chain[-1].status,
                 "initial_balance": self.initial_balance,
+                "state_root": next_state_root,
             },
             "chain": [block.to_dict() for block in self.chain],
             "pending": [tx.to_dict() for tx in self.pending.values()],

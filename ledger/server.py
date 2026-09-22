@@ -157,7 +157,11 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             path, _, query = self.path.partition("?")
-            if path == "/v1/trust":
+            if path == "/v1/state/root":
+                # GET /v1/state/root — confirmed account-state Merkle root.
+                status, body = service.get_state_root()
+                self._send_json(status, body)
+            elif path == "/v1/trust":
                 status, body = service.get_trust_document()
                 self._send_json(status, body)
             elif path == "/v1/audit/events":
@@ -250,12 +254,22 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     status, body = service.get_block(height)
                     self._send_json(status, body)
             elif path.startswith("/v1/accounts/"):
-                account = unquote(path[len("/v1/accounts/") :])
-                if not account:
-                    self._send_json(404, {"error": "account not found"})
-                    return
-                status, body = service.get_account(account)
-                self._send_json(status, body)
+                remainder = path[len("/v1/accounts/") :]
+                if remainder.endswith("/proof"):
+                    # GET /v1/accounts/{account}/proof
+                    account = unquote(remainder[: -len("/proof")])
+                    if not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    status, body = service.get_account_proof(account)
+                    self._send_json(status, body)
+                else:
+                    account = unquote(remainder)
+                    if not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    status, body = service.get_account(account)
+                    self._send_json(status, body)
             else:
                 self._send_json(404, {"error": "not found"})
 

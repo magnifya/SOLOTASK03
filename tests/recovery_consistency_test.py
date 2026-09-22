@@ -174,6 +174,16 @@ class RecordedEndowmentTests(unittest.TestCase):
         d2["state"]["generation"] = 77
         d1["state"]["initial_balance"] = 1000
         d2["state"]["initial_balance"] = 2000
+        # state_root commits every endowment-derived account balance, so each
+        # internally-consistent twin must carry the root matching its own
+        # endowment (a twin that only edits initial_balance while reusing the
+        # old root is now rejected as corrupt, not treated as a conflict).
+        d1["state"]["state_root"] = LedgerStore._state_root_from_chain(
+            [Block.from_dict(b) for b in d1["chain"]], 1000
+        )
+        d2["state"]["state_root"] = LedgerStore._state_root_from_chain(
+            [Block.from_dict(b) for b in d2["chain"]], 2000
+        )
         conflict_dir = tempfile.mkdtemp()
         main_path = os.path.join(conflict_dir, "state.json")
         write_json(main_path, d1)

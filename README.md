@@ -367,7 +367,7 @@ SHA-256 摘要作为签名消息。
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -388,6 +388,19 @@ SHA-256 摘要作为签名消息。
   兄弟节点位于路径节点的左/右侧；`verify_merkle_proof(tx_id, siblings, merkle_root,
   block_hash, expected_block_hash)` 重算根并比对区块哈希，任何畸形输入（非 64 位
   小写十六进制、非法 direction、层级过深等）均返回 `False`。
+- 账户状态树按 `account` 升序取叶；叶为
+  `sha256(utf8(规范 JSON {"account":a,"balance":b,"confirmed_transactions":T}))`，
+  其中 JSON `sort_keys=true`、`ensure_ascii=false`、`separators=(",",":")`，T 保持
+  链上回放原序（不另排序）。上层哈希与交易 Merkle 树同构（`sha256(left+right)`、
+  奇数自配对、空集根为 `sha256(b"")`）。状态根锚定最高“已确认”块。
+  `account_proof(accounts, account)` 返回 `(index, siblings, state_root)`，index 为
+  升序 0-based，siblings 自叶向根；`verify_account_proof(proof, expected_root,
+  expected_height, expected_hash)` 依据账户三元组重算叶、沿路径重算根并核对锚点，
+  且要求 `index` 与路径各位一致——非法哈希/direction/index、叶不符或锚点不符一律
+  返回 `False`。
+- 每个快照在 `state.state_root` 记录当时的状态根；恢复时从已确认链重算并比对，
+  不一致（含非法值、当前版本缺字段）抛 `StateRecoveryError(path, reason)`，绝不
+  静默新建链；旧版本（v9 及更早）无该字段时容忍并在下次保存时补齐。
 - 区块哈希为 `sha256(规范化 {"height","prev_hash","merkle_root"})`，不含时间戳，
   因此同一父块与同一批有序交易必然产生相同 `merkle_root` 与 `block_hash`。
 - 任务未定义铸币接口，故每个身份拥有固定初始余额（默认 1,000,000，可用
@@ -431,6 +444,13 @@ curl -s localhost:8080/v1/blocks/0
 curl -s localhost:8080/v1/accounts/<pubkey-hex>
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
+
+# 账户状态 Merkle 根（锚定最高“已确认”块；存在待定链尾时 -> 404）
+curl -s localhost:8080/v1/state/root
+# -> {"state_root":"...","height":N,"block_hash":"...","account_count":M}
+# 某账户的状态包含证明（账户未出现过 或 存在待定链尾 -> 404）
+curl -s localhost:8080/v1/accounts/<pubkey-hex>/proof
+# -> {account,balance,confirmed_transactions,index,state_root,height,block_hash,siblings}
 
 # 状态机
 curl -s localhost:8080/v1/blocks/1/status          # -> {"height":1,"status":"pending"}
@@ -541,6 +561,8 @@ python -m ledger.cli mine
 python -m ledger.cli block 1
 python -m ledger.cli account <pubkey-hex>
 python -m ledger.cli proof 1 <tx-id-hex>
+python -m ledger.cli state-root
+python -m ledger.cli state-proof <pubkey-hex>
 python -m ledger.cli status 1
 python -m ledger.cli confirm 1
 python -m ledger.cli rollback 1

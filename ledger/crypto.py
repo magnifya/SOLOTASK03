@@ -186,6 +186,33 @@ def merkle_proof(tx_ids: list[str], index: int) -> list[dict]:
     return siblings
 
 
+def _hash_merkle_path(leaf: str, siblings: list[dict]) -> str | None:
+    """Hash a leaf up through a leaf-to-root sibling path.
+
+    Returns the recomputed root, or None when the path is not a list, is
+    deeper than :data:`MAX_MERKLE_DEPTH`, contains a non-dict entry, an
+    illegal direction or a malformed sibling hash.
+    """
+    if not isinstance(siblings, list) or len(siblings) > MAX_MERKLE_DEPTH:
+        return None
+    current = leaf
+    for item in siblings:
+        if not isinstance(item, dict):
+            return None
+        direction = item.get("direction")
+        sibling_hash = item.get("hash")
+        if not _is_hex64(sibling_hash):
+            return None
+        if direction == "left":
+            pair = sibling_hash + current
+        elif direction == "right":
+            pair = current + sibling_hash
+        else:
+            return None
+        current = sha256_hex(pair.encode("ascii"))
+    return current
+
+
 def verify_merkle_proof(
     tx_id: str,
     siblings: list[dict],
@@ -208,29 +235,153 @@ def verify_merkle_proof(
             return False
         if not _is_hex64(block_hash) or not _is_hex64(expected_block_hash):
             return False
-        if not isinstance(siblings, list) or len(siblings) > MAX_MERKLE_DEPTH:
-            return False
 
-        current = tx_id
-        for item in siblings:
-            if not isinstance(item, dict):
-                return False
-            direction = item.get("direction")
-            sibling_hash = item.get("hash")
-            if not _is_hex64(sibling_hash):
-                return False
-            if direction == "left":
-                pair = sibling_hash + current
-            elif direction == "right":
-                pair = current + sibling_hash
-            else:
-                return False
-            current = sha256_hex(pair.encode("ascii"))
+        current = _hash_merkle_path(tx_id, siblings)
+        if current is None:
+            return False
 
         if not hmac.compare_digest(current, merkle_root):
             return False
         if not hmac.compare_digest(block_hash, expected_block_hash):
             return False
         return True
+    except (TypeError, ValueError):
+        return False
+
+
+# -- account state Merkle tree ----------------------------------------------
+
+
+def account_leaf(account: str, balance: int, confirmed_transactions: list[str]) -> str:
+    """SHA-256 hex digest of one account state's canonical JSON.
+
+    The leaf document is exactly
+    ``{"account": a, "balance": b, "confirmed_transactions": T}`` serialized
+    with sort_keys=True, ensure_ascii=False and separators=(",", ":"); T keeps
+    its stored (chain-replay) order and is never sorted here.
+    """
+    payload = {
+        "account": account,
+        "balance": balance,
+        "confirmed_transactions": confirmed_transactions,
+    }
+    data = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return sha256_hex(data)
+
+
+def account_leaves(accounts: list[tuple[str, int, list[str]]]) -> list[str]:
+    """Account leaves in ascending-account order (the state tree order)."""
+    ordered = sorted(accounts, key=lambda entry: entry[0])
+    return [
+        account_leaf(account, balance, transactions)
+        for account, balance, transactions in ordered
+    ]
+
+
+def account_state_root(accounts: list[tuple[str, int, list[str]]]) -> str:
+    """Merkle root of the account state leaves in ascending-account order.
+
+    Uses the same tree construction as :func:`merkle_root`; an empty account
+    set hashes to :data:`EMPTY_MERKLE_ROOT`.
+    """
+    return merkle_root(account_leaves(accounts))
+
+
+def account_proof(
+    accounts: list[tuple[str, int, list[str]]], account: str
+) -> tuple[int, list[dict], str]:
+    """Build ``(index, siblings, state_root)`` for ``account``.
+
+    Accounts are ordered ascending. Raises ValueError when the account is
+    absent; mirrors :func:`merkle_proof` for a single-account (empty-path)
+    tree.
+    """
+    leaves = account_leaves(accounts)
+    names = sorted(entry[0] for entry in accounts)
+    if account not in names:
+        raise ValueError("unknown account")
+    index = names.index(account)
+    return index, merkle_proof(leaves, index), merkle_root(leaves)
+
+
+def verify_account_proof(
+    proof: dict,
+    expected_root: str,
+    expected_height: int,
+    expected_hash: str,
+) -> bool:
+    """Verify an account-state Merkle proof against an expected anchor.
+
+    Recomputes the account leaf from the proof's
+    account/balance/confirmed_transactions triple, walks the leaf-to-root
+    sibling path, and requires the recomputed root to equal both the proof's
+    ``state_root`` and ``expected_root``; ``height``/``block_hash`` must equal
+    ``expected_height``/``expected_hash`` and ``index`` must match the binary
+    path the siblings describe. Every malformed value (bad hash, illegal
+    direction, wrong index/type, malformed leaf, wrong anchor) returns False
+    rather than raising.
+    """
+    try:
+        if not isinstance(proof, dict):
+            return False
+        account = proof.get("account")
+        balance = proof.get("balance")
+        confirmed_transactions = proof.get("confirmed_transactions")
+        index = proof.get("index")
+        state_root = proof.get("state_root")
+        height = proof.get("height")
+        block_hash = proof.get("block_hash")
+        siblings = proof.get("siblings")
+
+        if not isinstance(account, str) or not account:
+            return False
+        if isinstance(balance, bool) or not isinstance(balance, int):
+            return False
+        if not isinstance(confirmed_transactions, list) or any(
+            not isinstance(tx_id, str) for tx_id in confirmed_transactions
+        ):
+            return False
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            return False
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return False
+        if isinstance(expected_height, bool) or not isinstance(expected_height, int):
+            return False
+        if not _is_hex64(state_root) or not _is_hex64(expected_root):
+            return False
+        if not _is_hex64(block_hash) or not _is_hex64(expected_hash):
+            return False
+
+        # The index must agree with the sibling path: at level i the path node
+        # is a left child (sibling on its right -> bit 0) or a right child
+        # (sibling on its left -> bit 1), and every bit above the tree depth
+        # must be zero. This rejects an index that does not describe the path.
+        if not isinstance(siblings, list) or len(siblings) > MAX_MERKLE_DEPTH:
+            return False
+        for level, item in enumerate(siblings):
+            if not isinstance(item, dict):
+                return False
+            if item.get("direction") not in ("left", "right"):
+                return False
+            expected_bit = 1 if item["direction"] == "left" else 0
+            if ((index >> level) & 1) != expected_bit:
+                return False
+        if index >> len(siblings):
+            return False
+
+        if height != expected_height:
+            return False
+        if not hmac.compare_digest(block_hash, expected_hash):
+            return False
+        if not hmac.compare_digest(state_root, expected_root):
+            return False
+
+        leaf = account_leaf(account, balance, confirmed_transactions)
+        current = _hash_merkle_path(leaf, siblings)
+        if current is None:
+            return False
+        return hmac.compare_digest(current, state_root)
     except (TypeError, ValueError):
         return False

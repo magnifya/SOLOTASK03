@@ -1,8 +1,8 @@
-"""Command line interface: send, mine, block, account, proof, confirm,
-rollback, status, candidates, chain, adopt, export, index, sync, syncs,
-sync-history, audit, audit-export, trust (add/rotate/revoke/export/
-allowlist-add/allowlist-remove) and offline verify/audit-verify
-subcommands.
+"""Command line interface: send, mine, block, account, proof, state-root,
+state-proof, confirm, rollback, status, candidates, chain, adopt, export,
+index, sync, syncs, sync-history, audit, audit-export, trust
+(add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
+verify/audit-verify subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -150,6 +150,19 @@ def cmd_account(args: argparse.Namespace) -> int:
 def cmd_proof(args: argparse.Namespace) -> int:
     status, body = _request(
         "GET", f"{args.base_url}/v1/blocks/{args.height}/proof/{args.tx_id}", None
+    )
+    return _emit(status, body)
+
+
+def cmd_state_root(args: argparse.Namespace) -> int:
+    status, body = _request("GET", f"{args.base_url}/v1/state/root", None)
+    return _emit(status, body)
+
+
+def cmd_state_proof(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.account, safe="")
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/accounts/{quoted}/proof", None
     )
     return _emit(status, body)
 
@@ -539,6 +552,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_proof.add_argument("height", help="block height containing the transaction")
     p_proof.add_argument("tx_id", help="transaction id (64-char hex)")
     p_proof.set_defaults(func=cmd_proof)
+
+    p_state_root = sub.add_parser(
+        "state-root", help="fetch the confirmed account-state Merkle root"
+    )
+    p_state_root.set_defaults(func=cmd_state_root)
+
+    p_state_proof = sub.add_parser(
+        "state-proof", help="fetch an account's state Merkle inclusion proof"
+    )
+    p_state_proof.add_argument("account", help="account id (public key hex)")
+    p_state_proof.set_defaults(func=cmd_state_proof)
 
     p_confirm = sub.add_parser("confirm", help="confirm a pending tip block")
     p_confirm.add_argument("height", help="block height to confirm")

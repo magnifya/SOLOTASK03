@@ -304,6 +304,64 @@ class LedgerService:
                 "confirmed_transactions": list(entry["transactions"]),
             }
 
+    # -- account state Merkle tree ------------------------------------------
+
+    def get_state_root(self) -> tuple[int, dict]:
+        """GET /v1/state/root — the confirmed account-state Merkle root.
+
+        The tree covers every account that has appeared in a confirmed block,
+        ordered by ascending account, and is anchored at the highest
+        *confirmed* block. While a pending (unconfirmed) tip block exists the
+        confirmed state is not finalizable at the chain tip, so the endpoint
+        reports 404; the client can confirm or roll back and retry.
+        """
+        with self.store.lock:
+            if self.store.tip_is_pending():
+                return 404, {"error": "state is unavailable while the tip is pending"}
+            anchor, accounts = self.store.state_anchor_accounts()
+            state_root = crypto.account_state_root(accounts)
+            return 200, {
+                "state_root": state_root,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "account_count": len(accounts),
+            }
+
+    def get_account_proof(self, account: object) -> tuple[int, dict]:
+        """GET /v1/accounts/{account}/proof — account-state inclusion proof.
+
+        Returns the account fields plus ``index`` (0-based in ascending
+        account order), ``state_root``, the anchor ``height``/``block_hash``
+        and the leaf-to-root ``siblings`` path. The tree is anchored at the
+        highest confirmed block; while a pending tip exists the endpoint
+        reports 404, and an account that has never appeared in a confirmed
+        block also reports 404.
+        """
+        if not isinstance(account, str) or not account:
+            return 404, {"error": "account not found"}
+        with self.store.lock:
+            if self.store.tip_is_pending():
+                return 404, {"error": "state is unavailable while the tip is pending"}
+            anchor, accounts = self.store.state_anchor_accounts()
+            names = [name for name, _balance, _txs in accounts]
+            if account not in names:
+                return 404, {"error": "account not found"}
+            index = names.index(account)
+            leaves = crypto.account_leaves(accounts)
+            state_root = crypto.merkle_root(leaves)
+            siblings = crypto.merkle_proof(leaves, index)
+            _name, balance, confirmed_transactions = accounts[index]
+            return 200, {
+                "account": account,
+                "balance": balance,
+                "confirmed_transactions": confirmed_transactions,
+                "index": index,
+                "state_root": state_root,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "siblings": siblings,
+            }
+
     def confirmed_balance(self, account: str) -> int:
         """Balance from confirmed blocks only."""
         entry = self.store.accounts.get(account)
