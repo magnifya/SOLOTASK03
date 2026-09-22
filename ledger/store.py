@@ -80,6 +80,8 @@ EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
 EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
+EVENT_ALLOWLIST_ADDED = "allowlist_added"
+EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -1145,7 +1147,10 @@ class LedgerStore:
         and a 64-char lowercase hex ``tip_hash``; an ``expires_at`` and the
         frozen tip summary (``height`` / ``length`` / ``status``) are checked
         when present — older snapshots' adopted events predate those fields, so
-        missing ones are accepted but malformed ones are corruption.
+        missing ones are accepted but malformed ones are corruption. The
+        keyless-allowlist events ``allowlist_added`` / ``allowlist_removed``
+        likewise require a non-empty ``source`` and an integer
+        ``expires_at``.
         """
         if raw is None:
             return []
@@ -1155,6 +1160,10 @@ class LedgerStore:
             EVENT_SYNC_RECEIVED,
             EVENT_SYNC_ADOPTED,
             EVENT_SYNC_EXPIRED,
+        }
+        allowlist_kinds = {
+            EVENT_ALLOWLIST_ADDED,
+            EVENT_ALLOWLIST_REMOVED,
         }
         events: list[dict] = []
         for i, event in enumerate(raw):
@@ -1232,6 +1241,23 @@ class LedgerStore:
                     raise StateRecoveryError(
                         path,
                         f"audit event {event_id} ({kind}) has a partial frozen summary",
+                    )
+            elif kind in allowlist_kinds:
+                # The keyless allowlist is authoritative configuration (exactly
+                # like trust_sources): an allowlist_added/removed event must
+                # carry a non-empty ``source`` and a plain (non-boolean)
+                # integer ``expires_at``. A malformed payload is snapshot
+                # corruption and fails recovery rather than loading.
+                source = event.get("source")
+                expires_at = event.get("expires_at")
+                if not isinstance(source, str) or not source:
+                    raise StateRecoveryError(
+                        path, f"audit event {event_id} ({kind}) needs a source"
+                    )
+                if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) expires_at must be an integer",
                     )
             events.append(dict(event))
         return events

@@ -51,6 +51,8 @@ EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
 EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
+EVENT_ALLOWLIST_ADDED = "allowlist_added"
+EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 
 
 def _parse_height(height: object) -> int | None:
@@ -1672,6 +1674,94 @@ class LedgerService:
                 "allowlist": dict(self.store.allowlist),
                 "audit_signers": audit_signers,
             }
+
+    # -- keyless allowlist management -----------------------------------------
+
+    @staticmethod
+    def _allowlist_entry(source: str, expires_at: int) -> dict:
+        """Public shape of one keyless allowlist entry."""
+        return {"source": source, "expires_at": expires_at}
+
+    def add_allowlist_entry(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/trust/allowlist — add a keyless source for offline verify.
+
+        The body carries ``source`` (a non-empty string) and ``expires_at`` (a
+        plain, non-boolean Unix-seconds integer); anything malformed is 400. A
+        new entry is persisted together with its ``allowlist_added`` audit
+        event in one atomic write and returns 201 with
+        ``{source, expires_at}``. Re-posting the exact same content is
+        idempotent (200, no new event, no write); the same source with a
+        different expiry conflicts 409 (remove it first).
+
+        The allowlist is keyless and offline-only: it never creates a trust
+        source and never authorizes POST /v1/forks/sync, and expired entries
+        are retained verbatim (an expired entry is still an entry, so a
+        same-content retry stays 200 and a changed-content retry stays 409).
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in ("source", "expires_at"):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+        source = payload["source"]
+        expires_at = payload["expires_at"]
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "field 'source' must be a non-empty string"}
+        # bool is a subclass of int: reject it and every other non-int type.
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+            return 400, {"error": "field 'expires_at' must be a Unix-seconds integer"}
+        with self.store.lock:
+            existing = self.store.allowlist.get(source)
+            if existing is not None:
+                if existing == expires_at:
+                    # Idempotent re-add: the stored entry is reported
+                    # unchanged, with no new audit event and no new write.
+                    return 200, self._allowlist_entry(source, existing)
+                return 409, {"error": "allowlist entry already exists with different content"}
+            self.store.allowlist[source] = expires_at
+            self.store.append_audit_event(
+                EVENT_ALLOWLIST_ADDED,
+                {"source": source, "expires_at": expires_at},
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Undo the entry and its event together so a failed write
+                # never leaves one without the other.
+                self.store.allowlist.pop(source, None)
+                self.store.truncate_audit_events(1)
+                raise
+            return 201, self._allowlist_entry(source, expires_at)
+
+    def remove_allowlist_entry(self, source: object) -> tuple[int, dict]:
+        """DELETE /v1/trust/allowlist/{source} — remove a keyless entry.
+
+        An unknown source (including the empty path segment) returns 404. A
+        known entry is deleted and its ``allowlist_removed`` event (carrying
+        the source and the removed entry's ``expires_at``) is persisted in the
+        same atomic write; a failed write restores both. Returns
+        ``{source, removed: true}`` on success. Removing an allowlist entry
+        never touches a same-named entry of the persistent trust registry.
+        """
+        if not isinstance(source, str) or not source:
+            return 404, {"error": "unknown allowlist entry"}
+        with self.store.lock:
+            existing = self.store.allowlist.get(source)
+            if existing is None:
+                return 404, {"error": "unknown allowlist entry"}
+            del self.store.allowlist[source]
+            self.store.append_audit_event(
+                EVENT_ALLOWLIST_REMOVED,
+                {"source": source, "expires_at": existing},
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Restore the entry and drop its event together.
+                self.store.allowlist[source] = existing
+                self.store.truncate_audit_events(1)
+                raise
+            return 200, {"source": source, "removed": True}
 
     # -- audit log ------------------------------------------------------------
 

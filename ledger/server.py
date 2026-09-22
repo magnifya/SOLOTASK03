@@ -107,6 +107,14 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     source = unquote(remainder[: -len("/revoke")])
                     status, body = service.revoke_trust_source(source, payload)
                 self._send_json(status, body)
+            elif path == "/v1/trust/allowlist":
+                # POST /v1/trust/allowlist — add a keyless offline-verify entry.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.add_allowlist_entry(payload)
+                self._send_json(status, body)
             elif path.startswith("/v1/forks/") and path.endswith("/adopt"):
                 # POST /v1/forks/{tip_hash}/adopt — a body is not required.
                 if self.headers.get("Content-Length"):
@@ -133,6 +141,16 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     status, body = service.rollback_block(height)
                 else:
                     status, body = 404, {"error": "not found"}
+                self._send_json(status, body)
+            else:
+                self._send_json(404, {"error": "not found"})
+
+        def do_DELETE(self) -> None:  # noqa: N802 (stdlib naming)
+            path = self.path.split("?", 1)[0]
+            if path.startswith("/v1/trust/allowlist/"):
+                # DELETE /v1/trust/allowlist/{source}
+                source = unquote(path[len("/v1/trust/allowlist/") :])
+                status, body = service.remove_allowlist_entry(source)
                 self._send_json(status, body)
             else:
                 self._send_json(404, {"error": "not found"})

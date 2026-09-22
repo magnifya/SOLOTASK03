@@ -1,6 +1,7 @@
 """Command line interface: send, mine, block, account, proof, confirm,
 rollback, status, candidates, chain, adopt, export, index, sync, syncs,
-sync-history, audit, audit-export and offline verify/audit-verify
+sync-history, audit, audit-export, trust (add/rotate/revoke/export/
+allowlist-add/allowlist-remove) and offline verify/audit-verify
 subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
@@ -386,6 +387,20 @@ def cmd_trust_export(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_trust_allowlist_add(args: argparse.Namespace) -> int:
+    payload = {"source": args.source, "expires_at": args.expires_at}
+    status, body = _request("POST", f"{args.base_url}/v1/trust/allowlist", payload)
+    return _emit(status, body)
+
+
+def cmd_trust_allowlist_remove(args: argparse.Namespace) -> int:
+    source = urllib.parse.quote(args.source, safe="")
+    status, body = _request(
+        "DELETE", f"{args.base_url}/v1/trust/allowlist/{source}", None
+    )
+    return _emit(status, body)
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     filters = {
         "source": args.source,
@@ -690,6 +705,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_trust_export = trust_sub.add_parser("export", help="export the offline verify trust document")
     p_trust_export.set_defaults(func=cmd_trust_export)
+
+    p_trust_allowlist_add = trust_sub.add_parser(
+        "allowlist-add", help="add a keyless allowlist entry for offline verify"
+    )
+    p_trust_allowlist_add.add_argument("--source", required=True, help="source node identifier")
+    p_trust_allowlist_add.add_argument(
+        "--expires-at", required=True, type=int, help="expiry as Unix seconds"
+    )
+    p_trust_allowlist_add.set_defaults(func=cmd_trust_allowlist_add)
+
+    p_trust_allowlist_remove = trust_sub.add_parser(
+        "allowlist-remove", help="remove a keyless allowlist entry"
+    )
+    p_trust_allowlist_remove.add_argument("--source", required=True, help="source node identifier")
+    p_trust_allowlist_remove.set_defaults(func=cmd_trust_allowlist_remove)
 
     p_audit = sub.add_parser("audit", help="query the append-only audit event log")
     p_audit.add_argument("--source", help="filter by source identifier")

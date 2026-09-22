@@ -181,6 +181,19 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `{"expected_version"}`。未知来源 `404`；版本不符 `409`；成功置
   `status=revoked` 并返回 `200`，对已撤销来源以记录版本重复撤销是幂等的
   （仍 `200`，不产生第二条事件）。已撤销来源不能再轮换。
+- **allowlist 新增**：`POST /v1/trust/allowlist`，请求体
+  `{"source","expires_at"}`：`source` 必须是非空字符串，`expires_at` 必须是
+  非布尔整数（过去时刻合法，表示一条已过期条目）。合法新建在同一原子写入中
+  追加 `allowlist_added` 事件（携带 `source`、`expires_at`）并返回 `201` 与
+  `{source, expires_at}`；以完全相同内容重试是幂等的，返回 `200` 且**不追加
+  事件、不产生写入**；同 source 不同 `expires_at` 返回 `409`；字段非法
+  `400`。
+- **allowlist 删除**：`DELETE /v1/trust/allowlist/{source}`。未知条目 `404`；
+  成功在同一原子写入中删除条目并追加 `allowlist_removed` 事件（携带
+  `source` 与被删条目的 `expires_at`），返回 `200` 与
+  `{source, removed: true}`。删除 allowlist 条目不触及同名 trust source；
+  allowlist 仅供**离线 verify**，绝不改变 `POST /v1/forks/sync` 的授权。
+  过期条目**不自动删除**，verify 按既有规则返回 `expired`。
 - **信任文档**：`GET /v1/trust` 返回离线验证所需的
   `{"genesis_hash","sources","allowlist","audit_signers"}`：`genesis_hash` 固定
   锚定 canonical 创世块；`sources[source] = {public_key, expires_at}` 只包含
@@ -227,12 +240,17 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `sync_adopted`（候选被采用，按来源同步记录逐条登记）与 `sync_expired`
   （过期清理，包含已采用上链的 tip——只留审计记录、canonical 链不动）；
   审计检查点密钥轮换记录 `audit_signer_rotated`（携带新版本号与新公钥，
-  其事件 id 即新密钥的 `activated_event_id`）。事件一旦写入永不删除：候选
+  其事件 id 即新密钥的 `activated_event_id`）；keyless allowlist 的新增与
+  删除记录 `allowlist_added` / `allowlist_removed`（均携带 `source` 与
+  `expires_at`）。事件一旦写入永不删除：候选
   **采用或过期之后仍可按 source/kind 分页查询**。
 - **恢复语义**：信任注册表、allowlist 与审计流是权威配置而非可丢弃缓存，
-  快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；`event_id`
+  快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；allowlist
+  条目键唯一且 `expires_at` 为非布尔整数；`event_id`
   必须从 1 起连续无重复；每条 `prev_hash`/`event_hash` 必须重算一致，
-  `audit_checkpoint` 必须钉住真实链头）。审计检查点签名者同样严格校验：
+  `audit_checkpoint` 必须钉住真实链头，`allowlist_added`/`allowlist_removed`
+  事件也必须携带非空 `source` 与整数 `expires_at`）。任一项损坏，或同代
+  快照内容冲突，都抛 `StateRecoveryError`，绝不静默新建。审计检查点签名者同样严格校验：
   存储的私钥必须能推导出对应公钥，签名者历史版本必须自 1 起连续、首版在
   事件 0 激活、激活事件 id 升序，当前签名者必须等于最新历史条目，版本 1
   之后的每个版本都必须由一条 id/version/public_key 完全对应的
@@ -346,10 +364,10 @@ SHA-256 摘要作为签名消息。
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -483,6 +501,18 @@ curl -s -X POST localhost:8080/v1/trust/sources/node-2/rotate \
 # 撤销来源（未知 404，版本错 409，重复撤销 200）
 curl -s -X POST localhost:8080/v1/trust/sources/node-2/revoke \
   -H 'Content-Type: application/json' -d '{"expected_version":2}'
+
+# keyless allowlist 新增（仅供离线 verify，不授权 forks/sync；
+# 201 新条目，同内容重试 200 不追加事件，内容不同 409，非法 400；
+# 过期值合法，过期条目不自动删除）
+curl -s -X POST localhost:8080/v1/trust/allowlist \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"keyless-node","expires_at":1900000000}'
+# -> 201 {"source":"keyless-node","expires_at":1900000000}
+
+# 删除 allowlist 条目（未知 404；200 {source,removed:true}；不影响同名 trust source）
+curl -s -X DELETE localhost:8080/v1/trust/allowlist/keyless-node
+# -> 200 {"source":"keyless-node","removed":true}
 
 # 离线验证信任文档（genesis_hash 固定；sources 只含未过期未撤销来源；allowlist 保留）
 curl -s localhost:8080/v1/trust
