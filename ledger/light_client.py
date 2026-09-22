@@ -262,7 +262,10 @@ def _recompute_chain(candidate_raw: list, trust: dict) -> list[Block]:
     prev_hash linkage, per-transaction tx_id and Ed25519 signatures, unique
     tx_id-sorted transactions, Merkle roots, block hashes and the
     pending-only-at-tip rule. Every field is checked on the *raw* JSON value so
-    coercions such as ``"1"`` or ``1.0`` heights are rejected outright.
+    coercions such as ``"1"`` or ``1.0`` heights are rejected outright; such
+    type/domain defects (non-integer or negative height, non-positive or
+    non-integer amount) are reported as ``input``, while recomputation
+    mismatches stay ``integrity``.
     """
     blocks: list[Block] = []
     seen_tx_ids: set[str] = set()
@@ -275,7 +278,12 @@ def _recompute_chain(candidate_raw: list, trust: dict) -> list[Block]:
         block_hash = block_raw.get("block_hash")
         status = block_raw.get("status")
         txs_raw = block_raw.get("transactions")
-        if not _is_int(height) or not isinstance(prev_hash, str):
+        # A height of the wrong type or sign is a field-type defect (input),
+        # not a chain mismatch: strings, floats and booleans must never be
+        # coerced into plausible integers before the linkage checks below.
+        if not _is_int(height) or height < 0:
+            raise _Failure(ERR_INPUT)
+        if not isinstance(prev_hash, str):
             raise _Failure(ERR_INTEGRITY)
         if not crypto.is_hex64(merkle_root) or not crypto.is_hex64(block_hash):
             raise _Failure(ERR_INTEGRITY)
@@ -312,8 +320,11 @@ def _recompute_chain(candidate_raw: list, trust: dict) -> list[Block]:
                 raise _Failure(ERR_INTEGRITY)
             if not isinstance(recipient, str) or not recipient:
                 raise _Failure(ERR_INTEGRITY)
+            # Same rule as the block height: the raw amount must already be a
+            # non-boolean positive integer — never a coercible string, float
+            # or bool — so a domain/type defect is reported as input.
             if not _is_int(amount) or amount <= 0:
-                raise _Failure(ERR_INTEGRITY)
+                raise _Failure(ERR_INPUT)
             if not isinstance(signature, str) or not signature:
                 raise _Failure(ERR_INTEGRITY)
             message = crypto.canonical_message(sender, recipient, amount)

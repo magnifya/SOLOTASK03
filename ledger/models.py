@@ -39,10 +39,17 @@ class Transaction:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Transaction":
+        # The raw JSON value is validated BEFORE any use: no int()/str()
+        # coercion, so a string, float or boolean amount can never masquerade
+        # as the integer it converts to. bool is an int subclass and must be
+        # rejected explicitly.
+        amount = data["amount"]
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise ValueError("transaction amount must be an integer")
         return cls(
             sender=data["from"],
             recipient=data["to"],
-            amount=int(data["amount"]),
+            amount=amount,
             signature=data["signature"],
         )
 
@@ -106,16 +113,25 @@ class Block:
     def from_dict(cls, data: dict) -> "Block":
         # State files written before the status machine existed have no
         # "status" key; every block in such a file was final, so they load
-        # as confirmed.
+        # as confirmed. This compatibility default never extends to numeric
+        # coercion: the raw height must already be a non-boolean,
+        # non-negative integer — a string, float or bool is rejected, never
+        # converted.
         status = data.get("status", STATUS_CONFIRMED)
         if status not in BLOCK_STATUSES:
             raise ValueError(f"unknown block status: {status}")
+        height = data["height"]
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            raise ValueError("block height must be a non-negative integer")
+        transactions = data["transactions"]
+        if not isinstance(transactions, list):
+            raise ValueError("block transactions must be a list")
         return cls(
-            height=int(data["height"]),
+            height=height,
             prev_hash=data["prev_hash"],
             merkle_root=data["merkle_root"],
             block_hash=data["block_hash"],
-            transactions=[Transaction.from_dict(t) for t in data["transactions"]],
+            transactions=[Transaction.from_dict(t) for t in transactions],
             status=status,
         )
 

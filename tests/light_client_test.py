@@ -536,7 +536,7 @@ class InputTests(LightClientFixture):
         self.resign(bundle)
         self.assertEqual(
             verify_bundle(bundle, self.trust, now=NOW),
-            {"ok": False, "error": ERR_INTEGRITY},
+            {"ok": False, "error": ERR_INPUT},
         )
 
 

@@ -321,6 +321,13 @@ SHA-256 摘要作为签名消息。
   消息 `{"amount":N,"from":"...","to":"..."}`（key 升序、无空白的 UTF-8 JSON）
   的 Ed25519 签名十六进制。
 - `tx_id = sha256(规范化消息)`；同一笔交易重复提交（待打包或已确认）返回 409。
+- 区块与交易文档在所有入口（候选分叉、节点同步、快照恢复、离线 verify）都先校验
+  原始 JSON 类型再重算：`height` 必须是非布尔的非负整数且等于数组位置，`amount`
+  必须是非布尔的正整数；字符串、浮点数、布尔值一律拒绝（候选/同步 400 且不写任何
+  状态、同一幂等键也不回放 200；离线 verify 返回 `input`；canonical 链或待打包集合
+  含此类值在恢复时抛 `StateRecoveryError`，仅持久化候选/同步记录含此类值则按缓存
+  规则丢弃），绝不做 `int()` 转换后再判断。旧快照缺省 `status=confirmed` 的兼容
+  保留，但不因此接受任何数值转换。
 - Merkle 树每层做 `sha256(left_hex + right_hex)`，奇数节点与自身配对；
   空列表根为 `sha256(b"")`。包含证明 `merkle_proof(tx_ids, index)` 返回自叶向根
   的兄弟节点列表，每项 `{"direction": "left"|"right", "hash": ...}`，direction 表示
@@ -520,4 +527,5 @@ python tests/light_client_test.py     # 离线轻客户端验证（input/auth/ex
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI
+python tests/strict_type_validation_test.py  # 跨入口严格类型校验：height/amount 的字符串/浮点/布尔伪装在候选分叉与同步入口 400（不写状态、不回放 200）、离线 verify 返回 input、canonical/pending 恢复抛 StateRecoveryError、持久化候选/同步记录按缓存规则丢弃、旧快照缺省 status 兼容
 ```
