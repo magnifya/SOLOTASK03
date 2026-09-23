@@ -167,6 +167,31 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   pending 末块不入池、过期清理与重启调和全部直接作用于该完整候选，规则与整链
   同步完全一致；重启按当前信任注册表重新授权，并用持久化的 range 载荷独立重算
   指纹、核对存储候选恰为 canonical 前缀加该尾部，失配记录静默丢弃。
+- **签名增量区间**：`POST /v1/forks/sync/range/attested`，请求体
+  `{"source","request_id","expires_at","anchor","blocks","tip","signature"}`，
+  前六个字段与普通 range 接口一致；`tip` 仅含
+  `{tip_hash,height,length,status}` 四字段，`signature` 必须是 128 位小写
+  十六进制。签名覆盖
+  `{domain:"ledger-sync-range-v1", source, request_id, expires_at, anchor,
+  blocks, tip}`（即去掉 `signature` 的请求体加 domain）的 canonical JSON
+  （key 排序、`ensure_ascii=false`、紧凑分隔、UTF-8），取其 SHA-256 32 字节
+  摘要再用来源当前 **active 未过期**注册公钥做 Ed25519 验签。**新请求**状态码
+  优先级为：字段/`tip`/`anchor` 结构类型错误 `400` → 来源未授权 `403` → 请求
+  `expires_at` 已到 `410` → 验签失败 `403` → 锚点与当前 canonical 不匹配
+  `409` → 拼接 canonical 前缀的整链重验与 `tip` 核对失败 `400` → tip 与
+  canonical 或已存候选重复 `409`。成功 `201` 返回 S 加 `expires_at` 五字段。
+  幂等键 `(source, request_id)` 与普通同步相互独立；存活记录重试**豁免授权与
+  过期**，用**冻结公钥**重验：签名错 `403`，独立重验（不重新拼接、不依赖当前
+  canonical）的锚点/区块/`tip` 校验错 `400`，签名有效但内容指纹不同 `409`，
+  完全相同返回 `200` 与首次冻结结果（含原 `expires_at`），即使来源此后被
+  轮换/撤销/注册过期或 canonical 已推进。首次成功在**同一次原子写入**落盘拼接
+  后的完整候选、记录（冻结公钥、版本、签名及签名时的 anchor/blocks/tip 原形）
+  与一条 `mode="attested"` 的 `sync_received` 事件；写盘失败一并回滚。生命周期
+  （最长链采用、旧链已确认交易回池、pending 不入池、过期清理、重启重新授权与
+  指纹/签名重验）沿用签名整链同步规则：未采用候选随记录删除并补一条
+  `mode="attested"` 的 `sync_expired`；指纹不符或 tip 无处解析等其他失效仍静默
+  丢弃、不产生事件。`sync`/`sync/history` 查询按既有排序字段把该模式纳入
+  `attested`/`all`。
 
 ## 持久化来源信任与审计
 
@@ -459,7 +484,7 @@ SHA-256 摘要作为签名消息。
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+`ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -580,6 +605,14 @@ curl -s -X POST localhost:8080/v1/forks/sync/range \
   -d '{"source":"node-2","request_id":"req-8","expires_at":1800000000,"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"}}'
 # -> 201 {"tip_hash":"...","height":4,"length":5,"status":"confirmed","expires_at":1800000000}
 
+# 签名增量区间（结构 400→授权 403→过期 410→验签 403→锚点 409→整链/tip 400→重复 409；
+# signature 为 128 位小写 hex；同 source+request_id 冻结公钥重试：错签 403、校验错 400、
+# 有效但异内容 409、相同 200 回放首次结果）
+curl -s -X POST localhost:8080/v1/forks/sync/range/attested \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"node-2","request_id":"req-9","expires_at":1800000000,"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"},"signature":"<128-hex>"}'
+# -> 201 {"tip_hash":"...","height":4,"length":5,"status":"confirmed","expires_at":1800000000}
+
 # 同步审计查询（source/mode/min_height/max_height/limit/cursor；
 # mode 缺省或 plain 只列普通同步，attested 只列签名同步，all 合并；
 # 非法 mode、非法数值或重复参数均 400）
@@ -678,6 +711,13 @@ python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kin
 python -m ledger.cli chain-range --after-height 2 --after-hash <block-hash> [--limit 100]
 python -m ledger.cli sync-range --source node-2 --request-id req-8 --expires-at 1800000000 '{"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...}}'
 # range 文档也可以是 chain-range 的整页输出，或用 - 从标准输入读取
+
+# 签名增量区间：参数同 sync-range，另加 --signing-key（64 位小写十六进制种子）；
+# 对 domain=ledger-sync-range-v1 的规范化消息取 SHA-256 摘要做 Ed25519 签名，
+# 文档支持 JSON 参数或 -（标准输入），非 2xx 单行 JSON 退出 1
+python -m ledger.cli sync-range-attested --source node-2 --request-id req-9 \
+  --expires-at 1800000000 --signing-key <64-hex-seed> \
+  '{"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...}}'
 
 # 持久化来源信任：注册 / 轮换 / 撤销 / 导出 verify 信任文档
 python -m ledger.cli trust add --source node-2 --public-key <64-hex-pubkey> --expires-at 1900000000

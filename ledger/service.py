@@ -43,6 +43,8 @@ from .store import (
     LedgerStore,
     attested_fingerprint,
     attested_message,
+    attested_range_fingerprint,
+    attested_range_message,
 )
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
@@ -1596,6 +1598,285 @@ class LedgerService:
                 # Roll back the assembled candidate, its range record and the
                 # audit event together: a failed write changes nothing.
                 self.store.syncs.pop(key, None)
+                self.store.forks.pop(tip_hash, None)
+                self.store.truncate_audit_events(1)
+                raise
+
+            result = dict(summary)
+            result["expires_at"] = expires_at
+            return 201, result
+
+    # -- signature-attested incremental range sync ---------------------------
+
+    def submit_fork_sync_range_attested(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/forks/sync/range/attested — receive a signed incremental
+        chain range.
+
+        The request carries ``source``, ``request_id``, ``expires_at`` (Unix
+        seconds), ``anchor`` (``{height, block_hash}``), ``blocks`` (a non-empty
+        list of complete tail blocks), ``tip`` (the closed four-field summary
+        ``{tip_hash, height, length, status}`` of the assembled chain) and
+        ``signature`` — exactly 128 lowercase hex characters. The signature is
+        an Ed25519 signature over the raw 32-byte SHA-256 digest of the README
+        canonical JSON of
+        ``{domain:"ledger-sync-range-v1", source, request_id, expires_at,
+        anchor, blocks, tip}`` (key-sorted, compact separators,
+        ``ensure_ascii=False``) — the request envelope minus ``signature`` with
+        the range domain prepended.
+
+        Status precedence for a NEW key: structural/type/summary violations are
+        400 (decided before anything is touched); an unauthorized source
+        (unknown, revoked or registry-expired) is 403; a well-formed request
+        whose ``expires_at`` is not later than now is 410; a signature that does
+        not verify under the source's CURRENT active key is 403; then the
+        anchor must match the current canonical chain (409); the tail is spliced
+        onto the canonical prefix and put through the existing whole-chain
+        re-validation, with the ``tip`` summary recomputed (failure 400); a tip
+        already known as canonical or a stored candidate is 409. Success is 201
+        returning ``{tip_hash, height, length, status, expires_at}``.
+
+        On success the assembled candidate, the record and a
+        ``mode:"attested"`` ``sync_received`` event persist in one atomic
+        write; the record additionally freezes the signing public key, its
+        registry version, the signature and the signed
+        anchor/blocks/tip. The attested idempotency key ``(source, request_id)``
+        is a separate namespace from plain syncs. A same-key retry on a live
+        record bypasses authorization and the request deadline, re-verifies the
+        signature against the FROZEN key and re-validates the range standalone
+        (never re-spliced against the current canonical): wrong signature 403,
+        malformed/tampered body 400, a signature-valid but different fingerprint
+        409, identical content 200 replaying the original frozen result (with its
+        original ``expires_at``), even after rotation/revocation/expiry.
+        Lifecycle (adoption/expiry/restart reconciliation) follows the existing
+        attested rules.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        for field in (
+            "source",
+            "request_id",
+            "expires_at",
+            "anchor",
+            "blocks",
+            "tip",
+            "signature",
+        ):
+            if field not in payload:
+                return 400, {"error": f"missing field: {field}"}
+
+        source = payload["source"]
+        request_id = payload["request_id"]
+        expires_at = payload["expires_at"]
+        anchor_raw = payload["anchor"]
+        blocks_raw = payload["blocks"]
+        tip = payload["tip"]
+        signature = payload["signature"]
+
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "field 'source' must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "field 'request_id' must be a non-empty string"}
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+            return 400, {"error": "field 'expires_at' must be a Unix-seconds integer"}
+        if not crypto.is_hex128(signature):
+            return 400, {
+                "error": "field 'signature' must be 128 lowercase hex characters"
+            }
+        if not isinstance(anchor_raw, dict):
+            return 400, {"error": "field 'anchor' must be a JSON object"}
+        anchor_height = anchor_raw.get("height")
+        anchor_hash = anchor_raw.get("block_hash")
+        if (
+            isinstance(anchor_height, bool)
+            or not isinstance(anchor_height, int)
+            or anchor_height < 0
+        ):
+            return 400, {"error": "anchor.height must be a non-negative integer"}
+        if not crypto.is_hex64(anchor_hash):
+            return 400, {
+                "error": "anchor.block_hash must be 64 lowercase hex characters"
+            }
+        anchor = {"height": anchor_height, "block_hash": anchor_hash}
+        if not isinstance(blocks_raw, list) or not blocks_raw:
+            return 400, {"error": "field 'blocks' must be a non-empty list"}
+        # The tip summary is mandatory and closed: exactly the four fields
+        # tip_hash/height/length/status, each strictly typed.
+        if not isinstance(tip, dict):
+            return 400, {"error": "field 'tip' must be a JSON object"}
+        if set(tip) != {"tip_hash", "height", "length", "status"}:
+            return 400, {
+                "error": "tip must contain exactly tip_hash, height, length and status"
+            }
+        if not crypto.is_hex64(tip["tip_hash"]):
+            return 400, {"error": "tip.tip_hash must be 64 lowercase hex characters"}
+        if (
+            isinstance(tip["height"], bool)
+            or not isinstance(tip["height"], int)
+            or tip["height"] < 0
+        ):
+            return 400, {"error": "tip.height must be a non-negative integer"}
+        if (
+            isinstance(tip["length"], bool)
+            or not isinstance(tip["length"], int)
+            or tip["length"] < 1
+        ):
+            return 400, {"error": "tip.length must be a positive integer"}
+        if tip["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
+            return 400, {"error": "tip.status must be 'pending' or 'confirmed'"}
+
+        with self.store.lock:
+            self._prune_expired_syncs()
+            key = (source, request_id)
+            existing = self.store.attested_syncs.get(key)
+
+            if existing is None:
+                # New delivery: active/unexpired source (403) then the request
+                # deadline (410), before the signature or chain are examined.
+                now = time.time()
+                trusted = self.store.trust_sources.get(source)
+                if (
+                    trusted is None
+                    or trusted["status"] != TRUST_ACTIVE
+                    or trusted["expires_at"] <= now
+                ):
+                    return 403, {"error": "source is not an active trusted source"}
+                if expires_at <= now:
+                    return 410, {"error": "sync request has expired"}
+                signer_public_key = trusted["public_key"]
+                signer_version = trusted["version"]
+            else:
+                # A live-key replay verifies against the FROZEN key/version,
+                # never the current registry.
+                signer_public_key = existing["attested"]["public_key"]
+                signer_version = existing["attested"]["version"]
+
+            # Verify the Ed25519 signature over SHA-256 of the canonical signed
+            # range message before any anchor/chain work or write; failure
+            # changes nothing and is 403.
+            message = attested_range_message(
+                source, request_id, expires_at, anchor_raw, blocks_raw, tip
+            )
+            digest = hashlib.sha256(message).digest()
+            if not crypto.verify_signature(signer_public_key, digest, signature):
+                return 403, {"error": "attestation signature is invalid"}
+
+            fingerprint = attested_range_fingerprint(
+                source, request_id, expires_at, anchor_raw, blocks_raw, tip,
+                signature,
+            )
+
+            if existing is not None:
+                # Same-key retry: bypass authorization, the deadline and the
+                # current canonical anchor. Re-verify the range STANDALONE
+                # (never re-spliced): a malformed/tampered body fails 400 rather
+                # than replaying the cached 200; a signature-valid but different
+                # fingerprint conflicts 409; identical content replays the
+                # original frozen result as 200 with its original deadline.
+                try:
+                    tail = self.store.validate_range_tail(anchor, blocks_raw)
+                except ValueError as exc:
+                    return 400, {"error": str(exc)}
+                if tip != self._range_tip_summary(anchor, tail):
+                    return 400, {"error": "tip summary does not match the blocks"}
+                if fingerprint != existing["fingerprint"]:
+                    return 409, {
+                        "error": "request_id already used with different content"
+                    }
+                descriptor = None
+                if existing.get("height") is not None:
+                    descriptor = {
+                        "tip_hash": existing["tip_hash"],
+                        "height": existing["height"],
+                        "length": existing["length"],
+                        "status": existing["status"],
+                    }
+                if descriptor is None:
+                    descriptor = self._tip_descriptor(existing["tip_hash"]) or {
+                        "tip_hash": existing["tip_hash"],
+                        "height": None,
+                        "length": None,
+                        "status": None,
+                    }
+                return 200, {
+                    "tip_hash": descriptor["tip_hash"],
+                    "height": descriptor.get("height"),
+                    "length": descriptor.get("length"),
+                    "status": descriptor.get("status"),
+                    "expires_at": existing["expires_at"],
+                }
+
+            # New delivery: the anchor must match the current canonical chain
+            # (409 for an unknown height / mismatched hash) BEFORE the tail is
+            # spliced and re-validated as a whole chain (whose failures are 400).
+            anchor_block = self.store.block_at(anchor_height)
+            if anchor_block is None or anchor_block.block_hash != anchor_hash:
+                return 409, {"error": "anchor does not match the current canonical chain"}
+
+            # Splice the canonical prefix and run the existing whole-chain
+            # revalidation; failure is 400, as is a tip summary that does not
+            # recompute for the assembled chain.
+            assembled_raw = [
+                block.to_dict() for block in self.store.chain[: anchor_height + 1]
+            ]
+            assembled_raw.extend(blocks_raw)
+            try:
+                fork = self.store.validate_fork_blocks(assembled_raw)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            summary = self._fork_summary(fork)
+            if tip != summary:
+                return 400, {"error": "tip summary does not match the blocks"}
+            tip_hash = fork[-1].block_hash
+
+            if any(tip_hash == block.block_hash for block in self.store.chain):
+                return 409, {"error": "fork is identical to the canonical chain"}
+            if tip_hash in self.store.forks:
+                return 409, {
+                    "error": "candidate fork already exists",
+                    "tip_hash": tip_hash,
+                }
+
+            # Persist the ASSEMBLED candidate keyed by its tip and the attested
+            # record (freezing the key/version/signature and the signed
+            # anchor/blocks/tip) together with the mode=attested event in one
+            # atomic write; recovery re-verifies the signed range standalone and
+            # confirms the stored fork is exactly the canonical prefix + tail.
+            self.store.forks[tip_hash] = fork
+            self.store.attested_syncs[key] = {
+                "tip_hash": tip_hash,
+                "expires_at": expires_at,
+                "fingerprint": fingerprint,
+                "height": summary["height"],
+                "length": summary["length"],
+                "status": summary["status"],
+                "attested": {
+                    "public_key": signer_public_key,
+                    "version": signer_version,
+                    "signature": signature,
+                    "anchor": anchor_raw,
+                    "blocks": blocks_raw,
+                    "tip": tip,
+                },
+            }
+            self.store.append_audit_event(
+                EVENT_SYNC_RECEIVED,
+                {
+                    "mode": SYNC_MODE_ATTESTED,
+                    "source": source,
+                    "request_id": request_id,
+                    "tip_hash": tip_hash,
+                    "expires_at": expires_at,
+                    "height": summary["height"],
+                    "length": summary["length"],
+                    "status": summary["status"],
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Roll back the candidate, its attested metadata and the audit
+                # event together: a failed write leaves nothing behind.
+                self.store.attested_syncs.pop(key, None)
                 self.store.forks.pop(tip_hash, None)
                 self.store.truncate_audit_events(1)
                 raise

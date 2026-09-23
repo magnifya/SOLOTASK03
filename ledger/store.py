@@ -86,6 +86,11 @@ SYNC_MODE_ATTESTED = "attested"
 # verify as an attestation.
 ATTESTED_DOMAIN = "ledger-sync-v1"
 
+# Domain separator of the attested incremental-RANGE sync signature message;
+# distinct from the whole-chain domain so a range attestation can never verify
+# as a whole-chain attestation (or vice versa) under the same source key.
+ATTESTED_RANGE_DOMAIN = "ledger-sync-range-v1"
+
 # Audit event kinds are owned by the store layer (recovery emits them too);
 # service.EVENT_* constants mirror these literal values.
 EVENT_SYNC_RECEIVED = "sync_received"
@@ -147,6 +152,59 @@ def attested_fingerprint(
     detect any tampering with the envelope, the candidate or the signature.
     """
     message = attested_message(source, request_id, expires_at, candidate)
+    return hashlib.sha256(message + signature.encode("ascii")).hexdigest()
+
+
+def attested_range_message(
+    source: str,
+    request_id: str,
+    expires_at: int,
+    anchor: object,
+    blocks: object,
+    tip: object,
+) -> bytes:
+    """Canonical bytes signed by an attested incremental-RANGE delivery.
+
+    The document is exactly
+    ``{domain:"ledger-sync-range-v1", source, request_id, expires_at, anchor,
+    blocks, tip}`` — i.e. the request envelope minus ``signature``, with the
+    range domain prepended — serialized README-style (``sort_keys``, compact
+    separators, ``ensure_ascii=False``). The signature is verified over the raw
+    32-byte SHA-256 digest of these bytes.
+    """
+    document = {
+        "domain": ATTESTED_RANGE_DOMAIN,
+        "source": source,
+        "request_id": request_id,
+        "expires_at": expires_at,
+        "anchor": anchor,
+        "blocks": blocks,
+        "tip": tip,
+    }
+    return json.dumps(
+        document, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def attested_range_fingerprint(
+    source: str,
+    request_id: str,
+    expires_at: int,
+    anchor: object,
+    blocks: object,
+    tip: object,
+    signature: str,
+) -> str:
+    """Content fingerprint of an attested range delivery's signed original form.
+
+    Covers the exact signed message (the range envelope in its delivered raw
+    form) plus the signature itself, so same-key retries and restart
+    reconciliation detect any tampering with the envelope, anchor, blocks, tip
+    or signature.
+    """
+    message = attested_range_message(
+        source, request_id, expires_at, anchor, blocks, tip
+    )
     return hashlib.sha256(message + signature.encode("ascii")).hexdigest()
 
 
@@ -1776,60 +1834,116 @@ class LedgerStore:
                 continue
             if not isinstance(fingerprint, str) or not fingerprint:
                 continue
-            candidate_raw = attested["candidate"]
-            candidate_blocks_raw = (
-                candidate_raw.get("blocks")
-                if isinstance(candidate_raw, dict)
-                else candidate_raw
-            )
-            # Re-verification uses the FROZEN public key/version, not the
-            # current registry: a later key rotation is not an authorization
-            # failure (the source stays active/unexpired) and the recorded
-            # attestation must survive it, exactly like the runtime frozen-key
-            # replay. Only unknown/revoked/registry-expired sources are pruned
-            # above (and reconciled with a sync_expired). The signature is
-            # verified over the frozen message, the fingerprint recomputed, and
-            # the signed chain re-validated and bound to the surviving fork.
-            message = attested_message(
-                source, request_id, expires_at, candidate_raw
-            )
-            digest = hashlib.sha256(message).digest()
-            if not crypto.verify_signature(
-                attested["public_key"], digest, attested["signature"]
-            ):
-                continue
-            if (
-                attested_fingerprint(
-                    source,
-                    request_id,
-                    expires_at,
-                    candidate_raw,
-                    attested["signature"],
-                )
-                != fingerprint
-            ):
-                continue
-            # Independently re-validate the signed chain and bind it to the
-            # surviving stored fork (or the canonical prefix when adopted).
-            # Validation runs against the snapshot's parsed genesis and
-            # recorded endowment, not self.chain (not populated during
-            # recovery parsing).
-            try:
-                attested_fork = self._parse_verified_chain(
-                    candidate_blocks_raw, endowment, canonical_chain[0]
-                )
-            except ValueError:
-                continue
-            if attested_fork[-1].block_hash != tip_hash:
-                continue
-            attested_blocks = [block.to_dict() for block in attested_fork]
             surviving_fork = forks.get(tip_hash)
             if surviving_fork is not None:
                 blocks_raw = [block.to_dict() for block in surviving_fork]
             else:
                 blocks_raw = canonical_prefixes.get(tip_hash)
-            if blocks_raw is None or attested_blocks != blocks_raw:
-                continue
+            if "candidate" in attested:
+                # Whole-chain attestation: re-verify the signature over the
+                # frozen message, recompute the fingerprint, re-validate the
+                # signed chain and bind it to the surviving fork (or the
+                # canonical prefix when adopted).
+                candidate_raw = attested["candidate"]
+                candidate_blocks_raw = (
+                    candidate_raw.get("blocks")
+                    if isinstance(candidate_raw, dict)
+                    else candidate_raw
+                )
+                message = attested_message(
+                    source, request_id, expires_at, candidate_raw
+                )
+                digest = hashlib.sha256(message).digest()
+                if not crypto.verify_signature(
+                    attested["public_key"], digest, attested["signature"]
+                ):
+                    continue
+                if (
+                    attested_fingerprint(
+                        source,
+                        request_id,
+                        expires_at,
+                        candidate_raw,
+                        attested["signature"],
+                    )
+                    != fingerprint
+                ):
+                    continue
+                try:
+                    attested_fork = self._parse_verified_chain(
+                        candidate_blocks_raw, endowment, canonical_chain[0]
+                    )
+                except ValueError:
+                    continue
+                if attested_fork[-1].block_hash != tip_hash:
+                    continue
+                attested_blocks = [block.to_dict() for block in attested_fork]
+                if blocks_raw is None or attested_blocks != blocks_raw:
+                    continue
+            else:
+                # Incremental-range attestation: the signature/fingerprint cover
+                # the signed {anchor, blocks, tip} envelope. The tail is
+                # re-verified STANDALONE (never re-spliced against the current
+                # canonical chain), the signed tip recomputed, and the surviving
+                # stored fork must be exactly the canonical prefix through the
+                # anchor plus that tail — mirroring plain range recovery.
+                anchor = attested["anchor"]
+                signed_blocks = attested["blocks"]
+                signed_tip = attested["tip"]
+                message = attested_range_message(
+                    source,
+                    request_id,
+                    expires_at,
+                    anchor,
+                    signed_blocks,
+                    signed_tip,
+                )
+                digest = hashlib.sha256(message).digest()
+                if not crypto.verify_signature(
+                    attested["public_key"], digest, attested["signature"]
+                ):
+                    continue
+                if (
+                    attested_range_fingerprint(
+                        source,
+                        request_id,
+                        expires_at,
+                        anchor,
+                        signed_blocks,
+                        signed_tip,
+                        attested["signature"],
+                    )
+                    != fingerprint
+                ):
+                    continue
+                try:
+                    tail = self.validate_range_tail(anchor, signed_blocks)
+                except ValueError:
+                    continue
+                if tail[-1].block_hash != tip_hash:
+                    continue
+                recomputed_tip = {
+                    "tip_hash": tail[-1].block_hash,
+                    "height": tail[-1].height,
+                    "length": anchor["height"] + 1 + len(tail),
+                    "status": tail[-1].status,
+                }
+                if signed_tip != recomputed_tip:
+                    continue
+                if blocks_raw is None:
+                    continue
+                anchor_height = anchor["height"]
+                if len(blocks_raw) <= anchor_height + 1:
+                    continue
+                stored_anchor = blocks_raw[anchor_height]
+                stored_tail = blocks_raw[anchor_height + 1 :]
+                tail_dicts = [block.to_dict() for block in tail]
+                if (
+                    stored_anchor.get("height") != anchor_height
+                    or stored_anchor.get("block_hash") != anchor["block_hash"]
+                    or stored_tail != tail_dicts
+                ):
+                    continue
             descriptor = SyncSummary.from_blocks_raw(tip_hash, blocks_raw)
             if descriptor is None:
                 continue
@@ -1850,11 +1964,15 @@ class LedgerStore:
     def _parse_persisted_attestation(rec_raw: dict) -> dict | None:
         """Parse/validate one attested record's frozen attestation.
 
-        Returns ``{public_key, version, signature, candidate}`` or None when
-        any field is missing or malformed. ``candidate`` is retained in its
-        delivered original form (an export object, a ``{"blocks": [...]}``
-        wrapper or a bare block array) — it is the exact value the frozen
-        signature was made over.
+        Returns the frozen attestation dict or None when any field is missing
+        or malformed. Two signed forms share the attested table/namespace:
+
+        * a whole-chain delivery retains ``candidate`` in its delivered
+          original form (an export object, a ``{"blocks": [...]}`` wrapper or a
+          bare block array) — the exact value the frozen signature was made over;
+        * an incremental-range delivery retains the signed range triple
+          ``anchor`` / ``blocks`` / ``tip`` (the request envelope minus
+          ``signature``).
         """
         attested_raw = rec_raw.get("attested")
         if not isinstance(attested_raw, dict):
@@ -1862,23 +1980,77 @@ class LedgerStore:
         public_key = attested_raw.get("public_key")
         version = attested_raw.get("version")
         signature = attested_raw.get("signature")
-        candidate = attested_raw.get("candidate")
         if not crypto.is_hex64(public_key):
             return None
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             return None
         if not crypto.is_hex128(signature):
             return None
-        if isinstance(candidate, dict):
-            if not isinstance(candidate.get("blocks"), list):
+        if "candidate" in attested_raw:
+            candidate = attested_raw.get("candidate")
+            if isinstance(candidate, dict):
+                if not isinstance(candidate.get("blocks"), list):
+                    return None
+            elif not isinstance(candidate, list):
                 return None
-        elif not isinstance(candidate, list):
+            return {
+                "public_key": public_key,
+                "version": version,
+                "signature": signature,
+                "candidate": candidate,
+            }
+        # Range attestation: the signed {anchor, blocks, tip} triple, each
+        # strictly re-typed; any defect is a cache mismatch (silent prune).
+        anchor_raw = attested_raw.get("anchor")
+        blocks = attested_raw.get("blocks")
+        tip = attested_raw.get("tip")
+        if not isinstance(anchor_raw, dict):
+            return None
+        anchor_height = anchor_raw.get("height")
+        anchor_hash = anchor_raw.get("block_hash")
+        if (
+            isinstance(anchor_height, bool)
+            or not isinstance(anchor_height, int)
+            or anchor_height < 0
+        ):
+            return None
+        if not crypto.is_hex64(anchor_hash):
+            return None
+        if not isinstance(blocks, list) or not blocks:
+            return None
+        if not isinstance(tip, dict) or set(tip) != {
+            "tip_hash",
+            "height",
+            "length",
+            "status",
+        }:
+            return None
+        if not crypto.is_hex64(tip["tip_hash"]):
+            return None
+        if (
+            isinstance(tip["height"], bool)
+            or not isinstance(tip["height"], int)
+            or tip["height"] < 0
+        ):
+            return None
+        if (
+            isinstance(tip["length"], bool)
+            or not isinstance(tip["length"], int)
+            or tip["length"] < 1
+        ):
+            return None
+        if tip["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
             return None
         return {
             "public_key": public_key,
             "version": version,
             "signature": signature,
-            "candidate": candidate,
+            # The signed anchor/tip are retained VERBATIM (their shape is
+            # validated above): recovery must recompute the signature over the
+            # exact delivered JSON value, never a re-normalized approximation.
+            "anchor": anchor_raw,
+            "blocks": blocks,
+            "tip": tip,
         }
 
     @staticmethod

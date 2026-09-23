@@ -1,6 +1,7 @@
 """Command line interface: send, tx, mine, block, account, proof, state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
-index, sync, sync-range, sync-attested, syncs, sync-history, chain-range,
+index, sync, sync-range, sync-attested, sync-range-attested, syncs,
+sync-history, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify subcommands.
@@ -404,6 +405,88 @@ def cmd_sync_attested(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_sync_range_attested(args: argparse.Namespace) -> int:
+    """Sign and push an attested incremental chain range.
+
+    The range document is ``{"anchor", "blocks"[, "tip"]}`` (exactly like
+    sync-range); a GET /v1/chain/range page may be piped verbatim and ``-``
+    reads JSON from standard input. The signature covers SHA-256 of the
+    canonical ``{domain:"ledger-sync-range-v1", source, request_id, expires_at,
+    anchor, blocks, tip}`` message and is produced with the 64-lowercase-hex
+    Ed25519 seed given via --signing-key. Non-2xx responses print a single JSON
+    line and exit 1.
+    """
+    try:
+        if args.range_json == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            document = json.loads(args.range_json)
+    except (ValueError, TypeError) as exc:
+        return _emit(400, {"error": f"invalid JSON range document: {exc}"})
+    if not isinstance(document, dict):
+        return _emit(400, {"error": "range document must be a JSON object"})
+    anchor = document.get("anchor")
+    blocks = document.get("blocks")
+    if not isinstance(anchor, dict) or not isinstance(blocks, list):
+        return _emit(
+            400,
+            {"error": "range document must contain an anchor object and a blocks list"},
+        )
+    tip = document.get("tip")
+    if tip is None and blocks:
+        # Derive the closed tip summary from the final delivered block so a
+        # plain chain-range page (which carries no tip) can be pushed verbatim.
+        last = blocks[-1]
+        if isinstance(last, dict):
+            anchor_height = anchor.get("height")
+            length = (
+                anchor_height + 1 + len(blocks)
+                if isinstance(anchor_height, int) and not isinstance(anchor_height, bool)
+                else None
+            )
+            tip = {
+                "tip_hash": last.get("block_hash"),
+                "height": last.get("height"),
+                "length": length,
+                "status": last.get("status"),
+            }
+    if not isinstance(tip, dict):
+        return _emit(400, {"error": "range document must contain a tip object"})
+
+    signed = {
+        "domain": "ledger-sync-range-v1",
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "anchor": anchor,
+        "blocks": blocks,
+        "tip": tip,
+    }
+    message = json.dumps(
+        signed, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    # Sign the raw 32-byte SHA-256 digest with the 64-lowercase-hex Ed25519
+    # seed; the result is a 128-lowercase-hex signature.
+    signature = crypto.sign_message(
+        args.signing_key, hashlib.sha256(message).digest()
+    )
+    if signature is None:
+        return _emit(400, {"error": "signing key must be 64 lowercase hex characters"})
+    payload = {
+        "source": args.source,
+        "request_id": args.request_id,
+        "expires_at": args.expires_at,
+        "anchor": anchor,
+        "blocks": blocks,
+        "tip": tip,
+        "signature": signature,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/forks/sync/range/attested", payload
+    )
+    return _emit(status, body)
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     filters = {
         "tx_id": args.tx_id,
@@ -789,6 +872,34 @@ def build_parser() -> argparse.ArgumentParser:
         "or - to read JSON from standard input",
     )
     p_sync_attested.set_defaults(func=cmd_sync_attested)
+
+    p_sync_range_attested = sub.add_parser(
+        "sync-range-attested",
+        help="push a signature-attested incremental chain range from another node",
+    )
+    p_sync_range_attested.add_argument(
+        "--source", required=True, help="originating node identifier"
+    )
+    p_sync_range_attested.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync_range_attested.add_argument(
+        "--expires-at",
+        required=True,
+        type=int,
+        help="expiry as Unix seconds; an expired delivery is rejected 410",
+    )
+    p_sync_range_attested.add_argument(
+        "--signing-key",
+        required=True,
+        help="64 lowercase hex Ed25519 seed matching the source's registered key",
+    )
+    p_sync_range_attested.add_argument(
+        "range_json",
+        help='range document {"anchor","blocks"[,"tip"]}, a chain-range page, '
+        "or - to read JSON from standard input",
+    )
+    p_sync_range_attested.set_defaults(func=cmd_sync_range_attested)
 
     p_index = sub.add_parser(
         "index", help="query the confirmed-chain transaction index"
