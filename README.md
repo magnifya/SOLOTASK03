@@ -168,6 +168,47 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   同步完全一致；重启按当前信任注册表重新授权，并用持久化的 range 载荷独立重算
   指纹、核对存储候选恰为 canonical 前缀加该尾部，失配记录静默丢弃。
 
+## 签名认证的增量区间协议
+
+增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
+`{"source","request_id","expires_at","anchor","blocks","tip","signature"}`：
+`anchor`/`blocks`/`tip` 的结构与类型约束与普通区间完全一致（`tip` 仍为恰好四字段
+的封闭摘要，逐字段严格类型），`signature` 必须是 **128 位小写十六进制**。签名覆盖
+文档
+`{"domain":"ledger-sync-range-v1","source","request_id","expires_at","anchor","blocks","tip"}`
+（与整链签名不同的独立 domain，防止两种消息互验）：按 key 排序、
+`ensure_ascii=false`、紧凑分隔符 `(",",":")` 序列化为 UTF-8 字节，取其
+**SHA-256 32 字节摘要**，再用来源**当前 active 且未过期**的注册公钥做 Ed25519
+验签。
+
+- **状态码优先级（新 key）**：信封结构/类型/封闭 tip/签名格式错误 `400` →
+  来源未授权（未知、已撤销或注册已过期）`403` → 请求 `expires_at` 已到 `410` →
+  签名用当前公钥验不过 `403` → 锚点与当前 canonical 不匹配 `409` → 拼接 canonical
+  前缀执行整链重验并核对 `tip`，失败 `400` → tip 与 canonical 或已存候选重复
+  `409`。成功 `201` 返回 S（`tip_hash,height,length,status`）加 `expires_at`。
+- **冻结与幂等**：成功时在**同一次原子写入**里保存拼接后的完整候选、attested
+  同步记录（独立于普通区间端点的幂等命名空间）、冻结的**公钥/注册版本/签名/
+  已签名 range 载荷与指纹**，以及一条 `mode="attested"` 的 `sync_received` 事件。
+  同一 `source`+`request_id` 的存活记录重试**豁免授权与过期检查**，并用**冻结
+  公钥**重新验签：签名错 `403`；签名通过但锚点/尾部/tip 独立重验失败（不再重新
+  拼接、不依赖当前 canonical）`400`；签名有效但指纹不同 `409`；内容完全相同返回
+  `200` 与首次原结果（含原 `expires_at`），即使此后来源被轮换/撤销或 canonical
+  已推进——用轮换后的新公钥重签同一内容仍因冻结公钥验签失败而 `403`。
+- **生命周期与重启**：采用（最长链/最小 tip_hash）、旧链已确认交易去重回池、
+  pending 末块不入池、过期清理、重启调和全部沿用既有 attested 规则；未采用的
+  候选随记录过期删除，并补恰好一条 `mode="attested"` 的 `sync_expired`。重启时
+  用冻结公钥重验签名、重算指纹、独立重验尾部并核对存储候选恰为 canonical 前缀加
+  该尾部；签名/指纹不符或已签名 tip 解析失效一律**静默丢弃**该记录（链不动、
+  不产生事件），停机期间到期/失权则按既有去重规则补写 `sync_expired`。
+- **查询**：该记录自然纳入 `GET /v1/forks/sync` 的 `attested`/`all` 选择与
+  `(height, tip_hash, source, mode, request_id)` 排序，以及
+  `GET /v1/forks/sync/history` 中 `mode="attested"` 的生命周期事件，item 形状不变。
+- **命令行**：`python -m ledger.cli sync-range-attested --source ... --request-id
+  ... --expires-at ... --signing-key <64 位小写十六进制私钥种子> <区间 JSON|->`；
+  参数与 `sync-range` 相同（区间文档缺 `tip` 时按末块自动派生，`-` 从标准输入
+  读 JSON），客户端按上述 canonical 方式本地签名；非 2xx 响应打印单行 JSON 并以
+  退出码 1 结束。
+
 ## 持久化来源信任与审计
 
 轻客户端所需的信任文档不再靠手工维护：节点持久化保存**来源信任注册表**、
@@ -459,7 +500,7 @@ SHA-256 摘要作为签名消息。
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -679,6 +720,10 @@ python -m ledger.cli chain-range --after-height 2 --after-hash <block-hash> [--l
 python -m ledger.cli sync-range --source node-2 --request-id req-8 --expires-at 1800000000 '{"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...}}'
 # range 文档也可以是 chain-range 的整页输出，或用 - 从标准输入读取
 
+# 签名认证的增量区间：--signing-key 为 64 位小写十六进制私钥种子，客户端本地按
+# domain=ledger-sync-range-v1 对 SHA-256 摘要做 Ed25519 签名；非 2xx 退出码 1
+python -m ledger.cli sync-range-attested --source node-2 --request-id req-9 --expires-at 1800000000 --signing-key <64-hex-seed> '{"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...}}'
+
 # 持久化来源信任：注册 / 轮换 / 撤销 / 导出 verify 信任文档
 python -m ledger.cli trust add --source node-2 --public-key <64-hex-pubkey> --expires-at 1900000000
 python -m ledger.cli trust rotate --source node-2 --public-key <64-hex-pubkey> --expires-at 1900000000 --expected-version 1
@@ -722,6 +767,7 @@ python tests/fork_test.py             # 候选分叉校验、链比较、原子�
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
+python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
