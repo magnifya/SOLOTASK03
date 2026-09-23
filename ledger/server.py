@@ -18,8 +18,12 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         # -- helpers --------------------------------------------------------
 
-        def _send_json(self, status: int, body: dict) -> None:
-            data = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        def _send_json(
+            self, status: int, body: dict, sort_keys: bool = True
+        ) -> None:
+            data = json.dumps(
+                body, ensure_ascii=False, sort_keys=sort_keys
+            ).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -144,18 +148,34 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 self._send_json(status, body)
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
-                # POST /v1/blocks/{height}/confirm | /v1/blocks/{height}/rollback
-                if self.headers.get("Content-Length"):
-                    self._read_json()
-                if remainder.endswith("/confirm"):
-                    height = unquote(remainder[: -len("/confirm")])
-                    status, body = service.confirm_block(height)
-                elif remainder.endswith("/rollback"):
-                    height = unquote(remainder[: -len("/rollback")])
-                    status, body = service.rollback_block(height)
+                if remainder.endswith("/proofs"):
+                    # POST /v1/blocks/{height}/proofs — batch Merkle proofs.
+                    # The body is {"tx_ids": [...]} and is strictly validated
+                    # by the service (400), before any state is read. The
+                    # success document has a contract-fixed key order
+                    # (height, block_hash, merkle_root, transaction_ids,
+                    # proofs), so it is serialized in insertion order rather
+                    # than alphabetically.
+                    height = unquote(remainder[: -len("/proofs")])
+                    ok, payload = self._read_json()
+                    if not ok:
+                        self._send_json(400, payload)  # type: ignore[arg-type]
+                        return
+                    status, body = service.get_proofs(height, payload)
+                    self._send_json(status, body, sort_keys=False)
                 else:
-                    status, body = 404, {"error": "not found"}
-                self._send_json(status, body)
+                    # POST /v1/blocks/{height}/confirm | /v1/blocks/{height}/rollback
+                    if self.headers.get("Content-Length"):
+                        self._read_json()
+                    if remainder.endswith("/confirm"):
+                        height = unquote(remainder[: -len("/confirm")])
+                        status, body = service.confirm_block(height)
+                    elif remainder.endswith("/rollback"):
+                        height = unquote(remainder[: -len("/rollback")])
+                        status, body = service.rollback_block(height)
+                    else:
+                        status, body = 404, {"error": "not found"}
+                    self._send_json(status, body)
             else:
                 self._send_json(404, {"error": "not found"})
 

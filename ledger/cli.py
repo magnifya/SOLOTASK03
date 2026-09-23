@@ -1,4 +1,5 @@
-"""Command line interface: send, tx, mine, block, account, proof, state-root,
+"""Command line interface: send, tx, mine, block, account, proof, proofs,
+state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, chain-range,
@@ -55,8 +56,8 @@ def _request(method: str, url: str, payload: dict | None) -> tuple[int, dict]:
         return 0, {"error": f"cannot reach ledger server: {exc}"}
 
 
-def _emit(status: int, body: dict) -> int:
-    print(json.dumps(body, sort_keys=True, ensure_ascii=False))
+def _emit(status: int, body: dict, sort_keys: bool = True) -> int:
+    print(json.dumps(body, sort_keys=sort_keys, ensure_ascii=False))
     # 2xx responses are success; anything else (incl. connection failure) is 1.
     return 0 if 200 <= status < 300 else 1
 
@@ -181,6 +182,18 @@ def cmd_proof(args: argparse.Namespace) -> int:
         "GET", f"{args.base_url}/v1/blocks/{args.height}/proof/{args.tx_id}", None
     )
     return _emit(status, body)
+
+
+def cmd_proofs(args: argparse.Namespace) -> int:
+    # Batch Merkle proofs: POST the requested ids verbatim; the server applies
+    # the strict non-empty/distinct/64-lowercase-hex validation (400 on error).
+    # The success document has a contract-fixed key order, so it is printed in
+    # insertion order rather than alphabetically (error bodies are single-key).
+    payload = {"tx_ids": args.tx_ids}
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/blocks/{args.height}/proofs", payload
+    )
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
@@ -712,6 +725,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_proof.add_argument("height", help="block height containing the transaction")
     p_proof.add_argument("tx_id", help="transaction id (64-char hex)")
     p_proof.set_defaults(func=cmd_proof)
+
+    p_proofs = sub.add_parser(
+        "proofs", help="fetch Merkle inclusion proofs for several transactions"
+    )
+    p_proofs.add_argument("height", help="block height containing the transactions")
+    p_proofs.add_argument(
+        "tx_ids",
+        metavar="tx_id",
+        nargs="+",
+        help="one or more transaction ids (64 lowercase hex characters)",
+    )
+    p_proofs.set_defaults(func=cmd_proofs)
 
     p_confirm = sub.add_parser("confirm", help="confirm a pending tip block")
     p_confirm.add_argument("height", help="block height to confirm")

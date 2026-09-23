@@ -236,6 +236,155 @@ def verify_merkle_proof(
         return False
 
 
+# Exact, ordered key sets of a batch Merkle-proof response document. They let
+# verify_merkle_proof_bundle reject missing/extra keys *and* a wrong key order.
+_BUNDLE_TOP_KEYS = ("height", "block_hash", "merkle_root", "transaction_ids", "proofs")
+_BUNDLE_PROOF_KEYS = ("tx_id", "index", "siblings")
+_BUNDLE_SIBLING_KEYS = ("direction", "hash")
+
+
+def _exact_keys(value: object, keys: tuple[str, ...]) -> bool:
+    """True iff ``value`` is a dict with exactly ``keys``, in that insertion order."""
+    return isinstance(value, dict) and tuple(value.keys()) == keys
+
+
+def verify_merkle_proof_bundle(
+    bundle: object,
+    expected_block_hash: object,
+    expected_merkle_root: object,
+) -> bool:
+    """Strictly verify a batch Merkle-proof bundle offline.
+
+    The bundle mirrors POST /v1/blocks/{height}/proofs::
+
+        {"height": H, "block_hash": B, "merkle_root": R,
+         "transaction_ids": [id, ...],     # ALL block leaves, ascending
+         "proofs": [{"tx_id", "index", "siblings"}, ...]}  # requested subset
+
+    ``transaction_ids`` is the block's complete, ascending leaf list; ``proofs``
+    covers the requested tx_ids (a subset of it), itself sorted by tx_id. Every
+    proof's leaf-to-root sibling path is re-hashed with the same pairing rules
+    as :func:`merkle_root` (``sha256(left + right)`` hex pairs, a lone odd node
+    paired with itself); the root is additionally recomputed directly from
+    ``transaction_ids`` and must equal both the bundle's ``merkle_root`` and
+    ``expected_merkle_root``, while ``block_hash`` must equal
+    ``expected_block_hash``. Each proof ``index`` must be the tx_id's exact
+    position in ``transaction_ids`` and its path must agree with that index at
+    every level.
+
+    Every defect — a missing/extra key, a wrong key order, a wrong type, a
+    non-boolean/negative height, a duplicate/non-hex/non-string/unsorted tx_id,
+    an unknown or duplicated proof tx_id, an out-of-range index, a path
+    inconsistent with the index (including the phantom self-pair slot), an
+    illegal direction or hash, excessive depth, an empty proof list, a tampered
+    leaf list/root or block hash — returns False rather than raising.
+    """
+    try:
+        if not _exact_keys(bundle, _BUNDLE_TOP_KEYS):
+            return False
+        if not _is_hex64(expected_block_hash) or not _is_hex64(expected_merkle_root):
+            return False
+        height = bundle["height"]
+        block_hash = bundle["block_hash"]
+        bundle_root = bundle["merkle_root"]
+        transaction_ids = bundle["transaction_ids"]
+        proofs = bundle["proofs"]
+
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return False
+        if not _is_hex64(block_hash):
+            return False
+        if not _is_hex64(bundle_root):
+            return False
+        if not isinstance(transaction_ids, list) or not transaction_ids:
+            return False
+        if not isinstance(proofs, list) or not proofs:
+            return False
+        if any(not _is_hex64(tx_id) for tx_id in transaction_ids):
+            return False
+        # Unique leaves ...
+        if len(set(transaction_ids)) != len(transaction_ids):
+            return False
+        # ... in ascending tx_id order, matching the block's leaf ordering.
+        if transaction_ids != sorted(transaction_ids):
+            return False
+        # The root is recomputed straight from the claimed leaf list, so the
+        # list can never be tampered with independently of the paths.
+        if not hmac.compare_digest(merkle_root(transaction_ids), bundle_root):
+            return False
+
+        positions = {tx_id: i for i, tx_id in enumerate(transaction_ids)}
+        proof_ids: list[str] = []
+        leaf_count = len(transaction_ids)
+        for proof in proofs:
+            if not _exact_keys(proof, _BUNDLE_PROOF_KEYS):
+                return False
+            tx_id = proof["tx_id"]
+            index = proof["index"]
+            siblings = proof["siblings"]
+            if not _is_hex64(tx_id) or tx_id not in positions:
+                return False
+            if tx_id in proof_ids:
+                return False
+            if isinstance(index, bool) or not isinstance(index, int):
+                return False
+            # The index must be exactly the tx_id's leaf position; anything
+            # else is a mismatch or out of range regardless of supplied hashes.
+            if index != positions[tx_id] or not 0 <= index < leaf_count:
+                return False
+            if not isinstance(siblings, list) or len(siblings) > MAX_MERKLE_DEPTH:
+                return False
+
+            # A depth-D path addresses one of 2**D leaf slots.
+            depth = len(siblings)
+            if index >= (1 << depth):
+                return False
+            current = tx_id
+            position = index
+            for item in siblings:
+                if not _exact_keys(item, _BUNDLE_SIBLING_KEYS):
+                    return False
+                direction = item["direction"]
+                sibling_hash = item["hash"]
+                if not _is_hex64(sibling_hash):
+                    return False
+                # The odd-node promotion pairs the last (even-positioned) node
+                # with a copy of itself, so a genuine self-pair always points
+                # at a right sibling. A left sibling equal to the current node
+                # addresses the phantom duplicate slot, which is never a real
+                # leaf. The path must also agree with the index at every
+                # level: an even position is the left child (sibling on its
+                # right), an odd position the right child.
+                if direction == "left":
+                    if position % 2 == 0 or sibling_hash == current:
+                        return False
+                    pair = sibling_hash + current
+                elif direction == "right":
+                    if position % 2 == 1:
+                        return False
+                    pair = current + sibling_hash
+                else:
+                    return False
+                current = sha256_hex(pair.encode("ascii"))
+                position //= 2
+
+            if not hmac.compare_digest(current, bundle_root):
+                return False
+            proof_ids.append(tx_id)
+
+        # Proofs must be unique and ordered by tx_id ascending.
+        if proof_ids != sorted(proof_ids):
+            return False
+
+        if not hmac.compare_digest(bundle_root, expected_merkle_root):
+            return False
+        if not hmac.compare_digest(block_hash, expected_block_hash):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 # -- account state Merkle tree ----------------------------------------------
 
 

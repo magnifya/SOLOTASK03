@@ -392,6 +392,66 @@ class LedgerService:
                 "siblings": siblings,
             }
 
+    def get_proofs(self, height: object, payload: object) -> tuple[int, dict]:
+        """Return Merkle inclusion proofs for a batch of tx_ids at one height.
+
+        POST /v1/blocks/{height}/proofs with ``{"tx_ids": [...]}``. The body
+        must be a JSON object containing exactly the ``tx_ids`` key: a
+        non-empty list of distinct 64-lowercase-hex strings. A malformed body
+        — parse failure, missing/extra keys, a wrong type, an empty list,
+        duplicates or a wrongly formatted id — is 400 and never touches state.
+        A malformed/unknown height or any requested transaction absent from
+        the block is 404; proofs are only issued for confirmed blocks, so a
+        pending block returns 409.
+
+        On success the body carries the block's complete ascending
+        ``transaction_ids`` (every leaf) plus one
+        ``{tx_id, index, siblings}`` proof per requested id, the proofs sorted
+        by tx_id; the sibling paths run leaf-to-root exactly like
+        :meth:`get_proof`.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"tx_ids"}:
+            return 400, {"error": "request body must be a JSON object with only 'tx_ids'"}
+        tx_ids_raw = payload["tx_ids"]
+        if not isinstance(tx_ids_raw, list) or not tx_ids_raw:
+            return 400, {"error": "field 'tx_ids' must be a non-empty array"}
+        if any(not crypto.is_hex64(tx_id) for tx_id in tx_ids_raw):
+            return 400, {
+                "error": "every tx_id must be a string of 64 lowercase hex characters"
+            }
+        if len(set(tx_ids_raw)) != len(tx_ids_raw):
+            return 400, {"error": "tx_ids must be distinct"}
+
+        height_int = _parse_height(height)
+        if height_int is None:
+            return 404, {"error": "block not found"}
+        with self.store.lock:
+            block = self.store.block_at(height_int)
+            if block is None:
+                return 404, {"error": "block not found"}
+            if block.status != STATUS_CONFIRMED:
+                return 409, {"error": "block is pending confirmation"}
+            tx_ids = [tx.tx_id for tx in block.transactions]
+            present = set(tx_ids)
+            if any(tx_id not in present for tx_id in tx_ids_raw):
+                return 404, {"error": "transaction not found"}
+            requested = sorted(set(tx_ids_raw))
+            proofs = []
+            for tx_id in requested:
+                index = tx_ids.index(tx_id)
+                proofs.append({
+                    "tx_id": tx_id,
+                    "index": index,
+                    "siblings": crypto.merkle_proof(tx_ids, index),
+                })
+            return 200, {
+                "height": block.height,
+                "block_hash": block.block_hash,
+                "merkle_root": block.merkle_root,
+                "transaction_ids": tx_ids,
+                "proofs": proofs,
+            }
+
     # -- accounts -----------------------------------------------------------
 
     def get_account(self, account: str) -> tuple[int, dict]:
