@@ -473,12 +473,15 @@ class LedgerService:
         the canonical confirmed prefix through that block only: the value must
         be a plain non-negative decimal without leading zeros (a malformed or
         repeated query parameter is 400), and an unknown/non-canonical/pending
-        anchor height is 404. Returns 404 while a pending tip anchors the
-        default view, or for an account absent from the (historical) confirmed
-        account set.
+        anchor height is 404. ``height`` is the only accepted query parameter;
+        any unknown parameter is 400. Returns 404 while a pending tip anchors
+        the default view, or for an account absent from the (historical)
+        confirmed account set.
         """
         height_raw: object = None
         if params is not None:
+            if any(key != "height" for key in params):
+                return 400, {"error": "unknown query parameter"}
             height_raw = params.get("height")
         anchor_height: int | None = None
         if height_raw is not None:

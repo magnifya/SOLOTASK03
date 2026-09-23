@@ -343,7 +343,8 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `{direction: left|right, hash}`（64 位小写十六进制，direction 表示兄弟节点
   相对路径节点的方位）。最高块 pending 或账户不在已确认账户集时返回 `404`。
   可选查询参数 `?height=H` 按同样严格格式把 proof 锚定到历史已确认块：缺省
-  仍锚定最高已确认块；非法或重复参数返回 `400`，锚点未知/非 canonical/pending
+  仍锚定最高已确认块；`height` 是唯一允许的查询参数，非法、重复或未知参数
+  返回 `400`，锚点未知/非 canonical/pending
   返回 `404`，账户在该历史状态不存在也是 `404`。成功 proof 的
   `height/block_hash/state_root/index/siblings` 全部对应 H，
   `confirmed_transactions` 保持链上原序。
@@ -416,6 +417,12 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
   导出五字段文档）；`proofs` 为 `{height, proof}` 列表，`proof` 即
   `/proof/` 接口返回的 `{height, tx_id, index, merkle_root, block_hash,
   siblings}` 文档；`signature` 可选，为 Ed25519 签名的十六进制。
+  可选的**账户状态扩展**再带四个字段——`state_root`、`state_height`、
+  `state_block_hash`、`state_proofs`——要么全部省略（历史格式），要么全部
+  提供；`state_proofs` 为非空列表，每项仅含 `{height, proof}`，`proof` 即
+  `/v1/accounts/{account}/proof` 返回的 `{account, balance,
+  confirmed_transactions, index, state_root, height, block_hash, siblings}`
+  八字段文档（缺失、额外或类型错误都判 `input`）。
 - **trust**：`{genesis_hash, sources, allowlist}`（`GET /v1/trust` 还会带
   `audit_signers`，轻客户端束验证忽略该额外字段）。`genesis_hash` 锚定创世
   块；`sources[source] = {public_key, expires_at}`；
@@ -433,9 +440,19 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
   每个 proof 必须唯一（同 `height`+`tx_id` 不得重复），其 `tx_id`、`height`、
   `index` 与区块字段（`block_hash`、`merkle_root`）必须与候选链中的块一致，
   Merkle 路径按现有 `verify_merkle_proof` 规则验证；**pending 链尾禁止出 proof**。
+- **核对状态扩展**（存在时）：`state_height` 必须对应候选链中的**已确认**块
+  且 `state_block_hash` 相同（未知高度、pending 或哈希不符判 `integrity`）；
+  每项的 `height`、每个 proof 文档的 `height/state_root/block_hash` 都必须与
+  锚点一致。随后按该高度 confirmed 交易的账户**升序集合**核对每个 proof 的
+  `account` 与 `index`（不在集合或位置不符判 `proof`），`height`+`account`
+  不得重复，最后逐条交给 `crypto.verify_account_proof` 以束上的
+  `state_root/state_height/state_block_hash` 为锚验证（非法方向/哈希、伪造
+  leaf、非法自配对、siblings 畸形均判 `proof`）。
 
 成功返回 `{ok: true, source, S, verified_tx_ids}`（`verified_tx_ids` 为按
-tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`error` 仅取
+tx_id 升序的已验证交易列表）；带状态扩展的束成功时另含按 account 升序的
+`verified_accounts`，不带扩展的束返回形状与历史完全一致。失败返回
+`{ok: false, error}`，`error` 仅取
 `input` / `auth` / `expired` / `integrity` / `proof` 五类：
 
 | error | 含义 |
@@ -443,8 +460,8 @@ tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`e
 | `input` | bundle/trust 结构或字段类型不合法（含非 64 位十六进制公钥、布尔数值） |
 | `auth` | 来源不受信、受信来源缺签名，或 allowlist 来源带了无法核对的签名 |
 | `expired` | 束或信任条目已过期 |
-| `integrity` | 签名错误、链重算不一致（创世块/prev_hash/tx_id/签名/Merkle/block_hash）或 response 与链尾不符 |
-| `proof` | proof 重复、字段与区块不一致、Merkle 路径无效或指向 pending 链尾 |
+| `integrity` | 签名错误、链重算不一致（创世块/prev_hash/tx_id/签名/Merkle/block_hash）、response 与链尾不符，或状态锚点未知/pending/哈希不符 |
+| `proof` | proof 重复、字段与区块不一致、Merkle 路径无效或指向 pending 链尾；状态 proof 的账户不在锚点集合、index 不符、`height`+`account` 重复或 `verify_account_proof` 失败 |
 
 
 ## 审计导出的离线校验
@@ -772,6 +789,7 @@ python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/s
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
+python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI
