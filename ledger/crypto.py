@@ -236,6 +236,154 @@ def verify_merkle_proof(
         return False
 
 
+# Exact wire shapes of a batch Merkle proof bundle and its nested documents,
+# including key order (POST /v1/blocks/{height}/proofs responses).
+BUNDLE_KEYS = ("height", "block_hash", "merkle_root", "transaction_ids", "proofs")
+BUNDLE_PROOF_KEYS = ("tx_id", "index", "siblings")
+BUNDLE_SIBLING_KEYS = ("direction", "hash")
+
+
+def verify_merkle_proof_bundle(
+    bundle: object,
+    expected_block_hash: object,
+    expected_merkle_root: object,
+) -> bool:
+    """Verify a batch Merkle proof bundle offline and bind it to one block.
+
+    The bundle mirrors the ``POST /v1/blocks/{height}/proofs`` response::
+
+        {"height": int, "block_hash": hex64, "merkle_root": hex64,
+         "transaction_ids": [hex64, ...],          # ascending, unique
+         "proofs": [{"tx_id": hex64, "index": int,
+                     "siblings": [{"direction": "left"|"right",
+                                   "hash": hex64}, ...]}, ...]}
+
+    Every structural defect — a non-object bundle, missing/extra or reordered
+    keys, wrong JSON types (booleans never count as integers), empty or
+    duplicated tx ids, non-64-char lowercase hex hashes, illegal directions,
+    out-of-range or mismatched indices, proofs not ordered by ascending tx_id,
+    a proof whose tx_id is absent from the block's leaf list, a path
+    inconsistent with the index, an excessive depth — and every integrity
+    defect (a recomputed root other than the bundle/expected Merkle root, a
+    block hash other than the expected one, any tampered field) returns False
+    rather than raising.
+
+    ``transaction_ids`` is the block's *full* ascending leaf list (its Merkle
+    root is recomputed and bound to the expected root); ``proofs`` is the
+    requested non-empty subset, each proof's ``index`` naming the leaf's
+    position in that full list.
+    """
+    try:
+        if not isinstance(bundle, dict):
+            return False
+        # Exact key set AND key order, top level and in every nested document.
+        if list(bundle) != list(BUNDLE_KEYS):
+            return False
+        height = bundle["height"]
+        block_hash = bundle["block_hash"]
+        claimed_root = bundle["merkle_root"]
+        transaction_ids = bundle["transaction_ids"]
+        proofs = bundle["proofs"]
+
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return False
+        if not _is_hex64(block_hash) or not _is_hex64(expected_block_hash):
+            return False
+        if not _is_hex64(claimed_root) or not _is_hex64(expected_merkle_root):
+            return False
+        if not isinstance(transaction_ids, list) or not transaction_ids:
+            return False
+        if not isinstance(proofs, list) or not proofs:
+            return False
+
+        if any(not _is_hex64(tx_id) for tx_id in transaction_ids):
+            return False
+        if len(set(transaction_ids)) != len(transaction_ids):
+            return False
+        if transaction_ids != sorted(transaction_ids):
+            return False
+        # The advertised root must really be the root of the advertised leaves.
+        if merkle_root(transaction_ids) != claimed_root:
+            return False
+        if claimed_root != expected_merkle_root:
+            return False
+
+        if len(proofs) > len(transaction_ids):
+            return False
+        proof_ids = [item.get("tx_id") if isinstance(item, dict) else None
+                     for item in proofs]
+        if any(not _is_hex64(tx_id) for tx_id in proof_ids):
+            return False
+        if len(set(proof_ids)) != len(proof_ids):
+            return False
+        if proof_ids != sorted(proof_ids):
+            return False
+        if not set(proof_ids) <= set(transaction_ids):
+            return False
+
+        leaf_count = len(transaction_ids)
+        for item in proofs:
+            if list(item) != list(BUNDLE_PROOF_KEYS):
+                return False
+            tx_id = item["tx_id"]
+            index = item["index"]
+            siblings = item["siblings"]
+            if isinstance(index, bool) or not isinstance(index, int):
+                return False
+            if index < 0 or index >= leaf_count:
+                return False
+            if transaction_ids[index] != tx_id:
+                return False
+            if not isinstance(siblings, list) or len(siblings) > MAX_MERKLE_DEPTH:
+                return False
+
+            current = tx_id
+            position = index
+            for sibling in siblings:
+                if not isinstance(sibling, dict):
+                    return False
+                if list(sibling) != list(BUNDLE_SIBLING_KEYS):
+                    return False
+                direction = sibling["direction"]
+                sibling_hash = sibling["hash"]
+                if not _is_hex64(sibling_hash):
+                    return False
+                # As in verify_account_proof: the odd-node self-pair is always
+                # a *right* sibling equal to the path node; a left sibling
+                # equal to the current node addresses the phantom duplicate
+                # slot, which is never a real leaf.
+                if direction == "left" and sibling_hash == current:
+                    return False
+                # The path must agree with the index: an even position is the
+                # left child (sibling on its right), an odd position the right.
+                if direction == "left":
+                    if position % 2 == 0:
+                        return False
+                    pair = sibling_hash + current
+                elif direction == "right":
+                    if position % 2 == 1:
+                        return False
+                    pair = current + sibling_hash
+                else:
+                    return False
+                current = sha256_hex(pair.encode("ascii"))
+                position //= 2
+
+            # A depth-D path addresses one of 2**D leaf slots: after the
+            # walk the index must have collapsed to the single root slot.
+            # A path too shallow or too deep for its index is out of bounds.
+            if position != 0:
+                return False
+            if not hmac.compare_digest(current, claimed_root):
+                return False
+
+        if not hmac.compare_digest(block_hash, expected_block_hash):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 # -- account state Merkle tree ----------------------------------------------
 
 

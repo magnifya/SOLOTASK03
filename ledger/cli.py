@@ -1,4 +1,5 @@
-"""Command line interface: send, tx, mine, block, account, proof, state-root,
+"""Command line interface: send, tx, mine, block, account, proof, proofs,
+state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, chain-range,
@@ -181,6 +182,18 @@ def cmd_proof(args: argparse.Namespace) -> int:
         "GET", f"{args.base_url}/v1/blocks/{args.height}/proof/{args.tx_id}", None
     )
     return _emit(status, body)
+
+
+def cmd_proofs(args: argparse.Namespace) -> int:
+    # The batch endpoint pins a non-alphabetical key order at every level;
+    # emit the server document verbatim rather than re-sorting its keys.
+    payload = {"tx_ids": args.tx_ids}
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/blocks/{args.height}/proofs", payload
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    # 2xx responses are success; anything else (incl. connection failure) is 1.
+    return 0 if 200 <= status < 300 else 1
 
 
 def cmd_confirm(args: argparse.Namespace) -> int:
@@ -712,6 +725,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_proof.add_argument("height", help="block height containing the transaction")
     p_proof.add_argument("tx_id", help="transaction id (64-char hex)")
     p_proof.set_defaults(func=cmd_proof)
+
+    p_proofs = sub.add_parser(
+        "proofs", help="fetch Merkle inclusion proofs for a batch of transactions"
+    )
+    p_proofs.add_argument(
+        "height", help="block height containing the transactions (decimal)"
+    )
+    p_proofs.add_argument(
+        "tx_ids",
+        metavar="tx_id",
+        nargs="+",
+        help="one or more transaction ids (64 lowercase hex characters)",
+    )
+    p_proofs.set_defaults(func=cmd_proofs)
 
     p_confirm = sub.add_parser("confirm", help="confirm a pending tip block")
     p_confirm.add_argument("height", help="block height to confirm")

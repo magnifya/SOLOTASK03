@@ -407,6 +407,40 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
 `StateRecoveryError`。查询与提交、打包、确认、回滚、采用、清理共用同一把锁，
 只反映已持久化的状态。
 
+## 批量 Merkle 证明
+
+在单笔 `GET /v1/blocks/{height}/proof/{tx_id}` 之外，还可以一次为同一已确认块
+的多笔交易批量取证明：`POST /v1/blocks/{height}/proofs`，请求体恰好为
+`{"tx_ids": [...]}`。
+
+- **请求校验**：`tx_ids` 必须是非空数组，元素互异且每个都是恰好 64 位**小写**
+  十六进制。请求体不是对象、键缺失或有额外键、类型错误、数组为空、元素重复或
+  格式错误（大写、长度不对、含非 hex 字符、非字符串）一律返回 `400`，且不改任何
+  状态（接口本身只读）。
+- **高度与存在性**：`height` 必须是无前导零的非负十进制（`0` 合法；前导零、符号、
+  小数等均按未知高度处理）。未知高度或任一请求的交易不在该块中返回 `404`
+  （批量中只要有一个缺失，整单 404、不出任何部分结果）；待定块返回 `409`，语义
+  与单笔证明接口一致。
+- **成功响应 `200`**：顶层键序固定为
+  `height, block_hash, merkle_root, transaction_ids, proofs`。`transaction_ids`
+  是该块**全部**交易按 `tx_id` 升序的完整叶子列表（块本就按 tx_id 升序打包）；
+  `proofs` 数组按 `tx_id` 字典序升序排列，与请求给出的顺序无关，每项键序为
+  `tx_id, index, siblings`，`index` 是该交易在 `transaction_ids` 中的从 0 起位置，
+  `siblings` 自叶向根排列，每个节点键序为 `direction, hash`，`direction` 仅取
+  `left`/`right`（兄弟节点相对路径节点的方位），`hash` 为 64 位小写 hex。配对
+  规则沿用交易 Merkle 树：每层 `sha256(left_hex + right_hex)`，奇数节点与自身
+  配对。
+- **离线验证**：`ledger.crypto.verify_merkle_proof_bundle(bundle,
+  expected_block_hash, expected_merkle_root) -> bool` 严格校验整个束：顶层与
+  每层嵌套文档的键集与**键序**、JSON 类型（布尔不算整数）、`tx_id` 唯一且升序、
+  每个 proof 的 `index` 与完整叶子列表的映射、路径与 index 位置一致（含奇数层
+  自我配对只允许右兄弟、路径深度与 index 匹配）、逐节点重算到根，并把根与区块
+  哈希分别绑定到 `expected_merkle_root`/`expected_block_hash`。键缺失或额外、
+  非法方向或哈希、index 越界、任何字段被篡改、proof 引用叶子列表之外的交易等
+  一律返回 `False` 而**不抛异常**。
+- **CLI**：`proofs HEIGHT TX_ID...`（至少一个 tx_id），逐字转发为该 POST，输出
+  保持线上键序的单行 JSON；非 2xx（含无法连接）打印错误 JSON 并以退出码 1 结束。
+
 ## 离线轻客户端验证
 
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
@@ -510,14 +544,14 @@ SHA-256 摘要作为签名消息。
 
 | 文件 | 职责 |
 | --- | --- |
-| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
+| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明、`verify_merkle_proof_bundle` 批量证明离线验证、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
 
 约定：
 
@@ -537,7 +571,12 @@ SHA-256 摘要作为签名消息。
   的兄弟节点列表，每项 `{"direction": "left"|"right", "hash": ...}`，direction 表示
   兄弟节点位于路径节点的左/右侧；`verify_merkle_proof(tx_id, siblings, merkle_root,
   block_hash, expected_block_hash)` 重算根并比对区块哈希，任何畸形输入（非 64 位
-  小写十六进制、非法 direction、层级过深等）均返回 `False`。
+  小写十六进制、非法 direction、层级过深等）均返回 `False`。批量束
+  `verify_merkle_proof_bundle(bundle, expected_block_hash, expected_merkle_root)`
+  还固定顶层及各嵌套层的键集与**键序**、`tx_id` 唯一升序、proof `index` 与完整
+  叶子列表的映射、路径与 index 位置一致，并把重算根/区块哈希分别绑定到两个
+  expected 锚点；键缺失/额外、类型错、非法方向或哈希、index 越界、引用叶子之外
+  的交易、任何字段篡改均返回 `False` 而不抛异常。
 - 区块哈希为 `sha256(规范化 {"height","prev_hash","merkle_root"})`，不含时间戳，
   因此同一父块与同一批有序交易必然产生相同 `merkle_root` 与 `block_hash`。
 - 任务未定义铸币接口，故每个身份拥有固定初始余额（默认 1,000,000，可用
@@ -595,6 +634,14 @@ curl -s localhost:8080/v1/accounts/<pubkey-hex>/proof
 curl -s "localhost:8080/v1/accounts/<pubkey-hex>/proof?height=H"
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
+# 批量 Merkle 证明（同一块的多笔交易；体形状/类型/空/重复/格式错 -> 400，
+# 未知高度或缺任一交易 -> 404，区块待定 -> 409；proofs 按 tx_id 升序）
+curl -s -X POST localhost:8080/v1/blocks/1/proofs \
+  -H 'Content-Type: application/json' \
+  -d '{"tx_ids":["<tx-id-hex>","<tx-id-hex>"]}'
+# -> 200 {"height":1,"block_hash":"...","merkle_root":"...",
+#         "transaction_ids":[...],"proofs":[{"tx_id":"...","index":I,
+#         "siblings":[{"direction":"left|right","hash":"..."}]}]}
 
 # 状态机
 curl -s localhost:8080/v1/blocks/1/status          # -> {"height":1,"status":"pending"}
@@ -709,6 +756,7 @@ python -m ledger.cli block 1
 python -m ledger.cli tx <tx-id-hex>
 python -m ledger.cli account <pubkey-hex>
 python -m ledger.cli proof 1 <tx-id-hex>
+python -m ledger.cli proofs 1 <tx-id-hex> <tx-id-hex>   # 同块批量，非 2xx 退出 1
 python -m ledger.cli state-root                 # 锚定最高已确认块
 python -m ledger.cli state-root --height H      # 历史已确认前缀
 python -m ledger.cli state-proof <pubkey-hex>
@@ -776,6 +824,7 @@ cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
 python -m compileall -q ledger   # 编译检查
 python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
+python tests/merkle_proof_bundle_test.py  # 批量 Merkle 证明（verify_merkle_proof_bundle 键集/键序/严格类型/唯一升序/index 映射/路径/锚点、POST /v1/blocks/{height}/proofs 400/404/409 与线上键序、proofs CLI 退出码）
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）

@@ -18,8 +18,8 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         # -- helpers --------------------------------------------------------
 
-        def _send_json(self, status: int, body: dict) -> None:
-            data = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        def _send_json(self, status: int, body: dict, sort_keys: bool = True) -> None:
+            data = json.dumps(body, ensure_ascii=False, sort_keys=sort_keys).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
@@ -142,6 +142,19 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     self._read_json()
                 status, body = service.mine_block()
                 self._send_json(status, body)
+            elif path.startswith("/v1/blocks/") and path.endswith("/proofs"):
+                # POST /v1/blocks/{height}/proofs — batch Merkle inclusion
+                # proofs for the tx_ids carried in the JSON body.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                height = unquote(path[len("/v1/blocks/") : -len("/proofs")])
+                status, body = service.get_proofs(height, payload)
+                # The batch-proof contract fixes a non-alphabetical key order
+                # at every level; the service already builds that exact order,
+                # so emit it verbatim instead of sorting.
+                self._send_json(status, body, sort_keys=False)
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
                 # POST /v1/blocks/{height}/confirm | /v1/blocks/{height}/rollback
