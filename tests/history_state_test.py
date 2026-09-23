@@ -457,6 +457,14 @@ class HistoryHttpTests(unittest.TestCase):
             self.request(f"/v1/accounts/{self.B}/proof?height=1&height=1")[0], 400
         )
         self.assertEqual(self.request(f"/v1/accounts/{self.B}/proof?height=99")[0], 404)
+        # A single unknown parameter is rejected 400 too — it must not be
+        # silently ignored and fall back to the tip-anchored view.
+        self.assertEqual(
+            self.request(f"/v1/accounts/{self.B}/proof?foo=1")[0], 400
+        )
+        self.assertEqual(
+            self.request(f"/v1/accounts/{self.B}/proof?height=1&foo=1")[0], 400
+        )
         # An unrelated repeated parameter is rejected too.
         self.assertEqual(
             self.request(f"/v1/accounts/{self.B}/proof?height=1&foo=1&foo=2")[0], 400

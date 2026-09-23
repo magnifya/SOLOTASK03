@@ -343,8 +343,10 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `{direction: left|right, hash}`（64 位小写十六进制，direction 表示兄弟节点
   相对路径节点的方位）。最高块 pending 或账户不在已确认账户集时返回 `404`。
   可选查询参数 `?height=H` 按同样严格格式把 proof 锚定到历史已确认块：缺省
-  仍锚定最高已确认块；非法或重复参数返回 `400`，锚点未知/非 canonical/pending
-  返回 `404`，账户在该历史状态不存在也是 `404`。成功 proof 的
+  仍锚定最高已确认块；该端点**只认 `height`**，非法、未知或重复参数一律返回
+  `400`（未知参数不被静默忽略，以免误以为取到缺省锚点），锚点
+  未知/非 canonical/pending 返回 `404`，账户在该历史状态不存在也是 `404`。
+  成功 proof 的
   `height/block_hash/state_root/index/siblings` 全部对应 H，
   `confirmed_transactions` 保持链上原序。
 - **离线验证**：`ledger.crypto.verify_account_proof(proof, expected_root,
@@ -411,11 +413,19 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
 **信任文档**（trust）离线核对响应：
 
-- **bundle**：`{source, expires_at, response, candidate, proofs[, signature]}`。
-  `expires_at` 是 Unix 秒；`candidate` 是自创世块起的完整块数组（也接受现有
-  导出五字段文档）；`proofs` 为 `{height, proof}` 列表，`proof` 即
-  `/proof/` 接口返回的 `{height, tx_id, index, merkle_root, block_hash,
-  siblings}` 文档；`signature` 可选，为 Ed25519 签名的十六进制。
+- **bundle**：`{source, expires_at, response, candidate, proofs[, signature]}`，
+  另可携带**可选账户状态锚点**四字段（见下）。`expires_at` 是 Unix 秒；
+  `candidate` 是自创世块起的完整块数组（也接受现有导出五字段文档）；`proofs`
+  为 `{height, proof}` 列表，`proof` 即 `/proof/` 接口返回的
+  `{height, tx_id, index, merkle_root, block_hash, siblings}` 文档；
+  `signature` 可选，为 Ed25519 签名的十六进制。
+- **账户状态锚点（可选）**：`state_root`、`state_height`、`state_block_hash`、
+  `state_proofs` 四字段**要么全省略，要么全提供**；`state_proofs` 必须为非空
+  数组。`state_root`/`state_block_hash` 为 64 位小写十六进制，`state_height`
+  为非布尔非负整数；每个 `state_proofs` 元素恰好含 `height` 与 `proof`，
+  `proof` 恰好含 `account, balance, confirmed_transactions, index, state_root,
+  height, block_hash, siblings` 八字段——缺失、额外字段或类型错误一律 `input`。
+  签名天然覆盖扩展后的整个 bundle。
 - **trust**：`{genesis_hash, sources, allowlist}`（`GET /v1/trust` 还会带
   `audit_signers`，轻客户端束验证忽略该额外字段）。`genesis_hash` 锚定创世
   块；`sources[source] = {public_key, expires_at}`；
@@ -424,7 +434,8 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
   （束、来源、allowlist 三处的 `expires_at` 逐一检查，`<= now` 即过期）。
   受信且有公钥的来源**必须**验签：签名覆盖
   `SHA256(bundle 去掉 signature 后排序紧凑 UTF-8 JSON)`，再做 Ed25519 验签；
-  无公钥来源只有在 `allowlist` 中且束**不带签名**时才可接受。
+  无公钥来源只有在 `allowlist` 中且束**不带签名**时才可接受。扩展锚点不改变
+  授权与过期检查的顺序。
 - **重算链**：从 `genesis_hash` 锚定的创世块起，逐块核对连续高度与 `prev_hash`、
   重算每笔交易的 `tx_id` 并验证其 Ed25519 签名、`tx_id` 全链唯一且块内升序、
   重算 Merkle 根与 `block_hash`，且 pending 块只能位于链尾。
@@ -433,18 +444,30 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
   每个 proof 必须唯一（同 `height`+`tx_id` 不得重复），其 `tx_id`、`height`、
   `index` 与区块字段（`block_hash`、`merkle_root`）必须与候选链中的块一致，
   Merkle 路径按现有 `verify_merkle_proof` 规则验证；**pending 链尾禁止出 proof**。
+- **核对账户状态锚点与 state_proofs**：`state_height` 必须对应候选链中的
+  **confirmed** 块且该块哈希等于 `state_block_hash`；高度未知、指向 pending
+  块或锚点哈希不符为 `integrity`。逐项核对两处 `height`（元素层与 proof 内层）、
+  `state_root`、`block_hash` 与锚点完全一致；离线客户端不持有初始余额约定，故按
+  该高度 confirmed 前缀交易涉及账户的**升序集合**核对每个 proof 的 `account` 与
+  `index`（越界或账户不在该集合为 `proof`），且同 `height`+`account` 不得重复。
+  最后调用 `verify_account_proof(proof, state_root, state_height,
+  state_block_hash)`：伪造叶（account/balance/T）、非法 direction/哈希、非法
+  自配对、siblings 畸形或路径/索引不一致均为 `proof`。一个 bundle 的账户 proof
+  只许锚定唯一 height。
 
 成功返回 `{ok: true, source, S, verified_tx_ids}`（`verified_tx_ids` 为按
-tx_id 升序的已验证交易列表）；失败返回 `{ok: false, error}`，`error` 仅取
+tx_id 升序的已验证交易列表）；**仅当**提供了账户状态锚点时，额外返回按
+account 升序的 `verified_accounts`，省略锚点的历史 bundle 返回结构完全不变。
+失败返回 `{ok: false, error}`，`error` 仅取
 `input` / `auth` / `expired` / `integrity` / `proof` 五类：
 
 | error | 含义 |
 | --- | --- |
-| `input` | bundle/trust 结构或字段类型不合法（含非 64 位十六进制公钥、布尔数值） |
+| `input` | bundle/trust 结构或字段类型不合法（含非 64 位十六进制公钥/根/哈希、布尔数值、状态锚点半提供、state_proofs 为空或字段缺失/额外/类型错误） |
 | `auth` | 来源不受信、受信来源缺签名，或 allowlist 来源带了无法核对的签名 |
 | `expired` | 束或信任条目已过期 |
-| `integrity` | 签名错误、链重算不一致（创世块/prev_hash/tx_id/签名/Merkle/block_hash）或 response 与链尾不符 |
-| `proof` | proof 重复、字段与区块不一致、Merkle 路径无效或指向 pending 链尾 |
+| `integrity` | 签名错误、链重算不一致（创世块/prev_hash/tx_id/签名/Merkle/block_hash）、response 与链尾不符，或状态锚点高度未知/pending/块哈希不符 |
+| `proof` | proof 重复、字段与区块不一致、Merkle 路径无效或指向 pending 链尾；账户 proof 锚点高度不一致、account/index 与该高度账户集合不符、(height,account) 重复，或 verify_account_proof 失败 |
 
 
 ## 审计导出的离线校验
@@ -772,6 +795,7 @@ python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/s
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
+python tests/light_client_state_proof_test.py  # 离线 verify 的账户状态锚点扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格 input、confirmed 块锚点 integrity、唯一 height、account/index 升序集合核对、(height,account) 去重、verify_account_proof 各 proof 失败类、verified_accounts 与历史兼容、签名覆盖扩展 bundle、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI

@@ -13,6 +13,17 @@ serving node or holding any chain state:
                                       block_hash, siblings}},
             ...
         ],
+        # Optional account-state anchor; the four fields are all-or-nothing
+        # and state_proofs must be a non-empty list when present.
+        "state_root": str,            # 64 lowercase hex chars
+        "state_height": int,          # non-boolean, non-negative
+        "state_block_hash": str,      # 64 lowercase hex chars
+        "state_proofs": [             # account-state inclusion proofs
+            {"height": int, "proof": {account, balance, confirmed_transactions,
+                                      index, state_root, height, block_hash,
+                                      siblings}},
+            ...
+        ],
         "signature": str,             # optional Ed25519 signature hex
     }
 
@@ -29,7 +40,12 @@ sources accepted without signatures:
 Verification, in order:
 
 1. **input** — bundle and trust must have the documented shape; every numeric
-   field must be a plain (non-boolean) integer.
+   field must be a plain (non-boolean) integer. The optional account-state
+   anchor is all-or-nothing: ``state_root``/``state_block_hash`` must be
+   64-char lowercase hex, ``state_height`` a non-boolean non-negative integer,
+   ``state_proofs`` a non-empty list whose entries carry exactly
+   ``{height, proof}`` and whose proofs carry exactly the eight documented
+   fields with correct types; any missing, extra or mistyped field is input.
 2. **auth** — the source must be trusted (a ``sources`` entry or the
    ``allowlist``). A source with a public key must sign the bundle; a bundle
    carrying a signature for a key-less source, or an unsigned bundle from a
@@ -42,13 +58,24 @@ Verification, in order:
    (heights, prev_hash linkage, every transaction's tx_id and Ed25519
    signature, unique tx_ids, Merkle roots, block hashes, pending-only-at-tip)
    and the response's descriptor fields are checked against the recomputed
-   tip descriptor ``S``.
-5. **proof** — every proof must be unique, its tx_id/height/index and block
-   fields must agree with the candidate block, the Merkle path must verify
-   under the existing rules, and its block must not be the pending tip.
+   tip descriptor ``S``. When a state anchor is present, ``state_height`` must
+   name a confirmed candidate block whose hash equals ``state_block_hash`` —
+   an unknown height, a pending block or an anchor hash mismatch is integrity.
+5. **proof** — every tx proof must be unique, its tx_id/height/index and
+   block fields must agree with the candidate block, the Merkle path must
+   verify under the existing rules, and its block must not be the pending tip.
+6. **state-proof** — every account-state proof must anchor the single
+   ``state_height`` (entry and document), and its ``state_root``/
+   ``block_hash`` must equal the bundle anchor. Each ``account``/``index``
+   must name that account's slot in the ascending account set of the
+   confirmed prefix (out of range or absent fails); ``(height, account)``
+   must be unique; the recomputed leaf and sibling path must verify via
+   ``verify_account_proof`` (forged leaf, illegal direction/hash or
+   self-pair, malformed path all fail).
 
 On success :func:`verify_bundle` returns
-``{"ok": True, "source", "S", "verified_tx_ids"}``; on failure
+``{"ok": True, "source", "S", "verified_tx_ids"}`` plus, only when a state
+anchor was supplied, ``"verified_accounts"`` (ascending); on failure
 ``{"ok": False, "error": category}`` with category one of
 ``input/auth/expired/integrity/proof``.
 """
@@ -72,6 +99,32 @@ ERR_PROOF = "proof"
 
 # Descriptor fields of a chain tip, exactly as GET /v1/chain reports them.
 DESCRIPTOR_FIELDS = ("tip_hash", "height", "length", "status")
+
+# The four optional bundle fields that anchor account-state proofs. They are
+# all-or-nothing: either the bundle carries the whole anchor (root, height,
+# block hash and a non-empty proof list) or none of them at all.
+STATE_ANCHOR_FIELDS = (
+    "state_root",
+    "state_height",
+    "state_block_hash",
+    "state_proofs",
+)
+
+# The exact, closed field set of one account-state proof document, matching
+# GET /v1/accounts/{account}/proof. A document missing a field or carrying an
+# extra one is malformed (input).
+STATE_PROOF_FIELDS = frozenset(
+    (
+        "account",
+        "balance",
+        "confirmed_transactions",
+        "index",
+        "state_root",
+        "height",
+        "block_hash",
+        "siblings",
+    )
+)
 
 # An Ed25519 public key rendered as 64 lowercase hexadecimal characters.
 _HEX32_RE = re.compile(r"[0-9a-f]{64}")
@@ -113,46 +166,56 @@ def verify_bundle(bundle: object, trust: object, now: float | None = None) -> di
     """Verify an offline proof bundle against the local trust document.
 
     Returns ``{"ok": True, "source": ..., "S": ..., "verified_tx_ids": [...]}``
-    on success or ``{"ok": False, "error": category}`` on failure. Never raises
-    for malformed input: every defect maps to one of the five categories.
+    on success, additionally carrying ``"verified_accounts"`` (ascending) when
+    the bundle supplied the optional state anchor, or
+    ``{"ok": False, "error": category}`` on failure. Never raises for malformed
+    input: every defect maps to one of the five categories.
     """
     current = time.time() if now is None else now
     try:
-        source, candidate = _validate_inputs(bundle, trust)
+        source, candidate, state_anchor = _validate_inputs(bundle, trust)
         _authenticate(bundle, trust, source, current)
         blocks_raw = candidate["blocks"] if isinstance(candidate, dict) else candidate
         blocks = _recompute_chain(blocks_raw, trust)
         descriptor = _tip_descriptor(blocks)
         _check_candidate_summary(candidate, descriptor)
         _check_response(bundle["response"], descriptor)
+        state_block = _bind_state_anchor(state_anchor, blocks)
         verified_ids = _verify_proofs(bundle["proofs"], blocks)
+        verified_accounts = _verify_state_proofs(state_anchor, blocks, state_block)
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
         # Defensive: structurally unforeseeable inputs must report rather than
         # crash the verifying process.
         return {"ok": False, "error": ERR_INPUT}
-    return {
+    result = {
         "ok": True,
         "source": source,
         "S": descriptor,
         "verified_tx_ids": verified_ids,
     }
+    if state_anchor is not None:
+        result["verified_accounts"] = verified_accounts
+    return result
 
 
 # -- stage 1: shape -----------------------------------------------------------
 
 
-def _validate_inputs(bundle: object, trust: object) -> tuple[str, object]:
+def _validate_inputs(bundle: object, trust: object) -> tuple[str, object, dict | None]:
     """Structural validation of bundle and trust.
 
-    Returns ``(source, candidate)`` where ``candidate`` is the raw candidate
-    value (a bare block list or an export-format object carrying ``blocks``).
-    The bundle itself is never mutated: the signature covers it verbatim.
+    Returns ``(source, candidate, state_anchor)`` where ``candidate`` is the
+    raw candidate value (a bare block list or an export-format object carrying
+    ``blocks``) and ``state_anchor`` is the four-field account-state anchor
+    tuple-like dict when the bundle carries one, else None. The bundle itself
+    is never mutated: the signature covers it verbatim.
     """
     if not isinstance(bundle, dict):
         raise _Failure(ERR_INPUT)
-    for field in ("source", "expires_at", "response", "candidate", "proofs"):
+    required = ["source", "expires_at", "response", "candidate", "proofs"]
+    for field in required:
         if field not in bundle:
             raise _Failure(ERR_INPUT)
     source = bundle["source"]
@@ -173,6 +236,8 @@ def _validate_inputs(bundle: object, trust: object) -> tuple[str, object]:
     signature = bundle.get("signature")
     if signature is not None and (not isinstance(signature, str) or not signature):
         raise _Failure(ERR_INPUT)
+
+    state_anchor = _validate_state_anchor_fields(bundle)
 
     if not isinstance(trust, dict):
         raise _Failure(ERR_INPUT)
@@ -196,7 +261,102 @@ def _validate_inputs(bundle: object, trust: object) -> tuple[str, object]:
     for name, expires_at in allowlist.items():
         if not isinstance(name, str) or not name or not _is_int(expires_at):
             raise _Failure(ERR_INPUT)
-    return source, candidate
+    return source, candidate, state_anchor
+
+
+def _validate_state_anchor_fields(bundle: dict) -> dict | None:
+    """Extract and shape-check the optional account-state anchor.
+
+    The four anchor fields are all-or-nothing: a bundle that names some but
+    not all is malformed. ``state_root``/``state_block_hash`` must be 64-char
+    lowercase hex, ``state_height`` a non-boolean non-negative integer, and
+    ``state_proofs`` a non-empty list of tightly shaped ``{"height", "proof"}``
+    entries. Every shape/type/domain defect here is an ``input`` error; the
+    cryptographic content of the sibling paths is checked later (proof).
+    """
+    present = [field for field in STATE_ANCHOR_FIELDS if field in bundle]
+    if not present:
+        return None
+    if len(present) != len(STATE_ANCHOR_FIELDS):
+        raise _Failure(ERR_INPUT)
+
+    state_root = bundle["state_root"]
+    state_height = bundle["state_height"]
+    state_block_hash = bundle["state_block_hash"]
+    state_proofs = bundle["state_proofs"]
+
+    if not crypto.is_hex64(state_root):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(state_height) or state_height < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(state_block_hash):
+        raise _Failure(ERR_INPUT)
+    if not isinstance(state_proofs, list) or not state_proofs:
+        raise _Failure(ERR_INPUT)
+    for item in state_proofs:
+        if not isinstance(item, dict):
+            raise _Failure(ERR_INPUT)
+        # Each entry is exactly {"height", "proof"}: a missing or extra key
+        # cannot be mapped to any block and is a shape defect.
+        if set(item) != {"height", "proof"}:
+            raise _Failure(ERR_INPUT)
+        if not _is_int(item["height"]) or item["height"] < 0:
+            raise _Failure(ERR_INPUT)
+        if not _valid_state_proof_doc(item["proof"]):
+            raise _Failure(ERR_INPUT)
+
+    return {
+        "state_root": state_root,
+        "state_height": state_height,
+        "state_block_hash": state_block_hash,
+        "state_proofs": state_proofs,
+    }
+
+
+def _valid_state_proof_doc(proof: object) -> bool:
+    """Shape/type validation of one account-state proof document.
+
+    The document must carry exactly the eight fields returned by
+    GET /v1/accounts/{account}/proof, with the right raw types and domains
+    (hex digests, non-boolean non-negative integers, a hex list of
+    transactions and a list of sibling steps). The sibling *path content*
+    (directions, hashes, depth, index agreement) is deliberately left to the
+    cryptographic verifier, whose failure maps to ``proof``.
+    """
+    if not isinstance(proof, dict):
+        return False
+    if set(proof) != STATE_PROOF_FIELDS:
+        return False
+    account = proof["account"]
+    balance = proof["balance"]
+    transactions = proof["confirmed_transactions"]
+    index = proof["index"]
+    state_root = proof["state_root"]
+    height = proof["height"]
+    block_hash = proof["block_hash"]
+    siblings = proof["siblings"]
+
+    if not isinstance(account, str) or not account:
+        return False
+    if not _is_int(balance) or balance < 0:
+        return False
+    if not isinstance(transactions, list):
+        return False
+    if any(not crypto.is_hex64(tx_id) for tx_id in transactions):
+        return False
+    if not _is_int(index) or index < 0:
+        return False
+    if not crypto.is_hex64(state_root):
+        return False
+    if not _is_int(height) or height < 0:
+        return False
+    if not crypto.is_hex64(block_hash):
+        return False
+    # The path entries themselves are validated cryptographically later; only
+    # the top-level type is a shape concern.
+    if not isinstance(siblings, list):
+        return False
+    return True
 
 
 # -- stage 2/3: trust, expiry and signature -----------------------------------
@@ -441,4 +601,107 @@ def _verify_proofs(proofs_raw: list, blocks: list[Block]) -> list[str]:
         ):
             raise _Failure(ERR_PROOF)
         verified.append(tx_id)
+    return sorted(verified)
+
+
+# -- stage 6: account-state anchor and proofs --------------------------------
+
+
+def _bind_state_anchor(state_anchor: dict | None, blocks: list[Block]) -> Block | None:
+    """Bind the optional account-state anchor to a confirmed candidate block.
+
+    ``state_height`` must name a block that exists in the recomputed chain, is
+    confirmed and carries exactly ``state_block_hash``. An unknown height, a
+    pending block, or a hash that does not match the candidate block are all
+    chain-binding failures, hence ``integrity`` (the shapes were already proven
+    during input validation). Returns None when the bundle carries no anchor.
+    """
+    if state_anchor is None:
+        return None
+    height = state_anchor["state_height"]
+    if height >= len(blocks):
+        raise _Failure(ERR_INTEGRITY)
+    block = blocks[height]
+    if block.status != STATUS_CONFIRMED:
+        raise _Failure(ERR_INTEGRITY)
+    if block.block_hash != state_anchor["state_block_hash"]:
+        raise _Failure(ERR_INTEGRITY)
+    return block
+
+
+def _confirmed_accounts(blocks: list[Block], through_height: int) -> list[str]:
+    """Ascending set of accounts active in confirmed blocks through a height.
+
+    Mirrors the account ordering of ``LedgerStore.account_state_rows`` without
+    replaying balances: an offline client holds no endowment convention, but
+    the *set* of accounts (every confirmed transaction's sender and recipient)
+    and its ascending order are fully determined by the chain alone.
+    """
+    accounts: set[str] = set()
+    for block in blocks[: through_height + 1]:
+        if block.status != STATUS_CONFIRMED:
+            continue
+        for tx in block.transactions:
+            accounts.add(tx.sender)
+            accounts.add(tx.recipient)
+    return sorted(accounts)
+
+
+def _verify_state_proofs(
+    state_anchor: dict | None, blocks: list[Block], state_block: Block | None
+) -> list[str]:
+    """Verify every account-state proof against the anchored confirmed state.
+
+    All proofs must anchor the single ``state_height`` (both the entry height
+    and the proof document's height), and the document's ``state_root`` and
+    ``block_hash`` must equal the bundle anchor. Each ``account``/``index``
+    pair must name that account's slot in the ascending account set of the
+    confirmed prefix (out of range or absent is a ``proof`` failure); no
+    ``(height, account)`` pair may repeat. Finally the leaf-to-root path is
+    recomputed via :func:`crypto.verify_account_proof`, which rejects forged
+    leaves, illegal directions/hashes, illegal self-pairs and malformed paths.
+    The verified accounts are returned sorted ascending.
+    """
+    if state_anchor is None:
+        return []
+    assert state_block is not None
+    anchor_height = state_anchor["state_height"]
+    anchor_root = state_anchor["state_root"]
+    anchor_hash = state_anchor["state_block_hash"]
+    accounts = _confirmed_accounts(blocks, anchor_height)
+
+    verified: list[str] = []
+    seen: set[tuple[int, str]] = set()
+    for item in state_anchor["state_proofs"]:
+        entry_height = item["height"]
+        proof = item["proof"]
+        # Account proofs in one bundle all anchor the same height.
+        if entry_height != anchor_height:
+            raise _Failure(ERR_PROOF)
+        # The two heights (entry and document), the root and the block hash
+        # must agree with the bundle anchor before any cryptographic work.
+        if proof["height"] != anchor_height:
+            raise _Failure(ERR_PROOF)
+        if proof["state_root"] != anchor_root:
+            raise _Failure(ERR_PROOF)
+        if proof["block_hash"] != anchor_hash:
+            raise _Failure(ERR_PROOF)
+
+        account = proof["account"]
+        index = proof["index"]
+        if index < 0 or index >= len(accounts):
+            raise _Failure(ERR_PROOF)
+        if accounts[index] != account:
+            raise _Failure(ERR_PROOF)
+
+        key = (anchor_height, account)
+        if key in seen:
+            raise _Failure(ERR_PROOF)
+        seen.add(key)
+
+        if not crypto.verify_account_proof(
+            proof, anchor_root, anchor_height, anchor_hash
+        ):
+            raise _Failure(ERR_PROOF)
+        verified.append(account)
     return sorted(verified)

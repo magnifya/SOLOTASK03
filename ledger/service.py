@@ -471,12 +471,20 @@ class LedgerService:
         Without ``height`` the proof is anchored to the highest (confirmed)
         block. With ``height=H`` the state is deterministically replayed from
         the canonical confirmed prefix through that block only: the value must
-        be a plain non-negative decimal without leading zeros (a malformed or
-        repeated query parameter is 400), and an unknown/non-canonical/pending
-        anchor height is 404. Returns 404 while a pending tip anchors the
-        default view, or for an account absent from the (historical) confirmed
-        account set.
+        be a plain non-negative decimal without leading zeros (a malformed,
+        unknown or repeated query parameter is 400), and an
+        unknown/non-canonical/pending anchor height is 404. Returns 404 while
+        a pending tip anchors the default view, or for an account absent from
+        the (historical) confirmed account set.
         """
+        if params is not None:
+            # Only ``height`` is recognized: a single unknown parameter is
+            # rejected 400 just like a malformed or repeated one, so a client
+            # learns immediately that it was ignored rather than silently
+            # getting the default (tip-anchored) view.
+            unknown = set(params) - {"height"}
+            if unknown:
+                return 400, {"error": "unknown query parameter"}
         height_raw: object = None
         if params is not None:
             height_raw = params.get("height")
