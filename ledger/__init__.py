@@ -9,4 +9,5 @@ __all__ = [
     "server",
     "cli",
     "light_client",
+    "consistency",
 ]

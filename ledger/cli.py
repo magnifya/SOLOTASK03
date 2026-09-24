@@ -5,7 +5,7 @@ index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
-verify/audit-verify subcommands.
+verify/audit-verify/consistency subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -668,6 +668,38 @@ def cmd_verify(args: argparse.Namespace) -> int:
 # -- argparse wiring ---------------------------------------------------------
 
 
+def cmd_consistency(args: argparse.Namespace) -> int:
+    """Offline snapshot consistency verification; no server contact is made.
+
+    The snapshot JSON is read from ``FILE`` or standard input when the
+    argument is ``-``. Prints one contract-ordered JSON line:
+    ``{"ok", "error", "generation", "height", "tip_hash", "state_root",
+    "audit_checkpoint"}`` — the verified tip descriptor on success, or
+    ``{"ok": false, "error": "input"|"integrity", ...null}`` on failure.
+    Unreadable/non-JSON input is an ``input`` error. Exits 0 on success and 1
+    on any failure.
+    """
+    from .consistency import verify_snapshot
+
+    try:
+        if args.snapshot_file == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.snapshot_file, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        body = {"ok": False, "error": "input"}
+    else:
+        body = verify_snapshot(document)
+    # The success/failure document has a contract-fixed key order; print it in
+    # insertion order rather than alphabetically.
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
+# -- argparse wiring ---------------------------------------------------------
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ledger", description="Verifiable ledger CLI")
     parser.add_argument(
@@ -1037,6 +1069,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="current signer version (conflict 409 if stale)",
     )
     p_audit_signer.set_defaults(func=cmd_audit_signer_rotate)
+
+    p_consistency = sub.add_parser(
+        "consistency",
+        help="offline-verify a ledger snapshot's internal consistency",
+    )
+    p_consistency.add_argument(
+        "snapshot_file",
+        metavar="FILE|-",
+        help="snapshot JSON file, or - to read the document from stdin",
+    )
+    p_consistency.set_defaults(func=cmd_consistency)
 
     return parser
 

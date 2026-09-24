@@ -528,6 +528,39 @@ event_hash}}`，进程退出码 0；失败
 表示锚点、连续编号、任一哈希链接、分页计数、跨页检查点或末页检查点不一致。
 `audit-verify` 不发起任何网络请求。
 
+## 快照一致性的离线校验
+
+不连接服务端也能独立核验一份持久化快照的内部一致性：把快照 JSON 交给
+`ledger consistency FILE|-`（`-` 从标准输入读）。校验逐项重算而不信任任何
+已存储的值：
+
+- 顶层必须**恰好**包含核心节 `state`、`chain`、`pending`、`index`、
+  `accounts`、`audit_checkpoint`；允许扩展节 `audit_events`、`forks`、
+  `syncs`、`attested_syncs`、`trust_sources`、`allowlist`；
+  `audit_events` 可整体缺省（视为空日志），任何其他未知顶层键一律拒绝；
+- 逐笔交易重算 `tx_id`（canonical 消息的 SHA-256）并核对 Ed25519 签名，
+  逐块重算 Merkle 根与区块哈希，核对连续高度与 `prev_hash` 链接、
+  交易按 `tx_id` 升序、链内交易唯一、创世块为空且已确认、
+  pending 块只能位于链尾；
+- `pending` 内存池逐笔重算，必须内部唯一且不与任何区块交易重复；
+- 从**已确认**区块重算 `index`（tx_id→height）与 `accounts`
+  （每账户 `{sent,received,transactions}`，pending 链尾不计入），
+  并按记录的 `state.initial_balance`（缺省回退默认禀赋）重算
+  `state.state_root`，均须与快照逐字节一致；
+- 存在 `audit_events` 时核对密集 1..N `event_id`、`prev_hash` 事件链与
+  每条 `event_hash = SHA256(prev_hash ASCII || 去除 prev_hash/event_hash
+  两字段后的排序紧凑 UTF-8 JSON)`，且 `audit_checkpoint`
+  `{event_id,event_hash}` 必须钉住链头（空日志为 `{0,"0"×64}`）。
+
+输出恒为**单行 JSON**，键序固定为
+`ok,error,generation,height,tip_hash,state_root,audit_checkpoint`：成功为
+`true,null,N,N,H,H,C`（N≥0、H 为 64 位小写 hex、C 为
+`{event_id,event_hash}`），失败为 `false,"input"|"integrity"` 加其余字段
+全 `null`，退出码成功 0、失败 1。`input` 表示非对象根、核心节缺失/类型
+错误或顶层未知键；`integrity` 表示形状合法但任一重算不一致。文件无法
+读取或不是合法 JSON 时输出精简的 `{"ok": false, "error": "input"}`，
+退出码 1。`consistency` 不发起任何网络请求。
+
 **带信任文档的检查点认证（可选）**：追加 `--trust trust.json`（即
 `GET /v1/trust` 的输出）后，除上述哈希链核验外还核对检查点签名：信任
 文档的 `genesis_hash` 必须有效，`audit_signers` 必须自版本 1 起连续、首版
@@ -554,7 +587,7 @@ SHA-256 摘要作为签名消息。
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
 
 约定：
 
@@ -817,6 +850,17 @@ python -m ledger.cli audit-verify audit-page.json --trust trust.json
 python -m ledger.cli verify --bundle bundle.json --trust trust.json
 cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
 # -> 成功单行 {"ok":true,...} 退出 0；失败单行 {"ok":false,"error":"..."} 退出 1
+
+# 快照一致性离线校验（不连接服务端；- 从标准输入读取快照 JSON）
+python -m ledger.cli consistency ledger_state.json
+cat ledger_state.json | python -m ledger.cli consistency -
+# -> 成功单行 {"ok":true,"error":null,"generation":N,"height":N,
+#             "tip_hash":"...","state_root":"...",
+#             "audit_checkpoint":{"event_id":N,"event_hash":"..."}} 退出 0；
+#    失败单行 {"ok":false,"error":"input"|"integrity","generation":null,
+#             "height":null,"tip_hash":null,"state_root":null,
+#             "audit_checkpoint":null} 退出 1；
+#    文件无法读取/非 JSON 时为 {"ok":false,"error":"input"} 退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
