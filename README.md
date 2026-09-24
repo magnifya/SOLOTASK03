@@ -699,8 +699,10 @@ SHA-256 摘要作为签名消息。
 
 文档**必含**顶层键 `state`、`chain`、`pending`、`index`、`accounts`、
 `audit_checkpoint`；`audit_events` 可以缺省（视为空日志）；允许扩展
-`forks`、`syncs`、`attested_syncs`、`trust_sources`、`allowlist`（这些
-区段存在与否不影响本项自洽核验），其余顶层未知键一律拒绝。
+`forks`、`syncs`、`attested_syncs`（这三个区段存在与否不影响本项自洽
+核验）以及 `trust_sources`、`allowlist`、`source_key_history`（存在时
+按下述规则严格校验，缺失时兼容旧快照直接跳过），其余顶层未知键一律
+拒绝。
 
 逐项重算并比对：
 
@@ -724,6 +726,15 @@ SHA-256 摘要作为签名消息。
   字段后的排序紧凑 UTF-8 JSON)`；无论事件列表是否存在，
   `audit_checkpoint = {event_id, event_hash}` 都必须钉住真实链头（空日志
   为 `{0, "0"*64}`）。
+- 当 `trust_sources` 存在时，必须是按 `source` 升序且唯一的数组，每项恰
+  含 `source,public_key,expires_at,version,status`：公钥为 64 位小写
+  hex、`expires_at` 为非布尔整数、`version` 为正整数、`status` 仅
+  `active`/`revoked`；`allowlist` 存在时必须是 source→非布尔整数的
+  对象；`source_key_history` 存在时，每项恰含 `source,keys`，`keys`
+  每项仅含 `version,public_key,activated_event_id`，版本自 1 连续、
+  激活事件号严格递增，并且与注册表最新版本/公钥及审计事件**双向**
+  一致——`source_registered` 激活版本 1、每次 `source_rotated` 递增
+  一个版本、`source_revoked` 不新增版本。
 
 输出恒为**单行 JSON**，顶层键序固定为
 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`：
@@ -735,9 +746,12 @@ SHA-256 摘要作为签名消息。
   为 `null`。
 
 错误分类：文档不是对象、必含区段缺失或核心区段类型错误、顶层未知键，或
-字段原始类型非法（字符串/浮点/布尔伪装的数值等）均为 `input`；结构合法
-但任何重算量与记录不符（交易/签名/Merkle/区块哈希/链接/索引/账户/
-state_root、pending 唯一性、审计事件链或检查点）均为 `integrity`。
+字段原始类型非法（字符串/浮点/布尔伪装的数值等）均为 `input`——信任
+扩展区段的一切结构/类型缺陷（键集、hex 格式、枚举域、升序唯一、版本
+连续、激活号递增）同样归为 `input`；结构合法但任何重算量与记录不符
+（交易/签名/Merkle/区块哈希/链接/索引/账户/state_root、pending 唯一
+性、审计事件链或检查点），或持久化的公钥历史与信任注册表/来源生命周期
+事件不一致，均为 `integrity`。
 `consistency` 不发起任何网络请求；文件无法读取或内容不是 JSON 时输出
 `{"ok": false, "error": "input"}`，退出码成功 0、任何失败 1。
 
@@ -750,7 +764,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof` 与批量束 `verify_merkle_proof_bundle`）、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
-| `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
+| `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，审计事件哈希链与检查点，以及 `trust_sources`/`allowlist`/`source_key_history` 的结构校验与注册表/事件双向一致性核对；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
