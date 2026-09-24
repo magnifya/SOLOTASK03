@@ -2244,6 +2244,179 @@ class LedgerService:
         next_cursor = cursor + limit if cursor + limit < total else None
         return 200, {"items": items, "total": total, "next_cursor": next_cursor}
 
+    # -- single-record sync export -------------------------------------------
+
+    SYNC_EXPORT_MODES = (SYNC_MODE_PLAIN, SYNC_MODE_ATTESTED)
+    SYNC_EXPORT_PARAMS = frozenset(("source", "request_id", "mode"))
+
+    def export_fork_sync(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/forks/sync/export — export one received sync record.
+
+        Query parameters ``source``, ``request_id`` and ``mode`` are all
+        required, each a single value: ``source``/``request_id`` non-empty
+        strings, ``mode`` exactly ``plain`` or ``attested``. Unknown or
+        repeated parameters are 400 (repetition is rejected by the HTTP
+        layer). The two sync tables are separate idempotency namespaces, so
+        ``mode`` selects which table the ``(source, request_id)`` pair is
+        looked up in.
+
+        A match on a live record returns 200 with the fixed key order
+        ``source, request_id, mode, expires_at, tip_hash, height, length,
+        status, candidate, attestation``:
+
+        * ``plain`` — the candidate is rebuilt under the shared lock from the
+          stored fork or, when the tip was adopted, the canonical prefix (no
+          new authoritative copy is introduced and nothing is written), as
+          ``{tip_hash, height, length, status, blocks}``; ``attestation`` is
+          ``null``. The plain content fingerprint is recomputed and must
+          match.
+        * ``attested`` — the record retains the signed candidate in its exact
+          delivered form, and ``attestation`` is
+          ``{public_key, version, signature}``. The Ed25519 signature is
+          re-verified over the domain-separated canonical message under the
+          FROZEN public key, and the fingerprint is recomputed; attested
+          RANGE deliveries (which carry no signed candidate) are rejected 409.
+
+        A range delivery matched through either mode returns 409. An unknown,
+        expired (the due sweep runs first, and a failed sweep save restores
+        state and propagates OSError) or otherwise cleaned record — one whose
+        tip no longer resolves or whose signature/fingerprint no longer
+        verifies — returns 404. The append-only audit history is never
+        affected.
+        """
+        source = params.get("source")
+        request_id = params.get("request_id")
+        mode = params.get("mode")
+        if any(key not in self.SYNC_EXPORT_PARAMS for key in params):
+            return 400, {"error": "unknown query parameter"}
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "source must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "request_id must be a non-empty string"}
+        if mode not in self.SYNC_EXPORT_MODES:
+            return 400, {"error": "mode must be one of plain, attested"}
+
+        key = (source, request_id)
+        with self.store.lock:
+            # Sweep due expiries first (a failed sweep save restores records,
+            # forks and events and propagates OSError to the caller).
+            self._prune_expired_syncs()
+            if mode == SYNC_MODE_ATTESTED:
+                rec = self.store.attested_syncs.get(key)
+            else:
+                rec = self.store.syncs.get(key)
+            if rec is None:
+                return 404, {"error": "sync record not found"}
+
+            # Resolve the delivered chain: the stored candidate fork first,
+            # then the canonical prefix when the tip has since been adopted.
+            # Rebuilt under the shared lock; the export stores nothing.
+            tip_hash = rec["tip_hash"]
+            resolved = self.store.forks.get(tip_hash)
+            if resolved is None:
+                for index, block in enumerate(self.store.chain):
+                    if block.block_hash == tip_hash:
+                        resolved = self.store.chain[: index + 1]
+                        break
+            if resolved is None:
+                return 404, {"error": "sync record not found"}
+
+            # The frozen tip summary must agree with the resolved chain for a
+            # record written by current code; a disagreement is cache
+            # corruption (silent miss, audit history untouched).
+            descriptor = self._fork_summary(resolved)
+            if rec.get("height") is not None and (
+                rec["height"] != descriptor["height"]
+                or rec["length"] != descriptor["length"]
+                or rec["status"] != descriptor["status"]
+            ):
+                return 404, {"error": "sync record not found"}
+
+            if mode == SYNC_MODE_PLAIN:
+                # Incremental range deliveries are exported through no
+                # single-record document (anchor mismatch would be stale):
+                # 409, exactly like attested ranges.
+                if rec.get("range") is not None:
+                    return 409, {
+                        "error": "range sync records cannot be exported as a chain"
+                    }
+                rebuilt_blocks = [block.to_dict() for block in resolved]
+                if self._candidate_fingerprint(rebuilt_blocks) != rec["fingerprint"]:
+                    return 404, {"error": "sync record not found"}
+                candidate = {
+                    "tip_hash": descriptor["tip_hash"],
+                    "height": descriptor["height"],
+                    "length": descriptor["length"],
+                    "status": descriptor["status"],
+                    "blocks": rebuilt_blocks,
+                }
+                attestation = None
+            else:
+                attested = rec["attested"]
+                # An attested range freezes {anchor, blocks, tip}, not a
+                # signed candidate: the export contract has no range shape,
+                # so the hit conflicts (409).
+                if "range" in attested:
+                    return 409, {
+                        "error": "range sync records cannot be exported as a chain"
+                    }
+                signed_candidate = attested["candidate"]
+                expires_at = rec["expires_at"]
+                # Re-verify the domain-separated signature under the FROZEN
+                # public key (never the current registry), then recompute the
+                # fingerprint covering the signed candidate plus signature.
+                message = attested_message(
+                    source, request_id, expires_at, signed_candidate
+                )
+                digest = hashlib.sha256(message).digest()
+                if not crypto.verify_signature(
+                    attested["public_key"], digest, attested["signature"]
+                ):
+                    return 404, {"error": "sync record not found"}
+                if (
+                    attested_fingerprint(
+                        source,
+                        request_id,
+                        expires_at,
+                        signed_candidate,
+                        attested["signature"],
+                    )
+                    != rec["fingerprint"]
+                ):
+                    return 404, {"error": "sync record not found"}
+                # Bind the retained signed candidate to the record's tip:
+                # its final block hash must equal the resolved descriptor's
+                # tip_hash (an export object, a {"blocks":[...]} wrapper and a
+                # bare block list all expose the same block sequence).
+                signed_blocks = self._candidate_blocks(signed_candidate)
+                if not isinstance(signed_blocks, list) or not signed_blocks:
+                    return 404, {"error": "sync record not found"}
+                last_block = signed_blocks[-1]
+                if (
+                    not isinstance(last_block, dict)
+                    or last_block.get("block_hash") != descriptor["tip_hash"]
+                ):
+                    return 404, {"error": "sync record not found"}
+                candidate = signed_candidate
+                attestation = {
+                    "public_key": attested["public_key"],
+                    "version": attested["version"],
+                    "signature": attested["signature"],
+                }
+
+            return 200, {
+                "source": source,
+                "request_id": request_id,
+                "mode": mode,
+                "expires_at": rec["expires_at"],
+                "tip_hash": descriptor["tip_hash"],
+                "height": descriptor["height"],
+                "length": descriptor["length"],
+                "status": descriptor["status"],
+                "candidate": candidate,
+                "attestation": attestation,
+            }
+
     # -- transaction index ----------------------------------------------------
 
     INDEX_DEFAULT_LIMIT = 50

@@ -279,6 +279,25 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.list_fork_syncs(params)
                 self._send_json(status, body)
+            elif path == "/v1/forks/sync/export":
+                # GET /v1/forks/sync/export?source=&request_id=&mode=plain|
+                # attested — single-record sync export. The three parameters
+                # are required single values; unknown or repeated parameters
+                # are 400. The success document has a contract-fixed key order
+                # (source, request_id, mode, expires_at, tip_hash, height,
+                # length, status, candidate, attestation), so it is serialized
+                # in insertion order rather than alphabetically. The exact
+                # path match must precede the /v1/forks/{tip_hash}/export
+                # branch below.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.export_fork_sync(params)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/index/transactions":
                 # GET /v1/index/transactions?tx_id=&account=&height=&limit=&cursor=
                 params = {

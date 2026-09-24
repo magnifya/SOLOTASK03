@@ -2,7 +2,7 @@
 state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
-sync-history, chain-range,
+sync-export, sync-history, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency subcommands.
@@ -286,6 +286,24 @@ def cmd_syncs(args: argparse.Namespace) -> int:
         url = f"{url}?{query}"
     status, body = _request("GET", url, None)
     return _emit(status, body)
+
+
+def cmd_sync_export(args: argparse.Namespace) -> int:
+    # Single-record sync export: forward the three required single-value
+    # query parameters verbatim. The success document has a contract-fixed
+    # key order, so it is printed in insertion order rather than
+    # alphabetically (error bodies are single-key).
+    query = urllib.parse.urlencode(
+        {
+            "source": args.source,
+            "request_id": args.request_id,
+            "mode": args.mode,
+        }
+    )
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/forks/sync/export?{query}", None
+    )
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_sync_history(args: argparse.Namespace) -> int:
@@ -829,6 +847,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_syncs.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_syncs.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_syncs.set_defaults(func=cmd_syncs)
+
+    p_sync_export = sub.add_parser(
+        "sync-export", help="export one received sync record by source/request_id/mode"
+    )
+    p_sync_export.add_argument(
+        "--source", required=True, help="originating node identifier"
+    )
+    p_sync_export.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync_export.add_argument(
+        "--mode",
+        required=True,
+        help="sync table to look the record up in: plain or attested "
+        "(other values are rejected by the server with 400)",
+    )
+    p_sync_export.set_defaults(func=cmd_sync_export)
 
     p_sync_history = sub.add_parser(
         "sync-history", help="audit-list the full sync lifecycle event history"
