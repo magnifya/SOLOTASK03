@@ -269,6 +269,23 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.export_fork_sync(params)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/forks/sync/range/export":
+                # GET /v1/forks/sync/range/export?source=&request_id=&mode= —
+                # export one received incremental range delivery. Repeated
+                # query parameters are rejected 400 like the other strict
+                # endpoints; the success document has a contract-fixed key
+                # order, so it is serialized in insertion order. This exact
+                # match must precede the generic /v1/forks/{tip}/export
+                # branch below.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.export_fork_sync_range(params)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/forks/sync/history":
                 # GET /v1/forks/sync/history?source=&tip_hash=&kind=&
                 # min_height=&max_height=&limit=&cursor=

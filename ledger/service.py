@@ -2294,6 +2294,256 @@ class LedgerService:
                 "attestation": attestation,
             }
 
+    SYNC_RANGE_EXPORT_PARAMS = ("source", "request_id", "mode")
+
+    @staticmethod
+    def _range_export_anchor(raw: object) -> dict | None:
+        """Structurally validate a range export anchor ``{height, block_hash}``.
+
+        Mirrors the range endpoints: ``height`` is a non-boolean non-negative
+        integer and ``block_hash`` is 64 lowercase hex characters. Returns the
+        closed ``{height, block_hash}`` anchor or None.
+        """
+        if not isinstance(raw, dict):
+            return None
+        height = raw.get("height")
+        block_hash = raw.get("block_hash")
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return None
+        if not crypto.is_hex64(block_hash):
+            return None
+        return {"height": height, "block_hash": block_hash}
+
+    def export_fork_sync_range(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/forks/sync/range/export — export one received range delivery.
+
+        The query contract mirrors ``GET /v1/forks/sync/export``: exactly the
+        three single-valued parameters ``source`` and ``request_id``
+        (non-empty) and ``mode`` (``plain``/``attested``); missing, repeated,
+        unknown or illegal parameters are 400. The plain and attested tables
+        stay separate idempotency namespaces, so ``mode`` selects the table.
+
+        Only incremental RANGE records are exportable here: a whole-chain sync
+        record (a plain record without a range payload, or an attested record
+        whose frozen attestation carries a signed candidate rather than a
+        signed range) answers 409. Unknown, expired or already-cleaned keys
+        answer 404.
+
+        A hit returns 200 with the fixed key order ``source, request_id, mode,
+        expires_at, anchor, blocks, tip, attestation``. ``anchor`` is
+        ``{height, block_hash}``; ``blocks`` is the non-empty delivered tail
+        (normalized block documents in README key order); ``tip`` is the
+        closed ``{tip_hash, height, length, status}`` summary recomputed from
+        anchor + tail. A plain record carries ``attestation: null``; an
+        attested record carries the frozen ``{public_key, version,
+        signature}`` (64/positive-int/128 lowercase hex).
+
+        Before exporting, the record is re-verified exactly like on restart:
+        the tail standalone re-validates (consecutive heights, prev_hash
+        links, recomputed block hashes and Merkle roots, tx_id/Ed25519,
+        uniqueness/ordering, pending-only-at-tip), the assembled chain (the
+        stored fork or, after adoption, the canonical prefix) is fully
+        re-validated and confirmed to be exactly the canonical anchor prefix
+        plus that tail, and the range content fingerprint is recomputed. An
+        attested record additionally re-verifies its Ed25519 signature over
+        the SHA-256 digest of the canonical
+        ``{domain:"ledger-sync-range-v1", ...}`` message under the FROZEN
+        public key, recomputes its fingerprint and checks the frozen signed
+        tip recomputes. Any mismatch silently drops the cached record (and its
+        candidate fork under the existing cache rules; the audit history is
+        untouched, no event is emitted) and answers 404; if that cleanup save
+        fails the record and fork are restored and the OSError propagates.
+        """
+        unknown = [
+            key for key in params if key not in self.SYNC_RANGE_EXPORT_PARAMS
+        ]
+        if unknown:
+            return 400, {"error": f"unknown query parameter: {sorted(unknown)[0]}"}
+        for name in self.SYNC_RANGE_EXPORT_PARAMS:
+            if name not in params:
+                return 400, {"error": f"missing query parameter: {name}"}
+        source = params["source"]
+        request_id = params["request_id"]
+        mode = params["mode"]
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "source must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "request_id must be a non-empty string"}
+        if mode not in self.SYNC_EXPORT_MODES:
+            return 400, {"error": "mode must be one of plain, attested"}
+
+        table = (
+            self.store.attested_syncs
+            if mode == SYNC_MODE_ATTESTED
+            else self.store.syncs
+        )
+        with self.store.lock:
+            # Sweep due expiries first (persisted atomically, exactly like
+            # the other sync queries): an expired record exports as 404.
+            self._prune_expired_syncs()
+            key = (source, request_id)
+            rec = table.get(key)
+            if rec is None:
+                return 404, {"error": "sync record not found"}
+            # Only incremental range records are exportable here; a
+            # whole-chain delivery in either namespace answers 409.
+            attested = rec.get("attested")
+            if mode == SYNC_MODE_PLAIN:
+                range_payload = rec.get("range")
+                if not isinstance(range_payload, dict):
+                    return 409, {
+                        "error": "only incremental range sync records are exportable"
+                    }
+            else:
+                if not isinstance(attested, dict) or not isinstance(
+                    attested.get("range"), dict
+                ):
+                    return 409, {
+                        "error": "only incremental range sync records are exportable"
+                    }
+                range_payload = attested["range"]
+
+            anchor = self._range_export_anchor(range_payload.get("anchor"))
+            if anchor is None:
+                stale = True
+                tail = None
+                blocks_tail_raw: list[dict] = []
+            else:
+                stale = False
+                tail = []
+                blocks_tail_raw = []
+                try:
+                    tail = self.store.validate_range_tail(
+                        anchor, range_payload.get("blocks")
+                    )
+                except ValueError:
+                    stale = True
+                else:
+                    blocks_tail_raw = [block.to_dict() for block in tail]
+                    if tail[-1].block_hash != rec["tip_hash"]:
+                        stale = True
+
+            # Attested records additionally re-verify the frozen signature
+            # over the canonical ledger-sync-range-v1 message, recompute the
+            # fingerprint and check the signed closed tip recomputes.
+            signed_tip: dict | None = None
+            attestation: object = None
+            if not stale and mode == SYNC_MODE_ATTESTED:
+                public_key = attested.get("public_key")
+                version = attested.get("version")
+                signature = attested.get("signature")
+                signed_tip = range_payload.get("tip")
+                if (
+                    not crypto.is_hex64(public_key)
+                    or isinstance(version, bool)
+                    or not isinstance(version, int)
+                    or version < 1
+                    or not crypto.is_hex128(signature)
+                    or not isinstance(signed_tip, dict)
+                ):
+                    stale = True
+                else:
+                    message = attested_range_message(
+                        source,
+                        request_id,
+                        rec["expires_at"],
+                        anchor,
+                        range_payload.get("blocks"),
+                        signed_tip,
+                    )
+                    digest = hashlib.sha256(message).digest()
+                    if not crypto.verify_signature(public_key, digest, signature):
+                        stale = True
+                    elif (
+                        attested_range_fingerprint(
+                            source,
+                            request_id,
+                            rec["expires_at"],
+                            anchor,
+                            range_payload.get("blocks"),
+                            signed_tip,
+                            signature,
+                        )
+                        != rec.get("fingerprint")
+                    ):
+                        stale = True
+                    attestation = {
+                        "public_key": public_key,
+                        "version": version,
+                        "signature": signature,
+                    }
+            elif not stale:
+                # Plain range: recompute the anchor + tail fingerprint.
+                if self.store.range_fingerprint(anchor, tail) != rec.get(
+                    "fingerprint"
+                ):
+                    stale = True
+
+            # Resolve the stored assembled chain (the surviving fork, or the
+            # canonical prefix once adopted) and confirm it is exactly the
+            # anchor prefix plus the delivered tail; then run the full
+            # whole-chain re-validation (genesis connection, endowment
+            # replay and pending-only-at-tip included).
+            recomputed_tip = None
+            if not stale:
+                recomputed_tip = self._range_tip_summary(anchor, tail)
+                if mode == SYNC_MODE_ATTESTED and signed_tip != recomputed_tip:
+                    stale = True
+                elif rec.get("height") is not None and (
+                    rec["height"] != recomputed_tip["height"]
+                    or rec["length"] != recomputed_tip["length"]
+                    or rec["status"] != recomputed_tip["status"]
+                ):
+                    # The frozen summary must match the recomputed delivered
+                    # chain, exactly like the restart-time summary check.
+                    stale = True
+            blocks_full = None
+            if not stale:
+                blocks_full = self._resolve_sync_blocks(rec["tip_hash"])
+                if blocks_full is None:
+                    stale = True
+                else:
+                    anchor_height = anchor["height"]
+                    if len(blocks_full) <= anchor_height + 1:
+                        stale = True
+                    else:
+                        stored_anchor = blocks_full[anchor_height]
+                        stored_tail = blocks_full[anchor_height + 1 :]
+                        if (
+                            stored_anchor.get("height") != anchor_height
+                            or stored_anchor.get("block_hash")
+                            != anchor["block_hash"]
+                            or stored_tail != blocks_tail_raw
+                        ):
+                            stale = True
+                        else:
+                            try:
+                                assembled = self.store.validate_fork_blocks(
+                                    blocks_full
+                                )
+                            except ValueError:
+                                stale = True
+                            else:
+                                if assembled[-1].block_hash != rec["tip_hash"]:
+                                    stale = True
+            if stale:
+                # Signature/digest/chain mismatch: silently drop the cache
+                # (audit history untouched, no event) and answer 404. A
+                # failed cleanup save restores record and fork and propagates.
+                self._drop_sync_record(table, key)
+                return 404, {"error": "sync record not found"}
+
+            return 200, {
+                "source": source,
+                "request_id": request_id,
+                "mode": mode,
+                "expires_at": rec["expires_at"],
+                "anchor": {"height": anchor["height"], "block_hash": anchor["block_hash"]},
+                "blocks": blocks_tail_raw,
+                "tip": recomputed_tip,
+                "attestation": attestation,
+            }
+
 
     SYNC_HISTORY_KINDS = (
         EVENT_SYNC_RECEIVED,

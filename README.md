@@ -185,6 +185,29 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   pending 末块不入池、过期清理与重启调和全部直接作用于该完整候选，规则与整链
   同步完全一致；重启按当前信任注册表重新授权，并用持久化的 range 载荷独立重算
   指纹、核对存储候选恰为 canonical 前缀加该尾部，失配记录静默丢弃。
+- **区间记录导出**：`GET /v1/forks/sync/range/export?source=S&request_id=R&mode=M`
+  按幂等键导出一条已接收的增量区间记录（整链记录仍走
+  `GET /v1/forks/sync/export`，遇 range 记录依旧 `409`）。三个参数全部必填、
+  单值，`mode` 仅允许 `plain`/`attested`（两个幂等命名空间）；缺失、重复、
+  未知参数或非法取值一律 `400`，未知、已过期或已清理的键 `404`，命中整链
+  （非 range）记录 `409`。命中返回 `200`，顶层键序固定为
+  `source, request_id, mode, expires_at, anchor, blocks, tip, attestation`：
+  `expires_at` 为非布尔整数；`anchor` 键序 `height, block_hash`（非负整数、
+  64 位小写十六进制）；`blocks` 为交付的非空尾部区块文档（README 键序）；
+  `tip` 键序 `tip_hash, height, length, status`，由 anchor+blocks 重算。
+  `plain` 记录的 `attestation` 为 `null`；`attested` 记录携带冻结的
+  `{public_key, version, signature}`（公钥 64 位小写十六进制、`version`
+  正整数、`signature` 128 位小写十六进制）。导出前按既有规则重验：尾部独立
+  重验（高度连续、prev_hash 相连、重算 block_hash 与 Merkle 根、tx_id 与
+  Ed25519、唯一且块内升序、仅末块可 pending）、拼接链整链重验并核对恰为
+  canonical 锚点前缀加该尾部、重算 range 指纹；attested 记录另按
+  `ledger-sync-range-v1` domain、冻结公钥重新验签并核对冻结 tip 重算一致。
+  任一失配按既有缓存规则静默丢弃该记录（审计历史保留、不产生事件）并返回
+  `404`；清理落盘失败恢复记录与候选并抛出 `OSError`。导出在同一把锁内从
+  存储的 fork 或（已采用时）canonical 前缀重建，不新增权威副本；重启后
+  导出结果一致。命令行为
+  `python -m ledger.cli sync-range-export --source S --request-id R --mode
+  plain|attested`，打印单行 JSON，非 2xx 退出码 1。
 
 ## 签名认证的增量区间协议
 
@@ -624,7 +647,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
 
 约定：
 
@@ -779,6 +802,15 @@ curl -s 'localhost:8080/v1/forks/sync/export?source=node-2&request_id=req-7&mode
 #         "tip_hash":"...","height":N,"length":N+1,"status":"...",
 #         "candidate":{...五字段导出文档...},"attestation":null}
 
+# 增量区间记录导出（参数约束同上；整链记录在此端点返回 409；
+# 成功顶层键序固定 source,request_id,mode,expires_at,anchor,blocks,tip,attestation，
+# tip 由 anchor+blocks 重算，plain 的 attestation 为 null，
+# attested 带冻结 {public_key,version,signature}）
+curl -s 'localhost:8080/v1/forks/sync/range/export?source=node-2&request_id=req-8&mode=plain'
+# -> 200 {"source":"node-2","request_id":"req-8","mode":"plain","expires_at":...,
+#         "anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...},
+#         "attestation":null}
+
 # 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
@@ -873,6 +905,9 @@ python -m ledger.cli sync-range --source node-2 --request-id req-8 --expires-at 
 # domain=ledger-sync-range-v1 对 SHA-256 摘要做 Ed25519 签名；非 2xx 退出码 1
 python -m ledger.cli sync-range-attested --source node-2 --request-id req-9 --expires-at 1800000000 --signing-key <64-hex-seed> '{"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...}}'
 
+# 增量区间记录导出（按幂等键，mode 仅 plain|attested；单行 JSON，非 2xx 退出 1）
+python -m ledger.cli sync-range-export --source node-2 --request-id req-8 --mode plain
+
 # 持久化来源信任：注册 / 轮换 / 撤销 / 导出 verify 信任文档
 python -m ledger.cli trust add --source node-2 --public-key <64-hex-pubkey> --expires-at 1900000000
 python -m ledger.cli trust rotate --source node-2 --public-key <64-hex-pubkey> --expires-at 1900000000 --expected-version 1
@@ -928,6 +963,7 @@ python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sy
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
 python tests/sync_export_test.py       # 同步记录导出 GET /v1/forks/sync/export（source/request_id/mode 三参数必填单值，缺失/重复/未知 400；固定键序与类型；plain 五字段 candidate+attestation null、attested 签名候选+冻结公钥/版本/签名并按 domain/冻结公钥/指纹重验；range 记录 409；未知/过期/清理后 404；fork 或 canonical 前缀重建不增副本；签名/摘要失配丢缓存留审计；清理落盘失败恢复并抛 OSError；重启一致）与 HTTP/CLI sync-export
+python tests/sync_range_export_test.py  # 区间记录导出 GET /v1/forks/sync/range/export（三参数必填单值 400；未知/过期/清理后 404；整链记录 409；固定键序 source,request_id,mode,expires_at,anchor,blocks,tip,attestation；tip 由 anchor+blocks 重算；attested 冻结公钥/版本/签名按 ledger-sync-range-v1 重验；链/Merkle/指纹/签名失配丢缓存留审计 404；清理落盘失败恢复抛 OSError；采用后 canonical 前缀重建；重启一致）与 HTTP/CLI sync-range-export
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
