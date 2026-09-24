@@ -96,6 +96,19 @@ Failures map to ``input`` (structure), ``auth`` (authorization), ``expired``
 (deadlines) and ``integrity`` (anchor/chain/signature); nothing is raised.
 Success returns ``{"ok": True, "source", "request_id", "mode", "anchor",
 "tip", "verified_tx_ids"}`` with ``verified_tx_ids`` ascending.
+
+:func:`verify_range_exports` verifies an ordered, non-empty batch of such
+range deliveries as one continuous chain. The first page's anchor must equal
+the caller-pinned ``expected_anchor``; every later page's anchor must equal
+the previous page's closed tip's ``{height, block_hash}``. Each page is
+re-verified under the same input/auth/expired/integrity rules, transaction
+ids are unique across the whole batch, and a pending block may only appear on
+the last page — a broken anchor, a height jump, a duplicate transaction or any
+block after a pending one is an ``integrity`` failure. Success returns
+``{"ok": True, "anchor", "tip", "pages", "verified_tx_ids"}`` with ``tip``
+the last page's tip, ``pages`` the page count and ``verified_tx_ids``
+ascending; failure is ``{"ok": False, "error": category}`` with category one
+of ``input/auth/expired/integrity``.
 """
 from __future__ import annotations
 
@@ -105,7 +118,7 @@ import re
 import time
 
 from . import crypto
-from .models import STATUS_CONFIRMED, Block, compute_block_hash
+from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, compute_block_hash
 from .store import GENESIS_PREV_HASH, attested_range_message
 
 # Stable error categories returned to callers.
@@ -697,27 +710,16 @@ def verify_range_export(
     ``{"ok": False, "error": category}`` on failure with category one of
     ``input/auth/expired/integrity``. Never raises for malformed input.
     """
-    current = time.time() if now is None else now
     try:
-        anchor = _validate_range_export_inputs(document, expected_anchor, trust)
-        _authenticate_range_export(document, trust, current)
-        # The caller-pinned anchor must strictly equal the delivered one.
-        if document["anchor"] != expected_anchor:
-            raise _Failure(ERR_INTEGRITY)
-        tail = _recompute_range_tail(anchor, document["blocks"])
-        tip = _range_tip_descriptor(anchor, tail)
-        _check_range_tip(document["tip"], tip)
-        if document["mode"] == "attested":
-            _verify_range_attestation(document, trust)
+        anchor, tip, verified_ids = _verify_range_page(
+            document, expected_anchor, trust, time.time() if now is None else now
+        )
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
         # Defensive: structurally unforeseeable inputs must report rather than
         # crash the verifying process.
         return {"ok": False, "error": ERR_INPUT}
-    verified_ids = sorted(
-        tx.tx_id for block in tail for tx in block.transactions
-    )
     return {
         "ok": True,
         "source": document["source"],
@@ -727,6 +729,122 @@ def verify_range_export(
         "tip": tip,
         "verified_tx_ids": verified_ids,
     }
+
+
+# Fixed success key order for a verified multi-page range batch.
+RANGE_BATCH_RESULT_KEYS = (
+    "ok",
+    "anchor",
+    "tip",
+    "pages",
+    "verified_tx_ids",
+)
+
+
+def verify_range_exports(
+    documents: object,
+    expected_anchor: object,
+    trust: object,
+    now: int | float | None = None,
+) -> dict:
+    """Verify an ordered batch of exported range deliveries as one chain.
+
+    ``documents`` must be a non-empty list of decoded
+    ``GET /v1/forks/sync/range/export`` documents (each with the exact key
+    order ``source, request_id, mode, expires_at, anchor, blocks, tip,
+    attestation``); ``expected_anchor`` is the caller-pinned
+    ``{height, block_hash}`` the first page's anchor must strictly equal;
+    ``trust`` is the local trust document applied to every page.
+
+    The pages are re-verified in order: the first page is checked against
+    ``expected_anchor``, and every later page's anchor must strictly equal the
+    previous page's closed ``tip`` reduced to ``{height, block_hash}`` — which
+    also rejects a height jump or a fork at the seam. Transaction ids must be
+    unique across the whole batch, not just inside one page, and a pending
+    block may only appear on the last page.
+
+    Returns ``{"ok": True, "anchor", "tip", "pages", "verified_tx_ids"}`` on
+    success — ``anchor`` the pinned anchor of the first page, ``tip`` the last
+    page's closed tip, ``pages`` the number of pages and
+    ``verified_tx_ids`` ascending across every page — or
+    ``{"ok": False, "error": category}`` on failure with category one of
+    ``input/auth/expired/integrity``. Never raises for malformed input.
+    """
+    current = time.time() if now is None else now
+    try:
+        if not isinstance(documents, list) or not documents:
+            raise _Failure(ERR_INPUT)
+        # The pinned anchor is validated once up front so a malformed caller
+        # anchor is an input error even before the first page is inspected.
+        anchor = _validate_range_anchor(expected_anchor)
+        _validate_range_trust(trust)
+        pages = len(documents)
+        expected = anchor
+        first_anchor: dict | None = None
+        last_tip: dict | None = None
+        seen_tx_ids: set[str] = set()
+        verified_ids: list[str] = []
+        for position, document in enumerate(documents):
+            # _verify_range_page itself rejects a page whose anchor does not
+            # strictly equal ``expected`` — the first page's pinned anchor and
+            # every later page's previous tip — so a broken seam or a height
+            # jump surfaces as integrity here.
+            page_anchor, tip, page_tx_ids = _verify_range_page(
+                document, expected, trust, current
+            )
+            if first_anchor is None:
+                first_anchor = page_anchor
+            # Transaction ids must be unique across pages, not merely within
+            # one re-verified tail.
+            duplicates = seen_tx_ids.intersection(page_tx_ids)
+            if duplicates:
+                raise _Failure(ERR_INTEGRITY)
+            seen_tx_ids.update(page_tx_ids)
+            verified_ids.extend(page_tx_ids)
+            # A pending block may only sit on the very last page: any block
+            # delivered after a pending tip breaks the continuous confirmed
+            # chain and cannot be linked to a committed predecessor.
+            if tip["status"] == STATUS_PENDING and position != pages - 1:
+                raise _Failure(ERR_INTEGRITY)
+            last_tip = tip
+            expected = {"height": tip["height"], "block_hash": tip["tip_hash"]}
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "anchor": first_anchor,
+        "tip": last_tip,
+        "pages": pages,
+        "verified_tx_ids": sorted(verified_ids),
+    }
+
+
+def _verify_range_page(
+    document: object, expected_anchor: object, trust: object, now: float
+) -> tuple[dict, dict, list[str]]:
+    """Verify one range page, returning ``(anchor, tip, verified_tx_ids)``.
+
+    Shared core of :func:`verify_range_export` (one page) and
+    :func:`verify_range_exports` (a batch chaining each page's tip into the
+    next page's expected anchor). Raises :class:`_Failure` with the public
+    error category on every defect.
+    """
+    anchor = _validate_range_export_inputs(document, expected_anchor, trust)
+    _authenticate_range_export(document, trust, now)
+    # The caller-pinned anchor must strictly equal the delivered one.
+    if document["anchor"] != expected_anchor:
+        raise _Failure(ERR_INTEGRITY)
+    tail = _recompute_range_tail(anchor, document["blocks"])
+    tip = _range_tip_descriptor(anchor, tail)
+    _check_range_tip(document["tip"], tip)
+    if document["mode"] == "attested":
+        _verify_range_attestation(document, trust)
+    verified_ids = sorted(tx.tx_id for block in tail for tx in block.transactions)
+    return anchor, tip, verified_ids
 
 
 def _validate_range_export_inputs(

@@ -615,6 +615,41 @@ verified_tx_ids}`（`verified_tx_ids` 为尾部全部交易按 tx_id 升序）�
 `input`/`auth`/`expired`/`integrity`；任何畸形输入都不抛异常。CLI
 成功退出 0、失败退出 1。
 
+## 多页增量区间的离线连续校验
+
+一份较大的增量可能由多页导出文档按顺序组成。
+`ledger.light_client.verify_range_exports(documents, expected_anchor, trust,
+now=None) -> dict` 接收一个**非空数组**，每个元素都是一份八键顺序固定
+（`source, request_id, mode, expires_at, anchor, blocks, tip,
+attestation`）的区间导出文档，并把它们当作一条连续链逐页复验。
+
+- **逐页复验**：每一页都独立套用单页 `verify_range_export` 的全部
+  input/auth/expired/integrity 规则（结构、授权、期限、尾部重算、tip 摘要、
+  attested 签名）。
+- **锚点链接**：首页的 `anchor` 必须严格等于调用方钉住的
+  `expected_anchor = {height, block_hash}`；此后每页的 `anchor` 必须严格
+  等于**前一页闭合 tip** 的 `{height, block_hash}`。断锚、高度跳高或分叉
+  都归 `integrity`。
+- **跨页交易唯一**：tx_id 在整批范围内唯一（不仅是页内/块内），跨页重复
+  归 `integrity`。
+- **pending 只许末页**：任何一页（无论是否最后一页）的非末块为 pending 仍是
+  该页的 `integrity`；此外若某页以 pending 收尾而其后还有页面，则整批归
+  `integrity`——pending 之后不得再交付区块。
+
+成功返回固定键序 `{ok, anchor, tip, pages, verified_tx_ids}`：`anchor` 为
+首页钉住的锚点，`tip` 为**末页**的闭合 tip，`pages` 为页数（N），
+`verified_tx_ids` 为全部页面交易按 tx_id 升序。失败返回
+`{ok: false, error}`，`error` 仅取 `input`/`auth`/`expired`/`integrity`；
+数组为空、元素不是对象、锚点/trust 形状非法等均为 `input`，任何畸形输入都
+不抛异常。
+
+CLI 入口为 `python -m ledger.cli verify-range-batch --exports FILE|-
+--trust TRUST --anchor-height H --anchor-hash HASH`：`FILE` 读取导出文档的
+JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打印单行
+`{"ok":true,"anchor":{...},"tip":{...},"pages":N,"verified_tx_ids":[...]}`
+退出 0；任何核验失败、文件不可读、JSON 解析失败或锚点参数非法均打印
+`{"ok":false,"error":"..."}` 退出 1。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -1022,6 +1057,15 @@ cat range-export.json | python -m ledger.cli verify-range --export - --trust tru
 # -> 成功单行 {"ok":true,"source":...,"request_id":...,"mode":...,"anchor":{...},
 #    "tip":{...},"verified_tx_ids":[...]} 退出 0；
 #    失败单行 {"ok":false,"error":"input"|"auth"|"expired"|"integrity"} 退出 1
+
+# 多页增量区间的离线连续校验（--exports - 从标准输入读取导出文档数组）
+python -m ledger.cli verify-range-batch --exports range-exports.json --trust trust.json \
+    --anchor-height 8 --anchor-hash <64hex>
+cat range-exports.json | python -m ledger.cli verify-range-batch --exports - --trust trust.json \
+    --anchor-height 8 --anchor-hash <64hex>
+# -> 成功单行 {"ok":true,"anchor":{...},"tip":{...},"pages":N,
+#    "verified_tx_ids":[...]} 退出 0；
+#    失败单行 {"ok":false,"error":"input"|"auth"|"expired"|"integrity"} 退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -1049,6 +1093,7 @@ python tests/sync_range_export_test.py  # 区间记录导出 GET /v1/forks/sync/
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/range_export_verify_test.py  # 区间导出离线核验 verify_range_export（固定顶层键序、expected_anchor 严格相等、尾部重算与 pending 末块、tip 摘要、plain allowlist+attestation null、attested 钉住公钥+ledger-sync-range-v1 签名、input/auth/expired/integrity 分类、CLI verify-range 文件/stdin/退出码）
+python tests/range_export_batch_verify_test.py  # 多页增量区间离线连续核验 verify_range_exports（非空数组、逐页复验、首锚=expected_anchor 后锚=前页 tip{height,block_hash}、断锚/跳高/重叠 integrity、tx_id 跨页唯一、pending 只许末页、成功键序 ok,anchor,tip,pages,verified_tx_ids 升序、input/auth/expired/integrity 分类、CLI verify-range-batch 文件/stdin/退出码）
 python tests/source_key_history_test.py  # 来源公钥历史 source_key_history（注册写版本1及事件号、轮换递增记新事件、撤销保留历史、原子落盘回滚；GET /v1/trust 固定键序 genesis_hash,sources,allowlist,audit_signers,source_key_history 与项键序 version,public_key,activated_event_id；重启逐字节保留、旧快照内存重建不强制写盘、历史结构/事件不符 StateRecoveryError；verify_range_export 按 attestation.version 取历史公钥并匹配 attestation.public_key，未知项 auth、签名错 integrity、无历史旧规、畸形 input；HTTP 线序）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI

@@ -5,7 +5,8 @@ index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
-verify/audit-verify/consistency and offline verify-range subcommands.
+verify/audit-verify/consistency and offline verify-range/verify-range-batch
+subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -783,6 +784,44 @@ def _range_anchor_arg(height_raw: str, hash_raw: str) -> dict | None:
     return {"height": height, "block_hash": hash_raw}
 
 
+def cmd_verify_range_batch(args: argparse.Namespace) -> int:
+    """Offline verification of a batch of exported incremental range pages.
+
+    Reads a JSON array of range-export documents (the
+    ``GET /v1/forks/sync/range/export`` responses, in delivery order) from
+    ``--exports FILE`` or standard input (``-``), pins the first page's
+    expected anchor with ``--anchor-height``/``--anchor-hash`` and checks
+    every page against the local trust document. The pages must chain
+    continuously (each page's anchor is the previous page's tip), tx_ids must
+    be unique across the batch and a pending block may only appear on the last
+    page. Prints one JSON line in the verifier's fixed key order and exits 0
+    on success, 1 on any failure; unreadable files, non-JSON input and illegal
+    anchor arguments all report ``{"ok": false, "error": "input"}``.
+    """
+    from .light_client import verify_range_exports
+
+    try:
+        if args.exports == "-":
+            documents = json.loads(sys.stdin.read())
+        else:
+            with open(args.exports, "r", encoding="utf-8") as fh:
+                documents = json.load(fh)
+        with open(args.trust, "r", encoding="utf-8") as fh:
+            trust = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON inputs are reported in the same envelope as
+        # every other verification failure.
+        body = {"ok": False, "error": "input"}
+    else:
+        expected_anchor = _range_anchor_arg(args.anchor_height, args.anchor_hash)
+        if expected_anchor is None:
+            body = {"ok": False, "error": "input"}
+        else:
+            body = verify_range_exports(documents, expected_anchor, trust)
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -1127,6 +1166,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="expected anchor block hash (64 lowercase hex chars)",
     )
     p_verify_range.set_defaults(func=cmd_verify_range)
+
+    p_verify_range_batch = sub.add_parser(
+        "verify-range-batch",
+        help="offline-verify an ordered batch of incremental range deliveries "
+        "as one continuous chain against a pinned anchor and a trust document",
+    )
+    p_verify_range_batch.add_argument(
+        "--exports",
+        required=True,
+        metavar="FILE|-",
+        help="JSON array of range-export documents in delivery order, or - "
+        "to read it from standard input",
+    )
+    p_verify_range_batch.add_argument(
+        "--trust",
+        required=True,
+        help="local trust JSON file (sources, allowlist)",
+    )
+    p_verify_range_batch.add_argument(
+        "--anchor-height",
+        required=True,
+        help="expected anchor height of the first page (non-negative integer)",
+    )
+    p_verify_range_batch.add_argument(
+        "--anchor-hash",
+        required=True,
+        help="expected anchor block hash of the first page (64 lowercase hex)",
+    )
+    p_verify_range_batch.set_defaults(func=cmd_verify_range_batch)
 
     # Source-trust management: `trust <action> ...`.
     p_trust = sub.add_parser("trust", help="manage trusted sources and export the trust document")
