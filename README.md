@@ -541,6 +541,43 @@ tx_id 升序的已验证交易列表）；带状态扩展的束成功时另含�
 | `integrity` | 签名错误、链重算不一致（创世块/prev_hash/tx_id/签名/Merkle/block_hash）、response 与链尾不符，或状态锚点未知/pending/哈希不符 |
 | `proof` | proof 重复、字段与区块不一致、Merkle 路径无效或指向 pending 链尾；状态 proof 的账户不在锚点集合、index 不符、`height`+`account` 重复或 `verify_account_proof` 失败 |
 
+## 区间导出的离线校验
+
+不连接服务端也能核验一份已接收增量区间的导出文档：
+`ledger.light_client.verify_range_export(document, expected_anchor, trust,
+now=None) -> dict` 直接接收已解码的
+`GET /v1/forks/sync/range/export` 响应、调用方钉住的
+`expected_anchor = {height, block_hash}` 与本地信任文档。CLI 入口为
+`python -m ledger.cli verify-range --export FILE|- --trust TRUST
+--anchor-height H --anchor-hash HASH`（`-` 从标准输入读），不发起任何网络
+请求。
+
+- **结构（input）**：document 顶层键序必须恰为 `source, request_id, mode,
+  expires_at, anchor, blocks, tip, attestation`；`mode` 仅取
+  `plain`/`attested`；`anchor`/`expected_anchor` 为 `{height,
+  block_hash}`（非布尔非负整数、64 位小写十六进制）；`tip` 恰为
+  `{tip_hash, height, length, status}`；attested 的 `attestation` 恰为
+  `{public_key, version, signature}`（64 位十六进制公钥、正整数版本、
+  128 位十六进制签名）；trust 的 `sources`/`allowlist` 形状同离线
+  verify。文件不可读、JSON 解析失败或锚点参数非法同样返回 `input`。
+- **授权（auth）**：`plain` 要求来源在 `allowlist` 中且
+  `attestation` 为 `null`；`attested` 要求来源在 `trust.sources` 中且
+  attestation 携带的 `public_key` 与钉住公钥一致。
+- **期限（expired）**：文档的 `expires_at` 与对应信任条目的
+  `expires_at` 逐一检查，`<= now` 即过期。
+- **完整性（integrity）**：`expected_anchor` 必须严格等于文档的
+  `anchor`；随后从该锚点独立重验交付尾部（高度自 `anchor.height + 1`
+  连续、`prev_hash` 链接、逐笔 tx_id 与 Ed25519 签名、tx_id 全尾唯一且
+  块内升序、Merkle 根与区块哈希重算、pending 只能在末块；原始值类型
+  缺陷仍归 `input`），闭合 `tip` 摘要必须等于重算结果；attested 再按
+  钉住公钥验证 `ledger-sync-range-v1` canonical JSON 摘要的 Ed25519
+  签名。
+
+成功返回固定键序 `{ok, source, request_id, mode, anchor, tip,
+verified_tx_ids}`（`verified_tx_ids` 为尾部全部交易按 tx_id 升序），
+失败返回 `{ok: false, error}` 且 `error` 仅取
+`input`/`auth`/`expired`/`integrity`；任何畸形输入都不抛异常。CLI
+成功退出 0、失败退出 1。
 
 ## 审计导出的离线校验
 
@@ -646,8 +683,8 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名） |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
 
@@ -940,6 +977,15 @@ cat ledger_state.json | python -m ledger.cli consistency -
 python -m ledger.cli verify --bundle bundle.json --trust trust.json
 cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
 # -> 成功单行 {"ok":true,...} 退出 0；失败单行 {"ok":false,"error":"..."} 退出 1
+
+# 区间导出的离线校验（不连接服务端；--export - 从标准输入读取导出文档）
+python -m ledger.cli verify-range --export range-export.json --trust trust.json \
+    --anchor-height 8 --anchor-hash <64hex>
+cat range-export.json | python -m ledger.cli verify-range --export - --trust trust.json \
+    --anchor-height 8 --anchor-hash <64hex>
+# -> 成功单行 {"ok":true,"source":...,"request_id":...,"mode":...,"anchor":{...},
+#    "tip":{...},"verified_tx_ids":[...]} 退出 0；
+#    失败单行 {"ok":false,"error":"input"|"auth"|"expired"|"integrity"} 退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -966,6 +1012,7 @@ python tests/sync_export_test.py       # 同步记录导出 GET /v1/forks/sync/e
 python tests/sync_range_export_test.py  # 区间记录导出 GET /v1/forks/sync/range/export（三参数必填单值 400；未知/过期/清理后 404；整链记录 409；固定键序 source,request_id,mode,expires_at,anchor,blocks,tip,attestation；tip 由 anchor+blocks 重算；attested 冻结公钥/版本/签名按 ledger-sync-range-v1 重验；链/Merkle/指纹/签名失配丢缓存留审计 404；清理落盘失败恢复抛 OSError；采用后 canonical 前缀重建；重启一致）与 HTTP/CLI sync-range-export
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
+python tests/range_export_verify_test.py  # 区间导出离线核验 verify_range_export（固定顶层键序、expected_anchor 严格相等、尾部重算与 pending 末块、tip 摘要、plain allowlist+attestation null、attested 钉住公钥+ledger-sync-range-v1 签名、input/auth/expired/integrity 分类、CLI verify-range 文件/stdin/退出码）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）

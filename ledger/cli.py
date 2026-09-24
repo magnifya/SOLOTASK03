@@ -5,7 +5,7 @@ index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
-verify/audit-verify/consistency subcommands.
+verify/audit-verify/consistency and offline verify-range subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -729,6 +729,57 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if body.get("ok") is True else 1
 
 
+def cmd_verify_range(args: argparse.Namespace) -> int:
+    """Offline verification of one exported incremental range delivery.
+
+    Reads the export document (the ``GET /v1/forks/sync/range/export``
+    response) from ``--export FILE`` or standard input (``-``), pins the
+    expected anchor with ``--anchor-height``/``--anchor-hash`` and checks the
+    source against the local trust document. Prints a single JSON line in the
+    verifier's fixed key order and exits 0 on success, 1 on any failure;
+    unreadable files, non-JSON input and illegal anchor arguments all report
+    ``{"ok": false, "error": "input"}``.
+    """
+    from .light_client import verify_range_export
+
+    try:
+        if args.export == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.export, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+        with open(args.trust, "r", encoding="utf-8") as fh:
+            trust = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON inputs are reported in the same envelope as
+        # every other verification failure.
+        body = {"ok": False, "error": "input"}
+    else:
+        expected_anchor = _range_anchor_arg(args.anchor_height, args.anchor_hash)
+        if expected_anchor is None:
+            body = {"ok": False, "error": "input"}
+        else:
+            body = verify_range_export(document, expected_anchor, trust)
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
+def _range_anchor_arg(height_raw: str, hash_raw: str) -> dict | None:
+    """Close the ``--anchor-height``/``--anchor-hash`` pair into an anchor.
+
+    Both are validated as raw strings so an illegal value reports ``input``
+    (exit 1) instead of an argparse usage error: the height must be a
+    non-negative decimal integer and the hash 64 lowercase hex characters.
+    """
+    try:
+        height = int(height_raw, 10)
+    except ValueError:
+        return None
+    if height < 0 or not crypto.is_hex64(hash_raw):
+        return None
+    return {"height": height, "block_hash": hash_raw}
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -1045,6 +1096,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="local trust JSON file (genesis_hash, sources, allowlist)",
     )
     p_verify.set_defaults(func=cmd_verify)
+
+    p_verify_range = sub.add_parser(
+        "verify-range",
+        help="offline-verify an exported incremental range delivery against "
+        "a pinned anchor and a local trust document",
+    )
+    p_verify_range.add_argument(
+        "--export",
+        required=True,
+        metavar="FILE|-",
+        help="range export JSON file, or - to read it from standard input",
+    )
+    p_verify_range.add_argument(
+        "--trust",
+        required=True,
+        help="local trust JSON file (sources, allowlist)",
+    )
+    p_verify_range.add_argument(
+        "--anchor-height",
+        required=True,
+        help="expected anchor height (non-negative integer)",
+    )
+    p_verify_range.add_argument(
+        "--anchor-hash",
+        required=True,
+        help="expected anchor block hash (64 lowercase hex chars)",
+    )
+    p_verify_range.set_defaults(func=cmd_verify_range)
 
     # Source-trust management: `trust <action> ...`.
     p_trust = sub.add_parser("trust", help="manage trusted sources and export the trust document")

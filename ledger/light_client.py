@@ -71,6 +71,25 @@ On success :func:`verify_bundle` returns
 ``"verified_accounts"`` (ascending) when the state extension was verified —
 on failure ``{"ok": False, "error": category}`` with category one of
 ``input/auth/expired/integrity/proof``.
+
+:func:`verify_range_export` verifies one exported incremental range delivery
+(the ``GET /v1/forks/sync/range/export`` document, top-level key order
+``source, request_id, mode, expires_at, anchor, blocks, tip, attestation``)
+offline against a caller-pinned expected anchor and the local trust document.
+The expected anchor must strictly equal the document's ``anchor``; the
+delivered tail is recomputed standalone from that anchor (consecutive
+heights, prev_hash linkage, per-transaction tx_id and Ed25519 signatures,
+unique and block-ascending tx_ids, Merkle roots, block hashes,
+pending-only-at-tip) and the closed ``tip`` summary must recompute. A
+``plain`` export must come from an unexpired ``allowlist`` entry and carry
+``attestation: null``; an ``attested`` export must come from an unexpired
+``trust.sources`` entry whose pinned key matches the attestation and verifies
+the Ed25519 signature over the SHA-256 digest of the canonical
+``ledger-sync-range-v1`` message. Failures map to ``input`` (structure),
+``auth`` (authorization), ``expired`` (deadlines) and ``integrity``
+(anchor/chain/signature); nothing is raised. Success returns
+``{"ok": True, "source", "request_id", "mode", "anchor", "tip",
+"verified_tx_ids"}`` with ``verified_tx_ids`` ascending.
 """
 from __future__ import annotations
 
@@ -81,7 +100,7 @@ import time
 
 from . import crypto
 from .models import STATUS_CONFIRMED, Block, compute_block_hash
-from .store import GENESIS_PREV_HASH
+from .store import GENESIS_PREV_HASH, attested_range_message
 
 # Stable error categories returned to callers.
 ERR_INPUT = "input"
@@ -622,3 +641,331 @@ def _verify_state_proofs(bundle: dict, blocks: list[Block]) -> list[str]:
             raise _Failure(ERR_PROOF)
         verified.append(account)
     return sorted(verified)
+
+
+# -- range export verification -------------------------------------------------
+
+# The exact top-level key order of one exported incremental range delivery,
+# exactly as GET /v1/forks/sync/range/export emits it.
+RANGE_EXPORT_KEYS = (
+    "source",
+    "request_id",
+    "mode",
+    "expires_at",
+    "anchor",
+    "blocks",
+    "tip",
+    "attestation",
+)
+
+RANGE_EXPORT_MODES = ("plain", "attested")
+
+# The exact key sets of the export's nested closed documents.
+_RANGE_ANCHOR_KEYS = frozenset(("height", "block_hash"))
+_RANGE_TIP_KEYS = frozenset(DESCRIPTOR_FIELDS)
+_RANGE_ATTESTATION_KEYS = frozenset(("public_key", "version", "signature"))
+
+
+def verify_range_export(
+    document: object,
+    expected_anchor: object,
+    trust: object,
+    now: int | float | None = None,
+) -> dict:
+    """Verify one exported incremental range delivery offline.
+
+    ``document`` is the decoded ``GET /v1/forks/sync/range/export`` response
+    (top-level keys exactly ``source, request_id, mode, expires_at, anchor,
+    blocks, tip, attestation`` in that order); ``expected_anchor`` is the
+    caller-pinned ``{height, block_hash}`` the document's anchor must strictly
+    equal; ``trust`` is the local trust document (``sources`` pins
+    ``{public_key, expires_at}`` per attested source, ``allowlist`` maps
+    keyless plain sources to their expiry).
+
+    Returns ``{"ok": True, "source", "request_id", "mode", "anchor", "tip",
+    "verified_tx_ids"}`` on success (tx_ids ascending) or
+    ``{"ok": False, "error": category}`` on failure with category one of
+    ``input/auth/expired/integrity``. Never raises for malformed input.
+    """
+    current = time.time() if now is None else now
+    try:
+        anchor = _validate_range_export_inputs(document, expected_anchor, trust)
+        _authenticate_range_export(document, trust, current)
+        # The caller-pinned anchor must strictly equal the delivered one.
+        if document["anchor"] != expected_anchor:
+            raise _Failure(ERR_INTEGRITY)
+        tail = _recompute_range_tail(anchor, document["blocks"])
+        tip = _range_tip_descriptor(anchor, tail)
+        _check_range_tip(document["tip"], tip)
+        if document["mode"] == "attested":
+            _verify_range_attestation(document, trust)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    verified_ids = sorted(
+        tx.tx_id for block in tail for tx in block.transactions
+    )
+    return {
+        "ok": True,
+        "source": document["source"],
+        "request_id": document["request_id"],
+        "mode": document["mode"],
+        "anchor": anchor,
+        "tip": tip,
+        "verified_tx_ids": verified_ids,
+    }
+
+
+def _validate_range_export_inputs(
+    document: object, expected_anchor: object, trust: object
+) -> dict:
+    """Structural validation of the export document, the pinned anchor and
+    the trust document. Returns the closed ``{height, block_hash}`` anchor.
+    """
+    if not isinstance(document, dict):
+        raise _Failure(ERR_INPUT)
+    if tuple(document.keys()) != RANGE_EXPORT_KEYS:
+        raise _Failure(ERR_INPUT)
+    source = document["source"]
+    if not isinstance(source, str) or not source:
+        raise _Failure(ERR_INPUT)
+    request_id = document["request_id"]
+    if not isinstance(request_id, str) or not request_id:
+        raise _Failure(ERR_INPUT)
+    if document["mode"] not in RANGE_EXPORT_MODES:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(document["expires_at"]):
+        raise _Failure(ERR_INPUT)
+    anchor = _validate_range_anchor(document["anchor"])
+    # The expected anchor is validated for shape here; the strict equality
+    # binding itself is an integrity check after authorization and expiry.
+    _validate_range_anchor(expected_anchor)
+    blocks = document["blocks"]
+    if not isinstance(blocks, list) or not blocks:
+        raise _Failure(ERR_INPUT)
+    tip = document["tip"]
+    if not isinstance(tip, dict) or set(tip) != _RANGE_TIP_KEYS:
+        raise _Failure(ERR_INPUT)
+    if document["mode"] == "attested":
+        attestation = document["attestation"]
+        if not isinstance(attestation, dict) or set(attestation) != (
+            _RANGE_ATTESTATION_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(attestation["public_key"]):
+            raise _Failure(ERR_INPUT)
+        version = attestation["version"]
+        if not _is_int(version) or version < 1:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex128(attestation["signature"]):
+            raise _Failure(ERR_INPUT)
+    _validate_range_trust(trust)
+    return anchor
+
+
+def _validate_range_anchor(raw: object) -> dict:
+    """Structural validation of a ``{height, block_hash}`` anchor document."""
+    if not isinstance(raw, dict) or set(raw) != _RANGE_ANCHOR_KEYS:
+        raise _Failure(ERR_INPUT)
+    height = raw["height"]
+    if not _is_int(height) or height < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["block_hash"]):
+        raise _Failure(ERR_INPUT)
+    return {"height": height, "block_hash": raw["block_hash"]}
+
+
+def _validate_range_trust(trust: object) -> None:
+    """Structural validation of the trust document's ``sources``/``allowlist``.
+
+    Mirrors the bundle verifier's trust rules; a ``genesis_hash`` is not
+    required here because the caller pins the range anchor directly.
+    """
+    if not isinstance(trust, dict):
+        raise _Failure(ERR_INPUT)
+    sources = trust.get("sources", {})
+    if not isinstance(sources, dict):
+        raise _Failure(ERR_INPUT)
+    for name, entry in sources.items():
+        if not isinstance(name, str) or not name or not isinstance(entry, dict):
+            raise _Failure(ERR_INPUT)
+        if not _is_int(entry.get("expires_at")):
+            raise _Failure(ERR_INPUT)
+        public_key = entry.get("public_key")
+        # Ed25519 public keys are 32 raw bytes, i.e. 64 hex characters.
+        if not isinstance(public_key, str) or not _HEX32_RE.fullmatch(public_key):
+            raise _Failure(ERR_INPUT)
+    allowlist = trust.get("allowlist", {})
+    if not isinstance(allowlist, dict):
+        raise _Failure(ERR_INPUT)
+    for name, expires_at in allowlist.items():
+        if not isinstance(name, str) or not name or not _is_int(expires_at):
+            raise _Failure(ERR_INPUT)
+
+
+def _authenticate_range_export(document: dict, trust: dict, now: float) -> None:
+    """Check mode-specific source authorization and every deadline.
+
+    A ``plain`` export is only acceptable from an allowlisted source and must
+    carry ``attestation: null``; an ``attested`` export must come from a
+    ``sources`` entry. All deadlines are checked before any integrity work:
+    an expired, correctly-signed export is still unusable.
+    """
+    source = document["source"]
+    mode = document["mode"]
+    sources = trust.get("sources", {})
+    allowlist = trust.get("allowlist", {})
+    if mode == "plain":
+        if source not in allowlist:
+            raise _Failure(ERR_AUTH)
+        # A plain export carrying an attestation is not a plain delivery.
+        if document["attestation"] is not None:
+            raise _Failure(ERR_AUTH)
+    elif source not in sources:
+        raise _Failure(ERR_AUTH)
+
+    if document["expires_at"] <= now:
+        raise _Failure(ERR_EXPIRED)
+    if mode == "plain":
+        if allowlist[source] <= now:
+            raise _Failure(ERR_EXPIRED)
+    elif sources[source]["expires_at"] <= now:
+        raise _Failure(ERR_EXPIRED)
+
+
+def _recompute_range_tail(anchor: dict, blocks_raw: list) -> list[Block]:
+    """Recompute and validate the delivered tail standalone from the anchor.
+
+    Mirrors the node's own range-tail rules: heights run consecutively from
+    ``anchor.height + 1``, the first ``prev_hash`` is the anchor hash and
+    later ones link internally, every transaction's tx_id and Ed25519
+    signature verifies, tx_ids are unique across the tail and ascending
+    inside each block, Merkle roots and block hashes recompute, and a pending
+    block may only sit at the tail tip. Every field is checked on the *raw*
+    JSON value; type/domain defects (non-integer or negative height,
+    non-positive or non-integer amount) are reported as ``input``, while
+    recomputation mismatches stay ``integrity``.
+    """
+    blocks: list[Block] = []
+    seen_tx_ids: set[str] = set()
+    for position, block_raw in enumerate(blocks_raw):
+        if not isinstance(block_raw, dict):
+            raise _Failure(ERR_INTEGRITY)
+        height = block_raw.get("height")
+        prev_hash = block_raw.get("prev_hash")
+        merkle_root = block_raw.get("merkle_root")
+        block_hash = block_raw.get("block_hash")
+        status = block_raw.get("status")
+        txs_raw = block_raw.get("transactions")
+        # Same rule as the whole-chain recomputation: a height of the wrong
+        # type or sign is a field-type defect (input), never coerced.
+        if not _is_int(height) or height < 0:
+            raise _Failure(ERR_INPUT)
+        if not isinstance(prev_hash, str):
+            raise _Failure(ERR_INTEGRITY)
+        if not crypto.is_hex64(merkle_root) or not crypto.is_hex64(block_hash):
+            raise _Failure(ERR_INTEGRITY)
+        if status not in ("pending", "confirmed") or not isinstance(txs_raw, list):
+            raise _Failure(ERR_INTEGRITY)
+        if height != anchor["height"] + 1 + position:
+            raise _Failure(ERR_INTEGRITY)
+        expected_prev = (
+            anchor["block_hash"] if position == 0 else blocks[position - 1].block_hash
+        )
+        if prev_hash != expected_prev:
+            raise _Failure(ERR_INTEGRITY)
+        if position < len(blocks_raw) - 1 and status != STATUS_CONFIRMED:
+            # A pending block may only sit at the tail tip.
+            raise _Failure(ERR_INTEGRITY)
+
+        tx_ids: list[str] = []
+        for raw_tx in txs_raw:
+            if not isinstance(raw_tx, dict):
+                raise _Failure(ERR_INTEGRITY)
+            sender = raw_tx.get("from")
+            recipient = raw_tx.get("to")
+            amount = raw_tx.get("amount")
+            signature = raw_tx.get("signature")
+            stored_tx_id = raw_tx.get("tx_id")
+            if not isinstance(sender, str) or not sender:
+                raise _Failure(ERR_INTEGRITY)
+            if not isinstance(recipient, str) or not recipient:
+                raise _Failure(ERR_INTEGRITY)
+            # The raw amount must already be a non-boolean positive integer —
+            # never a coercible string, float or bool.
+            if not _is_int(amount) or amount <= 0:
+                raise _Failure(ERR_INPUT)
+            if not isinstance(signature, str) or not signature:
+                raise _Failure(ERR_INTEGRITY)
+            message = crypto.canonical_message(sender, recipient, amount)
+            tx_id = crypto.compute_tx_id(message)
+            if stored_tx_id != tx_id or not crypto.is_hex64(stored_tx_id):
+                raise _Failure(ERR_INTEGRITY)
+            if not crypto.verify_signature(sender, message, signature):
+                raise _Failure(ERR_INTEGRITY)
+            if tx_id in seen_tx_ids:
+                raise _Failure(ERR_INTEGRITY)
+            seen_tx_ids.add(tx_id)
+            tx_ids.append(tx_id)
+        if tx_ids != sorted(tx_ids):
+            raise _Failure(ERR_INTEGRITY)
+        if crypto.merkle_root(tx_ids) != merkle_root:
+            raise _Failure(ERR_INTEGRITY)
+        recomputed = compute_block_hash(height, prev_hash, merkle_root)
+        if recomputed != block_hash:
+            raise _Failure(ERR_INTEGRITY)
+        # Parsed only after every raw field has checked out; never trusted for
+        # the comparison decisions above.
+        try:
+            blocks.append(Block.from_dict(block_raw))
+        except (KeyError, TypeError, ValueError):
+            raise _Failure(ERR_INTEGRITY) from None
+    return blocks
+
+
+def _range_tip_descriptor(anchor: dict, tail: list[Block]) -> dict:
+    """Recompute the delivered chain's closed tip summary from anchor + tail."""
+    tip = tail[-1]
+    return {
+        "tip_hash": tip.block_hash,
+        "height": tip.height,
+        "length": anchor["height"] + 1 + len(tail),
+        "status": tip.status,
+    }
+
+
+def _check_range_tip(supplied: dict, descriptor: dict) -> None:
+    """The export's closed tip summary must equal the recomputed descriptor."""
+    for field in DESCRIPTOR_FIELDS:
+        if supplied[field] != descriptor[field]:
+            raise _Failure(ERR_INTEGRITY)
+
+
+def _verify_range_attestation(document: dict, trust: dict) -> None:
+    """Verify the attested export's Ed25519 signature under the pinned key.
+
+    The attestation's ``public_key`` must be exactly the key the trust
+    document pins for the source (a mismatched credential is an authorization
+    failure); the signature covers the SHA-256 digest of the canonical
+    ``ledger-sync-range-v1`` message over the document's delivered
+    ``source, request_id, expires_at, anchor, blocks, tip``.
+    """
+    source = document["source"]
+    attestation = document["attestation"]
+    pinned = trust.get("sources", {})[source]["public_key"]
+    if attestation["public_key"] != pinned:
+        raise _Failure(ERR_AUTH)
+    message = attested_range_message(
+        source,
+        document["request_id"],
+        document["expires_at"],
+        document["anchor"],
+        document["blocks"],
+        document["tip"],
+    )
+    digest = hashlib.sha256(message).digest()
+    if not crypto.verify_signature(pinned, digest, attestation["signature"]):
+        raise _Failure(ERR_INTEGRITY)
