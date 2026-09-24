@@ -82,14 +82,20 @@ heights, prev_hash linkage, per-transaction tx_id and Ed25519 signatures,
 unique and block-ascending tx_ids, Merkle roots, block hashes,
 pending-only-at-tip) and the closed ``tip`` summary must recompute. A
 ``plain`` export must come from an unexpired ``allowlist`` entry and carry
-``attestation: null``; an ``attested`` export must come from an unexpired
-``trust.sources`` entry whose pinned key matches the attestation and verifies
-the Ed25519 signature over the SHA-256 digest of the canonical
-``ledger-sync-range-v1`` message. Failures map to ``input`` (structure),
-``auth`` (authorization), ``expired`` (deadlines) and ``integrity``
-(anchor/chain/signature); nothing is raised. Success returns
-``{"ok": True, "source", "request_id", "mode", "anchor", "tip",
-"verified_tx_ids"}`` with ``verified_tx_ids`` ascending.
+``attestation: null``. An ``attested`` export is authenticated by key
+version: when the trust document carries a ``source_key_history`` mapping,
+the attestation's ``version`` selects that source's historical public key
+(which must equal the attestation's ``public_key``); an unknown source or
+version, or a mismatched key, is ``auth`` and a signature that fails to
+verify is ``integrity`` — so an export signed under a since-rotated key
+stays verifiable. A trust document without ``source_key_history`` keeps the
+legacy rule: the source must be an unexpired ``trust.sources`` entry whose
+pinned key matches the attestation and verifies the Ed25519 signature over
+the SHA-256 digest of the canonical ``ledger-sync-range-v1`` message.
+Failures map to ``input`` (structure), ``auth`` (authorization), ``expired``
+(deadlines) and ``integrity`` (anchor/chain/signature); nothing is raised.
+Success returns ``{"ok": True, "source", "request_id", "mode", "anchor",
+"tip", "verified_tx_ids"}`` with ``verified_tx_ids`` ascending.
 """
 from __future__ import annotations
 
@@ -665,6 +671,10 @@ _RANGE_ANCHOR_KEYS = frozenset(("height", "block_hash"))
 _RANGE_TIP_KEYS = frozenset(DESCRIPTOR_FIELDS)
 _RANGE_ATTESTATION_KEYS = frozenset(("public_key", "version", "signature"))
 
+# The exact key set of one GET /v1/trust source_key_history item, in its
+# documented key order version, public_key, activated_event_id.
+_HISTORY_ENTRY_KEYS = ("version", "public_key", "activated_event_id")
+
 
 def verify_range_export(
     document: object,
@@ -782,7 +792,12 @@ def _validate_range_trust(trust: object) -> None:
     """Structural validation of the trust document's ``sources``/``allowlist``.
 
     Mirrors the bundle verifier's trust rules; a ``genesis_hash`` is not
-    required here because the caller pins the range anchor directly.
+    required here because the caller pins the range anchor directly. The
+    optional GET /v1/trust ``source_key_history`` mapping is validated too:
+    each source maps to a non-empty ascending array of
+    ``{version, public_key, activated_event_id}`` items whose versions are
+    dense from 1 with strictly ascending activation ids, both numeric fields
+    non-boolean positive integers and the public key 64 lowercase hex.
     """
     if not isinstance(trust, dict):
         raise _Failure(ERR_INPUT)
@@ -804,15 +819,61 @@ def _validate_range_trust(trust: object) -> None:
     for name, expires_at in allowlist.items():
         if not isinstance(name, str) or not name or not _is_int(expires_at):
             raise _Failure(ERR_INPUT)
+    history = trust.get("source_key_history")
+    if history is not None:
+        if not isinstance(history, dict):
+            raise _Failure(ERR_INPUT)
+        for name, entries in history.items():
+            if not isinstance(name, str) or not name:
+                raise _Failure(ERR_INPUT)
+            if not isinstance(entries, list) or not entries:
+                raise _Failure(ERR_INPUT)
+            last_activated = None
+            for position, entry in enumerate(entries):
+                if not isinstance(entry, dict) or set(entry) != set(
+                    _HISTORY_ENTRY_KEYS
+                ):
+                    raise _Failure(ERR_INPUT)
+                version = entry.get("version")
+                public_key = entry.get("public_key")
+                activated = entry.get("activated_event_id")
+                # Versions are dense from 1; both numeric fields are plain
+                # (non-boolean) positive integers.
+                if not _is_int(version) or version != position + 1:
+                    raise _Failure(ERR_INPUT)
+                if not isinstance(public_key, str) or not _HEX32_RE.fullmatch(public_key):
+                    raise _Failure(ERR_INPUT)
+                if not _is_int(activated) or activated < 1:
+                    raise _Failure(ERR_INPUT)
+                if last_activated is not None and activated <= last_activated:
+                    raise _Failure(ERR_INPUT)
+                last_activated = activated
+
+
+def _has_key_history(trust: dict) -> bool:
+    """Whether the trust document carries a source_key_history mapping."""
+    return "source_key_history" in trust
 
 
 def _authenticate_range_export(document: dict, trust: dict, now: float) -> None:
     """Check mode-specific source authorization and every deadline.
 
     A ``plain`` export is only acceptable from an allowlisted source and must
-    carry ``attestation: null``; an ``attested`` export must come from a
-    ``sources`` entry. All deadlines are checked before any integrity work:
-    an expired, correctly-signed export is still unusable.
+    carry ``attestation: null``. An ``attested`` export is authorized one of
+    two ways:
+
+    * the trust document carries a ``source_key_history`` mapping (the new
+      rule): the source must appear in the mapping — the historical public key
+      matching and signature verification happen by attestation version in
+      :func:`_verify_range_attestation`; the trust ``sources`` entry and its
+      deadline play no role, so a delivery signed under a since-rotated or
+      revoked key still authenticates as long as the document itself is
+      unexpired;
+    * the mapping is absent (the legacy rule): the source must be a
+      ``sources`` entry whose unexpired deadline is checked.
+
+    All deadlines are checked before any integrity work: an expired,
+    correctly-signed export is still unusable.
     """
     source = document["source"]
     mode = document["mode"]
@@ -824,6 +885,12 @@ def _authenticate_range_export(document: dict, trust: dict, now: float) -> None:
         # A plain export carrying an attestation is not a plain delivery.
         if document["attestation"] is not None:
             raise _Failure(ERR_AUTH)
+    elif _has_key_history(trust):
+        # Historical-key authorization: the source (and later the attestation
+        # version) must resolve in the mapping; the current registry entry is
+        # deliberately not consulted.
+        if source not in trust["source_key_history"]:
+            raise _Failure(ERR_AUTH)
     elif source not in sources:
         raise _Failure(ERR_AUTH)
 
@@ -832,7 +899,8 @@ def _authenticate_range_export(document: dict, trust: dict, now: float) -> None:
     if mode == "plain":
         if allowlist[source] <= now:
             raise _Failure(ERR_EXPIRED)
-    elif sources[source]["expires_at"] <= now:
+    elif not _has_key_history(trust) and sources[source]["expires_at"] <= now:
+        # Legacy rule only: the pinned registry entry's own deadline applies.
         raise _Failure(ERR_EXPIRED)
 
 
@@ -947,17 +1015,40 @@ def _check_range_tip(supplied: dict, descriptor: dict) -> None:
 def _verify_range_attestation(document: dict, trust: dict) -> None:
     """Verify the attested export's Ed25519 signature under the pinned key.
 
-    The attestation's ``public_key`` must be exactly the key the trust
-    document pins for the source (a mismatched credential is an authorization
-    failure); the signature covers the SHA-256 digest of the canonical
-    ``ledger-sync-range-v1`` message over the document's delivered
-    ``source, request_id, expires_at, anchor, blocks, tip``.
+    Two rules, selected by the trust document:
+
+    * with ``source_key_history`` present, the attestation's ``version``
+      selects the source's historical public key; the source not appearing in
+      the mapping, or the attestation version not being one of its dense
+      versions, is an authorization failure (``auth``), as is a mismatch
+      between the attestation's ``public_key`` and that historical key. The
+      Ed25519 signature is then checked over the SHA-256 digest of the
+      canonical ``ledger-sync-range-v1`` message — a wrong signature is an
+      integrity failure. The attestation's version is already structurally
+      guaranteed to be a positive integer.
+    * without the mapping (legacy rule), the attestation's ``public_key``
+      must be exactly the key the trust document pins in ``sources`` for the
+      source (a mismatched credential is an authorization failure) and the
+      same signature check follows.
     """
     source = document["source"]
     attestation = document["attestation"]
-    pinned = trust.get("sources", {})[source]["public_key"]
-    if attestation["public_key"] != pinned:
-        raise _Failure(ERR_AUTH)
+    if _has_key_history(trust):
+        history = trust["source_key_history"].get(source)
+        if history is None:
+            raise _Failure(ERR_AUTH)
+        version = attestation["version"]
+        # Versions are structurally guaranteed dense from 1, so a valid
+        # version simply indexes the ascending history.
+        if version < 1 or version > len(history):
+            raise _Failure(ERR_AUTH)
+        pinned = history[version - 1]["public_key"]
+        if attestation["public_key"] != pinned:
+            raise _Failure(ERR_AUTH)
+    else:
+        pinned = trust.get("sources", {})[source]["public_key"]
+        if attestation["public_key"] != pinned:
+            raise _Failure(ERR_AUTH)
     message = attested_range_message(
         source,
         document["request_id"],

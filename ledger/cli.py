@@ -581,7 +581,10 @@ def cmd_trust_revoke(args: argparse.Namespace) -> int:
 
 def cmd_trust_export(args: argparse.Namespace) -> int:
     status, body = _request("GET", f"{args.base_url}/v1/trust", None)
-    return _emit(status, body)
+    # The trust document has a contract-fixed key order (genesis_hash,
+    # sources, allowlist, audit_signers, source_key_history), so it is printed
+    # in insertion order rather than alphabetically.
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_trust_allowlist_add(args: argparse.Namespace) -> int:

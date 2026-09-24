@@ -74,6 +74,12 @@ STATE_VERSION = 10
 TRUST_ACTIVE = "active"
 TRUST_REVOKED = "revoked"
 
+# Source-key lifecycle audit event kinds; service.EVENT_SOURCE_* constants
+# mirror these literal values.
+EVENT_SOURCE_REGISTERED = "source_registered"
+EVENT_SOURCE_ROTATED = "source_rotated"
+EVENT_SOURCE_REVOKED = "source_revoked"
+
 # Sync delivery modes: the plain endpoints (/v1/forks/sync[/range]) and the
 # signature-attested endpoint (/v1/forks/sync/attested) share one record table
 # but keep separate idempotency namespaces via a 3-key (mode, source,
@@ -293,6 +299,15 @@ class LedgerStore:
         # Persistent source-trust registry keyed by source identifier. Each
         # record is {"public_key", "expires_at", "version", "status"}.
         self.trust_sources: dict[str, dict] = {}
+        # Persistent per-source public-key history keyed by source identifier.
+        # Each value is the ascending list of every key the source ever held:
+        # {"version", "public_key", "activated_event_id"}; registration
+        # activates version 1 at the source_registered event id and each
+        # rotation appends the new version at its source_rotated event id.
+        # Revocation never removes an entry — the full history is retained so
+        # offline verification can still pick the key that signed an older
+        # attestation.
+        self.source_key_history: dict[str, list[dict]] = {}
         # Keyless trust allowlist {source: expires_at}; preserved verbatim and
         # surfaced by GET /v1/trust for offline light clients.
         self.allowlist: dict[str, int] = {}
@@ -361,6 +376,7 @@ class LedgerStore:
                 self.syncs = {}
                 self.attested_syncs = {}
                 self.trust_sources = {}
+                self.source_key_history = {}
                 self.allowlist = {}
                 self.audit_events = []
                 self.audit_checkpoint = audit.make_checkpoint([])
@@ -386,7 +402,8 @@ class LedgerStore:
                 #           syncs, trust_sources, allowlist, audit_events,
                 #           expired_records, audit_checkpoint, audit_repair,
                 #           signer_state, recorded_state_root, attested_syncs,
-                #           attested_expired_records)
+                #           attested_expired_records, source_key_history,
+                #           key_history_repair)
                 valid.append(
                     (
                         parsed[2],
@@ -406,6 +423,8 @@ class LedgerStore:
                         parsed[13],
                         parsed[14],
                         parsed[15],
+                        parsed[16],
+                        parsed[17],
                     )
                 )
 
@@ -420,7 +439,8 @@ class LedgerStore:
             # item layout: (generation, path, chain, pending, forks,
             # initial_balance, syncs, trust_sources, allowlist, audit_events,
             # expired_records, audit_checkpoint, audit_repair, signer_state,
-            # recorded_state_root, attested_syncs, attested_expired_records)
+            # recorded_state_root, attested_syncs, attested_expired_records,
+            # source_key_history, key_history_repair)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -434,6 +454,7 @@ class LedgerStore:
                 top[0][13][1],
                 top[0][14],
                 top[0][15],
+                top[0][17],
             )
             for item in top[1:]:
                 if (
@@ -450,6 +471,7 @@ class LedgerStore:
                         item[13][1],
                         item[14],
                         item[15],
+                        item[17],
                     )
                     != reference
                 ):
@@ -485,6 +507,8 @@ class LedgerStore:
                 recorded_state_root,
                 attested_syncs,
                 attested_expired_records,
+                source_key_history,
+                key_history_repair,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -554,6 +578,7 @@ class LedgerStore:
             self.syncs = syncs
             self.attested_syncs = attested_syncs
             self.trust_sources = trust_sources
+            self.source_key_history = source_key_history
             self.allowlist = allowlist
             self.audit_events = audit_events
             self.audit_checkpoint = audit_checkpoint
@@ -572,7 +597,9 @@ class LedgerStore:
             # events + legacy hash-chain completion + signer migration)
             # atomically so the next restart never re-derives or duplicates
             # anything; with nothing to reconcile no write happens and the
-            # recovered generation is kept byte-for-byte.
+            # recovered generation is kept byte-for-byte. (A legacy snapshot's
+            # reconstructed key history is loaded in memory and persisted by
+            # the next ordinary mutating save, never forced here.)
             if backfilled or audit_repair or signer_migration:
                 self.save()
 
@@ -608,6 +635,7 @@ class LedgerStore:
         audit_signer_history: list[dict] | None = None,
         state_root: str | None = None,
         attested_syncs: dict[tuple[str, str], dict] | None = None,
+        source_key_history: dict[str, list[dict]] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -623,7 +651,9 @@ class LedgerStore:
         different ``state_root`` describes a different confirmed state and is
         a conflict rather than a quietly accepted alternative. The attested
         sync table (with its frozen key/version/signature/signed form) is its
-        own section so it participates independently of plain syncs.
+        own section so it participates independently of plain syncs. The
+        per-source key history participates too: a twin disagreeing about a
+        source's historical public keys is a conflict.
         """
         sync_records = [
             {
@@ -663,6 +693,10 @@ class LedgerStore:
             {"source": source, **rec}
             for source, rec in sorted((trust_sources or {}).items())
         ]
+        key_history_records = [
+            {"source": source, "keys": [dict(entry) for entry in history]}
+            for source, history in sorted((source_key_history or {}).items())
+        ]
         return json.dumps(
             {
                 "initial_balance": initial_balance,
@@ -675,6 +709,7 @@ class LedgerStore:
                 "syncs": sync_records,
                 "attested_syncs": attested_records,
                 "trust_sources": trust_records,
+                "source_key_history": key_history_records,
                 "allowlist": dict(sorted((allowlist or {}).items())),
                 "audit_events": audit_events or [],
                 "audit_checkpoint": audit_checkpoint
@@ -740,6 +775,10 @@ class LedgerStore:
         bool,
         tuple[dict | None, list[dict], bool],
         str | None,
+        dict[tuple[str, str], dict],
+        list[tuple[str, str, dict]],
+        dict[str, list[dict]],
+        bool,
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -937,6 +976,18 @@ class LedgerStore:
         signer_state = self._parse_persisted_audit_signer(
             state, chain, audit_events, audit_checkpoint, path, state_version
         )
+        # The per-source key history is reconstructed from the registry and the
+        # audit log and either cross-checked against the persisted section
+        # (current snapshots) or used to migrate a pre-feature snapshot that
+        # records none. Any structural/event mismatch is corruption.
+        source_key_history, _key_history_repair = (
+            self._parse_persisted_source_key_history(
+                data.get("source_key_history"),
+                trust_sources,
+                audit_events,
+                path,
+            )
+        )
         syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
         )
@@ -979,6 +1030,8 @@ class LedgerStore:
             recorded_state_root,
             attested_syncs,
             attested_expired,
+            source_key_history,
+            _key_history_repair,
         )
 
     @staticmethod
@@ -1368,6 +1421,257 @@ class LedgerStore:
                 "status": status,
             }
         return sources
+
+    # Source-key lifecycle event kinds reconstructing the persistent key
+    # history; literal values identical to service.EVENT_SOURCE_*.
+    _SOURCE_KEY_EVENT_KINDS = (
+        "source_registered",
+        "source_rotated",
+        "source_revoked",
+    )
+
+    def _reconstruct_source_key_history(
+        self,
+        trust_sources: dict[str, dict],
+        audit_events: list[dict],
+        path: str,
+    ) -> dict[str, list[dict]]:
+        """Reconstruct every registry source's expected key history.
+
+        The history is reconstructed from the authoritative trust registry and
+        the append-only audit log: for each registered source, version 1 is
+        activated by its ``source_registered`` event and every later version by
+        the matching ``source_rotated`` event, in dense ascending order; a
+        ``source_revoked`` event must reference the current latest key without
+        adding one. The registry record's current version/public key must agree
+        with the reconstructed latest entry. Lifecycle events for sources
+        absent from the registry are ignored (the registry itself is parsed
+        strictly and never loses entries on a healthy node; an event for an
+        unknown source belongs to no reconstructed history). Any malformed
+        event payload of a registry source, a version gap, a non-register first
+        event, a key rotation after revocation or a registry/history mismatch
+        is snapshot corruption and fails recovery with StateRecoveryError.
+        """
+
+        def fail(reason: str) -> None:
+            raise StateRecoveryError(path, reason)
+
+        reconstructed: dict[str, list[dict]] = {}
+        for source, record in trust_sources.items():
+            entries: list[dict] = []
+            revoked = False
+            next_version = 1
+            for event in audit_events:
+                kind = event.get("kind")
+                if kind not in self._SOURCE_KEY_EVENT_KINDS:
+                    continue
+                if event.get("source") != source:
+                    continue
+                event_id = event.get("event_id")
+                public_key = event.get("public_key")
+                expires_at = event.get("expires_at")
+                version = event.get("version")
+                if not crypto.is_hex64(public_key):
+                    fail(
+                        f"audit event {event_id} ({kind}) for source "
+                        f"{source!r} has an invalid public_key"
+                    )
+                if isinstance(expires_at, bool) or not isinstance(expires_at, int):
+                    fail(
+                        f"audit event {event_id} ({kind}) for source "
+                        f"{source!r} expires_at must be an integer"
+                    )
+                if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+                    fail(
+                        f"audit event {event_id} ({kind}) for source "
+                        f"{source!r} needs a positive version"
+                    )
+                if not isinstance(event_id, int) or event_id < 1:
+                    fail(
+                        f"audit event for source {source!r} ({kind}) has an "
+                        "invalid event_id"
+                    )
+                if kind == "source_registered":
+                    if entries or version != 1:
+                        fail(
+                            f"source {source!r} key history must start with a "
+                            "single version 1 source_registered event"
+                        )
+                    entries.append(
+                        {
+                            "version": 1,
+                            "public_key": public_key,
+                            "activated_event_id": event_id,
+                        }
+                    )
+                    next_version = 2
+                elif kind == "source_rotated":
+                    if revoked:
+                        fail(
+                            f"source {source!r} has a source_rotated event "
+                            "after source_revoked"
+                        )
+                    if not entries or version != next_version:
+                        fail(
+                            f"source {source!r} key history versions must be "
+                            "dense from 1"
+                        )
+                    entries.append(
+                        {
+                            "version": version,
+                            "public_key": public_key,
+                            "activated_event_id": event_id,
+                        }
+                    )
+                    next_version = version + 1
+                else:  # source_revoked
+                    if not entries or version != entries[-1]["version"]:
+                        fail(
+                            f"source {source!r} source_revoked event does not "
+                            "match its current key version"
+                        )
+                    if public_key != entries[-1]["public_key"]:
+                        fail(
+                            f"source {source!r} source_revoked event does not "
+                            "match its current public key"
+                        )
+                    revoked = True
+            if not entries:
+                fail(f"trust source {source!r} has no source_registered event")
+            if len(entries) != record["version"]:
+                fail(
+                    f"trust source {source!r} version {record['version']} does "
+                    f"not match {len(entries)} key lifecycle events"
+                )
+            if entries[-1]["public_key"] != record["public_key"]:
+                fail(
+                    f"trust source {source!r} public key does not match its "
+                    "latest key lifecycle event"
+                )
+            reconstructed[source] = entries
+        return reconstructed
+
+    def _parse_persisted_source_key_history(
+        self,
+        raw: object,
+        trust_sources: dict[str, dict],
+        audit_events: list[dict],
+        path: str,
+    ) -> tuple[dict[str, list[dict]], bool]:
+        """Parse and cross-check the persisted per-source key history.
+
+        Returns ``(history, needs_repair)``. A snapshot written before the
+        feature (no ``source_key_history`` section) is accepted: the history is
+        reconstructed in memory from the registry and the audit log and is
+        naturally persisted by the next ordinary save — no migration write (and
+        therefore no recovery-time generation bump) is forced. A present
+        section is strictly validated structurally and must equal that
+        reconstruction entry for entry; any discrepancy — malformed items,
+        non-dense versions, wrong activation events or keys, or a registry
+        source missing from the section — is snapshot corruption and raises
+        StateRecoveryError, never silently rewritten. A history item whose
+        source vanished from the registry is orphan data (exactly like a sync
+        record whose source disappeared): it is pruned in memory rather than
+        failing canonical-chain recovery.
+        """
+
+        def fail(reason: str) -> None:
+            raise StateRecoveryError(path, reason)
+
+        expected = self._reconstruct_source_key_history(
+            trust_sources, audit_events, path
+        )
+        if raw is None:
+            # Legacy snapshot: reconstruct in memory; the next ordinary save
+            # persists it, so no migration write is forced on restart.
+            return (
+                {source: list(entries) for source, entries in expected.items()},
+                False,
+            )
+        if not isinstance(raw, list):
+            fail("'source_key_history' must be a list")
+        history: dict[str, list[dict]] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                fail("source_key_history entry must be an object")
+            source = item.get("source")
+            keys = item.get("keys")
+            if not isinstance(source, str) or not source:
+                fail("source_key_history entry needs a non-empty source")
+            if source in history:
+                fail(f"duplicate source_key_history for source {source!r}")
+            if not isinstance(keys, list) or not keys:
+                fail(f"source_key_history for {source!r} must be a non-empty list")
+            entries: list[dict] = []
+            for position, entry in enumerate(keys):
+                if not isinstance(entry, dict) or set(entry) != {
+                    "version",
+                    "public_key",
+                    "activated_event_id",
+                }:
+                    fail(
+                        f"source_key_history item for {source!r} must contain "
+                        "exactly version, public_key and activated_event_id"
+                    )
+                version = entry["version"]
+                public_key = entry["public_key"]
+                activated = entry["activated_event_id"]
+                if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+                    fail(
+                        f"source_key_history item for {source!r} needs a "
+                        "positive integer version"
+                    )
+                if version != position + 1:
+                    fail(
+                        f"source_key_history versions for {source!r} must be "
+                        "dense from 1"
+                    )
+                if not crypto.is_hex64(public_key):
+                    fail(
+                        f"source_key_history item for {source!r} public_key "
+                        "must be 64 lowercase hex characters"
+                    )
+                if isinstance(activated, bool) or not isinstance(activated, int) or activated < 0:
+                    fail(
+                        f"source_key_history item for {source!r} "
+                        "activated_event_id must be a non-negative integer"
+                    )
+                if position > 0 and activated <= entries[-1]["activated_event_id"]:
+                    fail(
+                        f"source_key_history activation ids for {source!r} "
+                        "must be strictly ascending"
+                    )
+                entries.append(
+                    {
+                        "version": version,
+                        "public_key": public_key,
+                        "activated_event_id": activated,
+                    }
+                )
+            history[source] = entries
+        # Cross-check against the registry + audit-log reconstruction.
+        repaired = False
+        for source in list(history):
+            if source not in trust_sources:
+                # The registry source vanished (the snapshot may have been
+                # tampered by dropping a registry entry): its key history is
+                # orphan data, pruned exactly like the source's sync records
+                # rather than failing the canonical chain recovery.
+                del history[source]
+                repaired = True
+                continue
+            if history[source] != expected[source]:
+                fail(
+                    f"source_key_history for {source!r} does not match its "
+                    "registry record and audit events"
+                )
+        for source, entries in expected.items():
+            if source not in history:
+                # Current code writes one history entry per registered source;
+                # a present section missing a registry source is corruption
+                # rather than a legacy migration.
+                fail(f"source_key_history is missing source {source!r}")
+        return history, repaired
 
     @staticmethod
     def _parse_persisted_allowlist(raw: object, path: str) -> dict[str, int]:
@@ -2396,6 +2700,17 @@ class LedgerStore:
             data["trust_sources"] = [
                 {"source": source, **self.trust_sources[source]}
                 for source in sorted(self.trust_sources)
+            ]
+        # The per-source public-key history is persisted in the same atomic
+        # document as the registry and the audit events it is reconstructed
+        # from: one entry per registered source, keys ascending by version.
+        if self.source_key_history:
+            data["source_key_history"] = [
+                {
+                    "source": source,
+                    "keys": [dict(entry) for entry in self.source_key_history[source]],
+                }
+                for source in sorted(self.source_key_history)
             ]
         if self.allowlist:
             data["allowlist"] = dict(sorted(self.allowlist.items()))

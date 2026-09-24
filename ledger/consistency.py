@@ -13,7 +13,8 @@ filesystem::
       "audit_checkpoint":  {"event_id", "event_hash"},
       "audit_events":      optional append-only hash-chained event list,
       # extensions, accepted but not re-verified here:
-      "forks" / "syncs" / "attested_syncs" / "trust_sources" / "allowlist",
+      "forks" / "syncs" / "attested_syncs" / "trust_sources" / "allowlist"
+      / "source_key_history",
     }
 
 Verification recomputes, from the raw JSON values:
@@ -69,6 +70,7 @@ KNOWN_OPTIONAL_SECTIONS = (
     "attested_syncs",
     "trust_sources",
     "allowlist",
+    "source_key_history",
 )
 
 # Raw keys every stored block document must carry ("status" defaults to

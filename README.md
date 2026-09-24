@@ -253,24 +253,30 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
 ## 持久化来源信任与审计
 
 轻客户端所需的信任文档不再靠手工维护：节点持久化保存**来源信任注册表**、
-**allowlist** 与一条**只增审计事件流**，与链、状态、候选分叉和同步记录在同一份
-原子快照中落盘；任何一次信任变更都与其审计事件一起提交，写盘失败一并回滚。
+**allowlist**、**来源公钥历史（source_key_history）** 与一条**只增审计事件流**，
+与链、状态、候选分叉和同步记录在同一份原子快照中落盘；任何一次信任变更都与其
+审计事件和公钥历史一起提交，写盘失败一并回滚。
 
 - **注册来源**：`POST /v1/trust/sources`，请求体
   `{"source","public_key","expires_at"}`：`source` 必须是非空字符串，
   `public_key` 必须是 64 位小写十六进制（Ed25519 公钥），`expires_at` 必须是
   整数（拒绝布尔）。合法新建返回 `201` 与 `{source, public_key, expires_at,
-  version, status}`，其中 `version=1`、`status=active`；同一来源以**完全相同**
-  的 `(public_key, expires_at)` 重试是幂等的，返回 `200` 与既有记录（不产生
-  新版本或新事件）；内容不同返回 `409`；字段非法返回 `400`。
+  version, status}`，其中 `version=1`、`status=active`，并在
+  `source_key_history` 中以 `source_registered` 事件号写入版本 1 公钥；同一
+  来源以**完全相同**的 `(public_key, expires_at)` 重试是幂等的，返回 `200`
+  与既有记录（不产生新版本或新事件，也不追加历史）；内容不同返回 `409`；
+  字段非法返回 `400`。
 - **轮换公钥**：`POST /v1/trust/sources/{source}/rotate`，请求体
   `{"public_key","expires_at","expected_version"}`。未知来源或已撤销来源
   返回 `404`；`expected_version` 与当前版本不符返回 `409`；成功则安装新公钥、
-  保持 `active`、`version` 递增并返回 `200`。
+  保持 `active`、`version` 递增，在同一原子写入中追加 `source_rotated`
+  事件并把 `{version: 新版本, public_key: 新公钥, activated_event_id: 该事件号}`
+  追加到该来源公钥历史（旧公钥永久保留），返回 `200`。
 - **撤销来源**：`POST /v1/trust/sources/{source}/revoke`，请求体
   `{"expected_version"}`。未知来源 `404`；版本不符 `409`；成功置
   `status=revoked` 并返回 `200`，对已撤销来源以记录版本重复撤销是幂等的
-  （仍 `200`，不产生第二条事件）。已撤销来源不能再轮换。
+  （仍 `200`，不产生第二条事件）。已撤销来源不能再轮换，**其公钥历史原样
+  保留**，以便旧 attestation 仍可离线核验。
 - **allowlist 新增**：`POST /v1/trust/allowlist`，请求体
   `{"source","expires_at"}`：`source` 必须是非空字符串，`expires_at` 必须是
   非布尔整数（过去时刻合法，表示一条已过期条目）。合法新建在同一原子写入中
@@ -285,14 +291,22 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   allowlist 仅供**离线 verify**，绝不改变 `POST /v1/forks/sync` 的授权。
   过期条目**不自动删除**，verify 按既有规则返回 `expired`。
 - **信任文档**：`GET /v1/trust` 返回离线验证所需的
-  `{"genesis_hash","sources","allowlist","audit_signers"}`：`genesis_hash` 固定
+  `{"genesis_hash","sources","allowlist","audit_signers","source_key_history"}`
+  （顶层即此固定键序）：`genesis_hash` 固定
   锚定 canonical 创世块；`sources[source] = {public_key, expires_at}` 只包含
   **未过期且未撤销**的来源（`expires_at <= now` 即剔除）；持久化的
   `allowlist[source] = expires_at` 原样保留；`audit_signers` 按 `version`
   升序列出节点曾经持有的**全部**审计检查点签名公钥，每项
   `{version, public_key, activated_event_id}`，首版 `activated_event_id` 为
-  `0`。该文档可直接作为 `ledger verify --trust` 的输入，其 `genesis_hash`
-  与 `audit_signers` 也供 `ledger audit-verify --trust` 使用。
+  `0`；`source_key_history` 是 source 到其**历史公钥**数组（数组按 `version`
+  升序）的映射，每项恰为 `{version, public_key, activated_event_id}`，其中
+  `version` 与 `activated_event_id` 均为非布尔正整数、`public_key` 为 64 位
+  小写十六进制。注册写入版本 1（`activated_event_id` 即
+  `source_registered` 事件号），轮换递增版本并以 `source_rotated` 事件号
+  激活新公钥，撤销**保留全部历史**。该文档可直接作为 `ledger verify
+  --trust` 的输入，其 `genesis_hash` 与 `audit_signers` 也供 `ledger
+  audit-verify --trust` 使用，`source_key_history` 供离线区间导出的 attested
+  核验按版本选取历史公钥。
 - **审计查询**：`GET /v1/audit/events` 支持 `source`、`kind`、`cursor`、
   `limit`（默认 50，范围 1–200）过滤；数值参数必须是首位非 0 的十进制
   （`0` 合法），非法值 `400`。事件按 `event_id` 升序分页，返回
@@ -334,13 +348,23 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   删除记录 `allowlist_added` / `allowlist_removed`（均携带 `source` 与
   `expires_at`）。事件一旦写入永不删除：候选
   **采用或过期之后仍可按 source/kind 分页查询**。
-- **恢复语义**：信任注册表、allowlist 与审计流是权威配置而非可丢弃缓存，
-  快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；allowlist
-  条目键唯一且 `expires_at` 为非布尔整数；`event_id`
+- **恢复语义**：信任注册表、allowlist、来源公钥历史与审计流是权威配置而非
+  可丢弃缓存，快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；
+  allowlist 条目键唯一且 `expires_at` 为非布尔整数；`event_id`
   必须从 1 起连续无重复；每条 `prev_hash`/`event_hash` 必须重算一致，
   `audit_checkpoint` 必须钉住真实链头，`allowlist_added`/`allowlist_removed`
   事件也必须携带非空 `source` 与整数 `expires_at`）。任一项损坏，或同代
-  快照内容冲突，都抛 `StateRecoveryError`，绝不静默新建。审计检查点签名者同样严格校验：
+  快照内容冲突，都抛 `StateRecoveryError`，绝不静默新建。来源公钥历史同样
+  严格校验：持久化的 `source_key_history` 每项必须结构合法（版本自 1 起
+  稠密、`activated_event_id` 升序、公钥为 64 位小写 hex），并与注册表记录
+  及审计事件完全一致——版本 1 必须由该来源的 `source_registered` 事件
+  （public_key/version 相符）激活，之后每个版本由 id/version/public_key
+  完全对应的 `source_rotated` 事件激活，撤销后不得再轮换，注册表当前
+  version/public_key 必须等于历史最新条目；历史结构错误、版本不稠密、激活
+  事件号或公钥对不上，都抛 `ledger.store.StateRecoveryError(path, reason)`。
+  写于该特性之前、没有 `source_key_history` 区段的旧快照不强制迁移写盘：
+  恢复时在内存中由注册表与审计事件重建（同代冲突判定、generation 均不受
+  影响），下一次普通写盘自然持久化。审计检查点签名者同样严格校验：
   存储的私钥必须能推导出对应公钥，签名者历史版本必须自 1 起连续、首版在
   事件 0 激活、激活事件 id 升序，当前签名者必须等于最新历史条目，版本 1
   之后的每个版本都必须由一条 id/version/public_key 完全对应的
@@ -502,8 +526,9 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
   confirmed_transactions, index, state_root, height, block_hash, siblings}`
   八字段文档（缺失、额外或类型错误都判 `input`）。
 - **trust**：`{genesis_hash, sources, allowlist}`（`GET /v1/trust` 还会带
-  `audit_signers`，轻客户端束验证忽略该额外字段）。`genesis_hash` 锚定创世
-  块；`sources[source] = {public_key, expires_at}`；
+  `audit_signers` 与 `source_key_history`，轻客户端束验证忽略这两个额外
+  字段）。`genesis_hash` 锚定创世块；
+  `sources[source] = {public_key, expires_at}`；
   `allowlist[source] = expires_at`。
 - **来源与签名**：`source` 必须受信（在 `sources` 或 `allowlist` 中）且未过期
   （束、来源、allowlist 三处的 `expires_at` 逐一检查，`<= now` 即过期）。
@@ -559,19 +584,30 @@ now=None) -> dict` 直接接收已解码的
   `{tip_hash, height, length, status}`；attested 的 `attestation` 恰为
   `{public_key, version, signature}`（64 位十六进制公钥、正整数版本、
   128 位十六进制签名）；trust 的 `sources`/`allowlist` 形状同离线
-  verify。文件不可读、JSON 解析失败或锚点参数非法同样返回 `input`。
+  verify，可选的 `source_key_history` 为 source 到非空升序数组的映射，
+  每项恰为 `{version, public_key, activated_event_id}`（版本自 1 起稠密、
+  `version`/`activated_event_id` 为非布尔正整数、公钥 64 位小写 hex、
+  激活事件号严格升序），任何形状/类型不符都返回 `input`。文件不可读、
+  JSON 解析失败或锚点参数非法同样返回 `input`。
 - **授权（auth）**：`plain` 要求来源在 `allowlist` 中且
-  `attestation` 为 `null`；`attested` 要求来源在 `trust.sources` 中且
-  attestation 携带的 `public_key` 与钉住公钥一致。
-- **期限（expired）**：文档的 `expires_at` 与对应信任条目的
-  `expires_at` 逐一检查，`<= now` 即过期。
+  `attestation` 为 `null`。`attested` 分两种情形：信任文档**携带**
+  `source_key_history` 时，按 attestation 的 `version` 从该来源的历史
+  公钥数组中选取公钥——来源不在映射中、版本号不是其稠密版本之一、或
+  attestation 的 `public_key` 与该历史公钥不一致，都返回 `auth`（来源
+  是否已轮换/撤销、是否仍在 `sources` 中均不影响，旧公钥签的旧导出仍可
+  核验）；信任文档**不带** `source_key_history` 时沿用旧规：来源必须在
+  `trust.sources` 中且 attestation 的 `public_key` 与钉住公钥一致。
+- **期限（expired）**：文档的 `expires_at` 必须晚于 `now`；`plain`
+  另查对应 allowlist 条目的期限，旧规（无历史映射）下 `attested` 另查
+  `sources` 条目的期限；携带历史映射时只查文档自身的 `expires_at`
+  （历史来源没有当前期限），`<= now` 即过期。
 - **完整性（integrity）**：`expected_anchor` 必须严格等于文档的
   `anchor`；随后从该锚点独立重验交付尾部（高度自 `anchor.height + 1`
   连续、`prev_hash` 链接、逐笔 tx_id 与 Ed25519 签名、tx_id 全尾唯一且
   块内升序、Merkle 根与区块哈希重算、pending 只能在末块；原始值类型
-  缺陷仍归 `input`），闭合 `tip` 摘要必须等于重算结果；attested 再按
-  钉住公钥验证 `ledger-sync-range-v1` canonical JSON 摘要的 Ed25519
-  签名。
+  缺陷仍归 `input`），闭合 `tip` 摘要必须等于重算结果；attested 再用
+  选中的公钥（历史公钥或旧规钉住公钥）验证 `ledger-sync-range-v1`
+  canonical JSON 摘要的 Ed25519 签名，签名验不过为 `integrity`。
 
 成功返回固定键序 `{ok, source, request_id, mode, anchor, tip,
 verified_tx_ids}`（`verified_tx_ids` 为尾部全部交易按 tx_id 升序），
@@ -1013,6 +1049,7 @@ python tests/sync_range_export_test.py  # 区间记录导出 GET /v1/forks/sync/
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/range_export_verify_test.py  # 区间导出离线核验 verify_range_export（固定顶层键序、expected_anchor 严格相等、尾部重算与 pending 末块、tip 摘要、plain allowlist+attestation null、attested 钉住公钥+ledger-sync-range-v1 签名、input/auth/expired/integrity 分类、CLI verify-range 文件/stdin/退出码）
+python tests/source_key_history_test.py  # 来源公钥历史 source_key_history（注册写版本1及事件号、轮换递增记新事件、撤销保留历史、原子落盘回滚；GET /v1/trust 固定键序 genesis_hash,sources,allowlist,audit_signers,source_key_history 与项键序 version,public_key,activated_event_id；重启逐字节保留、旧快照内存重建不强制写盘、历史结构/事件不符 StateRecoveryError；verify_range_export 按 attestation.version 取历史公钥并匹配 attestation.public_key，未知项 auth、签名错 integrity、无历史旧规、畸形 input；HTTP 线序）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）

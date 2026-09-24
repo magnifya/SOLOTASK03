@@ -2885,7 +2885,7 @@ class LedgerService:
                 "status": TRUST_ACTIVE,
             }
             self.store.trust_sources[source] = record
-            self.store.append_audit_event(
+            event = self.store.append_audit_event(
                 EVENT_SOURCE_REGISTERED,
                 {
                     "source": source,
@@ -2894,11 +2894,22 @@ class LedgerService:
                     "version": 1,
                 },
             )
+            # Open the source's key history at version 1, activated by the
+            # registration event; retained forever (rotation appends, revoke
+            # keeps) so an old attested delivery stays verifiable offline.
+            self.store.source_key_history[source] = [
+                {
+                    "version": 1,
+                    "public_key": public_key,
+                    "activated_event_id": event["event_id"],
+                }
+            ]
             try:
                 self.store.save()
             except BaseException:
-                # Undo both the registry change and its event together.
+                # Undo the registry change, its event and its history together.
                 self.store.trust_sources.pop(source, None)
+                self.store.source_key_history.pop(source, None)
                 self.store.truncate_audit_events(1)
                 raise
             return 201, self._trust_record(source, record)
@@ -2935,10 +2946,11 @@ class LedgerService:
             if existing["version"] != expected_version:
                 return 409, {"error": "expected_version does not match the current version"}
             old_record = dict(existing)
+            old_history = list(self.store.source_key_history.get(source, ()))
             existing["public_key"] = public_key
             existing["expires_at"] = expires_at
             existing["version"] = old_record["version"] + 1
-            self.store.append_audit_event(
+            event = self.store.append_audit_event(
                 EVENT_SOURCE_ROTATED,
                 {
                     "source": source,
@@ -2947,10 +2959,24 @@ class LedgerService:
                     "version": existing["version"],
                 },
             )
+            # Append the new key to the source's ascending history, activated
+            # by this rotation event; previous versions are retained forever.
+            history = self.store.source_key_history.setdefault(source, [])
+            history.append(
+                {
+                    "version": existing["version"],
+                    "public_key": public_key,
+                    "activated_event_id": event["event_id"],
+                }
+            )
             try:
                 self.store.save()
             except BaseException:
                 self.store.trust_sources[source] = old_record
+                if old_history:
+                    self.store.source_key_history[source] = old_history
+                else:
+                    self.store.source_key_history.pop(source, None)
                 self.store.truncate_audit_events(1)
                 raise
             return 200, self._trust_record(source, existing)
@@ -3014,7 +3040,13 @@ class LedgerService:
         checkpoint key ever held in ascending version order as
         ``{version, public_key, activated_event_id}`` (version 1 is activated
         at event 0), so offline audit export verification can pick the key
-        that signed each checkpoint.
+        that signed each checkpoint; ``source_key_history`` maps every
+        registered source to every source key it ever held, in ascending
+        version order as ``{version, public_key, activated_event_id}``
+        (version 1 is activated at the ``source_registered`` event, each
+        rotation at its ``source_rotated`` event; revocation retains the full
+        history), so offline attested-range verification can pick the key that
+        signed an older attestation.
         """
         with self.store.lock:
             now = time.time()
@@ -3027,11 +3059,16 @@ class LedgerService:
                     "expires_at": rec["expires_at"],
                 }
             audit_signers = [dict(entry) for entry in self.store.audit_signer_history]
+            source_key_history = {
+                source: [dict(entry) for entry in history]
+                for source, history in self.store.source_key_history.items()
+            }
             return 200, {
                 "genesis_hash": self.store.chain[0].block_hash,
                 "sources": sources,
                 "allowlist": dict(self.store.allowlist),
                 "audit_signers": audit_signers,
+                "source_key_history": source_key_history,
             }
 
     # -- keyless allowlist management -----------------------------------------
