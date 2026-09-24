@@ -96,6 +96,20 @@ Failures map to ``input`` (structure), ``auth`` (authorization), ``expired``
 (deadlines) and ``integrity`` (anchor/chain/signature); nothing is raised.
 Success returns ``{"ok": True, "source", "request_id", "mode", "anchor",
 "tip", "verified_tx_ids"}`` with ``verified_tx_ids`` ascending.
+
+:func:`verify_range_exports` verifies an *ordered, non-empty array* of such
+range export documents as one continuous offline delivery. The first page is
+pinned to the caller's ``expected_anchor``; every later page's ``anchor`` must
+equal the previous page's closed ``tip`` reduced to ``{height, block_hash}``
+(a broken anchor or a height jump is ``integrity``). Each page is independently
+re-authorized, expiry-checked and recomputed with the single-page rules,
+transaction ids must be unique across *all* pages (a repeat is ``integrity``),
+and a page whose tail ends ``pending`` may only be the final page — a page
+following one is ``integrity``. Success returns ``{"ok": True, "anchor",
+"tip", "pages", "verified_tx_ids"}`` with ``anchor`` the pinned anchor of the
+first page, ``tip`` the last page's closed tip summary, ``pages`` the page
+count and ``verified_tx_ids`` ascending across the whole delivery; failure
+returns ``{"ok": False, "error": category}`` with the same four categories.
 """
 from __future__ import annotations
 
@@ -699,25 +713,15 @@ def verify_range_export(
     """
     current = time.time() if now is None else now
     try:
-        anchor = _validate_range_export_inputs(document, expected_anchor, trust)
-        _authenticate_range_export(document, trust, current)
-        # The caller-pinned anchor must strictly equal the delivered one.
-        if document["anchor"] != expected_anchor:
-            raise _Failure(ERR_INTEGRITY)
-        tail = _recompute_range_tail(anchor, document["blocks"])
-        tip = _range_tip_descriptor(anchor, tail)
-        _check_range_tip(document["tip"], tip)
-        if document["mode"] == "attested":
-            _verify_range_attestation(document, trust)
+        anchor, tip, verified_ids = _verify_range_export_page(
+            document, expected_anchor, trust, current, set()
+        )
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
         # Defensive: structurally unforeseeable inputs must report rather than
         # crash the verifying process.
         return {"ok": False, "error": ERR_INPUT}
-    verified_ids = sorted(
-        tx.tx_id for block in tail for tx in block.transactions
-    )
     return {
         "ok": True,
         "source": document["source"],
@@ -727,6 +731,110 @@ def verify_range_export(
         "tip": tip,
         "verified_tx_ids": verified_ids,
     }
+
+
+# The fixed key order of a successful multi-page verification result.
+RANGE_BATCH_RESULT_KEYS = ("ok", "anchor", "tip", "pages", "verified_tx_ids")
+
+
+def verify_range_exports(
+    documents: object,
+    expected_anchor: object,
+    trust: object,
+    now: int | float | None = None,
+) -> dict:
+    """Verify an ordered, non-empty array of range exports as one delivery.
+
+    ``documents`` must be a non-empty list of documents shaped exactly like
+    :func:`verify_range_export`'s input (each with the eight top-level keys
+    ``source, request_id, mode, expires_at, anchor, blocks, tip,
+    attestation`` in that order); ``expected_anchor`` is the caller-pinned
+    ``{height, block_hash}`` the first page's anchor must strictly equal;
+    ``trust`` is the local trust document shared by every page.
+
+    Pages are verified in order: page *N*'s anchor must equal page *N-1*'s
+    closed tip reduced to ``{height, block_hash}`` (a broken anchor or a
+    height jump is ``integrity``), transaction ids already verified on an
+    earlier page must not recur (a repeat is ``integrity``), and a page whose
+    tail ends ``pending`` may only be the final page — any page following one
+    is ``integrity``.
+
+    Returns ``{"ok": True, "anchor", "tip", "pages", "verified_tx_ids"}`` on
+    success — ``anchor`` is the pinned first-page anchor, ``tip`` the last
+    page's closed tip summary, ``pages`` the page count and
+    ``verified_tx_ids`` ascending across the whole delivery — or
+    ``{"ok": False, "error": category}`` on failure with category one of
+    ``input/auth/expired/integrity``. Never raises for malformed input.
+    """
+    current = time.time() if now is None else now
+    try:
+        if not isinstance(documents, list) or not documents:
+            raise _Failure(ERR_INPUT)
+        # The pinned anchor and the trust document are structurally validated
+        # with page one inside _verify_range_export_page (which also enforces
+        # the strict anchor equality); nothing is checked before the loop so
+        # that every defect keeps the single-page categorization.
+        seen_tx_ids: set[str] = set()
+        tip = None
+        anchor = None
+        for position, document in enumerate(documents):
+            expected = (
+                expected_anchor
+                if position == 0
+                else {"height": tip["height"], "block_hash": tip["tip_hash"]}
+            )
+            page_anchor, tip, page_ids = _verify_range_export_page(
+                document, expected, trust, current, seen_tx_ids
+            )
+            if position == 0:
+                anchor = page_anchor
+            if tip["status"] == "pending" and position != len(documents) - 1:
+                # A pending tail must be the delivery's final block: a later
+                # page cannot extend a not-yet-confirmed tip.
+                raise _Failure(ERR_INTEGRITY)
+            seen_tx_ids.update(page_ids)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "anchor": anchor,
+        "tip": tip,
+        "pages": len(documents),
+        "verified_tx_ids": sorted(seen_tx_ids),
+    }
+
+
+def _verify_range_export_page(
+    document: object,
+    expected_anchor: object,
+    trust: object,
+    current: float,
+    seen_tx_ids: set[str],
+) -> tuple[dict, dict, list[str]]:
+    """Run every single-page verification rule for one page of a delivery.
+
+    Returns ``(anchor, tip, verified_ids)`` — the closed anchor document, the
+    recomputed closed tip summary and the ascending tx_ids of the page's
+    tail. ``seen_tx_ids`` is the set of transaction ids already delivered by
+    earlier pages (empty for a standalone verification); an id recurring on
+    this page is an integrity failure, and the set is not mutated here.
+    """
+    anchor = _validate_range_export_inputs(document, expected_anchor, trust)
+    _authenticate_range_export(document, trust, current)
+    # The expected anchor (the caller's pin for page one, otherwise the prior
+    # page's closed tip) must strictly equal the delivered one.
+    if document["anchor"] != expected_anchor:
+        raise _Failure(ERR_INTEGRITY)
+    tail = _recompute_range_tail(anchor, document["blocks"], seen_tx_ids)
+    tip = _range_tip_descriptor(anchor, tail)
+    _check_range_tip(document["tip"], tip)
+    if document["mode"] == "attested":
+        _verify_range_attestation(document, trust)
+    return anchor, tip, sorted(tx.tx_id for block in tail for tx in block.transactions)
 
 
 def _validate_range_export_inputs(
@@ -904,21 +1012,27 @@ def _authenticate_range_export(document: dict, trust: dict, now: float) -> None:
         raise _Failure(ERR_EXPIRED)
 
 
-def _recompute_range_tail(anchor: dict, blocks_raw: list) -> list[Block]:
+def _recompute_range_tail(
+    anchor: dict, blocks_raw: list, prior_tx_ids: set[str] | None = None
+) -> list[Block]:
     """Recompute and validate the delivered tail standalone from the anchor.
 
     Mirrors the node's own range-tail rules: heights run consecutively from
     ``anchor.height + 1``, the first ``prev_hash`` is the anchor hash and
     later ones link internally, every transaction's tx_id and Ed25519
-    signature verifies, tx_ids are unique across the tail and ascending
-    inside each block, Merkle roots and block hashes recompute, and a pending
-    block may only sit at the tail tip. Every field is checked on the *raw*
-    JSON value; type/domain defects (non-integer or negative height,
-    non-positive or non-integer amount) are reported as ``input``, while
-    recomputation mismatches stay ``integrity``.
+    signature verifies, tx_ids are unique across the tail (and, when
+    ``prior_tx_ids`` is supplied, across the earlier pages of a multi-page
+    delivery too) and ascending inside each block, Merkle roots and block
+    hashes recompute, and a pending block may only sit at the tail tip. Every
+    field is checked on the *raw* JSON value; type/domain defects
+    (non-integer or negative height, non-positive or non-integer amount) are
+    reported as ``input``, while recomputation mismatches stay ``integrity``.
+
+    The caller's ``prior_tx_ids`` set is never mutated: a page that fails
+    halfway through must not leak its ids into the delivery-wide set.
     """
     blocks: list[Block] = []
-    seen_tx_ids: set[str] = set()
+    seen_tx_ids: set[str] = set(prior_tx_ids or ())
     for position, block_raw in enumerate(blocks_raw):
         if not isinstance(block_raw, dict):
             raise _Failure(ERR_INTEGRITY)

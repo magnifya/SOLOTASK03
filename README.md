@@ -615,6 +615,37 @@ verified_tx_ids}`（`verified_tx_ids` 为尾部全部交易按 tx_id 升序）�
 `input`/`auth`/`expired`/`integrity`；任何畸形输入都不抛异常。CLI
 成功退出 0、失败退出 1。
 
+## 多页增量区间的离线连续校验
+
+把一份按交付顺序排列的导出文档**非空数组**作为一次连续投递整体离线复验：
+`ledger.light_client.verify_range_exports(documents, expected_anchor, trust,
+now=None) -> dict`。数组每个元素都必须是上节那八键（顺序
+`source, request_id, mode, expires_at, anchor, blocks, tip, attestation`）
+的导出文档；`expected_anchor = {height, block_hash}` 只钉住**首页**锚点。
+CLI 入口为 `python -m ledger.cli verify-range-batch --exports FILE|-
+--trust TRUST --anchor-height H --anchor-hash HASH`（`-` 从标准输入读
+JSON 数组），不发起任何网络请求。
+
+- **逐页复验**：每页都完整执行上节的 input/auth/expired/integrity 全部
+  规则（结构与键序、plain allowlist+`attestation: null`、attested 历史公钥
+  /旧规钉住公钥与 `ledger-sync-range-v1` 签名、尾部独立重算、闭合 `tip`）。
+- **跨页锚链**：首页 `anchor` 必须严格等于 `expected_anchor`；其后每页的
+  `anchor` 必须等于**前一页闭合 `tip`** 收敛成的 `{height, block_hash}`
+  （即 `tip.height` 与 `tip.tip_hash`）。断锚（哈希不符）与跳高（高度不
+  接续）都判 `integrity`。
+- **跨页 tx_id 唯一**：任一笔已在先前页面验证过的交易不得在后续页面重复
+  出现，重复判 `integrity`；块内升序等规则与单页一致。
+- **pending 只许末页**：某页尾部以 pending 块结束时，它必须是整份投递的
+  最后一页；pending 页之后还跟着页面，判 `integrity`。
+
+成功返回固定键序 `{ok, anchor, tip, pages, verified_tx_ids}`：`anchor` 为
+首页钉住的锚点、`tip` 为**末页**闭合 `tip` 摘要、`pages` 为页数 N、
+`verified_tx_ids` 为整份投递全部交易按 tx_id 升序。失败返回
+`{ok: false, error}`，`error` 仅取
+`input`/`auth`/`expired`/`integrity`；`documents` 不是非空数组、文件不可读、
+JSON 解析失败或锚点参数非法均为 `input`。任何畸形输入都不抛异常，CLI
+成功退出 0、失败退出 1。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -1022,6 +1053,14 @@ cat range-export.json | python -m ledger.cli verify-range --export - --trust tru
 # -> 成功单行 {"ok":true,"source":...,"request_id":...,"mode":...,"anchor":{...},
 #    "tip":{...},"verified_tx_ids":[...]} 退出 0；
 #    失败单行 {"ok":false,"error":"input"|"auth"|"expired"|"integrity"} 退出 1
+
+# 多页增量区间的离线连续校验（--exports 读 JSON 数组，- 从标准输入读取）
+python -m ledger.cli verify-range-batch --exports range-exports.json --trust trust.json \
+    --anchor-height 8 --anchor-hash <64hex>
+cat range-exports.json | python -m ledger.cli verify-range-batch --exports - --trust trust.json \
+    --anchor-height 8 --anchor-hash <64hex>
+# -> 成功单行 {"ok":true,"anchor":{...},"tip":{...},"pages":N,
+#    "verified_tx_ids":[...]} 退出 0；非数组/空数组或任一页面失败退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -1049,6 +1088,7 @@ python tests/sync_range_export_test.py  # 区间记录导出 GET /v1/forks/sync/
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/range_export_verify_test.py  # 区间导出离线核验 verify_range_export（固定顶层键序、expected_anchor 严格相等、尾部重算与 pending 末块、tip 摘要、plain allowlist+attestation null、attested 钉住公钥+ledger-sync-range-v1 签名、input/auth/expired/integrity 分类、CLI verify-range 文件/stdin/退出码）
+python tests/range_batch_verify_test.py  # 多页区间离线连续核验 verify_range_exports（非空数组、逐页复验、首锚 expected_anchor/后锚前页 tip{height,block_hash}、断锚/跳高 integrity、tx_id 跨页唯一、pending 只许末页、ok,anchor,tip,pages,verified_tx_ids 键序与升序、CLI verify-range-batch 数组文件/stdin/退出码）
 python tests/source_key_history_test.py  # 来源公钥历史 source_key_history（注册写版本1及事件号、轮换递增记新事件、撤销保留历史、原子落盘回滚；GET /v1/trust 固定键序 genesis_hash,sources,allowlist,audit_signers,source_key_history 与项键序 version,public_key,activated_event_id；重启逐字节保留、旧快照内存重建不强制写盘、历史结构/事件不符 StateRecoveryError；verify_range_export 按 attestation.version 取历史公钥并匹配 attestation.public_key，未知项 auth、签名错 integrity、无历史旧规、畸形 input；HTTP 线序）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
