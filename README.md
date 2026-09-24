@@ -541,6 +541,57 @@ SHA-256 摘要作为签名消息。
 密钥版本、跨页认证不一致、创世锚不符或签名验不过均返回新增的 `auth`，
 而链本身被篡改仍返回 `input`/`integrity`。
 
+## 快照整体一致性的离线校验
+
+不连接服务端、也不打开任何运行中的账本，就能核验一份持久化快照文档是否
+自洽：`ledger.consistency.verify_snapshot(document: object) -> dict` 直接
+接收已解码的 JSON 对象，重算文档内一切可自证的派生量。CLI 入口为
+`python -m ledger.cli consistency FILE|-`（`-` 从标准输入读）。
+
+文档**必含**顶层键 `state`、`chain`、`pending`、`index`、`accounts`、
+`audit_checkpoint`；`audit_events` 可以缺省（视为空日志）；允许扩展
+`forks`、`syncs`、`attested_syncs`、`trust_sources`、`allowlist`（这些
+区段存在与否不影响本项自洽核验），其余顶层未知键一律拒绝。
+
+逐项重算并比对：
+
+- 每笔交易的规范化 `tx_id`（SHA-256 of 排序紧凑 JSON）与 Ed25519 签名；
+  `amount`/`height` 等数值先在**原始 JSON 值**上校验为非布尔非负（或
+  正数）整数，绝不做 `int()` 转换；
+- 每个区块的交易按 `tx_id` 升序、Merkle 根、区块哈希，以及连续高度、
+  `prev_hash` 链接（创世块锚定 64 个 0）、创世块已确认且无交易、
+  pending 块只能位于链尾；
+- `pending` 集合内交易唯一、且不与链上（含 pending 尾块）任何交易重复；
+- 仅由**已确认**区块重算 `index`（tx_id→高度）与 `accounts`
+  （`{sent,received,transactions}`，transactions 保持链上原始顺序），与
+  文档记录完全一致；
+- 用 `state.initial_balance`（缺省回落到默认 1_000_000）重算已确认账户的
+  Merkle `state_root`；文档若记录了 `state.state_root`（64 位小写 hex）
+  必须等于重算值；`state.height`/`tip_hash`/`tip_status` 若存在也必须与
+  链尾一致；
+- 当 `audit_events` 存在时，事件 `event_id` 必须自 1 连续，每条
+  `prev_hash` 等于前一条 `event_hash`，且
+  `event_hash = SHA256(prev_hash 的 ASCII || 去除 prev_hash/event_hash 两
+  字段后的排序紧凑 UTF-8 JSON)`；无论事件列表是否存在，
+  `audit_checkpoint = {event_id, event_hash}` 都必须钉住真实链头（空日志
+  为 `{0, "0"*64}`）。
+
+输出恒为**单行 JSON**，顶层键序固定为
+`ok,error,generation,height,tip_hash,state_root,audit_checkpoint`：
+
+- 成功：`true, null, N, N, H, H, C`——`generation`/`height` 为非负整数，
+  `tip_hash`/`state_root` 为 64 位小写十六进制，
+  `C = {event_id, event_hash}`；
+- 失败：`ok=false`，`error` 为 `"input"` 或 `"integrity"`，其余字段全部
+  为 `null`。
+
+错误分类：文档不是对象、必含区段缺失或核心区段类型错误、顶层未知键，或
+字段原始类型非法（字符串/浮点/布尔伪装的数值等）均为 `input`；结构合法
+但任何重算量与记录不符（交易/签名/Merkle/区块哈希/链接/索引/账户/
+state_root、pending 唯一性、审计事件链或检查点）均为 `integrity`。
+`consistency` 不发起任何网络请求；文件无法读取或内容不是 JSON 时输出
+`{"ok": false, "error": "input"}`，退出码成功 0、任何失败 1。
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：
@@ -550,11 +601,12 @@ SHA-256 摘要作为签名消息。
 | `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof` 与批量束 `verify_merkle_proof_bundle`）、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
+| `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
 
 约定：
 
@@ -813,6 +865,13 @@ cat audit-page.json | python -m ledger.cli audit-verify -
 # 给 --trust 还会核对创世锚、密钥版本与 Ed25519 检查点签名（失败新增 "auth"）
 python -m ledger.cli audit-verify audit-page.json --trust trust.json
 
+# 快照整体一致性离线核验（consistency 不连接服务端；- 从标准输入读取快照文档）
+python -m ledger.cli consistency ledger_state.json
+cat ledger_state.json | python -m ledger.cli consistency -
+# -> 成功单行 {"ok":true,"error":null,"generation":N,"height":N,
+#    "tip_hash":"...","state_root":"...","audit_checkpoint":{...}} 退出 0；
+#    失败单行 {"ok":false,"error":"input"|"integrity",...其余 null} 退出 1
+
 # 离线轻客户端验证（不连接服务端；--bundle - 从标准输入读取束 JSON）
 python -m ledger.cli verify --bundle bundle.json --trust trust.json
 cat bundle.json | python -m ledger.cli verify --bundle - --trust trust.json
@@ -846,4 +905,5 @@ python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂�
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI
 python tests/strict_type_validation_test.py  # 跨入口严格类型校验：height/amount 的字符串/浮点/布尔伪装在候选分叉与同步入口 400（不写状态、不回放 200）、离线 verify 返回 input、canonical/pending 恢复抛 StateRecoveryError、持久化候选/同步记录按缓存规则丢弃、旧快照缺省 status 兼容
+python tests/consistency_verify_test.py   # 离线快照整体一致性 verify_snapshot：成功摘要与固定键序、缺区段/未知顶层键/类型伪装 input、交易/签名/Merkle/区块哈希/链接/索引/账户/state_root/pending 唯一性/审计链与检查点篡改 integrity、CLI consistency（退出码 1/0/1，IO/非 JSON 为 input）
 ```

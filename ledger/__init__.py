@@ -4,6 +4,7 @@ __all__ = [
     "crypto",
     "models",
     "audit",
+    "consistency",
     "store",
     "service",
     "server",

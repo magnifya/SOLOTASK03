@@ -5,7 +5,7 @@ index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
-verify/audit-verify subcommands.
+verify/audit-verify/consistency subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -634,6 +634,34 @@ def cmd_audit_verify(args: argparse.Namespace) -> int:
     return 0 if body.get("ok") is True else 1
 
 
+def cmd_consistency(args: argparse.Namespace) -> int:
+    """Offline whole-snapshot consistency verification; no server contact.
+
+    The input is one persisted snapshot document read from ``FILE`` or
+    standard input when the argument is ``-``. Prints a single JSON line with
+    the fixed key order ``ok,error,generation,height,tip_hash,state_root,
+    audit_checkpoint``: success carries the recomputed summary, failure
+    carries ``{"ok": false, "error": "input"|"integrity"}`` with every other
+    field null. Exits 0 on success, 1 on any failure (including unreadable or
+    non-JSON input).
+    """
+    from .consistency import verify_snapshot
+
+    try:
+        if args.snapshot_file == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.snapshot_file, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON input is an input error.
+        body = {"ok": False, "error": "input"}
+    else:
+        body = verify_snapshot(document)
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
 def cmd_audit_signer_rotate(args: argparse.Namespace) -> int:
     status, body = _request(
         "POST",
@@ -1020,6 +1048,18 @@ def build_parser() -> argparse.ArgumentParser:
         "when given, checkpoint_auth signatures are additionally verified",
     )
     p_audit_verify.set_defaults(func=cmd_audit_verify)
+
+    p_consistency = sub.add_parser(
+        "consistency",
+        help="offline-verify one persisted snapshot document; - reads "
+        "standard input",
+    )
+    p_consistency.add_argument(
+        "snapshot_file",
+        metavar="FILE|-",
+        help="snapshot JSON file, or - to read the document from stdin",
+    )
+    p_consistency.set_defaults(func=cmd_consistency)
 
     p_audit_signer = sub.add_parser(
         "audit-signer-rotate",
