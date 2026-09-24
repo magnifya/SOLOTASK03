@@ -582,6 +582,88 @@ class LedgerService:
                 "siblings": siblings,
             }
 
+    def get_account_proofs(
+        self, payload: object, params: dict | None = None
+    ) -> tuple[int, dict]:
+        """POST /v1/accounts/proofs — batch account-state inclusion proofs.
+
+        The body must be a JSON object containing exactly the ``accounts``
+        key: a non-empty list of distinct non-empty strings. A malformed body
+        — parse failure (handled by the server), missing/extra keys, a wrong
+        type, an empty list, an empty-string or duplicate account — is 400 and
+        never touches state.
+
+        The optional ``height=H`` query parameter behaves exactly like
+        :meth:`get_account_proof`: omitted it anchors the highest confirmed
+        block; supplied it must be an unsigned decimal without leading zeros
+        (a malformed, repeated or unknown parameter is 400), and an
+        unknown/non-canonical/pending anchor height is 404. Any requested
+        account absent from the (historical) confirmed account set is 404.
+
+        On success the body is
+        ``{height, block_hash, state_root, proofs}`` with one
+        ``{account, balance, confirmed_transactions, index, siblings}`` entry
+        per requested account, the entries sorted by account ascending; the
+        sibling paths run leaf-to-root exactly like :meth:`get_account_proof`.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"accounts"}:
+            return 400, {
+                "error": "request body must be a JSON object with only 'accounts'"
+            }
+        accounts_raw = payload["accounts"]
+        if not isinstance(accounts_raw, list) or not accounts_raw:
+            return 400, {"error": "field 'accounts' must be a non-empty array"}
+        if any(not isinstance(account, str) or not account for account in accounts_raw):
+            return 400, {"error": "every account must be a non-empty string"}
+        if len(set(accounts_raw)) != len(accounts_raw):
+            return 400, {"error": "accounts must be distinct"}
+
+        height_raw: object = None
+        if params is not None:
+            if any(key != "height" for key in params):
+                return 400, {"error": "unknown query parameter"}
+            height_raw = params.get("height")
+        anchor_height: int | None = None
+        if height_raw is not None:
+            anchor_height = _parse_decimal(height_raw)
+            if anchor_height is None:
+                return 400, {"error": "height must be a non-negative decimal"}
+        with self.store.lock:
+            if anchor_height is None:
+                anchor = self.store.tip()
+            else:
+                anchor = self.store.block_at(anchor_height)
+                if anchor is None:
+                    return 404, {"error": "anchor block not found"}
+            if anchor.status != STATUS_CONFIRMED:
+                return 404, {"error": "chain tip is pending confirmation"}
+            prefix = (
+                self.store.chain
+                if anchor_height is None
+                else self.store.chain[: anchor.height + 1]
+            )
+            rows, leaves, root = self._state_tree(prefix)
+            positions = {name: i for i, (name, _b, _t) in enumerate(rows)}
+            if any(account not in positions for account in accounts_raw):
+                return 404, {"error": "account not found"}
+            proofs = []
+            for account in sorted(set(accounts_raw)):
+                index = positions[account]
+                account_name, balance, transactions = rows[index]
+                proofs.append({
+                    "account": account_name,
+                    "balance": balance,
+                    "confirmed_transactions": transactions,
+                    "index": index,
+                    "siblings": crypto.merkle_proof(leaves, index),
+                })
+            return 200, {
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "state_root": root,
+                "proofs": proofs,
+            }
+
     def confirmed_balance(self, account: str) -> int:
         """Balance from confirmed blocks only."""
         entry = self.store.accounts.get(account)

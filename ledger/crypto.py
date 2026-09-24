@@ -524,3 +524,146 @@ def verify_account_proof(
         return True
     except (TypeError, ValueError):
         return False
+
+
+# Exact, ordered key sets of a batch account-state proof response document.
+# They let verify_account_proof_bundle reject missing/extra keys *and* a wrong
+# key order, mirroring verify_merkle_proof_bundle.
+_ACCOUNT_BUNDLE_TOP_KEYS = ("height", "block_hash", "state_root", "proofs")
+_ACCOUNT_BUNDLE_PROOF_KEYS = (
+    "account",
+    "balance",
+    "confirmed_transactions",
+    "index",
+    "siblings",
+)
+
+
+def verify_account_proof_bundle(
+    bundle: object,
+    expected_root: object,
+    expected_height: object,
+    expected_block_hash: object,
+) -> bool:
+    """Strictly verify a batch account-state proof bundle offline.
+
+    The bundle mirrors POST /v1/accounts/proofs::
+
+        {"height": H, "block_hash": B, "state_root": R,
+         "proofs": [{"account": a, "balance": b,
+                     "confirmed_transactions": T,
+                     "index": I, "siblings": [...]}, ...]}
+
+    ``proofs`` covers the requested accounts, sorted by account ascending. Each
+    entry's leaf is recomputed from its own ``{account, balance,
+    confirmed_transactions}`` triple exactly like
+    :func:`verify_account_proof`; the leaf-to-root ``siblings`` path is then
+    re-hashed with the same pairing rules as :func:`account_state_root`
+    (``sha256(left + right)`` hex pairs, a lone odd node paired with itself).
+    Every recomputed root must equal both the bundle's ``state_root`` and
+    ``expected_root``; ``height`` must equal ``expected_height`` and
+    ``block_hash`` must equal ``expected_block_hash``. Each proof ``index``
+    must agree with the supplied path at every level.
+
+    Every defect — a missing/extra key, a wrong key order, a wrong type, a
+    non-boolean/negative height or balance, an empty/duplicate/non-string
+    account, a non-hex transaction id, an out-of-range index, a path
+    inconsistent with the index (including the phantom self-pair slot), an
+    illegal direction or hash, excessive depth, a tampered leaf/root or anchor —
+    returns False rather than raising.
+    """
+    try:
+        if not _exact_keys(bundle, _ACCOUNT_BUNDLE_TOP_KEYS):
+            return False
+        if not _is_hex64(expected_root):
+            return False
+        if not _is_hex64(expected_block_hash):
+            return False
+        if isinstance(expected_height, bool) or not isinstance(expected_height, int):
+            return False
+        height = bundle["height"]
+        block_hash = bundle["block_hash"]
+        state_root = bundle["state_root"]
+        proofs = bundle["proofs"]
+
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return False
+        if not _is_hex64(block_hash) or not _is_hex64(state_root):
+            return False
+        if not isinstance(proofs, list) or not proofs:
+            return False
+        if height != expected_height:
+            return False
+        if not hmac.compare_digest(state_root, expected_root):
+            return False
+        if not hmac.compare_digest(block_hash, expected_block_hash):
+            return False
+
+        accounts: list[str] = []
+        for proof in proofs:
+            if not _exact_keys(proof, _ACCOUNT_BUNDLE_PROOF_KEYS):
+                return False
+            account = proof["account"]
+            balance = proof["balance"]
+            transactions = proof["confirmed_transactions"]
+            index = proof["index"]
+            siblings = proof["siblings"]
+            if not isinstance(account, str) or not account:
+                return False
+            if account in accounts:
+                return False
+            if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
+                return False
+            if not isinstance(transactions, list):
+                return False
+            if any(not _is_hex64(tx_id) for tx_id in transactions):
+                return False
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                return False
+            if not isinstance(siblings, list) or len(siblings) > MAX_MERKLE_DEPTH:
+                return False
+
+            # A depth-D path addresses one of 2**D leaf slots; a single-leaf
+            # tree (D == 0) can only ever be index 0.
+            depth = len(siblings)
+            if index >= (1 << depth):
+                return False
+            current = account_state_leaf(account, balance, transactions)
+            position = index
+            for item in siblings:
+                if not _exact_keys(item, _BUNDLE_SIBLING_KEYS):
+                    return False
+                direction = item["direction"]
+                sibling_hash = item["hash"]
+                if not _is_hex64(sibling_hash):
+                    return False
+                # The odd-node promotion pairs the last (even-positioned) node
+                # with a copy of itself, so a genuine self-pair always points
+                # at a right sibling. A left sibling equal to the current node
+                # addresses the phantom duplicate slot, which is never a real
+                # account. The path must also agree with the index at every
+                # level: an even position is the left child (sibling on its
+                # right), an odd position the right child.
+                if direction == "left":
+                    if position % 2 == 0 or sibling_hash == current:
+                        return False
+                    pair = sibling_hash + current
+                elif direction == "right":
+                    if position % 2 == 1:
+                        return False
+                    pair = current + sibling_hash
+                else:
+                    return False
+                current = sha256_hex(pair.encode("ascii"))
+                position //= 2
+
+            if not hmac.compare_digest(current, state_root):
+                return False
+            accounts.append(account)
+
+        # Proofs must be unique and ordered by account ascending.
+        if accounts != sorted(accounts):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False

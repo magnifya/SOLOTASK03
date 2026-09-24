@@ -48,7 +48,7 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
         # -- routing --------------------------------------------------------
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
-            path = self.path.split("?", 1)[0]
+            path, _, query = self.path.partition("?")
             if path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
@@ -140,6 +140,28 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 tip_hash = unquote(path[len("/v1/forks/") : -len("/adopt")])
                 status, body = service.adopt_fork(tip_hash)
                 self._send_json(status, body)
+            elif path == "/v1/accounts/proofs":
+                # POST /v1/accounts/proofs[?height=H] — batch account-state
+                # proofs. The body is {"accounts": [...]} and is strictly
+                # validated by the service (400), before any state is read.
+                # Repeated query parameters are rejected 400 at the HTTP layer
+                # like the other strict endpoints. The success document has a
+                # contract-fixed key order (height, block_hash, state_root,
+                # proofs), so it is serialized in insertion order rather than
+                # alphabetically.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.get_account_proofs(payload, params)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/blocks":
                 # A body is not required; drain one if present.
                 if self.headers.get("Content-Length"):
