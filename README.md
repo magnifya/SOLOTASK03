@@ -174,6 +174,26 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   初始余额重放不超支、仅末块可 pending）并逐一核对 `tip` 字段，失败 `400` →
   tip 与 canonical 或已存候选重复 `409`。成功 `201` 返回与整链同步相同的五字段
   `{tip_hash,height,length,status,expires_at}`。
+- **导出区间记录**：`GET /v1/forks/sync/range/export?source=S&request_id=R&mode=M`
+  按幂等键导出一条已接收的**增量区间**同步记录。三个参数全部必填且只能出现一次，
+  `mode` 仅允许 `plain`/`attested`（普通与签名记录是分立的幂等命名空间），
+  `source`/`request_id` 必须非空；缺失、重复、未知参数或非法取值一律 `400`。
+  命中返回 `200`，顶层键序固定为
+  `source, request_id, mode, expires_at, anchor, blocks, tip, attestation`：
+  `expires_at` 为非布尔整数；`anchor` 键序 `height,block_hash`（非负整数、64 位
+  小写 hex）；`blocks` 为非空的已交付尾部区块数组（README 区块键序）；`tip` 键序
+  `tip_hash,height,length,status`，由 `anchor + blocks` **重算**而非读缓存摘要。
+  `plain` 记录的 `attestation` 为 `null`；`attested` 记录的 `attestation` 为冻结的
+  `{public_key, version, signature}`（公钥 64 位小写 hex、version 正整数、
+  signature 128 位小写 hex）。导出前在同一把锁内独立重验尾部（连续高度、
+  prev_hash、重算 block_hash/Merkle 根、tx_id 与 Ed25519 签名、仅末块可 pending）、
+  重算指纹，并重验存储候选恰为 canonical 风格锚点前缀加该尾部、整链重算通过；
+  attested 还用**冻结公钥**按 domain `ledger-sync-range-v1` 重新验签。任何失配都
+  静默删除该缓存记录与其候选 fork（审计历史逐字保留、不产生事件）并返回 `404`；
+  清理落盘失败会恢复记录与候选并抛出 `OSError`。整链（非 range）记录在此端点返回
+  `409`（与 `GET /v1/forks/sync/export` 对 range 记录返回 `409` 互为镜像）；
+  未知、已过期或已清理的键返回 `404`。已采用上链的 tip 从 canonical 前缀重建尾部，
+  不新增权威副本；重启后导出结果一致，并发导出彼此串行化。
 - **幂等与原子持久化**：同一 `source`+`request_id` 的存活记录重试时**豁免授权
   与过期检查**，且不重新拼接、不依赖当前 canonical——只对请求自带的锚点与尾部
   区块做独立重验（篡改 `tip`/区块仍返回 `400`，不回放缓存）：内容相同返回 `200`
@@ -624,7 +644,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
 
 约定：
 
@@ -758,6 +778,17 @@ curl -s -X POST localhost:8080/v1/forks/sync/range \
   -d '{"source":"node-2","request_id":"req-8","expires_at":1800000000,"anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"}}'
 # -> 201 {"tip_hash":"...","height":4,"length":5,"status":"confirmed","expires_at":1800000000}
 
+# 增量区间记录导出（source/request_id/mode 三参数必填单值，mode 仅 plain/attested；
+# 缺失/重复/未知参数 400，非 range 记录 409，未知/过期/清理后 404；
+# 成功顶层键序固定 source,request_id,mode,expires_at,anchor,blocks,tip,attestation，
+# tip 由 anchor+blocks 重算，plain 的 attestation 为 null，
+# attested 带冻结 {public_key,version,signature} 并按 ledger-sync-range-v1 重验）
+curl -s 'localhost:8080/v1/forks/sync/range/export?source=node-2&request_id=req-8&mode=plain'
+# -> 200 {"source":"node-2","request_id":"req-8","mode":"plain","expires_at":...,
+#         "anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],
+#         "tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"},
+#         "attestation":null}
+
 # 同步审计查询（source/mode/min_height/max_height/limit/cursor；
 # mode 缺省或 plain 只列普通同步，attested 只列签名同步，all 合并；
 # 非法 mode、非法数值或重复参数均 400）
@@ -863,6 +894,9 @@ python -m ledger.cli syncs [--source node-2] [--mode plain|attested|all] [--min-
 python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--mode plain|attested|all] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 # 按幂等键导出一条已接收同步候选（mode 仅 plain|attested；单行 JSON，非 2xx 退出 1）
 python -m ledger.cli sync-export --source node-2 --request-id req-7 --mode plain
+# 按幂等键导出一条已接收增量区间同步记录（非 range 记录 409；键序
+# source,request_id,mode,expires_at,anchor,blocks,tip,attestation；非 2xx 退出 1）
+python -m ledger.cli sync-range-export --source node-2 --request-id req-8 --mode plain
 
 # 增量区间：chain-range 拉取（可把整页 JSON 直接交给 sync-range 推送，tip 自动派生）
 python -m ledger.cli chain-range --after-height 2 --after-hash <block-hash> [--limit 100]
@@ -928,6 +962,7 @@ python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sy
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
 python tests/sync_export_test.py       # 同步记录导出 GET /v1/forks/sync/export（source/request_id/mode 三参数必填单值，缺失/重复/未知 400；固定键序与类型；plain 五字段 candidate+attestation null、attested 签名候选+冻结公钥/版本/签名并按 domain/冻结公钥/指纹重验；range 记录 409；未知/过期/清理后 404；fork 或 canonical 前缀重建不增副本；签名/摘要失配丢缓存留审计；清理落盘失败恢复并抛 OSError；重启一致）与 HTTP/CLI sync-export
+python tests/range_sync_export_test.py   # 增量区间记录导出 GET /v1/forks/sync/range/export（source/request_id/mode 必填单值，缺失/重复/未知/非法 400；固定键序 source,request_id,mode,expires_at,anchor,blocks,tip,attestation；anchor 严格类型、blocks README 键序、tip 由 anchor+blocks 重算；plain attestation null、attested 冻结公钥/version/signature 并按 ledger-sync-range-v1 重验；重验链/Merkle/指纹及存储候选=canonical 前缀+尾部；非 range 记录 409；未知/过期/清理后 404；失配删记录/fork、审计不变；清理失败恢复抛 OSError；采用后从 canonical 前缀重建；重启与并发一致）与 HTTP/CLI sync-range-export
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）

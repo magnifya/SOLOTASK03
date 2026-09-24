@@ -254,6 +254,21 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 # GET /v1/state/root — confirmed account-state tree anchor.
                 status, body = service.get_state_root()
                 self._send_json(status, body)
+            elif path == "/v1/forks/sync/range/export":
+                # GET /v1/forks/sync/range/export?source=&request_id=&mode=
+                # — export one received incremental-range sync. Repeated query
+                # parameters are rejected 400 like the other strict
+                # endpoints; the success document has a contract-fixed key
+                # order, so it is serialized in insertion order.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.export_fork_sync_range(params)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/forks/sync/export":
                 # GET /v1/forks/sync/export?source=&request_id=&mode= —
                 # export one received sync candidate. Repeated query

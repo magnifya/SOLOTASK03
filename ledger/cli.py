@@ -2,7 +2,7 @@
 state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
-sync-history, sync-export, chain-range,
+sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency subcommands.
@@ -322,6 +322,23 @@ def cmd_sync_export(args: argparse.Namespace) -> int:
     )
     status, body = _request(
         "GET", f"{args.base_url}/v1/forks/sync/export?{query}", None
+    )
+    return _emit(status, body, sort_keys=False)
+
+
+def cmd_sync_range_export(args: argparse.Namespace) -> int:
+    # Export one received incremental-range sync by its idempotency key. The
+    # success document has a contract-fixed key order, so it is printed in
+    # insertion order rather than alphabetically (error bodies are single-key).
+    query = urllib.parse.urlencode(
+        {
+            "source": args.source,
+            "request_id": args.request_id,
+            "mode": args.mode,
+        }
+    )
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/forks/sync/range/export?{query}", None
     )
     return _emit(status, body, sort_keys=False)
 
@@ -887,6 +904,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="sync record namespace: plain or attested",
     )
     p_sync_export.set_defaults(func=cmd_sync_export)
+
+    p_sync_range_export = sub.add_parser(
+        "sync-range-export",
+        help="export one received incremental-range sync by source, request_id and mode",
+    )
+    p_sync_range_export.add_argument(
+        "--source", required=True, help="originating node identifier"
+    )
+    p_sync_range_export.add_argument(
+        "--request-id", required=True, help="idempotency key scoped to the source"
+    )
+    p_sync_range_export.add_argument(
+        "--mode",
+        required=True,
+        choices=("plain", "attested"),
+        help="sync record namespace: plain or attested",
+    )
+    p_sync_range_export.set_defaults(func=cmd_sync_range_export)
 
     p_chain_range = sub.add_parser(
         "chain-range",
