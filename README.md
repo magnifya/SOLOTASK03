@@ -127,6 +127,24 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   历史元数据、来源授权与排序；相关操作共锁并在一次原子写入中落盘，失败回滚
   候选、记录、generation 与审计事件，重试不产生重复事件；缺少冻结摘要的旧快照
   仍可加载（查询时回退实时解析）。
+- **同步记录导出**：`GET /v1/forks/sync/export?source=S&request_id=R&mode=M`
+  按幂等键导出一条已接收的同步候选。三个参数全部必填且只能出现一次，
+  `mode` 仅允许 `plain`/`attested`（普通与签名记录是分立的幂等命名空间），
+  `source`/`request_id` 必须非空；缺失、重复、未知参数或非法取值一律
+  `400`。命中返回 `200`，顶层键序固定为
+  `source, request_id, mode, expires_at, tip_hash, height, length, status,
+  candidate, attestation`：`expires_at`/`height`/`length` 为非布尔整数，
+  `tip_hash` 为 64 位小写十六进制，`status` 为 `pending|confirmed`。
+  `plain` 记录的 `candidate` 是五字段导出文档
+  `{tip_hash, height, length, status, blocks}`（可原样再提交），
+  `attestation` 为 `null`；`attested` 记录的 `candidate` 逐字保留被签名的
+  原始候选，`attestation` 为冻结的 `{public_key, version, signature}`，
+  导出前按 domain、冻结公钥与指纹重新验签。候选在同一把锁内从存储的
+  fork 或（已采用时）canonical 前缀重建，不新增权威副本；增量区间
+  （range）记录命中返回 `409`；未知、已过期或已清理的键返回 `404`。
+  导出时若签名/摘要重验失配，按既有规则静默丢弃该缓存记录（审计历史
+  保留、不产生事件）并返回 `404`；清理落盘失败会恢复记录与候选并抛出
+  `OSError`。重启后导出结果一致。
 - **串行化与采用**：同步接收、审计查询与候选采用共用同一把锁串行化。采用规则
   不变（最长链优先、同长取最小 `tip_hash`），在一次原子写入中换链、递增
   `generation` 并重建索引：旧链独有的已确认交易去重回池，旧链 pending 末块与
@@ -606,7 +624,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` 子命令 |
 
 约定：
 
@@ -752,6 +770,15 @@ curl -s 'localhost:8080/v1/forks/sync?source=node-2&mode=all&min_height=1&limit=
 curl -s 'localhost:8080/v1/forks/sync/history?source=node-2&kind=sync_adopted&limit=50&cursor=0'
 # -> 200 {"items":[{event_id,kind,at,source,request_id,tip_hash,height,length,status,expires_at}...],"total":N,"next_cursor":null}
 
+# 同步记录导出（source/request_id/mode 三参数必填单值，mode 仅 plain/attested；
+# 缺失/重复/未知参数 400，range 记录 409，未知/过期/清理后 404；
+# 成功顶层键序固定，plain 的 candidate 为五字段导出文档、attestation 为 null，
+# attested 保留签名候选并带冻结 {public_key,version,signature}）
+curl -s 'localhost:8080/v1/forks/sync/export?source=node-2&request_id=req-7&mode=plain'
+# -> 200 {"source":"node-2","request_id":"req-7","mode":"plain","expires_at":...,
+#         "tip_hash":"...","height":N,"length":N+1,"status":"...",
+#         "candidate":{...五字段导出文档...},"attestation":null}
+
 # 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
@@ -834,6 +861,8 @@ python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N]
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
 python -m ledger.cli syncs [--source node-2] [--mode plain|attested|all] [--min-height N] [--max-height N] [--cursor N] [--limit N]
 python -m ledger.cli sync-history [--source node-2] [--tip-hash <64-hex>] [--kind sync_received|sync_adopted|sync_expired] [--mode plain|attested|all] [--min-height N] [--max-height N] [--cursor N] [--limit N]
+# 按幂等键导出一条已接收同步候选（mode 仅 plain|attested；单行 JSON，非 2xx 退出 1）
+python -m ledger.cli sync-export --source node-2 --request-id req-7 --mode plain
 
 # 增量区间：chain-range 拉取（可把整页 JSON 直接交给 sync-range 推送，tip 自动派生）
 python -m ledger.cli chain-range --after-height 2 --after-hash <block-hash> [--limit 100]
@@ -898,6 +927,7 @@ python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
+python tests/sync_export_test.py       # 同步记录导出 GET /v1/forks/sync/export（source/request_id/mode 三参数必填单值，缺失/重复/未知 400；固定键序与类型；plain 五字段 candidate+attestation null、attested 签名候选+冻结公钥/版本/签名并按 domain/冻结公钥/指纹重验；range 记录 409；未知/过期/清理后 404；fork 或 canonical 前缀重建不增副本；签名/摘要失配丢缓存留审计；清理落盘失败恢复并抛 OSError；重启一致）与 HTTP/CLI sync-export
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）

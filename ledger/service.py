@@ -2064,6 +2064,236 @@ class LedgerService:
         next_cursor = cursor + limit if cursor + limit < total else None
         return 200, {"items": items, "total": total, "next_cursor": next_cursor}
 
+    # -- sync candidate export ------------------------------------------------
+
+    SYNC_EXPORT_PARAMS = ("source", "request_id", "mode")
+    SYNC_EXPORT_MODES = (SYNC_MODE_PLAIN, SYNC_MODE_ATTESTED)
+
+    def _resolve_sync_blocks(self, tip_hash: str) -> list[dict] | None:
+        """Rebuild a synced tip's full block list without new authoritative
+        copies: the stored candidate fork, or the canonical chain prefix when
+        the tip has since been adopted. Caller must hold the store lock."""
+        fork = self.store.forks.get(tip_hash)
+        if fork is not None:
+            return [block.to_dict() for block in fork]
+        prefix: list[dict] = []
+        for block in self.store.chain:
+            prefix.append(block.to_dict())
+            if block.block_hash == tip_hash:
+                return prefix
+        return None
+
+    def _drop_sync_record(
+        self, table: dict[tuple[str, str], dict], key: tuple[str, str]
+    ) -> None:
+        """Silently drop a stale sync record and persist the cleanup.
+
+        Mirrors the recovery-time cache rules: the record (and its candidate
+        fork, when no other live record references the tip and the tip is not
+        on the canonical chain) is removed in one atomic write; the audit
+        history is never touched and no lifecycle event is emitted. If the
+        write fails the pre-cleanup records and forks are restored and the
+        error (an OSError from the failed save) propagates. Caller must hold
+        the store lock.
+        """
+        rec = table.pop(key, None)
+        if rec is None:
+            return
+        tip = rec["tip_hash"]
+        canonical_hashes = {block.block_hash for block in self.store.chain}
+        live_tips = {r["tip_hash"] for r in self.store.syncs.values()}
+        live_tips.update(r["tip_hash"] for r in self.store.attested_syncs.values())
+        removed_fork: list | None = None
+        if tip not in canonical_hashes and tip not in live_tips:
+            removed_fork = self.store.forks.pop(tip, None)
+        try:
+            self.store.save()
+        except BaseException:
+            # Restore the pre-cleanup state: a failed write must neither
+            # leave the record gone nor its candidate orphaned.
+            table[key] = rec
+            if removed_fork is not None:
+                self.store.forks.setdefault(tip, removed_fork)
+            raise
+
+    def export_fork_sync(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/forks/sync/export — export one received sync candidate.
+
+        Exactly three query parameters are required, each a single value:
+        ``source`` and ``request_id`` (non-empty) and ``mode``
+        (``plain``/``attested``). Unknown or repeated parameters are 400.
+        The plain table and the attested table remain separate idempotency
+        namespaces, so ``mode`` selects which table the key is looked up in.
+
+        A hit returns 200 with the fixed key order ``source, request_id,
+        mode, expires_at, tip_hash, height, length, status, candidate,
+        attestation``. For ``plain`` the candidate is the five-field export
+        document ``{tip_hash, height, length, status, blocks}`` and
+        ``attestation`` is null; for ``attested`` the candidate is the
+        signed candidate preserved verbatim and ``attestation`` carries the
+        frozen ``{public_key, version, signature}``. The block list is
+        rebuilt under the store lock from the stored fork or — for an
+        adopted tip — the canonical prefix; no new authoritative copy is
+        created. Incremental range records are not exportable and answer
+        409. Unknown, expired or already-cleaned keys answer 404.
+
+        Before exporting, the record is re-verified exactly like on
+        restart: the plain content fingerprint is recomputed over the
+        rebuilt blocks, the attested signature is re-verified against the
+        domain message with the frozen public key and its fingerprint
+        recomputed, and the frozen tip summary is checked against the
+        rebuilt candidate. A signature/digest mismatch drops the cached
+        record (persisted atomically, audit history untouched) and answers
+        404; if that cleanup save fails the state is restored and the
+        OSError propagates.
+        """
+        unknown = [key for key in params if key not in self.SYNC_EXPORT_PARAMS]
+        if unknown:
+            return 400, {"error": f"unknown query parameter: {sorted(unknown)[0]}"}
+        for name in self.SYNC_EXPORT_PARAMS:
+            if name not in params:
+                return 400, {"error": f"missing query parameter: {name}"}
+        source = params["source"]
+        request_id = params["request_id"]
+        mode = params["mode"]
+        if not isinstance(source, str) or not source:
+            return 400, {"error": "source must be a non-empty string"}
+        if not isinstance(request_id, str) or not request_id:
+            return 400, {"error": "request_id must be a non-empty string"}
+        if mode not in self.SYNC_EXPORT_MODES:
+            return 400, {"error": "mode must be one of plain, attested"}
+
+        table = (
+            self.store.attested_syncs
+            if mode == SYNC_MODE_ATTESTED
+            else self.store.syncs
+        )
+        with self.store.lock:
+            # Sweep due expiries first (persisted atomically, exactly like
+            # the other sync queries): an expired record exports as 404.
+            self._prune_expired_syncs()
+            key = (source, request_id)
+            rec = table.get(key)
+            if rec is None:
+                return 404, {"error": "sync record not found"}
+            # Incremental range deliveries (a plain record carrying a
+            # "range" payload, or an attested record whose frozen
+            # attestation holds the signed range) are not exportable here.
+            attested = rec.get("attested")
+            if "range" in rec or (
+                isinstance(attested, dict) and "range" in attested
+            ):
+                return 409, {
+                    "error": "incremental range sync records are not exportable"
+                }
+
+            tip_hash = rec["tip_hash"]
+            blocks_raw = self._resolve_sync_blocks(tip_hash)
+            if blocks_raw is None:
+                # The tip resolves nowhere: a stale cache entry, dropped
+                # under the same rules as a fingerprint mismatch.
+                self._drop_sync_record(table, key)
+                return 404, {"error": "sync record not found"}
+            descriptor = {
+                "tip_hash": tip_hash,
+                "height": blocks_raw[-1]["height"],
+                "length": len(blocks_raw),
+                "status": blocks_raw[-1]["status"],
+            }
+
+            # Re-verify the record against the rebuilt candidate, exactly
+            # like restart reconciliation: any signature/digest mismatch
+            # drops the cache (audit history untouched) and answers 404.
+            stale = False
+            if mode == SYNC_MODE_PLAIN:
+                if self._candidate_fingerprint(blocks_raw) != rec.get("fingerprint"):
+                    stale = True
+            else:
+                if not isinstance(attested, dict):
+                    stale = True
+                else:
+                    public_key = attested.get("public_key")
+                    signature = attested.get("signature")
+                    signed_candidate = attested.get("candidate")
+                    if not crypto.is_hex64(public_key) or not crypto.is_hex128(
+                        signature
+                    ):
+                        stale = True
+                    else:
+                        message = attested_message(
+                            source, request_id, rec["expires_at"], signed_candidate
+                        )
+                        digest = hashlib.sha256(message).digest()
+                        if not crypto.verify_signature(public_key, digest, signature):
+                            stale = True
+                        elif attested_fingerprint(
+                            source,
+                            request_id,
+                            rec["expires_at"],
+                            signed_candidate,
+                            signature,
+                        ) != rec.get("fingerprint"):
+                            stale = True
+                        else:
+                            # Bind the signed chain to the rebuilt blocks.
+                            signed_blocks = self._candidate_blocks(signed_candidate)
+                            try:
+                                signed_fork = self.store.validate_fork_blocks(
+                                    signed_blocks
+                                )
+                            except ValueError:
+                                stale = True
+                            else:
+                                stale = [
+                                    block.to_dict() for block in signed_fork
+                                ] != blocks_raw
+            if not stale and rec.get("height") is not None:
+                # The frozen tip summary must match the rebuilt candidate,
+                # exactly like the restart-time summary check.
+                stale = (
+                    rec["height"] != descriptor["height"]
+                    or rec["length"] != descriptor["length"]
+                    or rec["status"] != descriptor["status"]
+                )
+            if stale:
+                self._drop_sync_record(table, key)
+                return 404, {"error": "sync record not found"}
+
+            # The frozen summary wins when present (legacy records without
+            # it fall back to the rebuilt descriptor); a valid record's
+            # frozen values always equal the descriptor.
+            height = rec["height"] if rec.get("height") is not None else descriptor["height"]
+            length = rec["length"] if rec.get("length") is not None else descriptor["length"]
+            status = rec["status"] if rec.get("status") is not None else descriptor["status"]
+            if mode == SYNC_MODE_PLAIN:
+                candidate_doc: object = {
+                    "tip_hash": tip_hash,
+                    "height": height,
+                    "length": length,
+                    "status": status,
+                    "blocks": blocks_raw,
+                }
+                attestation: object = None
+            else:
+                candidate_doc = attested["candidate"]
+                attestation = {
+                    "public_key": attested["public_key"],
+                    "version": attested["version"],
+                    "signature": attested["signature"],
+                }
+            return 200, {
+                "source": source,
+                "request_id": request_id,
+                "mode": mode,
+                "expires_at": rec["expires_at"],
+                "tip_hash": tip_hash,
+                "height": height,
+                "length": length,
+                "status": status,
+                "candidate": candidate_doc,
+                "attestation": attestation,
+            }
+
 
     SYNC_HISTORY_KINDS = (
         EVENT_SYNC_RECEIVED,
