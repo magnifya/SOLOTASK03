@@ -48,7 +48,7 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
         # -- routing --------------------------------------------------------
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
-            path = self.path.split("?", 1)[0]
+            path, _, query = self.path.partition("?")
             if path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
@@ -146,6 +146,29 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     self._read_json()
                 status, body = service.mine_block()
                 self._send_json(status, body)
+            elif path == "/v1/accounts/proofs":
+                # POST /v1/accounts/proofs[?height=H] — batch account-state
+                # proofs. The body is {"accounts": [...]} and is strictly
+                # validated by the service (400), before any state is read.
+                # The success document has a contract-fixed key order
+                # (height, block_hash, state_root, proofs), so it is
+                # serialized in insertion order rather than alphabetically.
+                # Repeated query parameters are rejected 400 here, like the
+                # other strict query endpoints.
+                parsed = parse_qs(query, keep_blank_values=True)
+                # Always read (drain) the body before replying so an unread
+                # request body cannot leak into the next keep-alive request.
+                ok, payload = self._read_json()
+                if any(len(values) > 1 for values in parsed.values()):
+                    ok, payload = False, {
+                        "error": "query parameters must not be repeated"
+                    }
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.get_account_proofs(payload, params)
+                self._send_json(status, body, sort_keys=False)
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
                 if remainder.endswith("/proofs"):
