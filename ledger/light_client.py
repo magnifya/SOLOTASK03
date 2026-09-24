@@ -85,7 +85,12 @@ pending-only-at-tip) and the closed ``tip`` summary must recompute. A
 ``attestation: null``; an ``attested`` export must come from an unexpired
 ``trust.sources`` entry whose pinned key matches the attestation and verifies
 the Ed25519 signature over the SHA-256 digest of the canonical
-``ledger-sync-range-v1`` message. Failures map to ``input`` (structure),
+``ledger-sync-range-v1`` message. When the trust document carries
+``source_key_history`` (the per-source key lineage emitted by
+``GET /v1/trust``), the attestation's ``version`` instead selects the
+historical signing key from that lineage — an unknown source or version
+fails ``auth`` — so an export signed before a key rotation still verifies.
+Failures map to ``input`` (structure),
 ``auth`` (authorization), ``expired`` (deadlines) and ``integrity``
 (anchor/chain/signature); nothing is raised. Success returns
 ``{"ok": True, "source", "request_id", "mode", "anchor", "tip",
@@ -680,7 +685,10 @@ def verify_range_export(
     caller-pinned ``{height, block_hash}`` the document's anchor must strictly
     equal; ``trust`` is the local trust document (``sources`` pins
     ``{public_key, expires_at}`` per attested source, ``allowlist`` maps
-    keyless plain sources to their expiry).
+    keyless plain sources to their expiry, and the optional
+    ``source_key_history`` maps a source to its ascending
+    ``{version, public_key, activated_event_id}`` lineage, letting an
+    attestation select its historical signing key by ``version``).
 
     Returns ``{"ok": True, "source", "request_id", "mode", "anchor", "tip",
     "verified_tx_ids"}`` on success (tx_ids ascending) or
@@ -804,6 +812,32 @@ def _validate_range_trust(trust: object) -> None:
     for name, expires_at in allowlist.items():
         if not isinstance(name, str) or not name or not _is_int(expires_at):
             raise _Failure(ERR_INPUT)
+    history = trust.get("source_key_history")
+    if history is not None:
+        # The optional per-source key lineage: each source maps to a
+        # non-empty list of {version, public_key, activated_event_id}
+        # entries; both numeric fields are plain positive integers and the
+        # public key is 64 lowercase hex characters.
+        if not isinstance(history, dict):
+            raise _Failure(ERR_INPUT)
+        for name, entries in history.items():
+            if not isinstance(name, str) or not name:
+                raise _Failure(ERR_INPUT)
+            if not isinstance(entries, list) or not entries:
+                raise _Failure(ERR_INPUT)
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise _Failure(ERR_INPUT)
+                if not _is_int(entry.get("version")) or entry["version"] < 1:
+                    raise _Failure(ERR_INPUT)
+                activated = entry.get("activated_event_id")
+                if not _is_int(activated) or activated < 1:
+                    raise _Failure(ERR_INPUT)
+                public_key = entry.get("public_key")
+                if not isinstance(public_key, str) or not _HEX32_RE.fullmatch(
+                    public_key
+                ):
+                    raise _Failure(ERR_INPUT)
 
 
 def _authenticate_range_export(document: dict, trust: dict, now: float) -> None:
@@ -947,15 +981,37 @@ def _check_range_tip(supplied: dict, descriptor: dict) -> None:
 def _verify_range_attestation(document: dict, trust: dict) -> None:
     """Verify the attested export's Ed25519 signature under the pinned key.
 
-    The attestation's ``public_key`` must be exactly the key the trust
-    document pins for the source (a mismatched credential is an authorization
-    failure); the signature covers the SHA-256 digest of the canonical
-    ``ledger-sync-range-v1`` message over the document's delivered
-    ``source, request_id, expires_at, anchor, blocks, tip``.
+    When the trust document carries ``source_key_history``, the
+    attestation's ``version`` selects the historical signing key from the
+    source's lineage and the attestation's ``public_key`` must equal it, so
+    an export signed before a rotation still verifies; an unknown source or
+    version is an authorization failure. Without a lineage the attestation's
+    ``public_key`` must be exactly the key ``trust.sources`` pins (a
+    mismatched credential is an authorization failure). The signature covers
+    the SHA-256 digest of the canonical ``ledger-sync-range-v1`` message
+    over the document's delivered ``source, request_id, expires_at, anchor,
+    blocks, tip``.
     """
     source = document["source"]
     attestation = document["attestation"]
-    pinned = trust.get("sources", {})[source]["public_key"]
+    history = trust.get("source_key_history")
+    if history is not None:
+        entries = history.get(source)
+        if entries is None:
+            raise _Failure(ERR_AUTH)
+        match = next(
+            (
+                entry
+                for entry in entries
+                if entry["version"] == attestation["version"]
+            ),
+            None,
+        )
+        if match is None:
+            raise _Failure(ERR_AUTH)
+        pinned = match["public_key"]
+    else:
+        pinned = trust.get("sources", {})[source]["public_key"]
     if attestation["public_key"] != pinned:
         raise _Failure(ERR_AUTH)
     message = attested_range_message(

@@ -201,8 +201,12 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.get_transaction(tx_id)
                 self._send_json(status, body)
             elif path == "/v1/trust":
+                # GET /v1/trust — the offline verify document; its top-level
+                # key order (genesis_hash, sources, allowlist, audit_signers,
+                # source_key_history) is contract-fixed, so it is serialized
+                # in insertion order.
                 status, body = service.get_trust_document()
-                self._send_json(status, body)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/audit/events":
                 # GET /v1/audit/events?source=&kind=&cursor=&limit=
                 params = {

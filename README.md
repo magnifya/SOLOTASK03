@@ -285,13 +285,21 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   allowlist 仅供**离线 verify**，绝不改变 `POST /v1/forks/sync` 的授权。
   过期条目**不自动删除**，verify 按既有规则返回 `expired`。
 - **信任文档**：`GET /v1/trust` 返回离线验证所需的
-  `{"genesis_hash","sources","allowlist","audit_signers"}`：`genesis_hash` 固定
+  `{"genesis_hash","sources","allowlist","audit_signers","source_key_history"}`：`genesis_hash` 固定
   锚定 canonical 创世块；`sources[source] = {public_key, expires_at}` 只包含
   **未过期且未撤销**的来源（`expires_at <= now` 即剔除）；持久化的
   `allowlist[source] = expires_at` 原样保留；`audit_signers` 按 `version`
   升序列出节点曾经持有的**全部**审计检查点签名公钥，每项
   `{version, public_key, activated_event_id}`，首版 `activated_event_id` 为
-  `0`。该文档可直接作为 `ledger verify --trust` 的输入，其 `genesis_hash`
+  `0`。`source_key_history` 把**每个**注册来源（含已过期、已撤销）映射到其
+  完整公钥谱系：按 `version` 升序的 `{version, public_key,
+  activated_event_id}` 数组（两者均为非布尔正整数，`public_key` 为 64 位
+  小写十六进制）；版本 1 由该来源的 `source_registered` 事件激活，每次轮换
+  追加一个由其 `source_rotated` 事件激活的新版本，撤销**不截断**谱系，因此
+  轮换/撤销前签发的 attested 区间导出仍可离线核验。谱系与注册表、审计事件
+  在同一原子快照中落盘；重启时谱系结构或与事件不符（版本不连续、激活事件
+  缺失/不匹配、与当前注册记录不一致）抛 `StateRecoveryError(path, reason)`。
+  该文档可直接作为 `ledger verify --trust` 的输入，其 `genesis_hash`
   与 `audit_signers` 也供 `ledger audit-verify --trust` 使用。
 - **审计查询**：`GET /v1/audit/events` 支持 `source`、`kind`、`cursor`、
   `limit`（默认 50，范围 1–200）过滤；数值参数必须是首位非 0 的十进制
@@ -502,7 +510,7 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
   confirmed_transactions, index, state_root, height, block_hash, siblings}`
   八字段文档（缺失、额外或类型错误都判 `input`）。
 - **trust**：`{genesis_hash, sources, allowlist}`（`GET /v1/trust` 还会带
-  `audit_signers`，轻客户端束验证忽略该额外字段）。`genesis_hash` 锚定创世
+  `audit_signers` 与 `source_key_history`，轻客户端束验证忽略这些额外字段）。`genesis_hash` 锚定创世
   块；`sources[source] = {public_key, expires_at}`；
   `allowlist[source] = expires_at`。
 - **来源与签名**：`source` 必须受信（在 `sources` 或 `allowlist` 中）且未过期
@@ -561,8 +569,11 @@ now=None) -> dict` 直接接收已解码的
   128 位十六进制签名）；trust 的 `sources`/`allowlist` 形状同离线
   verify。文件不可读、JSON 解析失败或锚点参数非法同样返回 `input`。
 - **授权（auth）**：`plain` 要求来源在 `allowlist` 中且
-  `attestation` 为 `null`；`attested` 要求来源在 `trust.sources` 中且
-  attestation 携带的 `public_key` 与钉住公钥一致。
+  `attestation` 为 `null`；`attested` 要求来源在 `trust.sources` 中。
+  trust 携带 `source_key_history` 时，按 `attestation.version` 从该来源的
+  谱系中取历史公钥并要求与 `attestation.public_key` 一致（未知来源或未知
+  版本判 `auth`）；不带谱系时沿用旧规——attestation 的 `public_key` 必须与
+  `sources` 钉住的当前公钥一致。
 - **期限（expired）**：文档的 `expires_at` 与对应信任条目的
   `expires_at` 逐一检查，`<= now` 即过期。
 - **完整性（integrity）**：`expected_anchor` 必须严格等于文档的
@@ -570,7 +581,8 @@ now=None) -> dict` 直接接收已解码的
   连续、`prev_hash` 链接、逐笔 tx_id 与 Ed25519 签名、tx_id 全尾唯一且
   块内升序、Merkle 根与区块哈希重算、pending 只能在末块；原始值类型
   缺陷仍归 `input`），闭合 `tip` 摘要必须等于重算结果；attested 再按
-  钉住公钥验证 `ledger-sync-range-v1` canonical JSON 摘要的 Ed25519
+  选定公钥（有 `source_key_history` 时为该版本的历史公钥，否则为钉住的
+  当前公钥）验证 `ledger-sync-range-v1` canonical JSON 摘要的 Ed25519
   签名。
 
 成功返回固定键序 `{ok, source, request_id, mode, anchor, tip,

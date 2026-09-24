@@ -22,6 +22,12 @@ confirm/rollback ``status``), a small ``state`` summary, the mempool
 (``pending``), candidate fork chains (``forks``, each a full block list
 anchored at the canonical genesis and keyed by its tip hash), the
 confirmed-transaction ``index`` and the confirmed ``accounts`` activity.
+The source-trust registry travels with a per-source key lineage
+(``source_key_history``): every public key a source has ever held, ascending
+by version and pinned to the audit event that activated it, so historical
+attestations stay verifiable after rotation or revocation; on recovery the
+lineage is strictly checked against the durable registration/rotation events
+and the current registry records, and any mismatch fails recovery.
 Derived data (index/accounts) is *rebuilt* from the chain on every load and
 every save — pending blocks are excluded, so a restart never resurrects
 unconfirmed transactions into balances. Persisted fork candidates are
@@ -93,6 +99,8 @@ ATTESTED_RANGE_DOMAIN = "ledger-sync-range-v1"
 
 # Audit event kinds are owned by the store layer (recovery emits them too);
 # service.EVENT_* constants mirror these literal values.
+EVENT_SOURCE_REGISTERED = "source_registered"
+EVENT_SOURCE_ROTATED = "source_rotated"
 EVENT_SYNC_RECEIVED = "sync_received"
 EVENT_SYNC_ADOPTED = "sync_adopted"
 EVENT_SYNC_EXPIRED = "sync_expired"
@@ -293,6 +301,13 @@ class LedgerStore:
         # Persistent source-trust registry keyed by source identifier. Each
         # record is {"public_key", "expires_at", "version", "status"}.
         self.trust_sources: dict[str, dict] = {}
+        # Per-source key lineage: every public key a source has ever held,
+        # ascending by version, each {"version", "public_key",
+        # "activated_event_id"}. Version 1 is activated by the source's
+        # source_registered audit event, each later version by its
+        # source_rotated event; revocation never truncates the lineage, so
+        # historical attestations stay verifiable offline.
+        self.source_key_history: dict[str, list[dict]] = {}
         # Keyless trust allowlist {source: expires_at}; preserved verbatim and
         # surfaced by GET /v1/trust for offline light clients.
         self.allowlist: dict[str, int] = {}
@@ -361,6 +376,7 @@ class LedgerStore:
                 self.syncs = {}
                 self.attested_syncs = {}
                 self.trust_sources = {}
+                self.source_key_history = {}
                 self.allowlist = {}
                 self.audit_events = []
                 self.audit_checkpoint = audit.make_checkpoint([])
@@ -386,7 +402,7 @@ class LedgerStore:
                 #           syncs, trust_sources, allowlist, audit_events,
                 #           expired_records, audit_checkpoint, audit_repair,
                 #           signer_state, recorded_state_root, attested_syncs,
-                #           attested_expired_records)
+                #           attested_expired_records, source_key_history_state)
                 valid.append(
                     (
                         parsed[2],
@@ -406,6 +422,7 @@ class LedgerStore:
                         parsed[13],
                         parsed[14],
                         parsed[15],
+                        parsed[16],
                     )
                 )
 
@@ -420,7 +437,8 @@ class LedgerStore:
             # item layout: (generation, path, chain, pending, forks,
             # initial_balance, syncs, trust_sources, allowlist, audit_events,
             # expired_records, audit_checkpoint, audit_repair, signer_state,
-            # recorded_state_root, attested_syncs, attested_expired_records)
+            # recorded_state_root, attested_syncs, attested_expired_records,
+            # source_key_history_state)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -434,6 +452,7 @@ class LedgerStore:
                 top[0][13][1],
                 top[0][14],
                 top[0][15],
+                top[0][17][0],
             )
             for item in top[1:]:
                 if (
@@ -450,6 +469,7 @@ class LedgerStore:
                         item[13][1],
                         item[14],
                         item[15],
+                        item[17][0],
                     )
                     != reference
                 ):
@@ -485,6 +505,7 @@ class LedgerStore:
                 recorded_state_root,
                 attested_syncs,
                 attested_expired_records,
+                source_key_history_state,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -548,12 +569,21 @@ class LedgerStore:
                 audit_signer = self._make_audit_signer(1, 0)
                 signer_history = [self._public_signer_entry(audit_signer)]
 
+            # A snapshot written before the per-source key lineage was
+            # persisted carries no source_key_history section: the history was
+            # derived from the durable registration/rotation events during
+            # parsing and is re-persisted by the single save() below.
+            source_key_history, source_key_history_migration = (
+                source_key_history_state
+            )
+
             self.chain = chain
             self.pending = pending
             self.forks = forks
             self.syncs = syncs
             self.attested_syncs = attested_syncs
             self.trust_sources = trust_sources
+            self.source_key_history = source_key_history
             self.allowlist = allowlist
             self.audit_events = audit_events
             self.audit_checkpoint = audit_checkpoint
@@ -569,11 +599,16 @@ class LedgerStore:
             self.rebuild_derived()
             self._cleanup_candidates(directory)
             # Persist the reconciled state (pruned records/forks + backfilled
-            # events + legacy hash-chain completion + signer migration)
-            # atomically so the next restart never re-derives or duplicates
-            # anything; with nothing to reconcile no write happens and the
-            # recovered generation is kept byte-for-byte.
-            if backfilled or audit_repair or signer_migration:
+            # events + legacy hash-chain completion + signer and key-lineage
+            # migrations) atomically so the next restart never re-derives or
+            # duplicates anything; with nothing to reconcile no write happens
+            # and the recovered generation is kept byte-for-byte.
+            if (
+                backfilled
+                or audit_repair
+                or signer_migration
+                or source_key_history_migration
+            ):
                 self.save()
 
     def _discover_candidates(self, directory: str) -> list[str]:
@@ -608,6 +643,7 @@ class LedgerStore:
         audit_signer_history: list[dict] | None = None,
         state_root: str | None = None,
         attested_syncs: dict[tuple[str, str], dict] | None = None,
+        source_key_history: dict[str, list[dict]] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -623,7 +659,10 @@ class LedgerStore:
         different ``state_root`` describes a different confirmed state and is
         a conflict rather than a quietly accepted alternative. The attested
         sync table (with its frozen key/version/signature/signed form) is its
-        own section so it participates independently of plain syncs.
+        own section so it participates independently of plain syncs. The
+        per-source key lineage participates as well: two same-generation
+        snapshots disagreeing about a source's historical keys or their
+        activation events are a conflict.
         """
         sync_records = [
             {
@@ -681,6 +720,7 @@ class LedgerStore:
                 or {"event_id": 0, "event_hash": "0" * 64},
                 "audit_signer_history": audit_signer_history or [],
                 "state_root": state_root,
+                "source_key_history": source_key_history or {},
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -740,6 +780,7 @@ class LedgerStore:
         bool,
         tuple[dict | None, list[dict], bool],
         str | None,
+        tuple[dict[str, list[dict]], bool],
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -937,6 +978,14 @@ class LedgerStore:
         signer_state = self._parse_persisted_audit_signer(
             state, chain, audit_events, audit_checkpoint, path, state_version
         )
+        # The per-source key lineage is authoritative configuration exactly
+        # like the trust registry: it must be internally consistent, backed
+        # by the durable registration/rotation events and agree with the
+        # current trust records. A pre-lineage snapshot (no section) is
+        # migrated by derivation from those events.
+        source_key_history_state = self._parse_persisted_source_key_history(
+            data.get("source_key_history"), trust_sources, audit_events, path
+        )
         syncs, expired_records, synced_tips = self._parse_persisted_syncs(
             data.get("syncs", []), forks, chain, trust_sources
         )
@@ -979,6 +1028,7 @@ class LedgerStore:
             recorded_state_root,
             attested_syncs,
             attested_expired,
+            source_key_history_state,
         )
 
     @staticmethod
@@ -1368,6 +1418,178 @@ class LedgerStore:
                 "status": status,
             }
         return sources
+
+    @staticmethod
+    def _parse_persisted_source_key_history(
+        raw: object,
+        trust_sources: dict[str, dict],
+        audit_events: list[dict],
+        path: str,
+    ) -> tuple[dict[str, list[dict]], bool]:
+        """Strictly validate the persisted per-source key lineage.
+
+        Returns ``(history, needs_migration)``. The history maps every trust
+        source to its ascending ``{version, public_key, activated_event_id}``
+        entries: version 1 is activated by the source's ``source_registered``
+        audit event, each later version by its ``source_rotated`` event, and
+        a revocation never truncates the lineage, so historical attestations
+        stay verifiable after a rotation or revocation.
+
+        A snapshot written before the lineage was persisted carries no
+        section: the history is then derived from the durable
+        registration/rotation events (which always recorded the version and
+        public key) and re-persisted by load(). A present section is
+        authoritative configuration exactly like the trust registry: any
+        structural defect, a version or activation-id inconsistency, an
+        entry not backed by its activation event, or a latest entry that
+        disagrees with the current trust record is snapshot corruption and
+        fails recovery with StateRecoveryError.
+        """
+
+        def fail(reason: str) -> None:
+            raise StateRecoveryError(path, reason)
+
+        if raw is None:
+            # Pre-lineage snapshot: derive the history from the durable
+            # events. Every source must have exactly one registration event
+            # and one rotation event per version past 1; anything else can
+            # never be reconciled with the trust registry and is corruption.
+            registered: dict[str, list[dict]] = {}
+            rotated: dict[str, list[dict]] = {}
+            for event in audit_events:
+                kind = event.get("kind")
+                if kind == EVENT_SOURCE_REGISTERED:
+                    registered.setdefault(event.get("source"), []).append(event)
+                elif kind == EVENT_SOURCE_ROTATED:
+                    rotated.setdefault(event.get("source"), []).append(event)
+            history: dict[str, list[dict]] = {}
+            for source, rec in trust_sources.items():
+                registrations = registered.get(source, [])
+                rotations = rotated.get(source, [])
+                if len(registrations) != 1 or len(rotations) != rec["version"] - 1:
+                    fail(
+                        f"cannot derive the key history of trust source "
+                        f"{source!r} from the audit events"
+                    )
+                entries = [
+                    {
+                        "version": 1,
+                        "public_key": registrations[0].get("public_key"),
+                        "activated_event_id": registrations[0]["event_id"],
+                    }
+                ]
+                for index, event in enumerate(rotations):
+                    entries.append(
+                        {
+                            "version": index + 2,
+                            "public_key": event.get("public_key"),
+                            "activated_event_id": event["event_id"],
+                        }
+                    )
+                history[source] = entries
+            migration = bool(history)
+        else:
+            if not isinstance(raw, dict):
+                fail("'source_key_history' must be a JSON object")
+            history = {}
+            for source, entries_raw in raw.items():
+                if not isinstance(source, str) or not source:
+                    fail("source_key_history source must be a non-empty string")
+                if not isinstance(entries_raw, list) or not entries_raw:
+                    fail(
+                        f"source_key_history for {source!r} must be a "
+                        "non-empty list"
+                    )
+                entries = []
+                for entry in entries_raw:
+                    if not isinstance(entry, dict):
+                        fail("source_key_history entry must be an object")
+                    entries.append(
+                        {
+                            "version": entry.get("version"),
+                            "public_key": entry.get("public_key"),
+                            "activated_event_id": entry.get(
+                                "activated_event_id"
+                            ),
+                        }
+                    )
+                history[source] = entries
+            migration = False
+
+        # One validation pass for both the parsed and the derived lineage:
+        # structure, agreement with the trust registry and backing events.
+        # The lineage may cover sources no longer present in the registry
+        # (a registry entry can vanish while its history stays auditable),
+        # but every registry source must have a lineage whose latest entry
+        # is its current record.
+        missing = set(trust_sources) - set(history)
+        if missing:
+            fail(
+                f"trust source(s) {sorted(missing)!r} have no key history"
+            )
+        events_by_id = {event["event_id"]: event for event in audit_events}
+        for source, entries in history.items():
+            for position, entry in enumerate(entries):
+                version = entry["version"]
+                public_key = entry["public_key"]
+                activated = entry["activated_event_id"]
+                if (
+                    isinstance(version, bool)
+                    or not isinstance(version, int)
+                    or version != position + 1
+                ):
+                    fail("source_key_history versions must be dense from 1")
+                if not crypto.is_hex64(public_key):
+                    fail(
+                        f"source_key_history entry for {source!r} has an "
+                        "invalid public_key"
+                    )
+                if (
+                    isinstance(activated, bool)
+                    or not isinstance(activated, int)
+                    or activated < 1
+                ):
+                    fail(
+                        "source_key_history activated_event_id must be a "
+                        "positive integer"
+                    )
+                if (
+                    position > 0
+                    and activated <= entries[position - 1]["activated_event_id"]
+                ):
+                    fail("source key activation ids must be strictly ascending")
+            record = trust_sources.get(source)
+            latest = entries[-1]
+            if record is not None and (
+                latest["version"] != record["version"]
+                or latest["public_key"] != record["public_key"]
+            ):
+                fail(
+                    f"latest source_key_history entry for {source!r} does "
+                    "not match the trust record"
+                )
+            for entry in entries:
+                expected_kind = (
+                    EVENT_SOURCE_REGISTERED
+                    if entry["version"] == 1
+                    else EVENT_SOURCE_ROTATED
+                )
+                event = events_by_id.get(entry["activated_event_id"])
+                if event is None or event.get("kind") != expected_kind:
+                    fail(
+                        f"source {source!r} key version {entry['version']} "
+                        f"has no matching {expected_kind} event"
+                    )
+                if (
+                    event.get("source") != source
+                    or event.get("public_key") != entry["public_key"]
+                    or event.get("version") != entry["version"]
+                ):
+                    fail(
+                        f"{expected_kind} event {event['event_id']} does not "
+                        "match the source key history"
+                    )
+        return history, migration
 
     @staticmethod
     def _parse_persisted_allowlist(raw: object, path: str) -> dict[str, int]:
@@ -2314,6 +2536,23 @@ class LedgerStore:
                 "public_key": self.audit_signer["public_key"],
                 "activated_event_id": self.audit_signer["activated_event_id"],
             }
+        # The key lineage is the second view of the trust registry: every
+        # registry source must have a lineage whose latest entry is its
+        # current record (the lineage may additionally retain sources whose
+        # registry entry is gone). Refuse to persist a document where the
+        # two disagree.
+        for source, record in self.trust_sources.items():
+            entries = self.source_key_history.get(source)
+            latest = entries[-1] if entries else None
+            if (
+                latest is None
+                or latest["version"] != record["version"]
+                or latest["public_key"] != record["public_key"]
+            ):
+                raise RuntimeError(
+                    "source_key_history does not match the trust registry; "
+                    "refusing to persist an inconsistent snapshot"
+                )
         data = {
             "state": {
                 "version": STATE_VERSION,
@@ -2397,6 +2636,14 @@ class LedgerStore:
                 {"source": source, **self.trust_sources[source]}
                 for source in sorted(self.trust_sources)
             ]
+        # Every public key a source has ever held (ascending version, each
+        # pinned to its activation audit event) travels with the registry so
+        # historical attestations stay verifiable after rotation/revocation.
+        if self.source_key_history:
+            data["source_key_history"] = {
+                source: [dict(entry) for entry in self.source_key_history[source]]
+                for source in sorted(self.source_key_history)
+            }
         if self.allowlist:
             data["allowlist"] = dict(sorted(self.allowlist.items()))
         # The audit trail is append-only; every trust change and every sync

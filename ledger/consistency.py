@@ -13,7 +13,8 @@ filesystem::
       "audit_checkpoint":  {"event_id", "event_hash"},
       "audit_events":      optional append-only hash-chained event list,
       # extensions, accepted but not re-verified here:
-      "forks" / "syncs" / "attested_syncs" / "trust_sources" / "allowlist",
+      "forks" / "syncs" / "attested_syncs" / "trust_sources" /
+      "source_key_history" / "allowlist",
     }
 
 Verification recomputes, from the raw JSON values:
@@ -68,6 +69,7 @@ KNOWN_OPTIONAL_SECTIONS = (
     "syncs",
     "attested_syncs",
     "trust_sources",
+    "source_key_history",
     "allowlist",
 )
 

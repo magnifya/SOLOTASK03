@@ -2885,7 +2885,7 @@ class LedgerService:
                 "status": TRUST_ACTIVE,
             }
             self.store.trust_sources[source] = record
-            self.store.append_audit_event(
+            event = self.store.append_audit_event(
                 EVENT_SOURCE_REGISTERED,
                 {
                     "source": source,
@@ -2894,11 +2894,22 @@ class LedgerService:
                     "version": 1,
                 },
             )
+            # Version 1 of the source's key lineage is activated by its
+            # registration event.
+            self.store.source_key_history[source] = [
+                {
+                    "version": 1,
+                    "public_key": public_key,
+                    "activated_event_id": event["event_id"],
+                }
+            ]
             try:
                 self.store.save()
             except BaseException:
-                # Undo both the registry change and its event together.
+                # Undo the registry change, its lineage entry and its event
+                # together.
                 self.store.trust_sources.pop(source, None)
+                self.store.source_key_history.pop(source, None)
                 self.store.truncate_audit_events(1)
                 raise
             return 201, self._trust_record(source, record)
@@ -2938,7 +2949,7 @@ class LedgerService:
             existing["public_key"] = public_key
             existing["expires_at"] = expires_at
             existing["version"] = old_record["version"] + 1
-            self.store.append_audit_event(
+            event = self.store.append_audit_event(
                 EVENT_SOURCE_ROTATED,
                 {
                     "source": source,
@@ -2947,10 +2958,22 @@ class LedgerService:
                     "version": existing["version"],
                 },
             )
+            # The rotation extends the key lineage: the new version is
+            # activated by its source_rotated event; the old keys are kept.
+            lineage = self.store.source_key_history.setdefault(source, [])
+            lineage_length = len(lineage)
+            lineage.append(
+                {
+                    "version": existing["version"],
+                    "public_key": public_key,
+                    "activated_event_id": event["event_id"],
+                }
+            )
             try:
                 self.store.save()
             except BaseException:
                 self.store.trust_sources[source] = old_record
+                del self.store.source_key_history[source][lineage_length:]
                 self.store.truncate_audit_events(1)
                 raise
             return 200, self._trust_record(source, existing)
@@ -3014,7 +3037,12 @@ class LedgerService:
         checkpoint key ever held in ascending version order as
         ``{version, public_key, activated_event_id}`` (version 1 is activated
         at event 0), so offline audit export verification can pick the key
-        that signed each checkpoint.
+        that signed each checkpoint. ``source_key_history`` maps every
+        registered source — active, expired or revoked — to its full key
+        lineage in ascending version order, each entry
+        ``{version, public_key, activated_event_id}`` pinned to the audit
+        event that activated it, so an attested export signed under an old
+        key version stays verifiable after rotation or revocation.
         """
         with self.store.lock:
             now = time.time()
@@ -3027,11 +3055,16 @@ class LedgerService:
                     "expires_at": rec["expires_at"],
                 }
             audit_signers = [dict(entry) for entry in self.store.audit_signer_history]
+            source_key_history = {
+                source: [dict(entry) for entry in self.store.source_key_history[source]]
+                for source in sorted(self.store.source_key_history)
+            }
             return 200, {
                 "genesis_hash": self.store.chain[0].block_hash,
                 "sources": sources,
                 "allowlist": dict(self.store.allowlist),
                 "audit_signers": audit_signers,
+                "source_key_history": source_key_history,
             }
 
     # -- keyless allowlist management -----------------------------------------
