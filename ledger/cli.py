@@ -5,7 +5,7 @@ index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
-verify/audit-verify/consistency subcommands.
+verify/verify-range/audit-verify/consistency subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -729,6 +730,43 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if body.get("ok") is True else 1
 
 
+def cmd_verify_range(args: argparse.Namespace) -> int:
+    """Offline verification of one range-export document; no server contact.
+
+    The export document is read from ``--export FILE`` or standard input
+    (``-``); the caller-pinned anchor comes from ``--anchor-height`` and
+    ``--anchor-hash``. Prints a single JSON line — the success document keeps
+    its contract key order ``ok,source,request_id,mode,anchor,tip,
+    verified_tx_ids`` — and exits 0 on success, 1 on any failure. An
+    unreadable file, malformed JSON or malformed anchor parameter is an
+    ``input`` error.
+    """
+    from .light_client import verify_range_export
+
+    height: int | None = None
+    if re.fullmatch(r"[0-9]+", args.anchor_height or ""):
+        height = int(args.anchor_height)
+    if height is None or not crypto.is_hex64(args.anchor_hash):
+        body = {"ok": False, "error": "input"}
+        print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+        return 1
+    try:
+        if args.export_file == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.export_file, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+        with open(args.trust, "r", encoding="utf-8") as fh:
+            trust = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        body = {"ok": False, "error": "input"}
+    else:
+        expected_anchor = {"height": height, "block_hash": args.anchor_hash}
+        body = verify_range_export(document, expected_anchor, trust)
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -1045,6 +1083,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="local trust JSON file (genesis_hash, sources, allowlist)",
     )
     p_verify.set_defaults(func=cmd_verify)
+
+    p_verify_range = sub.add_parser(
+        "verify-range",
+        help="offline-verify a range-export document against a pinned anchor "
+        "and a local trust document",
+    )
+    p_verify_range.add_argument(
+        "--export",
+        dest="export_file",
+        required=True,
+        metavar="FILE|-",
+        help="range-export JSON file, or - to read it from standard input",
+    )
+    p_verify_range.add_argument(
+        "--trust",
+        required=True,
+        help="local trust JSON file (sources, allowlist)",
+    )
+    p_verify_range.add_argument(
+        "--anchor-height",
+        required=True,
+        help="pinned anchor block height (unsigned decimal)",
+    )
+    p_verify_range.add_argument(
+        "--anchor-hash",
+        required=True,
+        help="pinned anchor block hash (64 lowercase hex characters)",
+    )
+    p_verify_range.set_defaults(func=cmd_verify_range)
 
     # Source-trust management: `trust <action> ...`.
     p_trust = sub.add_parser("trust", help="manage trusted sources and export the trust document")
