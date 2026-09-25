@@ -194,6 +194,31 @@ reordered pages and any tampering are rejected. Success is ``{"ok": True}``;
 failure is ``{"ok": False, "error": category}`` with category one of
 ``input`` (structure/types), ``auth`` (pinned key or signature) and
 ``integrity`` (chaining, pagination or checkpoint replay); nothing is raised.
+
+:func:`verify_history_trust` verifies the same pages against a signer
+rotation/revocation log instead of one pinned page key, so each page's
+``auth.public_key`` may differ. The ``trust`` document has the exact key
+order ``root, records, head``: ``root`` is a 64-hex Ed25519 key that must
+equal the pinned ``root`` argument; every non-empty record has the exact key
+order ``at, key, status, prev, signature`` with ``at`` a plain
+(non-boolean) positive strictly-ascending integer, ``key``/``prev`` 64
+lowercase hex, ``status`` exactly ``active``/``revoked`` and ``signature``
+128 lowercase hex. The first ``prev`` is 64 zeros, every later one is the
+previous record's canonical-JSON SHA-256 and ``head`` is the last record's
+hash; each certificate is the root key's Ed25519 signature over the
+SHA-256 of the record's canonical JSON with ``signature`` removed. An
+``active`` record authorizes ``key`` from its ``at`` until the next record;
+a ``revoked`` one withdraws it until a later ``active``. A page must name
+the single key active at every checkpoint ``verified_at`` it carries — a
+page straddling an authorization boundary is rejected — and its signature
+must verify over the auth-less canonical page digest. All page structure,
+chaining, pagination and checkpoint-replay rules stay identical to
+:func:`verify_history`. Failures map to ``input`` (missing/extra/reordered
+keys, wrong types or hex), ``auth`` (root mismatch, a bad certificate or
+page signature, an unknown or revoked page key) and ``integrity`` (``at``
+not ascending, a bad ``prev``/``head``, a boundary crossing, or any
+record/pagination/checkpoint-replay defect); nothing is raised and success
+is ``{"ok": True}``.
 """
 from __future__ import annotations
 
@@ -2089,7 +2114,21 @@ def verify_history(pages: object, public_key: object) -> dict:
     pagination or checkpoint replay). Never raises for malformed input.
     """
     try:
-        _verify_history_pages(pages, public_key)
+        if not isinstance(public_key, str) or not _HEX32_RE.fullmatch(public_key):
+            raise _Failure(ERR_INPUT)
+        parsed = _parse_all_history_pages(pages)
+
+        def authenticate(page: dict, check_shared: object) -> None:
+            # The old verifier judges the pinned-key mismatch before the
+            # shared-field comparison and the signature afterwards, so a page
+            # failing both reports ``auth`` for the key (and, only once the
+            # shared envelope matches, a bad signature).
+            if page["auth"]["public_key"] != public_key:
+                raise _Failure(ERR_AUTH)
+            check_shared()
+            _verify_history_page_signature(page, public_key)
+
+        _run_history_checks(parsed, authenticate)
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
@@ -2132,13 +2171,84 @@ def _validate_page_record(raw: object) -> dict:
     return {"checkpoint": checkpoint, "prev": raw["prev"], "hash": raw["hash"]}
 
 
-def _verify_history_pages(pages: object, pinned_key: object) -> None:
-    """All structural, authentication and chaining checks for :func:`verify_history`."""
+def _parse_history_page(raw_page: object) -> dict:
+    """Shape-validate one exported history page.
+
+    Returns ``{"raw", "auth", "base", "head", "checkpoint", "records",
+    "next"}`` with every nested document's key order and JSON type already
+    validated. Raises :class:`_Failure` (``input``) on every structural
+    defect; never judges signatures or cross-page chaining.
+    """
+    if not isinstance(raw_page, dict) or tuple(raw_page.keys()) != HISTORY_PAGE_KEYS:
+        raise _Failure(ERR_INPUT)
+    auth = raw_page["auth"]
+    if not isinstance(auth, dict) or tuple(auth.keys()) != HISTORY_PAGE_AUTH_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(auth["public_key"]):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex128(auth["signature"]):
+        raise _Failure(ERR_INPUT)
+    base = _validate_page_base(raw_page["base"])
+    head = raw_page["head"]
+    if not crypto.is_hex64(head):
+        raise _Failure(ERR_INPUT)
+    page_checkpoint = _validate_page_checkpoint(raw_page["checkpoint"])
+    records = raw_page["records"]
+    if not isinstance(records, list) or not records:
+        raise _Failure(ERR_INPUT)
+    next_value = raw_page["next"]
+    if next_value is not None and (not _is_int(next_value) or next_value < 0):
+        raise _Failure(ERR_INPUT)
+    # Every embedded record is shape- and type-validated up front, so a
+    # structurally malformed page reports ``input`` even if its (now
+    # mismatched) signature would fail too — structure precedes trust.
+    validated_records = [_validate_page_record(raw) for raw in records]
+    return {
+        "raw": raw_page,
+        "auth": auth,
+        "base": base,
+        "head": head,
+        "checkpoint": page_checkpoint,
+        "records": validated_records,
+        "next": next_value,
+    }
+
+
+def _parse_all_history_pages(pages: object) -> list[dict]:
+    """Shape-validate a non-empty ordered batch of exported history pages."""
     if not isinstance(pages, list) or not pages:
         raise _Failure(ERR_INPUT)
-    if not isinstance(pinned_key, str) or not _HEX32_RE.fullmatch(pinned_key):
-        raise _Failure(ERR_INPUT)
+    return [_parse_history_page(raw_page) for raw_page in pages]
 
+
+def _history_page_signing_digest(raw_page: dict) -> bytes:
+    """The SHA-256 digest of a page's auth-less canonical JSON document."""
+    unsigned = {
+        key: raw_page[key] for key in HISTORY_PAGE_KEYS if key != "auth"
+    }
+    return hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
+
+
+def _verify_history_page_signature(page: dict, signer_key: str) -> None:
+    """Verify one page signature over the auth-less canonical page digest."""
+    digest = _history_page_signing_digest(page["raw"])
+    if not crypto.verify_signature(signer_key, digest, page["auth"]["signature"]):
+        raise _Failure(ERR_AUTH)
+
+
+def _run_history_checks(parsed: list[dict], authenticate: object) -> None:
+    """Shared authentication/chaining core of both history verifiers.
+
+    Pages must already be shape-validated (see
+    :func:`_parse_all_history_pages`). They are processed in the exact order
+    the single-key verifier always used: ``authenticate(page, check_shared)``
+    runs per page (the callback invokes the deferred shared-field comparison
+    at its own point relative to key/signature checks), and only then are
+    that page's records generation-/prev-/hash-linked and their checkpoints
+    replayed; its ``next`` cursor is checked at the page seam. After the loop
+    the final page must carry ``next: null`` and close the shared
+    ``head``/``checkpoint``.
+    """
     common_base: dict | None = None
     common_head: str | None = None
     common_checkpoint: dict | None = None
@@ -2147,61 +2257,32 @@ def _verify_history_pages(pages: object, pinned_key: object) -> None:
     expected_generation: int | None = None
     previous_tip: dict | None = None
 
-    for position, raw_page in enumerate(pages):
-        is_last_page = position == len(pages) - 1
-        if not isinstance(raw_page, dict) or tuple(raw_page.keys()) != HISTORY_PAGE_KEYS:
-            raise _Failure(ERR_INPUT)
-        auth = raw_page["auth"]
-        if not isinstance(auth, dict) or tuple(auth.keys()) != HISTORY_PAGE_AUTH_KEYS:
-            raise _Failure(ERR_INPUT)
-        if not crypto.is_hex64(auth["public_key"]):
-            raise _Failure(ERR_INPUT)
-        if not crypto.is_hex128(auth["signature"]):
-            raise _Failure(ERR_INPUT)
-        base = _validate_page_base(raw_page["base"])
-        head = raw_page["head"]
-        if not crypto.is_hex64(head):
-            raise _Failure(ERR_INPUT)
-        page_checkpoint = _validate_page_checkpoint(raw_page["checkpoint"])
-        records = raw_page["records"]
-        if not isinstance(records, list) or not records:
-            raise _Failure(ERR_INPUT)
-        next_value = raw_page["next"]
-        if next_value is not None and (not _is_int(next_value) or next_value < 0):
-            raise _Failure(ERR_INPUT)
-        # Every embedded record is shape- and type-validated up front, so a
-        # structurally malformed page reports ``input`` even if its (now
-        # mismatched) signature would fail too — structure precedes trust.
-        validated_records = [_validate_page_record(raw) for raw in records]
+    for position, page in enumerate(parsed):
+        is_last_page = position == len(parsed) - 1
 
-        # The pinned trust anchor and the signed envelope must be shared by
-        # every page of the export.
-        if auth["public_key"] != pinned_key:
-            raise _Failure(ERR_AUTH)
-        if common_base is None:
-            common_base = base
-            common_head = head
-            common_checkpoint = page_checkpoint
-        elif base != common_base:
-            raise _Failure(ERR_INTEGRITY)
-        elif head != common_head or page_checkpoint != common_checkpoint:
-            raise _Failure(ERR_INTEGRITY)
+        def check_shared() -> None:
+            # The trust anchor (base) and signed envelope (head, checkpoint)
+            # must be shared by every page of the export.
+            nonlocal common_base, common_head, common_checkpoint
+            if common_base is None:
+                common_base = page["base"]
+                common_head = page["head"]
+                common_checkpoint = page["checkpoint"]
+            elif page["base"] != common_base:
+                raise _Failure(ERR_INTEGRITY)
+            elif page["head"] != common_head or (
+                page["checkpoint"] != common_checkpoint
+            ):
+                raise _Failure(ERR_INTEGRITY)
 
-        # The signature covers the page verbatim minus auth, canonicalized the
-        # same way the exporter canonicalizes it.
-        unsigned = {
-            key: raw_page[key] for key in HISTORY_PAGE_KEYS if key != "auth"
-        }
-        digest = hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
-        if not crypto.verify_signature(pinned_key, digest, auth["signature"]):
-            raise _Failure(ERR_AUTH)
+        authenticate(page, check_shared)
 
         if expected_prev is None:
             # The first page starts right at the shared base.
-            expected_prev = base["hash"]
-            expected_generation = base["generation"] + 1
+            expected_prev = page["base"]["hash"]
+            expected_generation = page["base"]["generation"] + 1
 
-        for record in validated_records:
+        for record in page["records"]:
             checkpoint = record["checkpoint"]
             if checkpoint["generation"] != expected_generation:
                 # A gap, duplicate or reordered page breaks generation order.
@@ -2228,20 +2309,239 @@ def _verify_history_pages(pages: object, pinned_key: object) -> None:
             expected_prev = record["hash"]
             expected_generation += 1
 
-        last_generation = records[-1]["checkpoint"]["generation"]
+        last_generation = page["records"][-1]["checkpoint"]["generation"]
         if is_last_page:
-            if next_value is not None:
+            if page["next"] is not None:
                 raise _Failure(ERR_INTEGRITY)
         else:
-            # A non-final page must name its last record as the cursor the next
-            # page continues from.
-            if next_value != last_generation:
+            # A non-final page must name its last record as the cursor the
+            # next page continues from.
+            if page["next"] != last_generation:
                 raise _Failure(ERR_INTEGRITY)
 
-    # The final page closes the export: its last record is the sidecar head and
-    # its checkpoint is the page checkpoint shared by every page.
-    final_record = _validate_page_record(pages[-1]["records"][-1])
+    # The final page closes the export: its last record is the sidecar head
+    # and its checkpoint is the page checkpoint shared by every page.
+    final_record = parsed[-1]["records"][-1]
     if final_record["hash"] != common_head:
         raise _Failure(ERR_INTEGRITY)
     if final_record["checkpoint"] != common_checkpoint:
         raise _Failure(ERR_INTEGRITY)
+
+
+# -- signed history export verification with signer rotation/revocation --------
+
+# The exact top-level key order of one signer trust/rotation log, and the exact
+# key order of one record in it.
+HISTORY_TRUST_KEYS = ("root", "records", "head")
+SIGNER_RECORD_KEYS = ("at", "key", "status", "prev", "signature")
+SIGNER_STATUSES = ("active", "revoked")
+
+# The first signer record's ``prev`` names no predecessor (64 zeros).
+SIGNER_ZERO_HASH = "0" * 64
+
+
+def verify_history_trust(pages: object, trust: object, root: object) -> dict:
+    """Verify signed history pages against a rotating/revocable signer log.
+
+    Same page rules as :func:`verify_history`: ``pages`` must be a non-empty
+    ordered batch of pages with the exact key order
+    ``base, records, next, head, checkpoint, auth`` and valid nested documents,
+    shared ``base``/``head``/``checkpoint``, consecutive record generations,
+    recomputed ``prev``/``hash`` links, ``next`` cursor seams, replayed
+    checkpoints with anchor continuity and final-page closure — but each page's
+    ``auth.public_key`` may name a different signer.
+
+    ``trust`` is a signer log with the exact key order ``root, records, head``:
+
+    * ``root`` is a 64-lowercase-hex Ed25519 key and must equal the pinned
+      ``root`` argument;
+    * ``records`` is a non-empty list of items with the exact key order
+      ``at, key, status, prev, signature``: ``at`` a plain (non-boolean)
+      positive integer running strictly ascending, ``key``/``prev`` 64
+      lowercase hex, ``status`` exactly ``active`` or ``revoked`` and
+      ``signature`` 128 lowercase hex;
+    * the first item's ``prev`` is 64 zeros and every later one is the
+      SHA-256 of the previous item's canonical (sorted, compact) JSON; ``head``
+      is the same hash of the final item;
+    * every ``signature`` is the root key's Ed25519 signature over the
+      SHA-256 of the item's canonical JSON with ``signature`` removed.
+
+    An ``active`` item authorizes ``key`` from its ``at`` until the following
+    item; a ``revoked`` item withdraws the key from its ``at`` until a later
+    ``active`` item. A page is accepted only when one single key is active for
+    every checkpoint ``verified_at`` it carries (a page spanning an
+    authorization boundary is rejected), the page names that key and its
+    signature verifies over the auth-less canonical page digest.
+
+    Returns ``{"ok": True}`` on success or ``{"ok": False, "error":
+    category}`` on failure: ``input`` (missing/extra/reordered keys, wrong
+    types or hex), ``auth`` (root mismatch, a bad certificate or page
+    signature, an unknown or revoked page key) and ``integrity`` (``at`` not
+    ascending, a bad ``prev``/``head``, an authorization-boundary crossing, or
+    any record/pagination/checkpoint-replay defect). Never raises.
+    """
+    try:
+        if not isinstance(root, str) or not _HEX32_RE.fullmatch(root):
+            raise _Failure(ERR_INPUT)
+        parsed = _parse_all_history_pages(pages)
+        entries, head, trust_root = _parse_signer_trust(trust)
+        # All structural checks precede trust: the well-formed log root is
+        # bound to the pinned argument only after every record has a legal
+        # shape and a strictly ascending ``at`` sequence.
+        if trust_root != root:
+            raise _Failure(ERR_AUTH)
+        _check_signer_log_chains(entries, head)
+        _verify_signer_certificates(entries, root)
+
+        def authenticate(page: dict, check_shared: object) -> None:
+            # Resolve the one key the log authorizes for this page's whole
+            # span before the shared-envelope comparison and signature check,
+            # mirroring the single-key verifier's auth-before-shared order.
+            authorized = _page_authorized_key(page, entries)
+            check_shared()
+            _verify_history_page_signature(page, authorized)
+
+        _run_history_checks(parsed, authenticate)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {"ok": True}
+
+
+def _parse_signer_trust(trust: object) -> tuple[list[dict], str, str]:
+    """Shape-validate the signer rotation log.
+
+    Returns ``(entries, head, root)`` with every item already carrying the
+    right keys, types and hex. Key-order/type/hex defects are ``input``; the
+    caller binds the well-formed ``root`` to its pinned argument (``auth``)
+    before the strictly-ascending ``at`` order, ``prev``/``head`` links
+    (``integrity``) and certificate signatures (``auth``) are judged.
+    """
+    if not isinstance(trust, dict) or tuple(trust.keys()) != HISTORY_TRUST_KEYS:
+        raise _Failure(ERR_INPUT)
+    trust_root = trust["root"]
+    if not crypto.is_hex64(trust_root):
+        raise _Failure(ERR_INPUT)
+    records = trust["records"]
+    if not isinstance(records, list) or not records:
+        raise _Failure(ERR_INPUT)
+    entries: list[dict] = []
+    for raw in records:
+        if not isinstance(raw, dict) or tuple(raw.keys()) != SIGNER_RECORD_KEYS:
+            raise _Failure(ERR_INPUT)
+        at_value = raw["at"]
+        key = raw["key"]
+        status = raw["status"]
+        prev = raw["prev"]
+        signature = raw["signature"]
+        # Booleans are rejected even though they are integers; every ``at`` is
+        # a positive instant.
+        if not _is_int(at_value) or at_value < 1:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(key) or not crypto.is_hex64(prev):
+            raise _Failure(ERR_INPUT)
+        if status not in SIGNER_STATUSES:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex128(signature):
+            raise _Failure(ERR_INPUT)
+        entries.append(
+            {
+                "raw": raw,
+                "at": at_value,
+                "key": key,
+                "status": status,
+                "prev": prev,
+                "signature": signature,
+            }
+        )
+    head = trust["head"]
+    if not crypto.is_hex64(head):
+        raise _Failure(ERR_INPUT)
+    return entries, head, trust_root
+
+
+def _signer_record_hash(raw: dict) -> str:
+    """SHA-256 of one signer record's full canonical (sorted, compact) JSON."""
+    return hashlib.sha256(_canonical_json_bytes(raw)).hexdigest()
+
+
+def _check_signer_log_chains(entries: list[dict], head: str) -> None:
+    """Check strictly ascending ``at`` values, ``prev`` links and ``head``."""
+    # The strictly ascending ``at`` sequence is a log-ordering rule rather
+    # than a shape rule, so a repeat or decrease is an integrity failure.
+    for earlier, later in zip(entries, entries[1:]):
+        if later["at"] <= earlier["at"]:
+            raise _Failure(ERR_INTEGRITY)
+    expected_prev = SIGNER_ZERO_HASH
+    for entry in entries:
+        if entry["prev"] != expected_prev:
+            raise _Failure(ERR_INTEGRITY)
+        expected_prev = _signer_record_hash(entry["raw"])
+    if head != expected_prev:
+        raise _Failure(ERR_INTEGRITY)
+
+
+def _signer_active_key(entries: list[dict], instant: int) -> str | None:
+    """The key authorized at ``instant`` per the last item with ``at <= instant``.
+
+    ``active`` authorizes that item's key from its ``at`` until the next item;
+    ``revoked`` withdraws it until a later ``active`` item. Returns None when
+    no item precedes ``instant`` or the latest one revokes.
+    """
+    current: str | None = None
+    for entry in entries:
+        if entry["at"] > instant:
+            break
+        if entry["status"] == "active":
+            current = entry["key"]
+        else:
+            current = None
+    return current
+
+
+def _page_authorized_key(page: dict, entries: list[dict]) -> str:
+    """Resolve the single key the log authorizes for one page's whole span.
+
+    The log's active key is sampled at every checkpoint ``verified_at`` the
+    page carries. All samples must agree: a page straddling any
+    authorization boundary — a rotation to another key or a transition into
+    (or out of) a revocation window — cannot carry one envelope signature
+    valid for all its generations and is an integrity failure. When no key
+    is active anywhere on the page (before the first activation or inside a
+    revocation window), or the page names another key, that is an unknown or
+    revoked signer: an auth failure. Returns the key the signature must be
+    checked against.
+    """
+    times = [
+        record["checkpoint"]["context"]["verified_at"]
+        for record in page["records"]
+    ]
+    authorized: str | None = _signer_active_key(entries, times[0])
+    for instant in times[1:]:
+        if _signer_active_key(entries, instant) != authorized:
+            # The page straddles a rotation/revocation boundary, so no single
+            # envelope key can have signed all its checkpoints.
+            raise _Failure(ERR_INTEGRITY)
+    if authorized is None:
+        # Every checkpoint sits outside an active window: the page's key is
+        # unknown or revoked for its whole span.
+        raise _Failure(ERR_AUTH)
+    if page["auth"]["public_key"] != authorized:
+        raise _Failure(ERR_AUTH)
+    return authorized
+
+
+def _verify_signer_certificates(entries: list[dict], root: str) -> None:
+    """Verify every signer record's root signature over its unsigned body."""
+    for entry in entries:
+        unsigned = {
+            key: entry["raw"][key]
+            for key in SIGNER_RECORD_KEYS
+            if key != "signature"
+        }
+        digest = hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
+        if not crypto.verify_signature(root, digest, entry["signature"]):
+            raise _Failure(ERR_AUTH)

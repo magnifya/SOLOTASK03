@@ -763,6 +763,44 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
 成功返回 `{"ok": true}`；失败返回 `{ok:false,error}`，`error` 仅取
 `input`/`auth`/`integrity`，任何畸形输入都不抛异常。
 
+### 检查点历史的签名者轮换/撤销校验
+
+`ledger.light_client.verify_history_trust(pages, trust, root) -> dict`
+在 `verify_history` 的页面规则不变的前提下，用一份由根密钥 `root` 锚定
+的签名者授权/撤销日志认证各页，因此**各页 `auth.public_key` 可以不同**。
+
+`trust` 必须是对象，顶层键序恰为 `root, records, head`：
+
+- `root` 为 64 位小写 hex 的 Ed25519 公钥，且必须与参数 `root` 完全相等；
+- `records` 为**非空数组**，每项键序恰为 `at, key, status, prev,
+  signature`：`at` 是**非布尔正整数**且全表**严格递增**；`key`、`prev`
+  为 64 位小写 hex；`status` 仅取 `active`/`revoked`；`signature` 为
+  128 位小写 hex；
+- 链接：首项 `prev` 为 64 个 0，其后每项 `prev` 取**前一项完整
+  canonical_json**（`sort_keys`、紧凑分隔符、`ensure_ascii=False`）的
+  SHA-256；`head` 取**末项同法哈希**；
+- 证书签名：每项的 `signature` 是用 `root` 对**去掉 `signature` 后的该
+  项 canonical_json 的 SHA-256 摘要**做出的 Ed25519 签名。
+
+授权语义：`active` 自 `at` 起授权 `key` 直至下一项，`revoked` 自 `at`
+起撤销该键直至后续 `active`（以不晚于某时刻 `verified_at` 的最后一项
+为准）。对每一页，取其全部记录检查点的 `verified_at`：这些时刻对应的
+有效 key（无有效 key 时为 `null`）必须**完全一致**——页面跨越任一授权
+边界（轮换到另一把 key，或进入/离开撤销窗口）即为 `integrity`；若整页
+都无有效 key，或页面 `auth.public_key` 与该有效 key 不符，则为 `auth`。
+随后用该有效 key 对**去 auth 的整页 canonical_json 摘要**验签。
+
+页面本身的形状/嵌套键序类型、共享 `base`/`head`/`checkpoint`、记录
+代号连续、`prev`/`hash` 重算、`next` 游标跨页接续、检查点重放（含锚点
+连续）与末页封闭，全部沿用 `verify_history` 原规则。
+
+成功返回 `{"ok": true}`；失败返回 `{ok:false,error}` 且不抛异常：
+
+- `input`：trust/记录/root 参数或页面的缺键、多键、键序错、类型或 hex 错；
+- `auth`：`root` 与参数不符、证书签名或页面签名验不过、key 未知或已撤销；
+- `integrity`：`at` 不严格递增、`prev`/`head` 错、跨授权边界，以及记录
+  链/分页/检查点重放等原 `verify_history` 的 integrity 错误。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -867,7 +905,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，以及检查点历史的签名分页导出 `export_history` 与多页离线连续校验 `verify_history` |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
