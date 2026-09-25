@@ -711,13 +711,26 @@ class LedgerStore:
             last_access.get("trust_head") != trust_head
             or last_access.get("history_head") != history_head
         ):
+            # Attribute the drift to the offending file's configured path: a
+            # trust-head mismatch names the --history-trust file; a
+            # history-head mismatch names the checkpoint sidecar
+            # (--history + ".history"). Trust wins when both disagree.
+            if last_access.get("trust_head") != trust_head:
+                offending_path = self.history_trust_path
+                offending_head = "trust_head"
+                actual_head = trust_head
+            else:
+                offending_path = self.history_path + ".history"
+                offending_head = "history_head"
+                actual_head = history_head
             raise StateRecoveryError(
-                self.history_path,
+                offending_path,
                 "managed history files are out of sync with the last "
                 f"history_access event {last_access.get('event_id')}: "
                 f"event trust_head={last_access.get('trust_head')!r} "
                 f"history_head={last_access.get('history_head')!r}, "
-                f"files trust_head={trust_head!r} history_head={history_head!r}",
+                f"files trust_head={trust_head!r} history_head={history_head!r} "
+                f"({offending_head} drifted, current value {actual_head!r})",
             )
 
     def _discover_candidates(self, directory: str) -> list[str]:
@@ -3158,7 +3171,11 @@ class LedgerStore:
             promoted = False
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    # Snapshot wire format: ascending keys, the default
+                    # separators, non-ASCII kept literal, UTF-8 encoding and a
+                    # single terminating LF.
                     json.dump(data, fh, ensure_ascii=False, sort_keys=True)
+                    fh.write("\n")
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp_path, self.path)
