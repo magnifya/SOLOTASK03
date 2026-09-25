@@ -1,6 +1,7 @@
 """HTTP server exposing the ledger REST API using the Python standard library."""
 from __future__ import annotations
 
+import hmac
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote
@@ -8,6 +9,16 @@ from urllib.parse import parse_qs, unquote
 from .service import LedgerService
 
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies
+
+# Token-gated checkpoint-history routes. Every request to one of these is
+# rejected 401 before the body is read or any state is touched unless the node
+# was started with --history* and the Authorization header carries the exact
+# configured bearer token.
+HISTORY_ROUTES = {
+    ("GET", "/v1/history/trust"),
+    ("POST", "/v1/history/trust"),
+    ("POST", "/v1/history/export"),
+}
 
 
 def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
@@ -30,6 +41,45 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(data)
 
+        def _history_authorized(self, method: str, path: str) -> bool:
+            """Bearer-token gate for the /v1/history/* routes.
+
+            Returns True when the request may proceed. When the feature is
+            disabled the gate is open (the service answers 404); otherwise a
+            missing/malformed/incorrect ``Authorization: Bearer TOKEN`` header
+            is answered 401 immediately, without reading the body or touching
+            any state (no audit event, no file access).
+            """
+            if (method, path) not in HISTORY_ROUTES:
+                return True
+            if not getattr(service, "history_enabled", False):
+                return True
+            expected = (
+                f"Bearer {service.history_token}"
+                if service.history_token is not None
+                else None
+            )
+            provided = self.headers.get("Authorization")
+            # Compare bytes: a header containing non-ASCII (decoded latin-1 by
+            # the HTTP layer) must simply mismatch, never raise out of
+            # compare_digest (which rejects non-ASCII str inputs).
+            if expected is None or provided is None or not hmac.compare_digest(
+                provided.encode("utf-8", errors="replace"),
+                expected.encode("utf-8"),
+            ):
+                self._send_json(
+                    401,
+                    {"ok": False, "error": "unauthorized"},
+                    sort_keys=False,
+                )
+                # The body was deliberately not consumed: close the
+                # connection so an unread Content-Length body cannot desync
+                # the next pipelined request on a keep-alive socket.
+                self.close_connection = True
+                return False
+            return True
+
+
         def _read_json(self) -> tuple[bool, object]:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -49,7 +99,35 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
             path = self.path.split("?", 1)[0]
-            if path == "/v1/transactions":
+            # Bearer gate first: a 401 must be returned before the body is
+            # read and without any state or file side effects.
+            if not self._history_authorized("POST", path):
+                return
+            if path == "/v1/history/trust":
+                # POST /v1/history/trust — append one signer certificate; the
+                # success document is the contract-ordered
+                # {root, records, head} log.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.update_history_trust(payload)
+                self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/history/export":
+                # POST /v1/history/export — one signed page; the success
+                # document has the contract key order
+                # base, records, next, head, checkpoint, auth.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.export_history_page(payload)
+                self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
@@ -191,7 +269,15 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             path, _, query = self.path.partition("?")
-            if path.startswith("/v1/transactions/"):
+            # Bearer gate first; a failed gate has no side effects.
+            if not self._history_authorized("GET", path):
+                return
+            if path == "/v1/history/trust":
+                # GET /v1/history/trust — the contract-ordered
+                # {root, records, head} signer log.
+                status, body = service.read_history_trust()
+                self._send_json(status, body, sort_keys=False)
+            elif path.startswith("/v1/transactions/"):
                 # GET /v1/transactions/{tx_id} — a transaction receipt; a
                 # malformed or unknown tx_id returns 404.
                 tx_id = unquote(path[len("/v1/transactions/") :])

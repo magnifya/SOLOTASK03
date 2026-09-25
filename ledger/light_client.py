@@ -2809,3 +2809,99 @@ def history_trust(
             _restore_bytes(path, original)
             return {"ok": False, "error": ERR_IO}
         return written
+
+
+# -- node-managed file pair inspection -----------------------------------------
+
+
+def inspect_history_files(path: object, trust_path: object = None) -> dict:
+    """Strictly load the checkpoint pair and the optional signer log.
+
+    Shared by the token-gated HTTP endpoints and by startup recovery, so both
+    apply the exact :func:`history_trust` / :func:`export_history` file
+    contracts (shape, hash chains, replay) and agree on what each file's
+    current head is.
+
+    On success returns
+    ``{"ok": True, "trust_head", "history_head", "trust_doc"}``: each head is
+    the file's current hash head or ``None`` when that file does not exist
+    (``trust_doc`` is the parsed ``{root, records, head}`` log or ``None``).
+    The checkpoint pair is loaded under its per-path lock (and the signer log
+    under its own lock): a sidecar requires its checkpoint and its tip record
+    must reproduce it. On failure returns
+    ``{"ok": False, "error": category, "path": offending_path}`` with category
+    one of ``input`` (bad path arguments), ``io`` (an unreadable file) and
+    ``state`` (a corrupt checkpoint/sidecar/log). Never raises.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT, "path": None}
+    if trust_path is not None and (
+        not isinstance(trust_path, str) or not trust_path
+    ):
+        return {"ok": False, "error": ERR_INPUT, "path": None}
+    try:
+        with _checkpoint_lock(path):
+            try:
+                checkpoint = _load_checkpoint(path)
+            except _CheckpointError as failure:
+                return {
+                    "ok": False,
+                    "error": failure.category,
+                    "path": path,
+                }
+            sidecar_path = _history_path(path)
+            try:
+                sidecar = _load_history(sidecar_path)
+            except _CheckpointError as failure:
+                return {
+                    "ok": False,
+                    "error": failure.category,
+                    "path": sidecar_path,
+                }
+            if sidecar is None:
+                # Either the pair has never been advanced (no files) or a
+                # pre-migration checkpoint exists without a sidecar: either
+                # way no sidecar head exists yet.
+                history_head = None
+            else:
+                if checkpoint is None:
+                    # A sidecar without its checkpoint is unrecoverable.
+                    return {
+                        "ok": False,
+                        "error": ERR_STATE,
+                        "path": path,
+                    }
+                history_head = sidecar["head"]
+
+            trust_doc = None
+            trust_head = None
+            if trust_path is not None:
+                with _checkpoint_lock(trust_path):
+                    try:
+                        trust_doc = _load_signer_log(trust_path)
+                    except _CheckpointError as failure:
+                        return {
+                            "ok": False,
+                            "error": failure.category,
+                            "path": trust_path,
+                        }
+                    if trust_doc is not None:
+                        trust_head = trust_doc["head"]
+    except OSError as exc:
+        return {"ok": False, "error": ERR_IO, "path": getattr(exc, "filename", path)}
+    return {
+        "ok": True,
+        "trust_head": trust_head,
+        "history_head": history_head,
+        "trust_doc": trust_doc,
+    }
+
+
+def restore_file_bytes(path: str, original: bytes | None) -> None:
+    """Best-effort restore of ``path`` to ``original`` bytes (None = absent).
+
+    Mirrors the in-transaction compensation used by :func:`advance` and
+    :func:`history_trust`: any failure is swallowed (the next strict load
+    surfaces the damage as ``state``).
+    """
+    _restore_bytes(path, original)

@@ -105,6 +105,10 @@ EVENT_SYNC_EXPIRED = "sync_expired"
 EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 EVENT_ALLOWLIST_ADDED = "allowlist_added"
 EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
+# Access to a node-managed checkpoint-history pair (the signer trust log and
+# the checkpoint sidecar) through the token-gated /v1/history endpoints.
+# service.EVENT_HISTORY_ACCESS mirrors this literal value.
+EVENT_HISTORY_ACCESS = "history_access"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -271,8 +275,24 @@ class StateRecoveryError(ValueError):
 
 
 class LedgerStore:
-    def __init__(self, path: str, initial_balance: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        initial_balance: int | None = None,
+        history_path: str | None = None,
+        history_trust_path: str | None = None,
+    ) -> None:
         self.path = path
+        # Optional node-managed checkpoint-history pair exposed by the
+        # token-gated /v1/history endpoints. Both paths are either set together
+        # (enforced by the server entry point) or both None: the checkpoint
+        # file at ``history_path`` and its generation sidecar at
+        # ``history_path + ".history"`` are maintained by ledger.light_client,
+        # while ``history_trust_path`` is its durable signer log. The pair, the
+        # audit log and every chain/state section share one lock and one
+        # atomic snapshot transaction.
+        self.history_path = history_path
+        self.history_trust_path = history_trust_path
         self.chain: list[Block] = []
         self.pending: dict[str, Transaction] = {}
         # Candidate fork chains keyed by tip block hash. Each value is the
@@ -387,6 +407,11 @@ class LedgerStore:
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
+                # Even a brand-new chain re-verifies the managed history files
+                # when the node is configured for them (they may already exist
+                # from offline CLI use); a fresh audit log has no events yet,
+                # so only strict file verification applies here.
+                self._bind_history_files(self.audit_events)
                 return
 
             valid: list[tuple] = []
@@ -607,6 +632,61 @@ class LedgerStore:
             # the next ordinary mutating save, never forced here.)
             if backfilled or audit_repair or signer_migration:
                 self.save()
+            # Finally bind the node-managed checkpoint-history files to the
+            # recovered audit log: both files are strictly re-verified and the
+            # last history_access event must name their current heads.
+            self._bind_history_files(self.audit_events)
+
+    def _bind_history_files(self, audit_events: list[dict]) -> None:
+        """Re-verify the managed history files and bind them to the audit log.
+
+        Only runs when the node was started with ``--history``/
+        ``--history-trust``. Both external files are strictly loaded with the
+        exact ``history_trust``/``export_history`` contracts (shape, hash
+        chains, checkpoint replay); any missing-unreadable file is an ``io``
+        defect and any corruption a ``state`` defect, both fatal. The last
+        ``history_access`` event in the recovered log must carry the files'
+        current ``trust_head``/``history_head`` (null for a file that does not
+        exist yet); a mismatch means the files and the snapshot drifted apart
+        and raises StateRecoveryError with the offending path and a reason. A
+        pair with no access event yet (e.g. created offline via the CLI) is
+        accepted as-is.
+        """
+        if self.history_path is None:
+            return
+        # Lazy import: light_client imports from this module at import time.
+        from . import light_client
+
+        inspection = light_client.inspect_history_files(
+            self.history_path, self.history_trust_path
+        )
+        if not inspection.get("ok"):
+            offending = inspection.get("path") or self.history_path
+            raise StateRecoveryError(
+                offending,
+                f"managed history file failed re-verification: "
+                f"{inspection.get('error')}",
+            )
+        trust_head = inspection["trust_head"]
+        history_head = inspection["history_head"]
+        last_access = None
+        for event in audit_events:
+            if event.get("kind") == EVENT_HISTORY_ACCESS:
+                last_access = event
+        if last_access is None:
+            return
+        if (
+            last_access.get("trust_head") != trust_head
+            or last_access.get("history_head") != history_head
+        ):
+            raise StateRecoveryError(
+                self.history_path,
+                "managed history files are out of sync with the last "
+                f"history_access event {last_access.get('event_id')}: "
+                f"event trust_head={last_access.get('trust_head')!r} "
+                f"history_head={last_access.get('history_head')!r}, "
+                f"files trust_head={trust_head!r} history_head={history_head!r}",
+            )
 
     def _discover_candidates(self, directory: str) -> list[str]:
         """List the main file and sibling .ledger-* snapshots (if any)."""
@@ -625,6 +705,24 @@ class LedgerStore:
             if os.path.isfile(full):
                 candidates.append(full)
         return candidates
+
+    @staticmethod
+    def _read_candidate(path: str) -> dict:
+        """Read and JSON-decode one snapshot file.
+
+        Any I/O or JSON failure becomes a StateRecoveryError carrying the
+        offending path, never a silent fall-back.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except OSError as exc:
+            raise StateRecoveryError(path, f"cannot read file: {exc}") from exc
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise StateRecoveryError(path, f"invalid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise StateRecoveryError(path, "snapshot root must be a JSON object")
+        return data
 
     @staticmethod
     def _canonical_view(
@@ -1787,6 +1885,10 @@ class LedgerStore:
             EVENT_ALLOWLIST_ADDED,
             EVENT_ALLOWLIST_REMOVED,
         }
+        # The node-managed checkpoint-history endpoints append history_access
+        # events carrying the action and the heads the two external files had
+        # at access time (64-hex, or null when the file did not exist yet).
+        history_access_kinds = {EVENT_HISTORY_ACCESS}
         events: list[dict] = []
         for i, event in enumerate(raw):
             if not isinstance(event, dict):
@@ -1891,6 +1993,31 @@ class LedgerStore:
                         path,
                         f"audit event {event_id} ({kind}) expires_at must be an integer",
                     )
+            elif kind in history_access_kinds:
+                # history_access events bind the audit log to the node-managed
+                # checkpoint-history files: action is read/update/export and
+                # both heads must be present as either 64-char lowercase hex
+                # or JSON null (the referenced file did not exist yet).
+                action = event.get("action")
+                if action not in ("read", "update", "export"):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) has an invalid action",
+                    )
+                for head_field in ("trust_head", "history_head"):
+                    if head_field not in event:
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} ({kind}) is missing "
+                            f"{head_field}",
+                        )
+                    head = event[head_field]
+                    if head is not None and not crypto.is_hex64(head):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} ({kind}) {head_field} "
+                            "must be 64 lowercase hex characters or null",
+                        )
             events.append(dict(event))
         return events
 
