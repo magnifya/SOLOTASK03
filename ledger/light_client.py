@@ -160,6 +160,40 @@ record's ``{generation, hash}`` and the sidecar is rewritten (the checkpoint
 file itself never changes). Loading replays every retained generation —
 shape, state hash, context replay and anchor continuity — so any tampering
 is a ``state`` failure; a missing or unreadable sidecar is ``io``.
+
+:func:`export_history` exports the retained sidecar pages as signed,
+offline-verifiable page documents. ``export_history(path, key, after=None,
+limit=50)`` strictly reloads both the checkpoint and its sidecar under the
+shared per-path lock and returns one page with the exact key order
+``base, records, next, head, checkpoint, auth``: ``base``/``records`` are the
+sidecar's own documents (nested key orders unchanged), ``head`` the sidecar
+head, ``checkpoint`` the persisted five-key checkpoint (identical to the last
+retained record's), ``next`` the page's last record generation when another
+page follows or ``null`` on the final page, and ``auth`` is
+``{public_key, signature}`` where the Ed25519 signature is made by the 64-hex
+seed ``key`` over the SHA-256 of the canonical (sorted, compact,
+unescaped-non-ASCII) JSON of the page with ``auth`` removed. ``after`` is
+``None`` (start after ``base``) or a non-boolean non-negative integer naming
+either ``base.generation`` or a non-last retained generation; ``limit`` is a
+non-boolean integer in 1..200. Bad arguments are ``input``, a missing or
+unreadable file ``io`` and a corrupt checkpoint/sidecar or unmatched cursor
+``state``.
+
+:func:`verify_history` verifies an ordered, non-empty list of such pages
+offline against one pinned 64-hex Ed25519 ``public_key``. Every page must have
+the exact key order and nested types; ``base``, ``head``, ``checkpoint`` and
+the signing public key must be identical on every page; each Ed25519 signature
+must verify over the auth-less canonical page digest. Records must run
+consecutively from ``base.generation + 1`` and link across page seams through
+each page's ``next`` (a non-final page's ``next`` is its last record
+generation), every record hash is recomputed and every checkpoint is replayed
+(state hash plus the stored batch context) with anchor continuity. The final
+page alone carries ``next: null``, its last record's hash must equal ``head``
+and its checkpoint must equal the page checkpoint; missing, duplicate or
+reordered pages and any tampering are rejected. Success is ``{"ok": True}``;
+failure is ``{"ok": False, "error": category}`` with category one of
+``input`` (structure/types), ``auth`` (pinned key or signature) and
+``integrity`` (chaining, pagination or checkpoint replay); nothing is raised.
 """
 from __future__ import annotations
 
@@ -1905,3 +1939,309 @@ def history(path: str, generation: object = None, keep: object = None) -> dict:
             "head": sidecar["head"],
             "kept": kept,
         }
+
+
+# -- signed history export / offline verification -----------------------------
+
+# The exact top-level key order of one exported history page, and of its auth.
+HISTORY_PAGE_KEYS = (
+    "base",
+    "records",
+    "next",
+    "head",
+    "checkpoint",
+    "auth",
+)
+HISTORY_PAGE_AUTH_KEYS = ("public_key", "signature")
+
+# Page-size bounds for :func:`export_history`.
+HISTORY_EXPORT_MIN_LIMIT = 1
+HISTORY_EXPORT_MAX_LIMIT = 200
+HISTORY_EXPORT_DEFAULT_LIMIT = 50
+
+
+def export_history(
+    path: object,
+    key: object,
+    after: object = None,
+    limit: object = HISTORY_EXPORT_DEFAULT_LIMIT,
+) -> dict:
+    """Export one signed page of retained checkpoint history for offline use.
+
+    Strictly reloads the checkpoint at ``path`` and its ``path + ".history"``
+    sidecar and returns one page with the exact key order
+    ``base, records, next, head, checkpoint, auth``:
+
+    * ``base``/``records``/``head`` are the sidecar's own documents (nested
+      key orders unchanged), ``checkpoint`` is the persisted five-key
+      checkpoint document (identical to the last retained record's);
+    * ``next`` is the last record generation of the page when another page
+      follows, or ``null`` on the final page;
+    * ``auth`` is ``{"public_key", "signature"}``: the Ed25519 public key
+      derived from the 64-lowercase-hex seed ``key`` and its signature over the
+      SHA-256 digest of the canonical (sorted, compact, non-ASCII-unescaped)
+      JSON of the page with ``auth`` removed.
+
+    ``after`` is ``None`` (page starts right after ``base``) or a non-boolean
+    non-negative integer naming either ``base.generation`` or a retained
+    generation that is not the last one; the page then starts at the following
+    record. ``limit`` is a non-boolean integer in 1..200. Bad arguments are
+    ``input``; a missing or unreadable file is ``io``; a corrupt checkpoint or
+    sidecar, a sidecar/checkpoint mismatch or an unmatched/terminal cursor is
+    ``state``.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not isinstance(key, str) or not _HEX32_RE.fullmatch(key):
+        return {"ok": False, "error": ERR_INPUT}
+    if after is not None and (not _is_int(after) or after < 0):
+        return {"ok": False, "error": ERR_INPUT}
+    if (
+        not _is_int(limit)
+        or limit < HISTORY_EXPORT_MIN_LIMIT
+        or limit > HISTORY_EXPORT_MAX_LIMIT
+    ):
+        return {"ok": False, "error": ERR_INPUT}
+    public_key = crypto.derive_public_key(key)
+    if public_key is None:
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            checkpoint = _load_checkpoint(path)
+            sidecar = _load_history(_history_path(path))
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        if sidecar is None:
+            # Nothing retained to export: the sidecar missing is an io defect.
+            return {"ok": False, "error": ERR_IO}
+        if checkpoint is None:
+            # A sidecar without its checkpoint is unrecoverable corruption.
+            return {"ok": False, "error": ERR_STATE}
+
+        base = sidecar["base"]
+        records = sidecar["records"]
+        if records[-1]["checkpoint"] != checkpoint:
+            # The sidecar tip must pin the persisted checkpoint.
+            return {"ok": False, "error": ERR_STATE}
+
+        if after is None or after == base["generation"]:
+            start = 0
+        else:
+            start = next(
+                (
+                    index + 1
+                    for index, record in enumerate(records)
+                    if record["checkpoint"]["generation"] == after
+                ),
+                None,
+            )
+            # An unknown cursor, or one naming the last retained generation
+            # (nothing follows it), is a state defect rather than an input one:
+            # the argument has a legal shape but does not name a usable cursor.
+            if start is None or start >= len(records):
+                return {"ok": False, "error": ERR_STATE}
+
+        page_records = records[start : start + limit]
+        has_next = start + limit < len(records)
+        next_value = (
+            page_records[-1]["checkpoint"]["generation"] if has_next else None
+        )
+        page = {
+            "base": base,
+            "records": page_records,
+            "next": next_value,
+            "head": sidecar["head"],
+            "checkpoint": checkpoint,
+        }
+        digest = hashlib.sha256(_canonical_json_bytes(page)).digest()
+        signature = crypto.sign_message(key, digest)
+        if signature is None:
+            return {"ok": False, "error": ERR_INPUT}
+        page["auth"] = {"public_key": public_key, "signature": signature}
+        return {name: page[name] for name in HISTORY_PAGE_KEYS}
+
+
+def verify_history(pages: object, public_key: object) -> dict:
+    """Verify an ordered, non-empty batch of signed history pages offline.
+
+    Every page must have the exact key order
+    ``base, records, next, head, checkpoint, auth`` (nested documents keep
+    their declared orders and types) and carry
+    ``auth = {"public_key", "signature"}``. The pinned ``public_key`` (64
+    lowercase hex) must match every page's signing key and verify every
+    Ed25519 signature over the auth-less canonical page digest; ``base``,
+    ``head`` and the page ``checkpoint`` must be identical across all pages.
+
+    Records must run consecutively from ``base.generation + 1`` with each
+    ``prev``/``hash`` link recomputed, chaining across page seams in step with
+    each non-final page's ``next`` cursor; every checkpoint is replayed (state
+    hash plus its stored batch context) with anchor continuity between
+    consecutive checkpoints. Only the final page may carry ``next: null``; its
+    last record's hash must equal ``head`` and its checkpoint must equal the
+    page checkpoint. Missing, duplicate or reordered pages and any tampering
+    are rejected.
+
+    Returns ``{"ok": True}`` on success or ``{"ok": False, "error":
+    category}`` on failure with category one of ``input`` (structure/types),
+    ``auth`` (pinned key or a failing signature) and ``integrity`` (chaining,
+    pagination or checkpoint replay). Never raises for malformed input.
+    """
+    try:
+        _verify_history_pages(pages, public_key)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {"ok": True}
+
+
+def _validate_page_base(raw: object) -> dict:
+    """Validate one exported page's ``{generation, hash}`` base document."""
+    if not isinstance(raw, dict) or tuple(raw.keys()) != HISTORY_BASE_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["generation"]) or raw["generation"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["hash"]):
+        raise _Failure(ERR_INPUT)
+    return {"generation": raw["generation"], "hash": raw["hash"]}
+
+
+def _validate_page_checkpoint(raw: object) -> dict:
+    """Shape-validate a checkpoint embedded in an exported history page.
+
+    Shape/type defects are the page's structural defects (``input``); the
+    state hash and context replay are judged separately as ``integrity``.
+    """
+    try:
+        return _validate_checkpoint_shape(raw)
+    except _CheckpointError:
+        raise _Failure(ERR_INPUT) from None
+
+
+def _validate_page_record(raw: object) -> dict:
+    """Validate one ``{checkpoint, prev, hash}`` record embedded in a page."""
+    if not isinstance(raw, dict) or tuple(raw.keys()) != HISTORY_RECORD_KEYS:
+        raise _Failure(ERR_INPUT)
+    checkpoint = _validate_page_checkpoint(raw["checkpoint"])
+    if not crypto.is_hex64(raw["prev"]) or not crypto.is_hex64(raw["hash"]):
+        raise _Failure(ERR_INPUT)
+    return {"checkpoint": checkpoint, "prev": raw["prev"], "hash": raw["hash"]}
+
+
+def _verify_history_pages(pages: object, pinned_key: object) -> None:
+    """All structural, authentication and chaining checks for :func:`verify_history`."""
+    if not isinstance(pages, list) or not pages:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(pinned_key, str) or not _HEX32_RE.fullmatch(pinned_key):
+        raise _Failure(ERR_INPUT)
+
+    common_base: dict | None = None
+    common_head: str | None = None
+    common_checkpoint: dict | None = None
+    # Linkage state carried across page seams.
+    expected_prev: str | None = None
+    expected_generation: int | None = None
+    previous_tip: dict | None = None
+
+    for position, raw_page in enumerate(pages):
+        is_last_page = position == len(pages) - 1
+        if not isinstance(raw_page, dict) or tuple(raw_page.keys()) != HISTORY_PAGE_KEYS:
+            raise _Failure(ERR_INPUT)
+        auth = raw_page["auth"]
+        if not isinstance(auth, dict) or tuple(auth.keys()) != HISTORY_PAGE_AUTH_KEYS:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(auth["public_key"]):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex128(auth["signature"]):
+            raise _Failure(ERR_INPUT)
+        base = _validate_page_base(raw_page["base"])
+        head = raw_page["head"]
+        if not crypto.is_hex64(head):
+            raise _Failure(ERR_INPUT)
+        page_checkpoint = _validate_page_checkpoint(raw_page["checkpoint"])
+        records = raw_page["records"]
+        if not isinstance(records, list) or not records:
+            raise _Failure(ERR_INPUT)
+        next_value = raw_page["next"]
+        if next_value is not None and (not _is_int(next_value) or next_value < 0):
+            raise _Failure(ERR_INPUT)
+        # Every embedded record is shape- and type-validated up front, so a
+        # structurally malformed page reports ``input`` even if its (now
+        # mismatched) signature would fail too — structure precedes trust.
+        validated_records = [_validate_page_record(raw) for raw in records]
+
+        # The pinned trust anchor and the signed envelope must be shared by
+        # every page of the export.
+        if auth["public_key"] != pinned_key:
+            raise _Failure(ERR_AUTH)
+        if common_base is None:
+            common_base = base
+            common_head = head
+            common_checkpoint = page_checkpoint
+        elif base != common_base:
+            raise _Failure(ERR_INTEGRITY)
+        elif head != common_head or page_checkpoint != common_checkpoint:
+            raise _Failure(ERR_INTEGRITY)
+
+        # The signature covers the page verbatim minus auth, canonicalized the
+        # same way the exporter canonicalizes it.
+        unsigned = {
+            key: raw_page[key] for key in HISTORY_PAGE_KEYS if key != "auth"
+        }
+        digest = hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
+        if not crypto.verify_signature(pinned_key, digest, auth["signature"]):
+            raise _Failure(ERR_AUTH)
+
+        if expected_prev is None:
+            # The first page starts right at the shared base.
+            expected_prev = base["hash"]
+            expected_generation = base["generation"] + 1
+
+        for record in validated_records:
+            checkpoint = record["checkpoint"]
+            if checkpoint["generation"] != expected_generation:
+                # A gap, duplicate or reordered page breaks generation order.
+                raise _Failure(ERR_INTEGRITY)
+            if record["prev"] != expected_prev:
+                raise _Failure(ERR_INTEGRITY)
+            rebuilt = _history_record(checkpoint, expected_prev)
+            if record["hash"] != rebuilt["hash"]:
+                raise _Failure(ERR_INTEGRITY)
+            # The state hash pins the document; the stored batch must replay
+            # from its anchor to its tip and reproduce the verified tx ids.
+            try:
+                _verify_checkpoint_document(checkpoint)
+            except _CheckpointError:
+                raise _Failure(ERR_INTEGRITY) from None
+            if previous_tip is not None:
+                expected_anchor = {
+                    "height": previous_tip["height"],
+                    "block_hash": previous_tip["tip_hash"],
+                }
+                if checkpoint["anchor"] != expected_anchor:
+                    raise _Failure(ERR_INTEGRITY)
+            previous_tip = checkpoint["tip"]
+            expected_prev = record["hash"]
+            expected_generation += 1
+
+        last_generation = records[-1]["checkpoint"]["generation"]
+        if is_last_page:
+            if next_value is not None:
+                raise _Failure(ERR_INTEGRITY)
+        else:
+            # A non-final page must name its last record as the cursor the next
+            # page continues from.
+            if next_value != last_generation:
+                raise _Failure(ERR_INTEGRITY)
+
+    # The final page closes the export: its last record is the sidecar head and
+    # its checkpoint is the page checkpoint shared by every page.
+    final_record = _validate_page_record(pages[-1]["records"][-1])
+    if final_record["hash"] != common_head:
+        raise _Failure(ERR_INTEGRITY)
+    if final_record["checkpoint"] != common_checkpoint:
+        raise _Failure(ERR_INTEGRITY)

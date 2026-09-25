@@ -709,6 +709,59 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
   被删记录的 `{generation, hash}` 并重写侧车——检查点文件本身永不被
   裁剪改动。
 
+### 检查点历史的签名分页导出与离线校验
+
+在 `history` 查询/裁剪之外，留存的代际历史还可以签名分页导出，供完全
+离线的一方校验（纯库 API，其余入口不变）：
+
+`ledger.light_client.export_history(path, key, after=None, limit=50)
+-> dict`
+
+- `key` 必须是 **64 位小写十六进制**的 Ed25519 私钥种子；公钥由其推导。
+- `after` 为 `None`（从 `base` 之后起始）或**非布尔非负整数**，且必须
+  命中 `base.generation` 或某个**非末代**留存代；页从该游标之后的下一条
+  记录开始。`limit` 必须是 **1–200 的非布尔整数**（缺省 50）。
+- 导出在与 `advance`/`history` 相同的按路径锁内严格重载检查点与侧车
+  （形状、`state_hash`、逐代重放、锚点连续），侧车末条记录必须复现当前
+  检查点。成功返回固定键序 `base, records, next, head, checkpoint,
+  auth`：`base`/`records`/`head` 即侧车文档（嵌套键序与既有一致），
+  `records` 非空；`checkpoint` 为落盘的五键检查点（与末条记录的检查点
+  逐字相同）；`next` 在其后还有页时取**本页末代代号**，否则为 `null`
+  （末页恰好取尽留存记录，不产生空尾页）。
+- `auth` 键序为 `public_key, signature`：对**去掉 `auth` 后的整页文档**
+  按 README canonical_json（`sort_keys`、紧凑分隔符、
+  `ensure_ascii=False`）序列化为 UTF-8 字节，取 SHA-256 32 字节摘要，再
+  用 `key` 做 Ed25519 签名（十六进制）。
+- 失败返回 `{ok:false,error}`：参数畸形（path/key/after/limit）为
+  `input`，侧车缺失或文件不可读写为 `io`，检查点/侧车损坏或游标无命中
+  （含指向末代）为 `state`。
+
+`ledger.light_client.verify_history(pages, public_key) -> dict` 离线
+校验按顺序排列的导出页：
+
+- `pages` 必须是**非空数组**，`public_key` 必须是 64 位小写十六进制
+  Ed25519 公钥。每页顶层键序必须恰为
+  `base, records, next, head, checkpoint, auth`，嵌套文档键序/类型沿用
+  检查点与侧车规则（非布尔整数、64 位小写 hex 等），任何形状/类型不符
+  为 `input`。
+- **信任（auth）**：每页 `auth = {public_key, signature}`（公钥 64 位
+  hex、签名 128 位 hex），其公钥必须与钉住的 `public_key` 相同；签名按
+  导出端同样的去 auth canonical_json 摘要验签，公钥不符或签名验不过为
+  `auth`。
+- **跨页一致与链接（integrity）**：各页的 `base`、`head`、`checkpoint`
+  与公钥必须相同；记录代号自 `base.generation + 1` 起跨页连续，每条
+  `prev` 必须等于前一条记录的 `hash`（首页首条接 `base.hash`），每条
+  `hash = SHA256(ASCII(prev) ‖ canonical_json(checkpoint))` 重算一致；
+  非末页的 `next` 必须等于其末代代号且下一页恰好续接，缺页、重页、乱页
+  或跨页断链均拒绝。
+- **检查点重放**：每条记录的检查点都重算 `state_hash` 并按其 context 的
+  `verified_at`/trust/documents 重放，复现 anchor/tip/verified_tx_ids，
+  相邻检查点锚点连续；任一不符为 `integrity`。
+- **末页封闭**：仅末页允许 `next = null`；末页末项记录的 `hash` 必须
+  等于 `head`，其 `checkpoint` 必须等于各页共享的 `checkpoint`。
+
+成功返回 `{"ok": true}`；失败返回 `{ok:false,error}`，`error` 仅取
+`input`/`auth`/`integrity`，任何畸形输入都不抛异常。
 
 ## 审计导出的离线校验
 
@@ -814,7 +867,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名） |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，以及检查点历史的签名分页导出 `export_history` 与多页离线连续校验 `verify_history` |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
