@@ -707,12 +707,21 @@ class LedgerStore:
                 last_access = event
         if last_access is None:
             return
-        if (
-            last_access.get("trust_head") != trust_head
-            or last_access.get("history_head") != history_head
-        ):
+        # A drifted head is attributed to the file that drifted: the signer
+        # log to the --history-trust path, the checkpoint sidecar to
+        # --history + ".history".
+        if last_access.get("trust_head") != trust_head:
             raise StateRecoveryError(
-                self.history_path,
+                self.history_trust_path or self.history_path,
+                "managed history files are out of sync with the last "
+                f"history_access event {last_access.get('event_id')}: "
+                f"event trust_head={last_access.get('trust_head')!r} "
+                f"history_head={last_access.get('history_head')!r}, "
+                f"files trust_head={trust_head!r} history_head={history_head!r}",
+            )
+        if last_access.get("history_head") != history_head:
+            raise StateRecoveryError(
+                self.history_path + ".history",
                 "managed history files are out of sync with the last "
                 f"history_access event {last_access.get('event_id')}: "
                 f"event trust_head={last_access.get('trust_head')!r} "
@@ -3158,7 +3167,10 @@ class LedgerStore:
             promoted = False
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    # Sorted keys, default separators, non-ASCII unescaped,
+                    # UTF-8, terminated by exactly one LF.
                     json.dump(data, fh, ensure_ascii=False, sort_keys=True)
+                    fh.write("\n")
                     fh.flush()
                     os.fsync(fh.fileno())
                 os.replace(tmp_path, self.path)
