@@ -29,6 +29,7 @@ transaction in an empty ledger could never be accepted.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import time
 
@@ -36,6 +37,11 @@ from . import audit
 from . import crypto
 from .models import STATUS_CONFIRMED, STATUS_PENDING, Block, Transaction
 from .store import (
+    HISTORY_CREDENTIAL_ACTIVE,
+    HISTORY_CREDENTIAL_KEYS,
+    HISTORY_CREDENTIAL_REVOKED,
+    HISTORY_PERMISSION_ORDER,
+    HISTORY_PERMISSION_SET,
     SYNC_MODE_ATTESTED,
     SYNC_MODE_PLAIN,
     TRUST_ACTIVE,
@@ -64,6 +70,7 @@ EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 EVENT_ALLOWLIST_ADDED = "allowlist_added"
 EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 EVENT_HISTORY_ACCESS = "history_access"
+EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
 
 
 def _parse_height(height: object) -> int | None:
@@ -3394,6 +3401,228 @@ class LedgerService:
             cls._HISTORY_STATUS.get(category, 500),
             {"ok": False, "error": category},
         )
+
+    # -- persistent permissioned history credential -------------------------
+
+    # The closed key set accepted by POST /v1/history/access.
+    HISTORY_ACCESS_FIELDS = ("action", "token", "permissions", "expected_version")
+
+    # The permission each gated route requires. POST /v1/history/access is
+    # absent here: it is exclusively owned by the configured static token (a
+    # permissioned credential can never manage the credential itself).
+    _HISTORY_ROUTE_PERMISSION = {
+        ("GET", "/v1/history/trust"): "read",
+        ("POST", "/v1/history/trust"): "update",
+        ("POST", "/v1/history/export"): "export",
+    }
+
+    def history_route_permission(self, method: str, path: str) -> str | None:
+        """The credential permission a route requires, or None when the route
+        is reserved for the static full-power token (or is not a gated route)."""
+        if (method, path) == ("POST", "/v1/history/access"):
+            return None
+        return self._HISTORY_ROUTE_PERMISSION.get((method, path))
+
+    def authorize_history(
+        self, provided: str | None, required_permission: str | None
+    ) -> str:
+        """Authenticate one bearer credential for a gated route.
+
+        Returns ``"ok"``, ``"unauthorized"`` (401) or ``"forbidden"`` (403).
+        The configured static token has every power and is the *only*
+        credential accepted for ``required_permission is None`` (the
+        /v1/history/access management route). Otherwise an ``active``
+        credential whose SHA-256 token hash matches authenticates, but only for
+        routes whose permission its permission set covers; a wrong token, a
+        missing/revoked credential or an insufficient permission set answers
+        unauthorized/forbidden respectively. Never raises.
+        """
+        if not self.history_enabled:
+            return "ok"
+        expected = (
+            f"Bearer {self.history_token}"
+            if self.history_token is not None
+            else None
+        )
+        provided_bytes = (
+            provided.encode("utf-8", errors="replace")
+            if isinstance(provided, str)
+            else b""
+        )
+        if expected is not None and hmac.compare_digest(
+            provided_bytes, expected.encode("utf-8")
+        ):
+            return "ok"
+        # Only the static token may reach the credential-management route.
+        if required_permission is None:
+            return "unauthorized"
+        credential = self.active_history_credential()
+        if credential is None:
+            return "unauthorized"
+        if not isinstance(provided, str) or not provided.startswith("Bearer "):
+            return "unauthorized"
+        presented = provided[len("Bearer ") :]
+        if not presented:
+            return "unauthorized"
+        presented_hash = hashlib.sha256(
+            presented.encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(
+            presented_hash, credential["token_hash"]
+        ):
+            return "unauthorized"
+        if required_permission not in credential["permissions"]:
+            return "forbidden"
+        return "ok"
+
+    @staticmethod
+    def _history_credential_response(credential: dict) -> dict:
+        """A fresh response-shaped copy with the fixed key order."""
+        return {key: credential[key] for key in HISTORY_CREDENTIAL_KEYS}
+
+    def active_history_credential(self) -> dict | None:
+        """The active credential in response shape, or None when absent/revoked.
+
+        Read under the store lock so the bearer gate never observes a
+        half-rotated record. Only an ``active`` credential can authenticate;
+        a revoked hash is reported as no credential (401).
+        """
+        with self.store.lock:
+            credential = self.store.history_credential
+            if credential is None or credential["status"] != HISTORY_CREDENTIAL_ACTIVE:
+                return None
+            response = self._history_credential_response(credential)
+            response["permissions"] = list(credential["permissions"])
+            return response
+
+    def manage_history_credential(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/history/access — rotate or revoke the history credential.
+
+        The body must be a closed JSON object with exactly
+        ``action, token, permissions, expected_version``. ``action`` is
+        ``rotate`` or ``revoke``. A rotate carries a non-empty ``token`` and a
+        non-empty, duplicate-free subset of read/update/export; a revoke
+        carries ``null`` for both. ``expected_version`` is a non-boolean
+        non-negative integer (the first create is made against version 0).
+        Every shape defect answers 400/input before any state is consulted; a
+        mismatched version answers 409/state. The first rotate creates the
+        credential (201); a later rotate installs a fresh token hash and
+        permission set at version+1 (200); a revoke keeps the version, token
+        hash and permissions but flips status to revoked (200). Re-revoking an
+        already-revoked credential at its version is an idempotent 200 with no
+        new event or write. The credential section, the
+        ``history_credential_changed`` event (action followed by the response)
+        and the generation land in one atomic write; a failed save rolls the
+        in-memory credential and event back.
+        """
+        if not self.history_enabled:
+            return 404, {"ok": False, "error": "not found"}
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != set(self.HISTORY_ACCESS_FIELDS)
+        ):
+            return 400, {"ok": False, "error": "input"}
+        action = payload["action"]
+        if action not in ("rotate", "revoke"):
+            return 400, {"ok": False, "error": "input"}
+        expected_version = payload["expected_version"]
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            return 400, {"ok": False, "error": "input"}
+        token = payload["token"]
+        permissions = payload["permissions"]
+        if action == "rotate":
+            if not isinstance(token, str) or not token:
+                return 400, {"ok": False, "error": "input"}
+            # Validate every element is a string before hashing them into a
+            # set: an unhashable (e.g. nested list/dict) permission must be a
+            # plain 400/input, never a TypeError/500.
+            if (
+                not isinstance(permissions, list)
+                or not permissions
+                or any(
+                    not isinstance(permission, str)
+                    for permission in permissions
+                )
+                or len(set(permissions)) != len(permissions)
+                or any(
+                    permission not in HISTORY_PERMISSION_SET
+                    for permission in permissions
+                )
+            ):
+                return 400, {"ok": False, "error": "input"}
+            ordered_permissions = [
+                permission
+                for permission in HISTORY_PERMISSION_ORDER
+                if permission in permissions
+            ]
+        else:  # revoke: both token and permissions must be JSON null.
+            if token is not None or permissions is not None:
+                return 400, {"ok": False, "error": "input"}
+            ordered_permissions = None
+
+        with self.store.lock:
+            current = self.store.history_credential
+            if current is None:
+                # The first operation must be a rotate against version 0; a
+                # revoke of a never-created credential, or any other expected
+                # version, is a state conflict rather than a format error.
+                if action != "rotate" or expected_version != 0:
+                    return 409, {"ok": False, "error": "state"}
+                created = True
+            else:
+                if expected_version != current["version"]:
+                    return 409, {"ok": False, "error": "state"}
+                if (
+                    action == "revoke"
+                    and current["status"] == HISTORY_CREDENTIAL_REVOKED
+                ):
+                    # Idempotent re-revoke: report the unchanged revoked
+                    # record with no event and no write (a second revoke event
+                    # would be rejected on recovery).
+                    return 200, self._history_credential_response(current)
+                created = False
+
+            previous = current
+            if action == "rotate":
+                token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+                new_version = 0 if current is None else current["version"] + 1
+                credential = {
+                    "version": new_version,
+                    "token_hash": token_hash,
+                    "permissions": ordered_permissions,
+                    "status": HISTORY_CREDENTIAL_ACTIVE,
+                }
+            else:
+                credential = self._history_credential_response(current)
+                credential["status"] = HISTORY_CREDENTIAL_REVOKED
+            self.store.history_credential = credential
+            # Event payload: action followed by the response document, in the
+            # response key order.
+            self.store.append_audit_event(
+                EVENT_HISTORY_CREDENTIAL_CHANGED,
+                {
+                    "action": action,
+                    "version": credential["version"],
+                    "token_hash": credential["token_hash"],
+                    "permissions": list(credential["permissions"]),
+                    "status": credential["status"],
+                },
+            )
+            try:
+                self.store.save()
+            except Exception:
+                # Roll the in-memory credential, its event and the generation
+                # back together; no half state survives an unserviced write.
+                self.store.history_credential = previous
+                self.store.truncate_audit_events(1)
+                return 500, {"ok": False, "error": "io"}
+            return (
+                201 if created else 200
+            ), self._history_credential_response(credential)
 
     def _history_heads(self) -> tuple[str | None, str | None]:
         """Current (trust_head, history_head); null for a not-yet-created file.

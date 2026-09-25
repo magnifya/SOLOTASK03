@@ -74,6 +74,20 @@ STATE_VERSION = 10
 TRUST_ACTIVE = "active"
 TRUST_REVOKED = "revoked"
 
+# Lifecycle status of the persistent node-history credential.
+HISTORY_CREDENTIAL_ACTIVE = "active"
+HISTORY_CREDENTIAL_REVOKED = "revoked"
+
+# Credential permission scopes in the fixed response/audit order. Each scope
+# authorizes one kind of route: read (GET the signer log), update (POST the
+# signer log) and export (POST a signed history page).
+HISTORY_PERMISSION_ORDER = ("read", "update", "export")
+HISTORY_PERMISSION_SET = frozenset(HISTORY_PERMISSION_ORDER)
+
+# Keys (and their order) of both the credential response and the persisted
+# ``history_credential`` snapshot section; the plaintext token is never stored.
+HISTORY_CREDENTIAL_KEYS = ("version", "token_hash", "permissions", "status")
+
 # Source-key lifecycle audit event kinds; service.EVENT_SOURCE_* constants
 # mirror these literal values.
 EVENT_SOURCE_REGISTERED = "source_registered"
@@ -109,6 +123,11 @@ EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 # the checkpoint sidecar) through the token-gated /v1/history endpoints.
 # service.EVENT_HISTORY_ACCESS mirrors this literal value.
 EVENT_HISTORY_ACCESS = "history_access"
+# A rotate/revoke of the persistent, permissioned credential that gates the
+# node-managed /v1/history endpoints. The payload is the action followed by the
+# response document (version, token_hash, permissions, status).
+# service.EVENT_HISTORY_CREDENTIAL_CHANGED mirrors this literal value.
+EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -339,6 +358,13 @@ class LedgerStore:
         # Head of the audit hash chain: {"event_id", "event_hash"} of the last
         # event, or {0, "0"*64} for an empty log. Persisted in every snapshot.
         self.audit_checkpoint: dict = audit.make_checkpoint([])
+        # Persistent permissioned credential gating the node-managed
+        # /v1/history endpoints, or None until one is first created. The record
+        # is exactly the response document
+        # {"version", "token_hash", "permissions", "status"}: the plaintext
+        # token is never retained, only its SHA-256 hash. Revocation flips
+        # status but preserves token_hash and permissions.
+        self.history_credential: dict | None = None
         # Rotatable Ed25519 checkpoint signer: the current
         # {"version", "private_key", "public_key"} or None on a legacy
         # unsigned snapshot until its one-time migration. Version 1 is
@@ -400,6 +426,7 @@ class LedgerStore:
                 self.allowlist = {}
                 self.audit_events = []
                 self.audit_checkpoint = audit.make_checkpoint([])
+                self.history_credential = None
                 # A brand-new node mints its version 1 checkpoint key; the
                 # first signer is activated at event 0 (the empty log).
                 self.audit_signer = self._make_audit_signer(1, 0)
@@ -428,7 +455,7 @@ class LedgerStore:
                 #           expired_records, audit_checkpoint, audit_repair,
                 #           signer_state, recorded_state_root, attested_syncs,
                 #           attested_expired_records, source_key_history,
-                #           key_history_repair)
+                #           key_history_repair, history_credential)
                 valid.append(
                     (
                         parsed[2],
@@ -450,6 +477,7 @@ class LedgerStore:
                         parsed[15],
                         parsed[16],
                         parsed[17],
+                        parsed[18],
                     )
                 )
 
@@ -470,7 +498,7 @@ class LedgerStore:
             # initial_balance, syncs, trust_sources, allowlist, audit_events,
             # expired_records, audit_checkpoint, audit_repair, signer_state,
             # recorded_state_root, attested_syncs, attested_expired_records,
-            # source_key_history, key_history_repair)
+            # source_key_history, key_history_repair, history_credential)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -485,6 +513,7 @@ class LedgerStore:
                 top[0][14],
                 top[0][15],
                 top[0][17],
+                history_credential=top[0][19],
             )
             for item in top[1:]:
                 if (
@@ -502,6 +531,7 @@ class LedgerStore:
                         item[14],
                         item[15],
                         item[17],
+                        history_credential=item[19],
                     )
                     != reference
                 ):
@@ -539,6 +569,7 @@ class LedgerStore:
                 attested_expired_records,
                 source_key_history,
                 key_history_repair,
+                history_credential,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -614,6 +645,7 @@ class LedgerStore:
             self.audit_checkpoint = audit_checkpoint
             self.audit_signer = audit_signer
             self.audit_signer_history = signer_history
+            self.history_credential = history_credential
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -739,6 +771,7 @@ class LedgerStore:
         state_root: str | None = None,
         attested_syncs: dict[tuple[str, str], dict] | None = None,
         source_key_history: dict[str, list[dict]] | None = None,
+        history_credential: dict | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -756,7 +789,9 @@ class LedgerStore:
         sync table (with its frozen key/version/signature/signed form) is its
         own section so it participates independently of plain syncs. The
         per-source key history participates too: a twin disagreeing about a
-        source's historical public keys is a conflict.
+        source's historical public keys is a conflict. The persistent
+        history credential participates too: a twin disagreeing about its
+        token hash, permissions, status or version is a conflict.
         """
         sync_records = [
             {
@@ -819,6 +854,11 @@ class LedgerStore:
                 or {"event_id": 0, "event_hash": "0" * 64},
                 "audit_signer_history": audit_signer_history or [],
                 "state_root": state_root,
+                "history_credential": (
+                    dict(history_credential)
+                    if history_credential is not None
+                    else None
+                ),
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -882,6 +922,7 @@ class LedgerStore:
         list[tuple[str, str, dict]],
         dict[str, list[dict]],
         bool,
+        dict | None,
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -1116,6 +1157,9 @@ class LedgerStore:
         for tip in all_synced_tips - live_tips - canonical_hashes:
             forks.pop(tip, None)
         allowlist = self._parse_persisted_allowlist(data.get("allowlist", {}), path)
+        history_credential = self._parse_persisted_history_credential(
+            data.get("history_credential"), audit_events, path
+        )
         return (
             chain,
             pending,
@@ -1135,6 +1179,7 @@ class LedgerStore:
             attested_expired,
             source_key_history,
             _key_history_repair,
+            history_credential,
         )
 
     @staticmethod
@@ -1850,6 +1895,184 @@ class LedgerStore:
                 )
             allowlist[source] = expires_at
         return allowlist
+
+    @staticmethod
+    def _validate_history_credential_shape(
+        raw: object, path: str, *, where: str
+    ) -> dict:
+        """Validate one ``{version, token_hash, permissions, status}`` record.
+
+        Shared by the persisted snapshot section and the
+        ``history_credential_changed`` audit payload. ``version`` is a
+        non-boolean non-negative integer (starting at 0), ``token_hash`` is a
+        64-char lowercase hex SHA-256 digest, ``permissions`` is a non-empty
+        duplicate-free list drawn from read/update/export and ``status`` is
+        active/revoked. Any defect is snapshot corruption. Returns a fresh dict
+        in the contract key order.
+        """
+        label = f"{where} history credential"
+        if not isinstance(raw, dict):
+            raise StateRecoveryError(path, f"{label} must be a JSON object")
+        if set(raw.keys()) != set(HISTORY_CREDENTIAL_KEYS):
+            raise StateRecoveryError(
+                path,
+                f"{label} must have exactly the keys {HISTORY_CREDENTIAL_KEYS}",
+            )
+        version = raw["version"]
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise StateRecoveryError(
+                path, f"{label} version must be a non-negative integer"
+            )
+        token_hash = raw["token_hash"]
+        if not crypto.is_hex64(token_hash):
+            raise StateRecoveryError(
+                path, f"{label} token_hash must be 64 lowercase hex characters"
+            )
+        permissions = raw["permissions"]
+        if (
+            not isinstance(permissions, list)
+            or not permissions
+            # Check element types before building a set, so an unhashable
+            # (nested list/dict) permission is reported as corruption rather
+            # than escaping as a TypeError.
+            or any(not isinstance(permission, str) for permission in permissions)
+            or len(set(permissions)) != len(permissions)
+            or any(
+                permission not in HISTORY_PERMISSION_SET
+                for permission in permissions
+            )
+        ):
+            raise StateRecoveryError(
+                path,
+                f"{label} permissions must be a non-empty duplicate-free "
+                "subset of read/update/export",
+            )
+        status = raw["status"]
+        if status not in (
+            HISTORY_CREDENTIAL_ACTIVE,
+            HISTORY_CREDENTIAL_REVOKED,
+        ):
+            raise StateRecoveryError(
+                path, f"{label} status must be active or revoked"
+            )
+        return {
+            "version": version,
+            "token_hash": token_hash,
+            # Persist in the fixed read/update/export response order.
+            "permissions": [
+                permission
+                for permission in HISTORY_PERMISSION_ORDER
+                if permission in permissions
+            ],
+            "status": status,
+        }
+
+    def _parse_persisted_history_credential(
+        self, raw: object, audit_events: list[dict], path: str
+    ) -> dict | None:
+        """Strictly parse the persisted history credential section.
+
+        The section is optional (a snapshot written before the feature omits
+        it). A present section must be structurally valid and exactly
+        reproducible by replaying the durable ``history_credential_changed``
+        events: the first rotate creates the version-0 active credential, each
+        later rotate bumps the version and installs a fresh token hash /
+        permission set, and the terminal revoke keeps version/hash/permissions
+        while flipping status to revoked. Any drift is corruption.
+        """
+        if raw is None:
+            credential = None
+        else:
+            credential = self._validate_history_credential_shape(
+                raw, path, where="persisted"
+            )
+        # Replay the change events independently of the stored section.
+        replayed: dict | None = None
+        for event in audit_events:
+            if event.get("kind") != EVENT_HISTORY_CREDENTIAL_CHANGED:
+                continue
+            action = event.get("action")
+            if action not in ("rotate", "revoke"):
+                raise StateRecoveryError(
+                    path,
+                    f"history_credential_changed event "
+                    f"{event.get('event_id')} has an invalid action",
+                )
+            change = self._validate_history_credential_shape(
+                {
+                    "version": event.get("version"),
+                    "token_hash": event.get("token_hash"),
+                    "permissions": event.get("permissions"),
+                    "status": event.get("status"),
+                },
+                path,
+                where=f"audit event {event.get('event_id')}",
+            )
+            if action == "rotate":
+                if change["status"] != HISTORY_CREDENTIAL_ACTIVE:
+                    raise StateRecoveryError(
+                        path,
+                        f"history_credential_changed event "
+                        f"{event.get('event_id')} rotate must leave the "
+                        "credential active",
+                    )
+                if replayed is None:
+                    if change["version"] != 0:
+                        raise StateRecoveryError(
+                            path,
+                            "first history_credential_changed rotate must "
+                            "create version 0",
+                        )
+                else:
+                    if change["version"] != replayed["version"] + 1:
+                        raise StateRecoveryError(
+                            path,
+                            f"history_credential_changed event "
+                            f"{event.get('event_id')} version must be exactly "
+                            "one greater than the previous version",
+                        )
+                replayed = change
+            else:  # revoke
+                if change["status"] != HISTORY_CREDENTIAL_REVOKED:
+                    raise StateRecoveryError(
+                        path,
+                        f"history_credential_changed event "
+                        f"{event.get('event_id')} revoke must leave the "
+                        "credential revoked",
+                    )
+                if replayed is None:
+                    raise StateRecoveryError(
+                        path,
+                        f"history_credential_changed event "
+                        f"{event.get('event_id')} revokes a credential that "
+                        "was never created",
+                    )
+                if replayed["status"] == HISTORY_CREDENTIAL_REVOKED:
+                    raise StateRecoveryError(
+                        path,
+                        f"history_credential_changed event "
+                        f"{event.get('event_id')} revokes an already-revoked "
+                        "credential",
+                    )
+                if (
+                    change["version"] != replayed["version"]
+                    or change["token_hash"] != replayed["token_hash"]
+                    or change["permissions"] != replayed["permissions"]
+                ):
+                    raise StateRecoveryError(
+                        path,
+                        f"history_credential_changed event "
+                        f"{event.get('event_id')} revoke must preserve "
+                        "version, token_hash and permissions",
+                    )
+                replayed = change
+        if credential != replayed:
+            raise StateRecoveryError(
+                path,
+                "persisted history_credential does not match the credential "
+                "reconstructed from history_credential_changed events",
+            )
+        return credential
 
     @staticmethod
     def _parse_persisted_audit_events(raw: object, path: str) -> list[dict]:
@@ -2907,6 +3130,20 @@ class LedgerStore:
         # reception/adoption/expiry is recorded here in write order.
         if self.audit_events:
             data["audit_events"] = list(self.audit_events)
+        # The persistent permissioned history credential is part of the same
+        # atomic document as the history_credential_changed event that last
+        # changed it. Only the SHA-256 token hash is retained — never the
+        # plaintext token. The dict carries the response key order; the
+        # snapshot itself is serialized sorted like every other section.
+        if self.history_credential is not None:
+            data["history_credential"] = {
+                key: (
+                    list(self.history_credential[key])
+                    if key == "permissions"
+                    else self.history_credential[key]
+                )
+                for key in HISTORY_CREDENTIAL_KEYS
+            }
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
         # Hold the class-wide recovery lock while a .ledger-* snapshot exists

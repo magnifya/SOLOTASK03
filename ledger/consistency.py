@@ -15,6 +15,9 @@ filesystem::
       # trust extensions, verified when present (a pre-feature snapshot
       # omits them and is accepted as legacy):
       "trust_sources" / "allowlist" / "source_key_history",
+      # the persistent permissioned history credential, verified when present
+      # (a pre-feature snapshot omits it and is accepted as legacy):
+      "history_credential",
       # extensions, accepted but not re-verified here:
       "forks" / "syncs" / "attested_syncs",
     }
@@ -81,10 +84,16 @@ from .models import (
 )
 from .store import (
     DEFAULT_INITIAL_BALANCE,
+    EVENT_HISTORY_CREDENTIAL_CHANGED,
     EVENT_SOURCE_REGISTERED,
     EVENT_SOURCE_REVOKED,
     EVENT_SOURCE_ROTATED,
     GENESIS_PREV_HASH,
+    HISTORY_CREDENTIAL_ACTIVE,
+    HISTORY_CREDENTIAL_KEYS,
+    HISTORY_CREDENTIAL_REVOKED,
+    HISTORY_PERMISSION_ORDER,
+    HISTORY_PERMISSION_SET,
     TRUST_ACTIVE,
     TRUST_REVOKED,
     LedgerStore,
@@ -110,6 +119,7 @@ KNOWN_OPTIONAL_SECTIONS = (
     "trust_sources",
     "allowlist",
     "source_key_history",
+    "history_credential",
 )
 
 # Raw keys every stored block document must carry ("status" defaults to
@@ -275,6 +285,9 @@ def _verify(data: dict) -> dict:
         data.get("source_key_history"),
         events,
     )
+
+    # -- persistent permissioned history credential --------------------------
+    _verify_history_credential(data.get("history_credential"), events)
 
     return {
         "generation": generation,
@@ -545,6 +558,125 @@ def _verify_trust(
         if source not in history:
             # Current snapshots write one history item per registered source.
             raise _Failure(ERR_INTEGRITY)
+
+
+def _parse_history_credential(raw: object) -> dict:
+    """Validate a persisted history credential's raw JSON shape.
+
+    Exactly ``{version, token_hash, permissions, status}``: a non-boolean
+    non-negative integer version, a 64-char lowercase hex token hash, a
+    non-empty duplicate-free list drawn from read/update/export and an
+    active/revoked status. Missing/extra keys or wrong primitive types are
+    input errors; invalid digest/permission/status values or an out-of-order
+    permission list are integrity errors. Returns a normalized response-ordered
+    dict.
+    """
+    if not isinstance(raw, dict):
+        raise _Failure(ERR_INPUT)
+    if set(raw.keys()) != set(HISTORY_CREDENTIAL_KEYS):
+        raise _Failure(ERR_INPUT)
+    version = raw["version"]
+    token_hash = raw["token_hash"]
+    permissions = raw["permissions"]
+    status = raw["status"]
+    if not _is_int(version) or version < 0:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(token_hash, str):
+        raise _Failure(ERR_INPUT)
+    if not isinstance(permissions, list) or not isinstance(status, str):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(token_hash):
+        raise _Failure(ERR_INTEGRITY)
+    if (
+        not isinstance(permissions, list)
+        or not permissions
+        or any(not isinstance(permission, str) for permission in permissions)
+        or len(set(permissions)) != len(permissions)
+        or any(
+            permission not in HISTORY_PERMISSION_SET
+            for permission in permissions
+        )
+    ):
+        raise _Failure(ERR_INTEGRITY)
+    normalized = [
+        permission
+        for permission in HISTORY_PERMISSION_ORDER
+        if permission in permissions
+    ]
+    if permissions != normalized:
+        # Permissions are persisted in the fixed read/update/export order.
+        raise _Failure(ERR_INTEGRITY)
+    if status not in (HISTORY_CREDENTIAL_ACTIVE, HISTORY_CREDENTIAL_REVOKED):
+        raise _Failure(ERR_INTEGRITY)
+    return {
+        "version": version,
+        "token_hash": token_hash,
+        "permissions": normalized,
+        "status": status,
+    }
+
+
+def _verify_history_credential(raw: object, events: list[dict]) -> None:
+    """Reconcile the optional history credential with its change events.
+
+    The section is optional. When present (or when any
+    ``history_credential_changed`` event exists) the credential must exactly
+    reproduce the event replay: the first rotate creates the version-0 active
+    credential, each later rotate bumps the version and installs a fresh token
+    hash/permission set, and the terminal revoke keeps version/hash/
+    permissions while flipping status to revoked. A malformed event payload is
+    an integrity failure; the stored section must equal the replay result (a
+    present section with no events, or vice versa, is too).
+    """
+    replayed: dict | None = None
+    saw_event = False
+    for event in events:
+        if event.get("kind") != EVENT_HISTORY_CREDENTIAL_CHANGED:
+            continue
+        saw_event = True
+        action = event.get("action")
+        try:
+            change = _parse_history_credential(
+                {
+                    "version": event.get("version"),
+                    "token_hash": event.get("token_hash"),
+                    "permissions": event.get("permissions"),
+                    "status": event.get("status"),
+                }
+            )
+        except _Failure:
+            raise _Failure(ERR_INTEGRITY) from None
+        if action == "rotate":
+            if change["status"] != HISTORY_CREDENTIAL_ACTIVE:
+                raise _Failure(ERR_INTEGRITY)
+            if replayed is None:
+                if change["version"] != 0:
+                    raise _Failure(ERR_INTEGRITY)
+            elif change["version"] != replayed["version"] + 1:
+                raise _Failure(ERR_INTEGRITY)
+            replayed = change
+        elif action == "revoke":
+            if change["status"] != HISTORY_CREDENTIAL_REVOKED:
+                raise _Failure(ERR_INTEGRITY)
+            if (
+                replayed is None
+                or replayed["status"] == HISTORY_CREDENTIAL_REVOKED
+                or change["version"] != replayed["version"]
+                or change["token_hash"] != replayed["token_hash"]
+                or change["permissions"] != replayed["permissions"]
+            ):
+                raise _Failure(ERR_INTEGRITY)
+            replayed = change
+        else:
+            raise _Failure(ERR_INTEGRITY)
+    if raw is None:
+        if saw_event:
+            # Change events exist but the credential section is missing.
+            raise _Failure(ERR_INTEGRITY)
+        return
+    credential = _parse_history_credential(raw)
+    if credential != replayed:
+        raise _Failure(ERR_INTEGRITY)
 
 
 def _parse_trust_sources(raw: object) -> dict[str, dict]:

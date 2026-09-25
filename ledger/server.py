@@ -1,7 +1,6 @@
 """HTTP server exposing the ledger REST API using the Python standard library."""
 from __future__ import annotations
 
-import hmac
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote
@@ -11,13 +10,16 @@ from .service import LedgerService
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies
 
 # Token-gated checkpoint-history routes. Every request to one of these is
-# rejected 401 before the body is read or any state is touched unless the node
-# was started with --history* and the Authorization header carries the exact
-# configured bearer token.
+# rejected before the body is read or any state is touched unless the node was
+# started with --history* and the request authenticates: the configured static
+# bearer token is full-power, or the active persisted credential presents a
+# token hash covering the route's permission. POST /v1/history/access manages
+# that credential and is reserved for the static token.
 HISTORY_ROUTES = {
     ("GET", "/v1/history/trust"),
     ("POST", "/v1/history/trust"),
     ("POST", "/v1/history/export"),
+    ("POST", "/v1/history/access"),
 }
 
 
@@ -45,39 +47,36 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             """Bearer-token gate for the /v1/history/* routes.
 
             Returns True when the request may proceed. When the feature is
-            disabled the gate is open (the service answers 404); otherwise a
-            missing/malformed/incorrect ``Authorization: Bearer TOKEN`` header
-            is answered 401 immediately, without reading the body or touching
-            any state (no audit event, no file access).
+            disabled the gate is open (the service answers 404); otherwise the
+            request is authenticated before the body is read or any state is
+            touched. The configured static token is full-power; an active
+            persisted credential whose token hash matches is admitted only for
+            routes covered by its permission set. A missing/malformed/unknown
+            bearer is answered 401 (``unauthorized``); an authenticated
+            credential lacking the route's permission is answered 403
+            (``forbidden``). Both failures happen without reading the body,
+            appending an audit event or touching any file.
             """
             if (method, path) not in HISTORY_ROUTES:
                 return True
             if not getattr(service, "history_enabled", False):
                 return True
-            expected = (
-                f"Bearer {service.history_token}"
-                if service.history_token is not None
-                else None
-            )
+            required = service.history_route_permission(method, path)
             provided = self.headers.get("Authorization")
-            # Compare bytes: a header containing non-ASCII (decoded latin-1 by
-            # the HTTP layer) must simply mismatch, never raise out of
-            # compare_digest (which rejects non-ASCII str inputs).
-            if expected is None or provided is None or not hmac.compare_digest(
-                provided.encode("utf-8", errors="replace"),
-                expected.encode("utf-8"),
-            ):
-                self._send_json(
-                    401,
-                    {"ok": False, "error": "unauthorized"},
-                    sort_keys=False,
-                )
-                # The body was deliberately not consumed: close the
-                # connection so an unread Content-Length body cannot desync
-                # the next pipelined request on a keep-alive socket.
-                self.close_connection = True
-                return False
-            return True
+            outcome = service.authorize_history(provided, required)
+            if outcome == "ok":
+                return True
+            error = "unauthorized" if outcome == "unauthorized" else "forbidden"
+            self._send_json(
+                401 if error == "unauthorized" else 403,
+                {"ok": False, "error": error},
+                sort_keys=False,
+            )
+            # The body was deliberately not consumed: close the connection so
+            # an unread Content-Length body cannot desync the next pipelined
+            # request on a keep-alive socket.
+            self.close_connection = True
+            return False
 
 
         def _read_json(self) -> tuple[bool, object]:
@@ -103,7 +102,20 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             # read and without any state or file side effects.
             if not self._history_authorized("POST", path):
                 return
-            if path == "/v1/history/trust":
+            if path == "/v1/history/access":
+                # POST /v1/history/access — rotate/revoke the persistent
+                # permissioned credential. Reserved for the static full-power
+                # token by the gate above; the success body has the contract
+                # key order version, token_hash, permissions, status.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.manage_history_credential(payload)
+                self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/history/trust":
                 # POST /v1/history/trust — append one signer certificate; the
                 # success document is the contract-ordered
                 # {root, records, head} log.

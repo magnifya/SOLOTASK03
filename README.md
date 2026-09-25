@@ -348,7 +348,10 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   删除记录 `allowlist_added` / `allowlist_removed`（均携带 `source` 与
   `expires_at`）；节点托管检查点历史接口的访问记录 `history_access`
   （载荷键序 `action,trust_head,history_head`，`action` 为
-  read/update/export，无头时为 `null`）。事件一旦写入永不删除：候选
+  read/update/export，无头时为 `null`）；持久分权历史凭据的轮换/撤销记录
+  `history_credential_changed`（载荷为 `action` 后接凭据响应四字段
+  `version,token_hash,permissions,status`，`action` 为 rotate/revoke，
+  首版版本为 0）。事件一旦写入永不删除：候选
   **采用或过期之后仍可按 source/kind 分页查询**。
 - **恢复语义**：信任注册表、allowlist、来源公钥历史与审计流是权威配置而非
   可丢弃缓存，快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；
@@ -364,6 +367,14 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   完全对应的 `source_rotated` 事件激活，撤销后不得再轮换，注册表当前
   version/public_key 必须等于历史最新条目；历史结构错误、版本不稠密、激活
   事件号或公钥对不上，都抛 `ledger.store.StateRecoveryError(path, reason)`。
+  持久分权历史凭据同样严格校验：顶层 `history_credential` 区段（存在时）
+  必须恰为 `{version,token_hash,permissions,status}`（版本为非布尔非负整数、
+  `token_hash` 为 64 位小写 hex、权限为 read/update/export 的非空无重子集且
+  按该顺序、status 为 active/revoked），且必须与重放全部
+  `history_credential_changed` 事件得到的凭据**逐字一致**——首次 rotate
+  创建版本 0，之后每次 rotate 版本恰 +1，revoke 保留版本/哈希/权限仅置
+  revoked，动作或载荷非法、版本不连续、撤销后再撤销、区段与事件不符都抛
+  `StateRecoveryError(path, reason)`；该区段也参与同代快照冲突比较。
   写于该特性之前、没有 `source_key_history` 区段的旧快照不强制迁移写盘：
   恢复时在内存中由注册表与审计事件重建（同代冲突判定、generation 均不受
   影响），下一次普通写盘自然持久化。审计检查点签名者同样严格校验：
@@ -866,12 +877,46 @@ JSON**，成功/失败退出 0/1：
 `--history PATH --history-trust TRUST --history-token TOKEN`：三者**必须
 同时给出且非空，或全部缺省**；只给其中一两个（含空值）是配置错误，
 进程向 stderr 报错并以退出码 **2** 结束，不加载任何状态。全部缺省时
-服务行为与以前完全一致，下面三个路径返回 404，其余接口不变。
+服务行为与以前完全一致，下面的历史路径返回 404，其余接口不变。
 
-- **令牌闸门**：三个路由先核对 `Authorization: Bearer TOKEN` 请求头，
-  用恒定时间比较；缺失、方案错误或令牌错误一律 **401**
-  `{"ok":false,"error":"unauthorized"}`，且在读取请求体或访问任何
-  状态/文件之前返回，**没有任何副作用**（不追加事件、不改文件）。
+- **令牌闸门**：历史路由先核对 `Authorization: Bearer TOKEN` 请求头。
+  闸门接受两类凭据：其一是启动配置的**静态 TOKEN**，全权且恒定时间比较；
+  其二是下面 `POST /v1/history/access` 维护的**持久分权凭据**——仅当其
+  当前 `status=active`、提供的 token 的 SHA-256 等于存储的 `token_hash`，
+  且其权限覆盖所请路由时才放行（`GET /v1/history/trust` 需 `read`，
+  `POST /v1/history/trust` 需 `update`，`POST /v1/history/export` 需
+  `export`）。缺失、方案错误、token 不匹配、无活动凭据或凭据已撤销一律
+  **401** `{"ok":false,"error":"unauthorized"}`；凭据有效但权限不足一律
+  **403** `{"ok":false,"error":"forbidden"}`。二者都在读取请求体或访问
+  任何状态/文件之前返回，**没有任何副作用**（不追加事件、不改文件）。
+  `POST /v1/history/access` **只接受静态 TOKEN**：任何分权凭据（即便持
+  全部权限）都无权管理凭据本身。
+- **持久分权凭据管理**：`POST /v1/history/access`（仅静态 TOKEN）的 JSON
+  体**仅含** `action,token,permissions,expected_version` 四键（键集封闭）。
+  - `action="rotate"`：`token` 必须为非空字符串；`permissions` 必须是
+    `read`/`update`/`export` 顺序下的**非空、无重复子集**（存储与响应均
+    归一化为 read/update/export 顺序）。首次创建针对 `expected_version=0`，
+    返回 **201**；此后每次轮换版本 +1、安装新 token 哈希与权限集，返回
+    **200**。`expected_version` 必须是非布尔非负整数；格式错误一律
+    **400** `{"ok":false,"error":"input"}`，版本不符一律 **409**
+    `{"ok":false,"error":"state"}`，二者均无副作用。
+  - `action="revoke"`：`token` 与 `permissions` 都必须为 `null`（否则
+    400/input），版本相符返回 **200**：保留 `version`、`token_hash` 与
+    `permissions`，仅把 `status` 置为 `revoked`；对已撤销凭据以相同版本
+    重复撤销是**幂等**的（仍 200，不追加事件、不写盘）。撤销后该 token
+    立即不可用（401）；针对被撤销版本再 `rotate` 会以版本 +1 签发一把新的
+    active 凭据。
+  - 成功响应的键序固定为 `version,token_hash,permissions,status`；
+    `token_hash = SHA256(token 的 UTF-8 字节)`（64 位小写十六进制），
+    **明文 token 绝不落盘**；`status` 仅取 `active`/`revoked`，首版版本
+    为 0。
+  - 凭据与一条 `history_credential_changed` 审计事件、审计检查点及
+    `generation` 在**同一次原子快照**中落盘；事件载荷为 `action` 后接
+    与响应一致的四字段，写盘失败回滚凭据、事件与 generation。快照另存
+    顶层 `history_credential`，恰为该响应文档（不存明文），沿旧有序
+    序列化（快照按 key 排序写入）；恢复时严格校验其形状并重放全部
+    `history_credential_changed` 事件复现它，且把它纳入同代快照冲突比较，
+    任何损坏或失配都抛 `ledger.store.StateRecoveryError(path, reason)`。
 - **读签名者日志**：`GET /v1/history/trust` 严格加载并返回
   `{root, records, head}` 文档（键序、记录形状、`prev`/`head` 链接与
   根证书签名规则同 `history_trust` 读取契约）；日志缺失为 500/io，
@@ -964,7 +1009,13 @@ SHA-256 摘要作为签名消息。
 文档**必含**顶层键 `state`、`chain`、`pending`、`index`、`accounts`、
 `audit_checkpoint`；`audit_events` 可以缺省（视为空日志）；允许扩展
 `forks`、`syncs`、`attested_syncs`、`trust_sources`、`allowlist`（这些
-区段存在与否不影响本项自洽核验），其余顶层未知键一律拒绝。
+区段存在与否不影响本项自洽核验），其余顶层未知键一律拒绝。存在时还会
+严格校验 `source_key_history`（见信任扩展）与持久分权历史凭据
+`history_credential`：它必须恰为
+`{version,token_hash,permissions,status}`，且与重放
+`history_credential_changed` 事件得到的凭据逐字一致（首版版本 0、rotate
+版本恰 +1、revoke 保留版本/哈希/权限），形状错为 `input`、与事件不符为
+`integrity`。
 
 逐项重算并比对：
 
@@ -1015,10 +1066,12 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
-| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流（含 `history_access` 绑定）的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复、节点托管检查点历史文件的启动重验与末条同类事件绑定 |
+| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流（含 `history_access` 绑定）的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复、节点托管检查点历史文件的启动重验与末条同类事件绑定、持久分权历史凭据（`history_credential` 快照区段与 `history_credential_changed` 事件重放校验） |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记、令牌保护的 `/v1/history/trust`
 读取/追加（201/200 幂等）与 `/v1/history/export` 签名分页及其
-`history_access` 审计事件 |
+`history_access` 审计事件，以及持久分权凭据 `/v1/history/access`
+的 rotate/revoke（201 首创/200 更新，仅存 SHA-256 哈希，分权 Bearer 闸门
+read/update/export，401/403 无副作用）与 `history_credential_changed` 事件 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
@@ -1248,6 +1301,21 @@ curl -s -X POST localhost:8080/v1/history/export \
   -d '{"key":"<64hex 签名种子>","after":0,"limit":50}'
 # -> 200 {"base":...,"records":[...],"next":null,"head":"...","checkpoint":{...},
 #         "auth":{"public_key":"...","signature":"..."}}
+
+# 持久分权凭据（仅静态 TOKEN；首创 expected_version=0 返回 201，之后 200）
+curl -s -X POST localhost:8080/v1/history/access \
+  -H 'Authorization: Bearer <static-token>' -H 'Content-Type: application/json' \
+  -d '{"action":"rotate","token":"<新明文token>","permissions":["read","export"],"expected_version":0}'
+# -> 201 {"version":0,"token_hash":"<SHA256(token)>","permissions":["read","export"],"status":"active"}
+# 轮换（版本+1、新哈希）/ 撤销（保留哈希与权限，status=revoked）
+curl -s -X POST localhost:8080/v1/history/access \
+  -H 'Authorization: Bearer <static-token>' -H 'Content-Type: application/json' \
+  -d '{"action":"rotate","token":"<另一把>","permissions":["update"],"expected_version":1}'
+curl -s -X POST localhost:8080/v1/history/access \
+  -H 'Authorization: Bearer <static-token>' -H 'Content-Type: application/json' \
+  -d '{"action":"revoke","token":null,"permissions":null,"expected_version":2}'
+# 格式错 400/input；版本冲突 409/state；此后活动凭据可用其明文 token 按
+# read/update/export 分权访问上面三个历史路由（无效 401，缺权 403）。
 ```
 
 ## 命令行
@@ -1387,4 +1455,5 @@ python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首
 python tests/strict_type_validation_test.py  # 跨入口严格类型校验：height/amount 的字符串/浮点/布尔伪装在候选分叉与同步入口 400（不写状态、不回放 200）、离线 verify 返回 input、canonical/pending 恢复抛 StateRecoveryError、持久化候选/同步记录按缓存规则丢弃、旧快照缺省 status 兼容
 python tests/consistency_verify_test.py   # 离线快照整体一致性 verify_snapshot：成功摘要与固定键序、缺区段/未知顶层键/类型伪装 input、交易/签名/Merkle/区块哈希/链接/索引/账户/state_root/pending 唯一性/审计链与检查点篡改 integrity、CLI consistency（退出码 1/0/1，IO/非 JSON 为 input）
 python tests/history_http_test.py  # 节点托管 /v1/history/trust 与 /v1/history/export（--history/--history-trust/--history-token 全有/全缺否则退出2、Bearer 401 无副作用、读缺失 500/io、追加 201/幂等 200、导出 200 页离线 verify_history_trust 可验、400/403/409/500 与 {"ok":false,"error"}、history_access 事件键序 action,trust_head,history_head 与 null 头、共锁并发、快照写盘失败恢复信任日志原字节与内存事件、重启重验文件并绑定末条 history_access、篡改/坏事件 StateRecoveryError(path,reason)）
+python tests/history_credential_test.py  # 持久分权凭据 POST /v1/history/access（仅静态 TOKEN；首创 201 版本0/更新 200 版本+1/撤销保留 hash 与权限/幂等重复撤销；token_hash=SHA256(token UTF8) 不落明文、响应键序 version,token_hash,permissions,status；格式错 400/input、版本冲突 409/state；permissions 归一化 read/update/export；静态全权、活动凭据按 read/update/export 分权、无效 401/unauthorized、缺权 403/forbidden 且无副作用、凭据不能管理凭据；history_credential 快照区段与 history_credential_changed 事件原子落盘、写盘失败回滚、重启保留、篡改区段/事件 StateRecoveryError(path,reason)；特性关闭时 404）
 ```
