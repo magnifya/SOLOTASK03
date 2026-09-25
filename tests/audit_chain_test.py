@@ -317,7 +317,7 @@ class RecoveryChainTests(unittest.TestCase):
         # An individually-valid alternative candidate with one extra event and
         # therefore a different checkpoint head.
         data["audit_events"].append(
-            {"event_id": 2, "kind": "source_registered", "at": 1.0, "source": "x"}
+            {"event_id": 2, "kind": "note", "at": 1.0}
         )
         data["audit_events"] = audit.link_events(data["audit_events"])
         data["audit_checkpoint"] = audit.make_checkpoint(data["audit_events"])

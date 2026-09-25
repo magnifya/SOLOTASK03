@@ -543,8 +543,9 @@ class RecoverySignerTests(unittest.TestCase):
         with self.assertRaises(StateRecoveryError) as ctx:
             self._reopen()
         self.assertEqual(
-            os.path.dirname(self.state_path), ctx.exception.path
+            os.path.abspath(self.state_path), os.path.abspath(ctx.exception.path)
         )
+        self.assertTrue(ctx.exception.reason)
 
     def test_missing_version_without_signer_sections_fails(self) -> None:
         # No state.version at all and both signer sections gone: never reset a

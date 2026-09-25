@@ -41,7 +41,7 @@ from ledger.cli import main as cli_main
 from ledger.models import Block, Transaction
 from ledger.server import build_handler
 from ledger.service import LedgerService
-from ledger.store import LedgerStore
+from ledger.store import LedgerStore, StateRecoveryError
 
 KEY_A = "a" * 64
 KEY_B = "b" * 64
@@ -462,30 +462,34 @@ class RestartReauthorizationTests(_ServiceCase):
         # event_id sequence stays dense.
         self._assert_prefix_plus_expiry(before, tip=tip, source=source)
 
-    def test_restart_drops_record_when_registry_entry_missing(self) -> None:
-        # Simulate a snapshot whose trust entry vanished while the sync record
-        # and its reception event remain: the record is pruned, the event log
-        # (dense event_ids) is preserved exactly.
+    def test_restart_fails_when_registry_entry_missing(self) -> None:
+        # A snapshot whose trust entry vanished while its source_registered
+        # lifecycle event remains is internally inconsistent: the registry and
+        # the event log must correspond both ways. Recovery rejects it (an
+        # orphan lifecycle event) rather than pruning the record and silently
+        # continuing; the corrupt snapshot on disk is never replaced.
         self.assertEqual(self.register("node-1")[0], 201)
         doc = self.candidate(self.block())
-        status, body = self.sync(doc)
+        status, _ = self.sync(doc)
         self.assertEqual(status, 201)
-        tip = body["tip_hash"]
-        before = self._events_snapshot()
 
         with open(self.state_path, encoding="utf-8") as fh:
             data = json.load(fh)
         data["trust_sources"] = []
         with open(self.state_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
+        written = json.dumps(data)
 
-        reopened = self._reopen()
-        self.assertNotIn(("node-1", "req-1"), reopened.syncs)
-        self.assertNotIn(tip, reopened.forks)
-        # A source that vanished from the registry invalidates the record while
-        # down: the record is pruned and one sync_expired is backfilled, while
-        # the prior event log is retained verbatim with dense event_ids.
-        self._assert_prefix_plus_expiry(before, tip=tip)
+        with self.assertRaises(StateRecoveryError) as ctx:
+            self._reopen()
+        self.assertEqual(
+            os.path.abspath(self.state_path), os.path.abspath(ctx.exception.path)
+        )
+        self.assertTrue(ctx.exception.reason)
+        self.assertIn("node-1", ctx.exception.reason)
+        # The corrupt snapshot must not be trimmed or silently replaced.
+        with open(self.state_path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), written)
 
     def test_restart_adopted_tip_keeps_chain_and_history_after_revoke(self) -> None:
         # Canonical confirmed block 1 (A->B 10).

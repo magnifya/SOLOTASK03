@@ -405,11 +405,13 @@ class TrustAuditServiceTests(unittest.TestCase):
             data = json.load(fh)
         generation = data["state"]["generation"]
         data["audit_events"].append(
-            {"event_id": 2, "kind": "source_registered", "at": 1.0, "source": "x"}
+            {"event_id": 2, "kind": "note", "at": 1.0}
         )
         # Keep the alternative candidate individually valid under the hash
         # chain: relink the whole log and pin its checkpoint, leaving only the
-        # extra event as the same-generation content conflict.
+        # extra event as the same-generation content conflict. (A generic
+        # event kind is used: an orphan source-key lifecycle event is itself
+        # fatal corruption and could no longer serve as valid twin content.)
         from ledger import audit as audit_mod
 
         data["audit_events"] = audit_mod.link_events(data["audit_events"])

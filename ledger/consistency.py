@@ -37,22 +37,33 @@ Verification recomputes, from the raw JSON values:
   version, status}`` records (64-char lowercase hex key, non-boolean integer
   expiry, positive integer version, ``active``/``revoked`` status),
   ``allowlist`` as a ``source -> non-boolean integer expires_at`` object, and
-  ``source_key_history`` as ``{source, keys}`` items whose
-  ``{version, public_key, activated_event_id}`` keys are dense from version 1
-  with strictly ascending activation ids — bidirectionally consistent with
-  the trust registry's latest version/public key and with the audit log's
-  source-key lifecycle events (``source_registered`` opens version 1,
-  ``source_rotated`` increments it, ``source_revoked`` adds none).
+  ``source_key_history`` as a source-ascending array of ``{source, keys}``
+  items whose ``{version, public_key, activated_event_id}`` keys are dense
+  from version 1 with strictly ascending, positive activation ids —
+  bidirectionally consistent with the trust registry's latest
+  version/public key/revoked status and with the audit log's source-key
+  lifecycle events (``source_registered`` opens version 1,
+  ``source_rotated`` increments it, ``source_revoked`` pins the current key
+  and must be present exactly when the registry record is ``revoked``);
+  every registry source, history item and lifecycle event must correspond
+  both ways, so an orphan source or event and a missing event are integrity
+  failures. A snapshot predating ``source_key_history`` omits the section and
+  is accepted as legacy without that cross-check.
 
 Two failure categories are returned, never raised:
 
 * ``input`` — the document is not an object, a required section is missing or
   has the wrong JSON type, an unknown top-level key appears, or a field carries
-  a non-integer/non-string value of the wrong kind before any recomputation;
+  a non-integer/non-string value of the wrong kind before any recomputation
+  (including a trust record missing or adding a key);
 * ``integrity`` — the document parses but a recomputed value disagrees with
   the stored one (tx/merkle/block hashes, linkage, index, accounts, state_root,
   pending uniqueness or the audit chain/checkpoint), or the trust extensions
-  disagree among themselves, the registry or the audit event log.
+  disagree among themselves, the registry or the audit event log (an invalid
+  public key or status, a non-positive version, unsorted or duplicate sources,
+  non-dense versions, a non-positive/non-ascending activation id, an orphan
+  source or lifecycle event, a missing lifecycle event, or a revoked-status
+  mismatch).
 """
 from __future__ import annotations
 
@@ -497,20 +508,29 @@ def _verify_trust(
     """Validate the trust extension sections against each other and the log.
 
     Every section is optional (a pre-feature snapshot omits them); a present
-    section is strictly validated. Field presence and raw JSON types are input
-    errors; value-format, ordering and uniqueness defects, and any
+    section is strictly validated. Field presence and raw JSON primitive types
+    are input errors; value-format, ordering and uniqueness defects, and any
     disagreement between the key history, the trust registry and the audit
     log's source-key lifecycle events, are integrity errors.
+
+    The registry is always reconciled against the event log: every registry
+    source must have a complete, well-formed lifecycle (register -> rotates ->
+    at most one revoke), its latest version/public key and its revoked status
+    must agree with the log, and every lifecycle event must name a registry
+    source — orphan sources/events and missing events are integrity failures.
+    A snapshot predating ``source_key_history`` omits that one section: the
+    registry/event checks still run, but there is no persisted history array to
+    cross-check (the history is reconstructed in memory by the node instead).
     """
     registry = _parse_trust_sources(trust_raw)
     _parse_allowlist(allowlist_raw)
+    expected = _reconstruct_key_history(registry, events)
     if history_raw is None:
-        # Legacy snapshot without the section: the registry and allowlist
-        # checks above still apply, but there is no persisted history to
-        # cross-check against the registry and the event log.
+        # Legacy snapshot without the section: the registry/allowlist and the
+        # registry/event reconciliation above still apply, but there is no
+        # persisted history array to cross-check.
         return
     history = _parse_source_key_history(history_raw)
-    expected = _reconstruct_key_history(registry, events)
     for source, entries in history.items():
         if source not in registry:
             # A history item whose source is absent from the registry is
@@ -529,6 +549,9 @@ def _parse_trust_sources(raw: object) -> dict[str, dict]:
 
     The array must be sorted by source with no duplicates; each record
     carries exactly ``{source, public_key, expires_at, version, status}``.
+    A missing/extra key or a wrong primitive field type is an input error; an
+    invalid public key or status, a non-positive integer version, or an
+    unsorted/duplicate source is an integrity error.
     """
     if raw is None:
         return {}
@@ -552,11 +575,15 @@ def _parse_trust_sources(raw: object) -> dict[str, dict]:
             raise _Failure(ERR_INPUT)
         if not _is_int(expires_at):
             raise _Failure(ERR_INPUT)
-        if not _is_int(version) or version < 1:
+        if not _is_int(version):
             raise _Failure(ERR_INPUT)
         if not isinstance(status, str):
             raise _Failure(ERR_INPUT)
         if not crypto.is_hex64(public_key):
+            raise _Failure(ERR_INTEGRITY)
+        if version < 1:
+            # A structurally integer but non-positive version is a corrupt
+            # value, not a wrong-shape document.
             raise _Failure(ERR_INTEGRITY)
         if status not in _TRUST_STATUSES:
             raise _Failure(ERR_INTEGRITY)
@@ -589,13 +616,18 @@ def _parse_allowlist(raw: object) -> None:
 def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
     """Validate the persisted per-source key history structurally.
 
-    Each item is exactly ``{source, keys}`` with a non-empty ``keys`` list of
+    The array must be sorted by source with no duplicates; each item is
+    exactly ``{source, keys}`` with a non-empty ``keys`` list of
     ``{version, public_key, activated_event_id}`` entries whose versions are
-    dense from 1 and whose activation ids strictly ascend.
+    dense from 1 and whose activation ids are positive and strictly ascend.
+    A missing/extra key or a wrong primitive field type is an input error; an
+    invalid public key, a non-positive/non-dense version, a non-positive or
+    non-ascending activation id, or a duplicate/unsorted source is integrity.
     """
     if not isinstance(raw, list):
         raise _Failure(ERR_INPUT)
     history: dict[str, list[dict]] = {}
+    previous: str | None = None
     for item in raw:
         if not isinstance(item, dict):
             raise _Failure(ERR_INPUT)
@@ -607,8 +639,11 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
             raise _Failure(ERR_INPUT)
         if not isinstance(keys, list) or not keys:
             raise _Failure(ERR_INPUT)
-        if source in history:
+        if previous is not None and source <= previous:
+            # History items must be unique and source-ascending like the
+            # registry they mirror.
             raise _Failure(ERR_INTEGRITY)
+        previous = source
         entries: list[dict] = []
         for position, entry in enumerate(keys):
             if not isinstance(entry, dict) or set(entry) != set(_HISTORY_KEY_KEYS):
@@ -616,16 +651,19 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
             version = entry["version"]
             public_key = entry["public_key"]
             activated = entry["activated_event_id"]
-            if not _is_int(version) or version < 1:
+            if not _is_int(version):
                 raise _Failure(ERR_INPUT)
             if not isinstance(public_key, str):
                 raise _Failure(ERR_INPUT)
-            if not _is_int(activated) or activated < 0:
+            if not _is_int(activated):
                 raise _Failure(ERR_INPUT)
             if not crypto.is_hex64(public_key):
                 raise _Failure(ERR_INTEGRITY)
-            if version != position + 1:
-                # Key versions are dense from 1.
+            if version < 1 or version != position + 1:
+                # Key versions are positive integers dense from 1.
+                raise _Failure(ERR_INTEGRITY)
+            if activated < 1:
+                # Every key is activated by a real, positive audit event id.
                 raise _Failure(ERR_INTEGRITY)
             if position > 0 and activated <= entries[-1]["activated_event_id"]:
                 # Activation event ids strictly ascend with the version.
@@ -644,40 +682,72 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
 def _reconstruct_key_history(
     registry: dict[str, dict], events: list[dict]
 ) -> dict[str, list[dict]]:
-    """Rebuild every registry source's expected key history from the log.
+    """Rebuild the expected key histories and reconcile them with the registry.
 
-    Mirrors ``LedgerStore._reconstruct_source_key_history``: version 1 is
-    activated by the source's ``source_registered`` event, each later version
-    by the matching ``source_rotated`` event, and a ``source_revoked`` event
-    references the current key without adding one. Any malformed lifecycle
-    payload, version gap, rotation after revocation or registry/event
-    disagreement is an integrity error. Lifecycle events for sources absent
-    from the registry belong to no reconstructed history and are ignored.
+    Mirrors ``LedgerStore._reconstruct_source_key_history`` but enforces
+    *bidirectional* correspondence among the registry, the persisted history
+    and the audit log:
+
+    * every ``source_registered`` / ``source_rotated`` / ``source_revoked``
+      event must name a source present in the registry (an event for an
+      unknown source is an orphan event);
+    * version 1 is activated by a source's single ``source_registered``
+      event, each later version by the matching dense ``source_rotated``
+      event, and a ``source_revoked`` event references the current key
+      without adding one;
+    * each registry source must have its registration (a missing event is
+      fatal), the number of key events must equal its current version, the
+      latest event's public key must equal the registry key, and the
+      registry status is ``revoked`` exactly when a revoke event exists.
+
+    Any malformed lifecycle payload, orphan event, missing registration,
+    version gap, rotation after revocation, latest-key/version disagreement
+    or revoked-status mismatch is an integrity error. Returns the
+    reconstructed histories.
     """
+    # Collect every source-key lifecycle event by source in log order. A
+    # lifecycle event for an unknown source is validated like any other; it
+    # can never be silently ignored as an orphan.
+    events_by_source: dict[str, list[dict]] = {}
+    for event in events:
+        kind = event.get("kind")
+        if kind not in _SOURCE_KEY_EVENT_KINDS:
+            continue
+        source = event.get("source")
+        event_id = event.get("event_id")
+        public_key = event.get("public_key")
+        expires_at = event.get("expires_at")
+        version = event.get("version")
+        if not isinstance(source, str) or not source:
+            raise _Failure(ERR_INTEGRITY)
+        if (
+            not isinstance(public_key, str)
+            or not crypto.is_hex64(public_key)
+            or not _is_int(expires_at)
+            or not _is_int(version)
+            or version < 1
+            or not _is_int(event_id)
+            or event_id < 1
+        ):
+            raise _Failure(ERR_INTEGRITY)
+        events_by_source.setdefault(source, []).append(event)
+
+    for source in events_by_source:
+        if source not in registry:
+            # A source-key lifecycle event with no registry record is orphan
+            # data: the registry and the event log must correspond both ways.
+            raise _Failure(ERR_INTEGRITY)
+
     reconstructed: dict[str, list[dict]] = {}
     for source, record in registry.items():
         entries: list[dict] = []
         revoked = False
         next_version = 1
-        for event in events:
-            kind = event.get("kind")
-            if kind not in _SOURCE_KEY_EVENT_KINDS:
-                continue
-            if event.get("source") != source:
-                continue
-            event_id = event.get("event_id")
-            public_key = event.get("public_key")
-            expires_at = event.get("expires_at")
-            version = event.get("version")
-            if (
-                not crypto.is_hex64(public_key)
-                or not _is_int(expires_at)
-                or not _is_int(version)
-                or version < 1
-                or not _is_int(event_id)
-                or event_id < 1
-            ):
-                raise _Failure(ERR_INTEGRITY)
+        for event in events_by_source.get(source, ()):
+            kind = event["kind"]
+            event_id = event["event_id"]
+            public_key = event["public_key"]
+            version = event["version"]
             if kind == EVENT_SOURCE_REGISTERED:
                 if entries or version != 1:
                     # The history opens with a single version-1 registration.
@@ -718,6 +788,11 @@ def _reconstruct_key_history(
         if len(entries) != record["version"]:
             raise _Failure(ERR_INTEGRITY)
         if entries[-1]["public_key"] != record["public_key"]:
+            raise _Failure(ERR_INTEGRITY)
+        if revoked != (record["status"] == TRUST_REVOKED):
+            # The registry status and the event log must agree on whether the
+            # source was revoked: a revoked record without a revoke event, or
+            # an active record carrying one, is corruption.
             raise _Failure(ERR_INTEGRITY)
         reconstructed[source] = entries
     return reconstructed
