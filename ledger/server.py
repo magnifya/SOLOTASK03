@@ -339,6 +339,23 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.get_chain_range(params)
                 self._send_json(status, body)
+            elif path == "/v1/chain/headers":
+                # GET /v1/chain/headers?after_height=&after_hash=&limit= —
+                # one signed page of block headers strictly after an anchor;
+                # the parameter rules are identical to /v1/chain/range.
+                # Repeated query parameters are rejected 400 like the other
+                # strict endpoints. The success document has a contract-fixed
+                # key order (anchor, headers, tip, auth), so it is serialized
+                # in insertion order rather than alphabetically.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(
+                        400, {"error": "query parameters must not be repeated"}
+                    )
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.get_chain_headers(params)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/chain":
                 status, body = service.get_chain()
                 self._send_json(status, body)

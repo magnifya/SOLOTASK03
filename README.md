@@ -209,6 +209,52 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `python -m ledger.cli sync-range-export --source S --request-id R --mode
   plain|attested`，打印单行 JSON，非 2xx 退出码 1。
 
+## 签名区块头分页
+
+`GET /v1/chain/headers` 在既有入口全部不变的前提下，提供只含**区块头**的
+签名分页，供离线节点只同步头、随后按需校验。
+
+- **参数**：`after_height`、`after_hash` 必填，`limit` 可选（默认 100，
+  范围 1–500），规则与 `GET /v1/chain/range` 完全相同：参数重复、严格
+  十进制/64 位小写十六进制格式不符、`limit` 越界一律 `400`；锚点高度未知
+  `404`；`after_hash` 与该高度区块不符 `409`。
+- **200 文档键序固定为 `anchor, headers, tip, auth`**：
+  - `anchor` 键序 `height, block_hash`，即本页起始锚点（页面内容在其
+    **之后**）；
+  - `headers` 为锚点之后的区块头**升序**数组（不含交易），至多 `limit`
+    个；每项键序恰为
+    `height, prev_hash, merkle_root, block_hash, status`（非负非布尔整数、
+    64 位小写 hex、`status` 仅取 `confirmed`/`pending`），pending 区块只
+    能出现在链尾；
+  - `tip` 沿用链描述符 S（`tip_hash, height, length, status`）；
+  - `auth` 键序 `key_version, signature`：由节点当前审计签名者
+    （`GET /v1/trust` 的 `audit_signers` 中当前版本）对
+    **SHA-256 摘要**做出的 Ed25519 签名，签名消息为
+    `UTF8("ledger-headers-v1") ‖ canonical_json(去掉 auth 的文档)`，其中
+    `canonical_json` 即 `json.dumps(..., sort_keys=True,
+    separators=(",",":"), ensure_ascii=False)` 的 UTF-8 字节，签名为 128
+    位小写十六进制。
+- 当锚点就是当前链尾时，`headers` 为空数组，文档仍照常签名；客户端可据此
+  轮询链是否推进。
+- **离线校验**：`ledger.light_client.verify_header_page(document, anchor,
+  tip_hash, trust) -> dict`。`anchor` 为调用方钉住的
+  `{height, block_hash}`，`tip_hash` 为钉住的链尾哈希，`trust` 取
+  `GET /v1/trust` 文档（按 `audit_signers` 中 `key_version` 对应的
+  `public_key` 取公钥）。校验顺序：顶层与嵌套**键序/类型**严格一致
+  （畸形为 `input`）；按 `key_version` 取审计公钥并按上述
+  `ledger-headers-v1` 摘要验 Ed25519 签名（版本未知或签名验不过为
+  `auth`）；`document.anchor` 必须与钉住锚点严格相等；逐项**重算头哈希**
+  （`block_hash = SHA256(canonical_json({height, prev_hash, merkle_root}))`，
+  键按 `height, merkle_root, prev_hash` 排序的紧凑 JSON）并核对
+  `prev_hash` 链接与连续高度（首页首项接锚点哈希，其后接前一项哈希），
+  pending 只允许在链尾；`tip` 必须命名钉住的 `tip_hash`、`length` 等于
+  `height + 1`，且页面末项（或空页时的锚点）与 S 自洽——任一不符为
+  `integrity`。函数**不抛异常**，失败返回 `{"ok": false, "error"}`，
+  `error` 仅取 `input`/`auth`/`integrity`；成功键序固定为
+  `ok, anchor, tip, verified_block_hashes`，`verified_block_hashes` 为本页
+  按升序验证通过的头哈希（锚点即链尾时为空数组）。签名者轮换后，旧页面仍
+  可用其 `key_version` 对应的历史公钥继续验证。
+
 ## 签名认证的增量区间协议
 
 增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
@@ -1205,6 +1251,12 @@ curl -s -X POST localhost:8080/v1/forks/sync \
 curl -s 'localhost:8080/v1/chain/range?after_height=2&after_hash=<block-hash>&limit=100'
 # -> 200 {"anchor":{"height":2,"block_hash":"..."},"blocks":[{...},...],"canonical":{...},"next_height":4}
 
+# 签名区块头分页（参数规则同 /v1/chain/range；200 键序 anchor,headers,tip,auth；
+# 锚点即链尾时 headers 为空；auth.signature = Ed25519(SHA256(UTF8("ledger-headers-v1")
+# || canonical_json(去auth)))，离线用 verify_header_page(document, anchor, tip_hash, trust) 校验）
+curl -s 'localhost:8080/v1/chain/headers?after_height=2&after_hash=<block-hash>&limit=100'
+# -> 200 {"anchor":{"height":2,"block_hash":"..."},"headers":[{"height":3,"prev_hash":"...","merkle_root":"...","block_hash":"...","status":"confirmed"}],"tip":{"tip_hash":"...","height":3,"length":4,"status":"confirmed"},"auth":{"key_version":1,"signature":"..."}}
+
 # 增量区间：仅推送锚点之后的尾部区块（拼接 canonical 前缀做整链重验；
 # 状态优先级 400→403→410→锚点 409→重验/tip 400→重复 409；201 五字段，
 # 同 source+request_id 同内容重试 200 首次结果、异内容 409）
@@ -1438,6 +1490,7 @@ python tests/fork_test.py             # 候选分叉校验、链比较、原子�
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
+python tests/header_page_test.py      # 签名区块头分页 GET /v1/chain/headers（after_height/after_hash 必填、limit 1–500 默认 100、400/404/409；固定键序 anchor,headers,tip,auth 与头项 height,prev_hash,merkle_root,block_hash,status；anchor=tip 时空 headers；pending 仅链尾；domain=ledger-headers-v1 的 SHA-256+Ed25519 签名；verify_header_page input/auth/integrity、锚点/tip 钉住、重算哈希与链接、分页串联、轮换历史验签）与 HTTP
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI

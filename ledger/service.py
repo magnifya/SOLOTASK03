@@ -894,6 +894,93 @@ class LedgerService:
                 "next_height": next_height,
             }
 
+    # -- signed block-header pages -------------------------------------------
+
+    @staticmethod
+    def _header_entry(block: Block) -> dict:
+        """One signed header page item in its fixed key order."""
+        return {
+            "height": block.height,
+            "prev_hash": block.prev_hash,
+            "merkle_root": block.merkle_root,
+            "block_hash": block.block_hash,
+            "status": block.status,
+        }
+
+    def get_chain_headers(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/chain/headers — one signed page of block headers.
+
+        Query parameters follow exactly the same rules as
+        ``GET /v1/chain/range``: ``after_height`` and ``after_hash`` are both
+        required, ``limit`` defaults to 100 and must be a decimal between 1
+        and 500; malformed values or unknown parameters are 400, an unknown
+        anchor height is 404 and an anchor hash mismatch is 409.
+
+        The success body has the fixed key order ``anchor, headers, tip,
+        auth``: ``anchor`` is ``{height, block_hash}`` (the block the page
+        starts *after*), ``headers`` are the headers strictly after it in
+        ascending height with item key order
+        ``height, prev_hash, merkle_root, block_hash, status`` (no
+        transactions; a pending chain tip is exported as the page tail),
+        ``tip`` is the current chain descriptor S, and ``auth`` is
+        ``{key_version, signature}`` — an Ed25519 signature made with the
+        current audit signer over
+        ``SHA256(UTF8("ledger-headers-v1") || canonical_json({anchor, headers,
+        tip}))``. When the anchor is the current tip the page carries an
+        empty ``headers`` list, still signed.
+        """
+        after_height_raw = params.get("after_height")
+        after_hash = params.get("after_hash")
+        if after_height_raw is None:
+            return 400, {"error": "missing parameter: after_height"}
+        if after_hash is None:
+            return 400, {"error": "missing parameter: after_hash"}
+        after_height = _parse_decimal(after_height_raw)
+        if after_height is None:
+            return 400, {"error": "after_height must be a non-negative decimal"}
+        if not crypto.is_hex64(after_hash):
+            return 400, {"error": "after_hash must be 64 lowercase hex characters"}
+        limit = self.RANGE_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.RANGE_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 500"}
+            limit = parsed
+
+        from . import light_client
+
+        with self.store.lock:
+            anchor_block = self.store.block_at(after_height)
+            if anchor_block is None:
+                return 404, {"error": "anchor block not found"}
+            if after_hash != anchor_block.block_hash:
+                return 409, {
+                    "error": "after_hash does not match the block at after_height"
+                }
+            page = self.store.chain[
+                after_height + 1 : after_height + 1 + limit
+            ]
+            anchor = self._anchor_descriptor(anchor_block)
+            headers = [self._header_entry(block) for block in page]
+            tip = self._fork_summary(self.store.chain)
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError("no audit signer available for header page")
+            auth = light_client.sign_header_page(
+                signer["private_key"], signer["version"], anchor, headers, tip
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "anchor": anchor,
+                "headers": headers,
+                "tip": tip,
+                "auth": auth,
+            }
+
     # -- inter-node fork sync -------------------------------------------------
 
     SYNC_DEFAULT_LIMIT = 50

@@ -110,6 +110,23 @@ the last page's tip, ``pages`` the page count and ``verified_tx_ids``
 ascending; failure is ``{"ok": False, "error": category}`` with category one
 of ``input/auth/expired/integrity``.
 
+:func:`verify_header_page` verifies one signed ``GET /v1/chain/headers``
+page offline. The document has the exact top-level key order
+``anchor, headers, tip, auth``: a closed ``{height, block_hash}`` anchor, an
+ascending list of ``{height, prev_hash, merkle_root, block_hash, status}``
+headers (no transactions), the chain descriptor S and an
+``{key_version, signature}`` envelope. The caller pins both the anchor and
+the tip hash; ``trust.audit_signers`` supplies the public key selected by
+``key_version``. Key-order/type defects are ``input``; an unknown key
+version or a failed Ed25519 verification over
+``SHA256(UTF8("ledger-headers-v1") || canonical_json(document without
+auth))`` is ``auth``; an anchor/tip mismatch, a recomputed header hash or
+prev_hash link mismatch, a non-consecutive height, or a pending header
+anywhere but the chain tail is ``integrity``. An empty page is valid only
+when its anchor is the pinned tip. Success returns
+``{"ok": True, "anchor", "tip", "verified_block_hashes"}``; nothing is
+raised for malformed input.
+
 :func:`advance` durably checkpoints a verified batch to ``path``. The
 checkpoint file is one compact UTF-8 JSON document with the exact declared key
 order ``generation, anchor, tip, context, state_hash`` and a single trailing
@@ -2905,3 +2922,268 @@ def restore_file_bytes(path: str, original: bytes | None) -> None:
     surfaces the damage as ``state``).
     """
     _restore_bytes(path, original)
+
+# -- signed block-header pages (GET /v1/chain/headers) ------------------------
+
+# Domain separator prefixing every signed header page.
+HEADER_PAGE_DOMAIN = "ledger-headers-v1"
+
+# The exact contract key order of a signed header page and of its nested
+# closed documents.
+HEADER_PAGE_KEYS = ("anchor", "headers", "tip", "auth")
+HEADER_ANCHOR_KEYS = ("height", "block_hash")
+HEADER_ITEM_KEYS = ("height", "prev_hash", "merkle_root", "block_hash", "status")
+HEADER_TIP_KEYS = DESCRIPTOR_FIELDS
+HEADER_AUTH_KEYS = ("key_version", "signature")
+
+# Fixed success key order returned by :func:`verify_header_page`.
+HEADER_PAGE_RESULT_KEYS = ("ok", "anchor", "tip", "verified_block_hashes")
+
+
+def _header_page_bytes(unsigned: dict) -> bytes:
+    """The signed bytes of a header page without its ``auth`` envelope:
+    ``UTF8("ledger-headers-v1") || canonical_json(anchor, headers, tip)``.
+    """
+    return HEADER_PAGE_DOMAIN.encode("utf-8") + _canonical_json_bytes(unsigned)
+
+
+def sign_header_page(
+    private_key_hex: str,
+    key_version: int,
+    anchor: dict,
+    headers: list,
+    tip: dict,
+) -> dict | None:
+    """Build the ``{key_version, signature}`` envelope of a header page.
+
+    The signature is an Ed25519 signature over
+    ``SHA256(UTF8("ledger-headers-v1") || canonical_json({anchor, headers,
+    tip}))``. Returns None when the private key is malformed.
+    """
+    unsigned = {"anchor": anchor, "headers": headers, "tip": tip}
+    digest = hashlib.sha256(_header_page_bytes(unsigned)).digest()
+    signature = crypto.sign_message(private_key_hex, digest)
+    if signature is None:
+        return None
+    return {"key_version": key_version, "signature": signature}
+
+
+def verify_header_page(
+    document: object,
+    anchor: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Offline-verify one signed ``GET /v1/chain/headers`` page.
+
+    ``document`` is the decoded response with the exact top-level key order
+    ``anchor, headers, tip, auth``: ``anchor`` is ``{height, block_hash}``
+    (key order ``height, block_hash``), ``headers`` is an ascending list of
+    ``{height, prev_hash, merkle_root, block_hash, status}`` header items,
+    ``tip`` is the chain descriptor S (``tip_hash, height, length, status``)
+    and ``auth`` is ``{key_version, signature}``. ``anchor`` is the
+    caller-pinned anchor the page's ``anchor`` must strictly equal;
+    ``tip_hash`` is the caller-pinned chain tip the page's ``tip`` must
+    name. ``trust`` must carry an ``audit_signers`` list; the envelope's
+    ``key_version`` selects that version's public key.
+
+    Verification, in order: strict key order and types (``input``), signer
+    lookup by ``key_version`` and the Ed25519 signature over
+    ``SHA256(UTF8("ledger-headers-v1") || canonical_json(document without
+    auth))`` (unknown version/key or a signature that does not verify is
+    ``auth``), the pinned anchor, the recomputed header hashes and prev_hash
+    links (heights consecutive from the anchor, pending only at the page
+    tail), and the tip descriptor (``integrity``). An empty page is valid
+    only when its anchor is the pinned tip; a page ending before the tip is
+    a valid non-final pagination page. Never raises for malformed input.
+
+    Returns ``{"ok": True, "anchor", "tip", "verified_block_hashes"}`` on
+    success (the hashes in ascending page order, empty for an anchor=tip
+    page) or ``{"ok": False, "error": "input"|"auth"|"integrity"}``.
+    """
+    try:
+        closed_anchor, closed_tip, verified_hashes = _verify_header_page(
+            document, anchor, tip_hash, trust
+        )
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "anchor": closed_anchor,
+        "tip": closed_tip,
+        "verified_block_hashes": verified_hashes,
+    }
+
+
+def _validate_header_anchor(raw: object) -> dict:
+    """Structural validation of a closed ``{height, block_hash}`` anchor."""
+    if not isinstance(raw, dict) or tuple(raw.keys()) != HEADER_ANCHOR_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["height"]) or raw["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["block_hash"]):
+        raise _Failure(ERR_INPUT)
+    return {"height": raw["height"], "block_hash": raw["block_hash"]}
+
+
+def _validate_header_trust(trust: object) -> dict:
+    """Parse ``trust.audit_signers`` into ``{version: public_key}``.
+
+    The list must be non-empty; every entry must carry a positive,
+    non-boolean integer ``version`` and a 64-lowercase-hex ``public_key``.
+    Versions must be unique. Any other defect is an input error.
+    """
+    if not isinstance(trust, dict):
+        raise _Failure(ERR_INPUT)
+    raw_signers = trust.get("audit_signers")
+    if not isinstance(raw_signers, list) or not raw_signers:
+        raise _Failure(ERR_INPUT)
+    signers: dict[int, str] = {}
+    for entry in raw_signers:
+        if not isinstance(entry, dict):
+            raise _Failure(ERR_INPUT)
+        version = entry.get("version")
+        public_key = entry.get("public_key")
+        if not _is_int(version) or version < 1:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(public_key):
+            raise _Failure(ERR_INPUT)
+        if version in signers:
+            raise _Failure(ERR_INPUT)
+        signers[version] = public_key
+    return signers
+
+
+def _verify_header_page(
+    document: object,
+    expected_anchor: object,
+    expected_tip_hash: object,
+    trust: object,
+) -> tuple[dict, dict, list[str]]:
+    """Strict core of :func:`verify_header_page`; may raise :class:`_Failure`."""
+    # 1. Exact key order and types — every defect here is an input error.
+    if not isinstance(document, dict):
+        raise _Failure(ERR_INPUT)
+    if tuple(document.keys()) != HEADER_PAGE_KEYS:
+        raise _Failure(ERR_INPUT)
+    page_anchor = _validate_header_anchor(document["anchor"])
+    raw_headers = document["headers"]
+    if not isinstance(raw_headers, list):
+        raise _Failure(ERR_INPUT)
+    headers: list[dict] = []
+    for item in raw_headers:
+        if not isinstance(item, dict) or tuple(item.keys()) != HEADER_ITEM_KEYS:
+            raise _Failure(ERR_INPUT)
+        if not _is_int(item["height"]) or item["height"] < 0:
+            raise _Failure(ERR_INPUT)
+        if (
+            not crypto.is_hex64(item["prev_hash"])
+            or not crypto.is_hex64(item["merkle_root"])
+            or not crypto.is_hex64(item["block_hash"])
+        ):
+            raise _Failure(ERR_INPUT)
+        if item["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
+            raise _Failure(ERR_INPUT)
+        headers.append({key: item[key] for key in HEADER_ITEM_KEYS})
+    raw_tip = document["tip"]
+    if not isinstance(raw_tip, dict) or tuple(raw_tip.keys()) != HEADER_TIP_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_tip["tip_hash"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_tip["height"]) or raw_tip["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_tip["length"]) or raw_tip["length"] < 1:
+        raise _Failure(ERR_INPUT)
+    if raw_tip["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
+        raise _Failure(ERR_INPUT)
+    tip = {key: raw_tip[key] for key in HEADER_TIP_KEYS}
+    raw_auth = document["auth"]
+    if not isinstance(raw_auth, dict) or tuple(raw_auth.keys()) != HEADER_AUTH_KEYS:
+        raise _Failure(ERR_INPUT)
+    key_version = raw_auth["key_version"]
+    signature = raw_auth["signature"]
+    if not _is_int(key_version) or key_version < 1:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(signature, str) or not crypto.is_hex128(signature):
+        raise _Failure(ERR_INPUT)
+
+    # The caller-pinned anchor and tip hash are validated for shape too.
+    pinned_anchor = _validate_header_anchor(expected_anchor)
+    if not isinstance(expected_tip_hash, str) or not crypto.is_hex64(
+        expected_tip_hash
+    ):
+        raise _Failure(ERR_INPUT)
+
+    # 2. Trust signer lookup by key version, then the Ed25519 signature over
+    # the domain-prefixed canonical bytes of the page without its auth.
+    signers = _validate_header_trust(trust)
+    public_key = signers.get(key_version)
+    if public_key is None:
+        raise _Failure(ERR_AUTH)
+    unsigned = {key: document[key] for key in HEADER_PAGE_KEYS if key != "auth"}
+    digest = hashlib.sha256(_header_page_bytes(unsigned)).digest()
+    if not crypto.verify_signature(public_key, digest, signature):
+        raise _Failure(ERR_AUTH)
+
+    # 3. The delivered anchor must strictly equal the caller-pinned anchor.
+    if page_anchor != pinned_anchor:
+        raise _Failure(ERR_INTEGRITY)
+
+    # 4. Recompute every header hash and prev_hash link standalone from the
+    # anchor: heights run consecutively from anchor.height + 1, the first
+    # prev_hash is the anchor hash and later ones link internally. The
+    # merkle_root cannot be recomputed from a header-only page, but it is
+    # bound into the recomputed block hash. A pending header may only sit at
+    # the page tail.
+    previous_hash = page_anchor["block_hash"]
+    for position, header in enumerate(headers):
+        if header["height"] != page_anchor["height"] + 1 + position:
+            raise _Failure(ERR_INTEGRITY)
+        if header["prev_hash"] != previous_hash:
+            raise _Failure(ERR_INTEGRITY)
+        recomputed = compute_block_hash(
+            header["height"], header["prev_hash"], header["merkle_root"]
+        )
+        if recomputed != header["block_hash"]:
+            raise _Failure(ERR_INTEGRITY)
+        if position < len(headers) - 1 and header["status"] != STATUS_CONFIRMED:
+            raise _Failure(ERR_INTEGRITY)
+        previous_hash = header["block_hash"]
+
+    # 5. The tip descriptor and the caller-pinned tip hash.
+    if tip["tip_hash"] != expected_tip_hash:
+        raise _Failure(ERR_INTEGRITY)
+    # The canonical chain starts at height 0, so its descriptor length is
+    # always the tip height plus one.
+    if tip["length"] != tip["height"] + 1:
+        raise _Failure(ERR_INTEGRITY)
+    if headers:
+        last = headers[-1]
+        if last["block_hash"] == tip["tip_hash"]:
+            # Final page: the page ends exactly at the pinned tip.
+            if tip["height"] != last["height"] or tip["status"] != last["status"]:
+                raise _Failure(ERR_INTEGRITY)
+        else:
+            # Non-final pagination page ending strictly before the tip: the
+            # chain continues past this page, so a pending last header would
+            # put a pending block somewhere other than the chain tail.
+            if last["height"] >= tip["height"]:
+                # A same-height different hash is a fork past the pin; a page
+                # can never extend beyond the tip either.
+                raise _Failure(ERR_INTEGRITY)
+            if last["status"] != STATUS_CONFIRMED:
+                raise _Failure(ERR_INTEGRITY)
+    else:
+        # An empty page is only coherent when the anchor itself is the tip.
+        if (
+            page_anchor["block_hash"] != tip["tip_hash"]
+            or page_anchor["height"] != tip["height"]
+        ):
+            raise _Failure(ERR_INTEGRITY)
+
+    verified_hashes = [header["block_hash"] for header in headers]
+    return page_anchor, tip, verified_hashes
