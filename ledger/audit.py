@@ -495,3 +495,42 @@ def _verify_checkpoint_auth(
         first["signature"],
     ):
         raise _VerifyError(ERR_AUTH)
+
+
+# -- signed block-header pages -----------------------------------------------
+
+# Domain separator for GET /v1/chain/headers page signatures. It is its own
+# constant so a header-page signature can never verify as any other signed
+# document (and vice versa).
+HEADERS_DOMAIN = "ledger-headers-v1"
+
+
+def header_page_bytes(page: dict) -> bytes:
+    """The exact pre-image of a header-page signature digest.
+
+    ``UTF-8("ledger-headers-v1") || canonical_json(page)`` where the page is
+    the GET /v1/chain/headers document with its ``auth`` field removed and
+    ``canonical_json`` is sorted-key compact UTF-8 JSON
+    (``sort_keys=True``, ``separators=(",", ":")``, ``ensure_ascii=False``).
+    """
+    canonical = json.dumps(
+        page, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return HEADERS_DOMAIN.encode("utf-8") + canonical
+
+
+def sign_header_auth(private_key_hex: str, page: dict) -> str | None:
+    """Ed25519-sign SHA-256 of a header page (without its ``auth`` field).
+
+    Returns the 128-hex signature, or None when the private key is malformed.
+    """
+    digest = hashlib.sha256(header_page_bytes(page)).digest()
+    return crypto.sign_message(private_key_hex, digest)
+
+
+def verify_header_auth(
+    public_key_hex: str, page: dict, signature_hex: str
+) -> bool:
+    """Verify a header-page Ed25519 signature. Never raises."""
+    digest = hashlib.sha256(header_page_bytes(page)).digest()
+    return crypto.verify_signature(public_key_hex, digest, signature_hex)

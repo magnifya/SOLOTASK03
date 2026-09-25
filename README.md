@@ -250,6 +250,58 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   读 JSON），客户端按上述 canonical 方式本地签名；非 2xx 响应打印单行 JSON 并以
   退出码 1 结束。
 
+## 签名区块头分页与离线校验
+
+除完整区块的 `/v1/chain/range` 外，节点还提供只含**区块头**（不含交易）的
+签名分页，便于不持有交易数据的一方核验链头推进。
+
+- **拉取头分页**：`GET /v1/chain/headers`，参数与 `/v1/chain/range` 完全一致：
+  必填 `after_height`、`after_hash`，可选 `limit`（默认 100，范围 1–500）。
+  参数重复出现、数值不是首位非 0 的严格十进制、`after_hash` 不是 64 位小写
+  十六进制、`limit` 越界一律 `400`；锚点高度不存在返回 `404`；`after_hash`
+  与该高度区块不匹配返回 `409`。
+- **响应**：在同一把锁内返回顶层键序固定为 `anchor, headers, tip, auth` 的
+  文档（HTTP 线序即此顺序，不按字母序）：
+  - `anchor` 键序 `{height, block_hash}`，是本页起始锚点；
+  - `headers` 为锚点**之后**的区块头，按 `height` 升序，至多 `limit` 个；每项
+    键序恰为 `{height, prev_hash, merkle_root, block_hash, status}`（pending 块
+    只能位于链尾，故至多末项为 pending）；
+  - `tip` 沿用链描述符 S（`tip_hash,height,length,status`），始终是当前链尾，
+    允许页面只覆盖到链尾之前的中间段；
+  - `auth` 键序 `{key_version, signature}`，由节点当前审计签名者
+    （`GET /v1/trust` 的 `audit_signers`）签名。
+  当锚点本身就是链尾时 `headers` 为空数组，此时 `tip` 必须与锚点重合。
+- **签名**：`signature` 是对
+  `Ed25519(SHA256(UTF8("ledger-headers-v1") || canonical_json(去掉 auth 的
+  整页文档)))` 的签名；`canonical_json` 用 `sort_keys`、紧凑分隔符
+  `(",",":")`、`ensure_ascii=False` 的 UTF-8 JSON。domain 与其他签名消息均不
+  同，防止互验。签名原语为 `ledger.audit.sign_header_auth` /
+  `verify_header_auth`。
+- **离线校验**：`ledger.light_client.verify_header_page(document, anchor,
+  tip_hash, trust) -> dict` 接收已解码的头分页、调用方钉住的
+  `anchor = {height, block_hash}`、调用方钉住的链尾 `tip_hash`（64 位小写
+  十六进制）与本地信任文档。严格校验：
+  - **input**：文档/锚点/tip/auth 的键序与键集（顶层恰为
+    `anchor,headers,tip,auth`，头项恰为五字段、`tip` 恰为四字段、`auth` 恰为
+    `key_version,signature`）与原始类型（非布尔非负/正整数、64/128 位小写
+    hex、status 取值合法），调用方 `anchor`/`tip_hash` 形状，以及
+    `trust.audit_signers`（非空、版本自 1 起稠密、公钥 64 位 hex、
+    `activated_event_id` 非布尔非负整数）；任何畸形为 `input`，全程不抛异常。
+  - **auth**：按 `auth.key_version` 从 `audit_signers` 取对应公钥（版本未知
+    为 `auth`），并用其验证上面 domain 摘要的 Ed25519 签名；签名验不过为
+    `auth`。
+  - **integrity**：文档 `anchor` 必须严格等于调用方 `anchor`；从头重算每个
+    区块头哈希（`sha256(规范化 {height,prev_hash,merkle_root})`）、核对高度自
+    `anchor.height + 1` 连续、`prev_hash` 相接；pending 头只许出现在**具名链
+    尾**上；`tip` 必须闭合自洽（`length == height + 1`、页面不得越过 tip、页
+    面到达 tip 时末头与 tip 的哈希/状态一致、空页只在锚点即链尾时合法），且
+    `tip.tip_hash` 必须等于调用方 `tip_hash`。
+
+  成功返回固定键序 `{ok, anchor, tip, verified_block_hashes}`，
+  `verified_block_hashes` 为本页区块哈希按高度升序；失败返回
+  `{ok: false, error}`，`error` 仅取 `input`/`auth`/`integrity`。其余入口
+  （CLI 等）保持不变。
+
 ## 持久化来源信任与审计
 
 轻客户端所需的信任文档不再靠手工维护：节点持久化保存**来源信任注册表**、
@@ -1064,16 +1116,19 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | --- | --- |
 | `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof` 与批量束 `verify_merkle_proof_bundle`）、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
-| `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
+| `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，区块头分页的 `ledger-headers-v1` domain 签名/验签原语（`sign_header_auth`/`verify_header_auth`），以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流（含 `history_access` 绑定）的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复、节点托管检查点历史文件的启动重验与末条同类事件绑定、持久分权历史凭据（`history_credential` 快照区段与 `history_credential_changed` 事件重放校验） |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记、令牌保护的 `/v1/history/trust`
 读取/追加（201/200 幂等）与 `/v1/history/export` 签名分页及其
 `history_access` 审计事件，以及持久分权凭据 `/v1/history/access`
 的 rotate/revoke（201 首创/200 更新，仅存 SHA-256 哈希，分权 Bearer 闸门
-read/update/export，401/403 无副作用）与 `history_credential_changed` 事件 |
+read/update/export，401/403 无副作用）与 `history_credential_changed` 事件，以及
+签名区块头分页 `GET /v1/chain/headers`（锚点/limit 规则同 chain/range，400/404/
+409，返回固定键序 anchor,headers,tip,auth 并由当前审计签名者按
+`ledger-headers-v1` 签名） |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；签名区块头分页的离线核验 `verify_header_page`（键序/类型、按 key_version 选 audit_signers 公钥、`ledger-headers-v1` 签名、锚点/重算头哈希与链接/pending 只许链尾/tip 闭合，失败分 input/auth/integrity）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
@@ -1204,6 +1259,14 @@ curl -s -X POST localhost:8080/v1/forks/sync \
 # 高度不存在 404、哈希非法 400、锚点不匹配 409、重复参数 400），pending 尾块同样导出
 curl -s 'localhost:8080/v1/chain/range?after_height=2&after_hash=<block-hash>&limit=100'
 # -> 200 {"anchor":{"height":2,"block_hash":"..."},"blocks":[{...},...],"canonical":{...},"next_height":4}
+
+# 签名区块头分页（参数/400/404/409 规则同 chain/range；只含区块头、不含交易；
+# 顶层键序固定 anchor,headers,tip,auth，auth 由审计签名者按 ledger-headers-v1 签名，
+# 可用 ledger.light_client.verify_header_page 离线核验）
+curl -s 'localhost:8080/v1/chain/headers?after_height=2&after_hash=<block-hash>&limit=100'
+# -> 200 {"anchor":{"height":2,"block_hash":"..."},"headers":[{"height":3,...},...],
+#         "tip":{"tip_hash":"...","height":4,"length":5,"status":"confirmed"},
+#         "auth":{"key_version":1,"signature":"..."}}
 
 # 增量区间：仅推送锚点之后的尾部区块（拼接 canonical 前缀做整链重验；
 # 状态优先级 400→403→410→锚点 409→重验/tip 400→重复 409；201 五字段，
@@ -1438,6 +1501,7 @@ python tests/fork_test.py             # 候选分叉校验、链比较、原子�
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
+python tests/chain_headers_test.py    # 签名区块头分页 GET /v1/chain/headers（锚点/limit 同 chain/range、400/404/409、固定键序 anchor,headers,tip,auth、头项五字段升序、pending 只许链尾、anchor=tip 时空页、签名轮换按 key_version 验证）与 verify_header_page 离线核验（键序/类型、audit_signers 选钥、ledger-headers-v1 签名、锚点/重算头哈希与链接/tip 闭合，input/auth/integrity，不抛异常）与 HTTP
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI

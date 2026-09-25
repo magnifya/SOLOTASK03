@@ -3579,6 +3579,30 @@ class LedgerStore:
             "signature": signature,
         }
 
+    def sign_header_page(self, page: dict) -> dict | None:
+        """Return ``{key_version, signature}`` for a chain-headers page.
+
+        The signature covers
+        ``Ed25519(SHA256(UTF8("ledger-headers-v1") || canonical_json(page)))``
+        where ``page`` is the GET /v1/chain/headers document without its
+        ``auth`` field, under the current audit signer. Returns None on a
+        legacy unsigned snapshot that has not yet been migrated. Caller must
+        hold the lock.
+        """
+        if self.audit_signer is None:
+            return None
+        signature = audit.sign_header_auth(
+            self.audit_signer["private_key"], page
+        )
+        # A locally generated/validated key cannot fail; treat it as a
+        # programming error rather than emitting an unsigned page.
+        if signature is None:
+            raise RuntimeError("current audit signer key is invalid")
+        return {
+            "key_version": self.audit_signer["version"],
+            "signature": signature,
+        }
+
     def append_audit_event(self, kind: str, payload: dict, at: float | None = None) -> dict:
         """Append an audit event in memory with the next monotonic event_id.
 

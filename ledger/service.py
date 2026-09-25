@@ -894,6 +894,77 @@ class LedgerService:
                 "next_height": next_height,
             }
 
+    def get_chain_headers(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/chain/headers — a signed page of canonical block headers.
+
+        Query parameters follow ``GET /v1/chain/range`` exactly: required
+        ``after_height`` (strict non-negative decimal) and ``after_hash`` (64
+        lowercase hex), optional ``limit`` (default 100, range 1-500). A
+        malformed value is 400, an unknown anchor height 404 and an anchor
+        hash that does not match the block at that height 409.
+
+        Under the store lock the response is
+        ``{anchor, headers, tip, auth}`` in that key order: ``anchor`` is
+        ``{height, block_hash}``; ``headers`` lists the headers strictly
+        after the anchor in ascending height order, each
+        ``{height, prev_hash, merkle_root, block_hash, status}`` (a pending
+        block can only ever sit at the chain tip, so only the last header of
+        a page may be pending; a page anchored at the tip is empty);
+        ``tip`` is the current chain descriptor S; ``auth`` is
+        ``{key_version, signature}`` — the Ed25519 signature of the current
+        audit signer over
+        ``SHA256(UTF8("ledger-headers-v1") || canonical_json(page without
+        auth))``, verifiable offline against the trust document's
+        ``audit_signers``.
+        """
+        after_height_raw = params.get("after_height")
+        after_hash = params.get("after_hash")
+        if after_height_raw is None:
+            return 400, {"error": "missing parameter: after_height"}
+        if after_hash is None:
+            return 400, {"error": "missing parameter: after_hash"}
+        after_height = _parse_decimal(after_height_raw)
+        if after_height is None:
+            return 400, {"error": "after_height must be a non-negative decimal"}
+        if not crypto.is_hex64(after_hash):
+            return 400, {"error": "after_hash must be 64 lowercase hex characters"}
+        limit = self.RANGE_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.RANGE_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 500"}
+            limit = parsed
+
+        with self.store.lock:
+            anchor_block = self.store.block_at(after_height)
+            if anchor_block is None:
+                return 404, {"error": "anchor block not found"}
+            if after_hash != anchor_block.block_hash:
+                return 409, {
+                    "error": "after_hash does not match the block at after_height"
+                }
+            page = self.store.chain[
+                after_height + 1 : after_height + 1 + limit
+            ]
+            body = {
+                "anchor": self._anchor_descriptor(anchor_block),
+                "headers": [
+                    {
+                        "height": block.height,
+                        "prev_hash": block.prev_hash,
+                        "merkle_root": block.merkle_root,
+                        "block_hash": block.block_hash,
+                        "status": block.status,
+                    }
+                    for block in page
+                ],
+                "tip": self._fork_summary(self.store.chain),
+            }
+            # The signature covers the page without its auth field; it is
+            # appended last so the response keeps the contract key order.
+            body["auth"] = self.store.sign_header_page(body)
+            return 200, body
+
     # -- inter-node fork sync -------------------------------------------------
 
     SYNC_DEFAULT_LIMIT = 50
