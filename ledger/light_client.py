@@ -194,6 +194,33 @@ reordered pages and any tampering are rejected. Success is ``{"ok": True}``;
 failure is ``{"ok": False, "error": category}`` with category one of
 ``input`` (structure/types), ``auth`` (pinned key or signature) and
 ``integrity`` (chaining, pagination or checkpoint replay); nothing is raised.
+
+:func:`verify_history_trust` verifies the same ordered, non-empty page list
+against a signer-rotation trust document instead of one pinned key, so an
+export whose pages were signed under rotated (or revoked and reactivated)
+keys stays verifiable. The trust document has the exact key order
+``root, records, head``: ``root`` is the 64-lowercase-hex Ed25519 public key
+the caller pins (it must equal the ``root`` argument); ``records`` is a
+non-empty list of rotation certificates with the exact key order
+``at, key, status, prev, signature`` — ``at`` a non-boolean positive integer
+strictly increasing across the list, ``key`` the 64-hex page signing key,
+``status`` exactly ``active`` or ``revoked``, ``prev`` the SHA-256 of the
+previous record's canonical JSON (64 zeros for the first) and ``signature``
+the root key's Ed25519 signature (128 hex) over the SHA-256 of the record's
+canonical JSON with ``signature`` removed; ``head`` is the last record's
+hash, computed the same way. An ``active`` record authorizes its key from
+``at`` until the key's next record; a ``revoked`` record withdraws it from
+``at`` until a later ``active`` record. Every page's ``auth.public_key`` may
+differ but must be authorized at the ``verified_at`` of every generation the
+page signs, and consecutive generations signed by the same key must not
+cross a revocation/reactivation boundary of that key. Signature, hash, cursor,
+cross-page linking and checkpoint-replay rules are exactly
+:func:`verify_history`'s. Success is ``{"ok": True}``; failure is
+``{"ok": False, "error": category}`` with category one of ``input``
+(structure/types), ``auth`` (root mismatch, a failing certificate or page
+signature, an unknown or revoked key) and ``integrity`` (``at`` order,
+``prev``/``head`` chain, a crossed authorization boundary, chaining,
+pagination or checkpoint replay); nothing is raised.
 """
 from __future__ import annotations
 
@@ -2132,11 +2159,25 @@ def _validate_page_record(raw: object) -> dict:
     return {"checkpoint": checkpoint, "prev": raw["prev"], "hash": raw["hash"]}
 
 
-def _verify_history_pages(pages: object, pinned_key: object) -> None:
-    """All structural, authentication and chaining checks for :func:`verify_history`."""
+def _verify_history_pages(
+    pages: object,
+    pinned_key: object,
+    page_authorizer: object = None,
+) -> None:
+    """All structural, authentication and chaining checks for :func:`verify_history`.
+
+    With ``page_authorizer`` None the pinned-key rule of
+    :func:`verify_history` applies: every page must carry ``pinned_key`` in
+    its ``auth``. Otherwise each page is verified under its own
+    ``auth.public_key`` and ``page_authorizer(page_key, validated_records)``
+    is invoked after the signature check to judge the key's authorization
+    (the :func:`verify_history_trust` rotation rules).
+    """
     if not isinstance(pages, list) or not pages:
         raise _Failure(ERR_INPUT)
-    if not isinstance(pinned_key, str) or not _HEX32_RE.fullmatch(pinned_key):
+    if page_authorizer is None and (
+        not isinstance(pinned_key, str) or not _HEX32_RE.fullmatch(pinned_key)
+    ):
         raise _Failure(ERR_INPUT)
 
     common_base: dict | None = None
@@ -2175,8 +2216,9 @@ def _verify_history_pages(pages: object, pinned_key: object) -> None:
         validated_records = [_validate_page_record(raw) for raw in records]
 
         # The pinned trust anchor and the signed envelope must be shared by
-        # every page of the export.
-        if auth["public_key"] != pinned_key:
+        # every page of the export. With a page authorizer the pinned-key
+        # equality rule is replaced by per-key authorization below.
+        if page_authorizer is None and auth["public_key"] != pinned_key:
             raise _Failure(ERR_AUTH)
         if common_base is None:
             common_base = base
@@ -2193,8 +2235,13 @@ def _verify_history_pages(pages: object, pinned_key: object) -> None:
             key: raw_page[key] for key in HISTORY_PAGE_KEYS if key != "auth"
         }
         digest = hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
-        if not crypto.verify_signature(pinned_key, digest, auth["signature"]):
+        page_key = auth["public_key"]
+        if not crypto.verify_signature(page_key, digest, auth["signature"]):
             raise _Failure(ERR_AUTH)
+        if page_authorizer is not None:
+            # The rotation rules: the page key must be authorized for every
+            # generation it signs, without crossing an authorization boundary.
+            page_authorizer(page_key, validated_records)
 
         if expected_prev is None:
             # The first page starts right at the shared base.
@@ -2245,3 +2292,182 @@ def _verify_history_pages(pages: object, pinned_key: object) -> None:
         raise _Failure(ERR_INTEGRITY)
     if final_record["checkpoint"] != common_checkpoint:
         raise _Failure(ERR_INTEGRITY)
+
+
+# -- signer-rotation trust verification ----------------------------------------
+
+# The exact top-level key order of the signer-rotation trust document, and of
+# one rotation certificate record.
+TRUST_KEYS = ("root", "records", "head")
+TRUST_RECORD_KEYS = ("at", "key", "status", "prev", "signature")
+
+# The only legal certificate statuses.
+TRUST_STATUSES = ("active", "revoked")
+
+
+def verify_history_trust(pages: object, trust: object, root: object) -> dict:
+    """Verify signed history pages against a signer-rotation trust document.
+
+    ``pages`` is an ordered, non-empty list of exported history pages exactly
+    as :func:`verify_history` accepts, except each page's ``auth.public_key``
+    may differ. ``trust`` is the rotation trust document (exact key order
+    ``root, records, head``; see the module docstring) and ``root`` the
+    caller-pinned 64-lowercase-hex Ed25519 public key the document's ``root``
+    must equal and every certificate signature must verify under.
+
+    Returns ``{"ok": True}`` on success or ``{"ok": False, "error":
+    category}`` on failure with category one of ``input`` (structure/types),
+    ``auth`` (root mismatch, a failing certificate or page signature, an
+    unknown or revoked key) and ``integrity`` (``at`` order, ``prev``/``head``
+    chain, a crossed authorization boundary, chaining, pagination or
+    checkpoint replay). Never raises for malformed input.
+    """
+    try:
+        records = _validate_trust_document(trust, root)
+        _verify_trust_records(records, trust["head"], trust["root"], root)
+        intervals = _trust_key_intervals(records)
+        # The (page key, authorizing certificate's ``at``) of the previous
+        # generation, carried across pages so two consecutive generations
+        # signed by one key cannot silently span a revocation/reactivation
+        # boundary of that key.
+        previous: dict = {}
+
+        def _authorize(page_key: str, validated_records: list) -> None:
+            _authorize_history_page(page_key, validated_records, intervals,
+                                    previous)
+
+        _verify_history_pages(pages, None, page_authorizer=_authorize)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {"ok": True}
+
+
+def _validate_trust_document(trust: object, root: object) -> list:
+    """Structural validation of the rotation trust document and pinned root.
+
+    Every defect here — a missing/extra/reordered key, a wrong type, a bad hex
+    field — is an ``input`` failure; the chain and signature checks run later.
+    Returns the record list (its items are not copied: verification never
+    mutates them).
+    """
+    if not isinstance(root, str) or not _HEX32_RE.fullmatch(root):
+        raise _Failure(ERR_INPUT)
+    if not isinstance(trust, dict) or tuple(trust.keys()) != TRUST_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(trust["root"]):
+        raise _Failure(ERR_INPUT)
+    records = trust["records"]
+    if not isinstance(records, list) or not records:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(trust["head"]):
+        raise _Failure(ERR_INPUT)
+    for raw in records:
+        if not isinstance(raw, dict) or tuple(raw.keys()) != TRUST_RECORD_KEYS:
+            raise _Failure(ERR_INPUT)
+        # ``at`` is a plain (non-boolean) positive integer; the strict
+        # ascending order across the list is a chain (integrity) check.
+        if not _is_int(raw["at"]) or raw["at"] < 1:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(raw["key"]):
+            raise _Failure(ERR_INPUT)
+        if raw["status"] not in TRUST_STATUSES:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(raw["prev"]):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex128(raw["signature"]):
+            raise _Failure(ERR_INPUT)
+    return list(records)
+
+
+def _verify_trust_records(
+    records: list, head: str, trust_root: str, root: str
+) -> None:
+    """Authenticate the trust document and verify its hash chain.
+
+    The document's ``root`` must equal the caller-pinned root and every
+    certificate must carry the root key's Ed25519 signature over the SHA-256
+    of the record's canonical JSON without ``signature`` (both ``auth``). The
+    chain itself — strictly increasing ``at``, the first ``prev`` being 64
+    zeros, every later ``prev`` the SHA-256 of the previous record's canonical
+    JSON and ``head`` the last record's hash — is ``integrity``.
+    """
+    if trust_root != root:
+        raise _Failure(ERR_AUTH)
+    for record in records:
+        unsigned = {
+            key: record[key] for key in TRUST_RECORD_KEYS if key != "signature"
+        }
+        digest = hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
+        if not crypto.verify_signature(root, digest, record["signature"]):
+            raise _Failure(ERR_AUTH)
+    prev = HISTORY_ZERO_HASH
+    last_at = 0
+    for record in records:
+        if record["at"] <= last_at:
+            raise _Failure(ERR_INTEGRITY)
+        last_at = record["at"]
+        if record["prev"] != prev:
+            raise _Failure(ERR_INTEGRITY)
+        prev = hashlib.sha256(_canonical_json_bytes(record)).hexdigest()
+    if head != prev:
+        raise _Failure(ERR_INTEGRITY)
+
+
+def _trust_key_intervals(records: list) -> dict:
+    """Map each key to its ascending ``(at, status)`` certificate list.
+
+    The records are globally ``at``-ordered by the chain check, so each key's
+    subsequence is ascending too.
+    """
+    intervals: dict[str, list] = {}
+    for record in records:
+        intervals.setdefault(record["key"], []).append(
+            (record["at"], record["status"])
+        )
+    return intervals
+
+
+def _trust_authorizer(intervals: dict, key: str, moment: int) -> tuple | None:
+    """The ``(at, status)`` certificate governing ``key`` at ``moment``.
+
+    The governing certificate is the key's latest record with ``at <=
+    moment``; None when the key is unknown or not yet mentioned at that time.
+    """
+    current = None
+    for entry in intervals.get(key, ()):
+        if entry[0] > moment:
+            break
+        current = entry
+    return current
+
+
+def _authorize_history_page(
+    page_key: str,
+    validated_records: list,
+    intervals: dict,
+    previous: dict,
+) -> None:
+    """Check the page key's authorization for every generation it signs.
+
+    Each generation is governed by the page key's certificate at the
+    checkpoint's ``verified_at``: an unknown or revoked key is an ``auth``
+    failure. Consecutive generations signed by the same key must not cross an
+    authorization boundary — a revocation followed by a reactivation — so
+    when this generation's key equals the previous generation's, both must be
+    governed by the very same certificate; a crossed boundary is an
+    ``integrity`` failure. ``previous`` carries the last generation's
+    ``(page_key, certificate at)`` across page seams.
+    """
+    for record in validated_records:
+        moment = record["checkpoint"]["context"]["verified_at"]
+        current = _trust_authorizer(intervals, page_key, moment)
+        if current is None or current[1] != "active":
+            raise _Failure(ERR_AUTH)
+        last = previous.get("last")
+        if last is not None and last[0] == page_key and last[1] != current[0]:
+            raise _Failure(ERR_INTEGRITY)
+        previous["last"] = (page_key, current[0])
