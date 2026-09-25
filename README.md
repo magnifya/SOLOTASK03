@@ -677,6 +677,38 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
   批次核验沿用四类，已存检查点失配为 `state`（JSON 解析失败也是 `state`），
   文件无法读/写/原子替换为 `io`。
 
+### 检查点代际历史 `path + ".history"` 与 `history`
+
+每次成功的 `advance` 还会在同一事务里维护 `path + ".history"` 侧车文件
+（纯库 API，其余入口不变），序列化规则与检查点完全相同（紧凑 UTF-8、
+非 ASCII 不转义、末尾恰好一个换行、临时文件 fsync 后 `os.replace`）：
+
+- 顶层键序固定为 `v, base, records, head`，`v = 1`；`base` 键序
+  `generation, hash`，命名第一条留存记录**之前**的代；每条记录键序
+  `checkpoint, prev, hash`，其中 `checkpoint` 即落盘的原五键检查点文档。
+- 记录代号从 `base.generation + 1` 起连续；首条 `prev = base.hash`，之后
+  取前一条的 `hash`；`hash = SHA256(ASCII(prev) ‖ canonical_json(checkpoint))`，
+  `head` 为末条记录的 `hash`，均为 64 位小写 hex。
+- 全新路径从 `base = {0, Z}`（Z = 64 个 0）开始；已存在的 g 代检查点
+  若没有侧车，视为 `base = {g-1, Z}` 且该检查点即首条记录，之后推进时
+  追加。侧车末条记录必须复现当前检查点，否则为 `state`。
+- 两个文件共用同一把按路径锁作为一个事务写入；任一写失败归 `io` 并
+  **尽力补偿**回原始字节（补偿失败后的读取会自然报 `state`）；不保证
+  崩溃/断电时两文件的原子性。
+
+`ledger.light_client.history(path, generation=None, keep=None) -> dict`
+查询或裁剪侧车。`generation` 与 `keep` 互斥，且都必须是**非布尔正整数**。
+加载时逐代重放（形状、`state_hash`、context 重放、锚点连续性），任何
+篡改归 `state`；侧车缺失或不可读写归 `io`；参数畸形归 `input`；查询的
+目标代不在留存记录中也归 `state`。成功按键序
+`ok, base, record, head, kept` 返回：
+
+- 查询（默认）：`record` 为指定代（缺省末代）的记录，`kept = null`；
+- 裁剪（`keep=n`）：仅保留末 `kept = min(n, 原记录数)` 条，`record` 为
+  末项；没有删除任何记录时侧车字节**原样不动**，否则 `base` 推进为末条
+  被删记录的 `{generation, hash}` 并重写侧车——检查点文件本身永不被
+  裁剪改动。
+
 
 ## 审计导出的离线校验
 

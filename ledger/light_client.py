@@ -130,6 +130,36 @@ truncated or rebuilt. Failures return only ``{"ok": False, "error":
 category}`` with category one of
 ``input/auth/expired/integrity/state/io``; success appends the new
 ``generation`` as the final result key.
+
+Every successful :func:`advance` also maintains a generation-history sidecar
+at ``path + ".history"``: one compact UTF-8 JSON document (same serialization
+rules as the checkpoint) with the exact top-level key order
+``v, base, records, head``. ``v`` is 1; ``base`` is ``{generation, hash}``
+naming the generation *before* the first retained record; each record is
+``{checkpoint, prev, hash}`` where ``checkpoint`` is the persisted five-key
+checkpoint document, ``prev`` is the previous record's hash (the first
+record's is ``base.hash``) and ``hash`` is
+``SHA256(ASCII(prev) || canonical_json(checkpoint))``; ``head`` is the last
+record's hash. Record generations run consecutively from
+``base.generation + 1``. A fresh path starts from ``base = {0, Z}`` (Z = 64
+zeros); a pre-existing generation-``g`` checkpoint without a sidecar is
+treated as ``base = {g-1, Z}`` with that checkpoint as the first record, and
+later advances append. Both files are written under the same per-path lock as
+one transaction: an ``io`` failure restores the original bytes best-effort
+(a failed compensation surfaces as ``state`` on the next read); crash
+atomicity across the two files is not guaranteed.
+
+:func:`history` reads (and prunes) the sidecar. ``history(path)`` returns
+``{"ok", "base", "record", "head", "kept"}`` with ``record`` the last
+generation's record and ``kept`` null; ``generation=`` selects one retained
+generation (an absent one is a ``state`` failure). ``keep=n`` (mutually
+exclusive with ``generation``; both must be non-boolean positive integers)
+retains only the last ``min(n, count)`` records: when nothing is pruned the
+file's bytes are untouched, otherwise ``base`` becomes the last pruned
+record's ``{generation, hash}`` and the sidecar is rewritten (the checkpoint
+file itself never changes). Loading replays every retained generation —
+shape, state hash, context replay and anchor continuity — so any tampering
+is a ``state`` failure; a missing or unreadable sidecar is ``io``.
 """
 from __future__ import annotations
 
@@ -1219,6 +1249,20 @@ CHECKPOINT_CONTEXT_KEYS = (
     "verified_tx_ids",
 )
 
+# The exact top-level key order of the generation-history sidecar persisted
+# at ``path + ".history"`` alongside every advance checkpoint.
+HISTORY_KEYS = ("v", "base", "records", "head")
+
+# The exact key order of the sidecar's base cursor and of one record.
+HISTORY_BASE_KEYS = ("generation", "hash")
+HISTORY_RECORD_KEYS = ("checkpoint", "prev", "hash")
+
+# The sidecar format version.
+HISTORY_VERSION = 1
+
+# The sentinel hash of a base that names no real record (64 zeros).
+HISTORY_ZERO_HASH = "0" * 64
+
 # One lock per checkpoint path serializes same-path advances (and their
 # atomic replace) across threads within one process.
 _checkpoint_locks: dict[str, threading.RLock] = {}
@@ -1280,11 +1324,21 @@ def advance(
     verification never bumps it. The return value is the verifier result with
     the new ``generation`` appended as the final key.
 
+    The same transaction appends the new checkpoint to the generation-history
+    sidecar at ``path + ".history"`` (see the module docstring for the exact
+    format): a missing sidecar is opened at ``base = {0, Z}`` for a first
+    advance, or migrated from a pre-existing generation-``g`` checkpoint as
+    ``base = {g-1, Z}`` with that checkpoint as the first record; an existing
+    sidecar is strictly reloaded and replayed, and its last record must
+    reproduce the stored checkpoint. Both files are written under the shared
+    per-path lock; an ``io`` failure restores the original bytes of both
+    best-effort (crash atomicity across the pair is not guaranteed).
+
     Every failure is ``{"ok": False, "error": category}`` with category one of
     ``input`` (bad arguments or checkpoint shape), ``auth``/``expired``/
-    ``integrity`` (batch verification), ``state`` (an existing checkpoint fails
-    its key-order/type/hash/replay checks; it is never truncated or rebuilt) and
-    ``io`` (the checkpoint cannot be read or written).
+    ``integrity`` (batch verification), ``state`` (an existing checkpoint or
+    sidecar fails its key-order/type/hash/replay checks; it is never truncated
+    or rebuilt) and ``io`` (the checkpoint cannot be read or written).
     """
     # Argument shape is validated before any file or verification work.
     if not isinstance(path, str) or not path:
@@ -1296,15 +1350,21 @@ def advance(
     with lock:
         try:
             previous = _load_checkpoint(path)
+            sidecar = _load_history(_history_path(path))
         except _CheckpointError as failure:
             return _failed_advance(failure.category)
 
         if previous is None:
+            # A sidecar without its checkpoint is unrecoverable corruption.
+            if sidecar is not None:
+                return _failed_advance(ERR_STATE)
             # First use: the caller must pin a legal anchor.
             expected_anchor = _validate_advance_anchor(anchor)
             if expected_anchor is None:
                 return _failed_advance(ERR_INPUT)
             generation = 0
+            base = {"generation": 0, "hash": HISTORY_ZERO_HASH}
+            records: list[dict] = []
         else:
             generation = previous["generation"]
             stored_tip = previous["tip"]
@@ -1325,6 +1385,20 @@ def advance(
                     }
                 ):
                     return _failed_advance(ERR_INPUT)
+            if sidecar is None:
+                # Migrate a pre-existing checkpoint: it becomes the first
+                # record over a zero base one generation below it.
+                base = {
+                    "generation": generation - 1,
+                    "hash": HISTORY_ZERO_HASH,
+                }
+                records = [_history_record(previous, HISTORY_ZERO_HASH)]
+            else:
+                # The sidecar's tip record must pin the stored checkpoint.
+                if sidecar["records"][-1]["checkpoint"] != previous:
+                    return _failed_advance(ERR_STATE)
+                base = sidecar["base"]
+                records = list(sidecar["records"])
 
         result = verify_range_exports(docs, expected_anchor, trust, now)
         if not result.get("ok"):
@@ -1349,9 +1423,28 @@ def advance(
             checkpoint["tip"],
             checkpoint["context"],
         )
+        head = records[-1]["hash"] if records else base["hash"]
+        record = _history_record(checkpoint, head)
+        history_document = {
+            "v": HISTORY_VERSION,
+            "base": base,
+            "records": records + [record],
+            "head": record["hash"],
+        }
+
+        history_path = _history_path(path)
+        try:
+            original_checkpoint = _read_bytes_or_none(path)
+            original_history = _read_bytes_or_none(history_path)
+        except OSError:
+            return _failed_advance(ERR_IO)
         try:
             _atomic_write_checkpoint(path, checkpoint)
+            _atomic_write_history(history_path, history_document)
         except OSError:
+            # Compensate: put both files' original bytes back best-effort.
+            _restore_bytes(path, original_checkpoint)
+            _restore_bytes(history_path, original_history)
             return _failed_advance(ERR_IO)
 
         advanced = dict(result)
@@ -1407,9 +1500,19 @@ def _load_checkpoint(path: str) -> dict | None:
     except (ValueError, UnicodeDecodeError) as exc:
         raise _CheckpointError(ERR_STATE) from exc
     checkpoint = _validate_checkpoint_shape(data)
+    _verify_checkpoint_document(checkpoint)
+    return checkpoint
 
-    # The recorded state hash pins the document before any replay: a tampered
-    # generation, anchor, tip or context is state corruption, not re-verified.
+
+def _verify_checkpoint_document(checkpoint: dict) -> None:
+    """Re-verify one shape-validated checkpoint document.
+
+    The recorded state hash pins the document before any replay: a tampered
+    generation, anchor, tip or context is state corruption, not re-verified.
+    The stored batch is then replayed through :func:`verify_range_exports` at
+    the context's ``verified_at`` — it must chain from the stored anchor to
+    the stored tip and reproduce the stored verified tx ids.
+    """
     recomputed = _checkpoint_state_hash(
         checkpoint["generation"],
         checkpoint["anchor"],
@@ -1434,7 +1537,6 @@ def _load_checkpoint(path: str) -> dict | None:
         raise _CheckpointError(ERR_STATE)
     if replay["verified_tx_ids"] != context["verified_tx_ids"]:
         raise _CheckpointError(ERR_STATE)
-    return checkpoint
 
 
 def _validate_checkpoint_shape(data: object) -> dict:
@@ -1497,19 +1599,27 @@ def _validate_checkpoint_shape(data: object) -> dict:
     }
 
 
-def _atomic_write_checkpoint(path: str, checkpoint: dict) -> None:
-    """Write the checkpoint in declared key order and atomically replace ``path``.
+def _serialize_document(ordered: dict) -> bytes:
+    """Compact UTF-8 JSON (non-ASCII unescaped) with one trailing newline."""
+    return (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
 
-    The document is compact UTF-8 JSON with non-ASCII unescaped and exactly one
-    trailing newline. The temp file is fsynced before the replace and the
-    directory afterwards, mirroring the main store's durability rules.
+
+def _atomic_write_checkpoint(path: str, checkpoint: dict) -> None:
+    """Write the checkpoint in declared key order and atomically replace ``path``."""
+    ordered = {key: checkpoint[key] for key in CHECKPOINT_KEYS}
+    _atomic_write_bytes(path, _serialize_document(ordered))
+
+
+def _atomic_write_bytes(path: str, payload: bytes) -> None:
+    """Atomically replace ``path`` with ``payload``.
+
+    The temp file is fsynced before the replace and the directory afterwards,
+    mirroring the main store's durability rules.
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
-    ordered = {key: checkpoint[key] for key in CHECKPOINT_KEYS}
-    payload = (
-        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
-    ).encode("utf-8")
     fd, tmp_path = tempfile.mkstemp(prefix=".light-checkpoint-", dir=directory)
     promoted = False
     try:
@@ -1528,6 +1638,31 @@ def _atomic_write_checkpoint(path: str, checkpoint: dict) -> None:
                 pass
 
 
+def _read_bytes_or_none(path: str) -> bytes | None:
+    """Raw bytes of ``path`` (None when absent); other read errors propagate."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+def _restore_bytes(path: str, original: bytes | None) -> None:
+    """Best-effort compensation: put ``original`` back at ``path``.
+
+    A file that did not exist is unlinked again. Any failure is swallowed —
+    the caller already reports ``io`` and the next strict load surfaces the
+    corruption as ``state``.
+    """
+    try:
+        if original is None:
+            os.unlink(path)
+        else:
+            _atomic_write_bytes(path, original)
+    except OSError:
+        pass
+
+
 def _fsync_dir(directory: str) -> None:
     """Best-effort directory fsync so the checkpoint rename survives a crash."""
     try:
@@ -1540,3 +1675,233 @@ def _fsync_dir(directory: str) -> None:
         pass
     finally:
         os.close(dir_fd)
+
+
+# -- generation-history sidecar ------------------------------------------------
+
+
+def _history_path(path: str) -> str:
+    """The sidecar path mirroring one advance checkpoint path."""
+    return path + ".history"
+
+
+def _history_record(checkpoint: dict, prev: str) -> dict:
+    """One sidecar record: ``{checkpoint, prev, hash}`` in declared key order.
+
+    ``hash`` chains the record: SHA-256 over the ASCII bytes of ``prev``
+    concatenated with the canonical (sorted, compact) JSON of the checkpoint.
+    """
+    ordered = {key: checkpoint[key] for key in CHECKPOINT_KEYS}
+    digest = hashlib.sha256(
+        prev.encode("ascii") + _canonical_json_bytes(ordered)
+    ).hexdigest()
+    return {"checkpoint": ordered, "prev": prev, "hash": digest}
+
+
+def _atomic_write_history(path: str, document: dict) -> None:
+    """Write the sidecar in declared key order and atomically replace ``path``."""
+    ordered = {key: document[key] for key in HISTORY_KEYS}
+    _atomic_write_bytes(path, _serialize_document(ordered))
+
+
+def _load_history(path: str) -> dict | None:
+    """Strictly load and replay the generation-history sidecar.
+
+    Returns None when no file exists at ``path``. Otherwise validates the
+    exact key orders and JSON types, then replays every retained generation:
+    record generations must run consecutively from ``base.generation + 1``,
+    each ``prev`` must name the previous record's hash (the first names
+    ``base.hash``), each record hash and the head are recomputed, and every
+    checkpoint passes the same state-hash/context-replay checks as
+    :func:`_load_checkpoint` plus anchor continuity with its predecessor. Any
+    defect is a ``state`` failure (unreadable JSON is ``state`` too, an
+    unreadable file ``io``); the file is never truncated or rebuilt.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+
+    try:
+        data = json.loads(text)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    return _validate_history_document(data)
+
+
+def _validate_history_document(data: object) -> dict:
+    """Validate and replay one parsed sidecar document."""
+    if not isinstance(data, dict) or tuple(data.keys()) != HISTORY_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(data["v"]) or data["v"] != HISTORY_VERSION:
+        raise _CheckpointError(ERR_STATE)
+
+    base = data["base"]
+    if not isinstance(base, dict) or tuple(base.keys()) != HISTORY_BASE_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(base["generation"]) or base["generation"] < 0:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(base["hash"]):
+        raise _CheckpointError(ERR_STATE)
+
+    records = data["records"]
+    if not isinstance(records, list) or not records:
+        raise _CheckpointError(ERR_STATE)
+    head = data["head"]
+    if not crypto.is_hex64(head):
+        raise _CheckpointError(ERR_STATE)
+
+    validated = []
+    prev = base["hash"]
+    previous_tip: dict | None = None
+    for index, raw in enumerate(records):
+        record = _validate_history_record(raw)
+        checkpoint = record["checkpoint"]
+        if checkpoint["generation"] != base["generation"] + 1 + index:
+            raise _CheckpointError(ERR_STATE)
+        if record["prev"] != prev:
+            raise _CheckpointError(ERR_STATE)
+        if record != _history_record(checkpoint, prev):
+            raise _CheckpointError(ERR_STATE)
+        _verify_checkpoint_document(checkpoint)
+        if previous_tip is not None:
+            # Consecutive checkpoints chain: each anchor is the previous tip.
+            expected_anchor = {
+                "height": previous_tip["height"],
+                "block_hash": previous_tip["tip_hash"],
+            }
+            if checkpoint["anchor"] != expected_anchor:
+                raise _CheckpointError(ERR_STATE)
+        previous_tip = checkpoint["tip"]
+        prev = record["hash"]
+        validated.append(record)
+
+    if head != validated[-1]["hash"]:
+        raise _CheckpointError(ERR_STATE)
+    return {
+        "v": HISTORY_VERSION,
+        "base": {
+            "generation": base["generation"],
+            "hash": base["hash"],
+        },
+        "records": validated,
+        "head": head,
+    }
+
+
+def _validate_history_record(raw: object) -> dict:
+    """Validate the exact key order and JSON types of one sidecar record."""
+    if not isinstance(raw, dict) or tuple(raw.keys()) != HISTORY_RECORD_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    checkpoint = _validate_checkpoint_shape(raw["checkpoint"])
+    if not crypto.is_hex64(raw["prev"]):
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(raw["hash"]):
+        raise _CheckpointError(ERR_STATE)
+    return {"checkpoint": checkpoint, "prev": raw["prev"], "hash": raw["hash"]}
+
+
+def history(path: str, generation: object = None, keep: object = None) -> dict:
+    """Query or prune the generation-history sidecar of one advance checkpoint.
+
+    ``generation`` and ``keep`` are mutually exclusive and, when given, must
+    be non-boolean positive integers. Without either, the last generation's
+    record is reported. With ``keep=n`` only the last ``min(n, count)``
+    records are retained: when nothing is pruned the sidecar's bytes are left
+    untouched, otherwise ``base`` advances to the last pruned record's
+    ``{generation, hash}`` and the sidecar is rewritten under the same
+    per-path lock as :func:`advance` (the checkpoint file never changes; an
+    ``io`` failure restores the original bytes best-effort).
+
+    Success returns ``{"ok", "base", "record", "head", "kept"}`` in that key
+    order — ``record`` the queried (default last) or, with ``keep``, the last
+    retained record, ``kept`` null for queries and the retained count for
+    prunes. Failure returns ``{"ok": False, "error": category}`` with
+    category one of ``input`` (bad arguments), ``io`` (the sidecar is missing
+    or cannot be read/written) and ``state`` (the sidecar fails validation or
+    the requested generation is not retained).
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if generation is not None and keep is not None:
+        return {"ok": False, "error": ERR_INPUT}
+    for parameter in (generation, keep):
+        if parameter is not None and (not _is_int(parameter) or parameter < 1):
+            return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        sidecar_path = _history_path(path)
+        try:
+            sidecar = _load_history(sidecar_path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        if sidecar is None:
+            return {"ok": False, "error": ERR_IO}
+
+        records = sidecar["records"]
+        if keep is None:
+            if generation is None:
+                record = records[-1]
+            else:
+                record = next(
+                    (
+                        candidate
+                        for candidate in records
+                        if candidate["checkpoint"]["generation"] == generation
+                    ),
+                    None,
+                )
+                if record is None:
+                    return {"ok": False, "error": ERR_STATE}
+            return {
+                "ok": True,
+                "base": sidecar["base"],
+                "record": record,
+                "head": sidecar["head"],
+                "kept": None,
+            }
+
+        kept = min(keep, len(records))
+        record = records[-1]
+        if kept == len(records):
+            # Nothing pruned: the sidecar's bytes stay exactly as they were.
+            return {
+                "ok": True,
+                "base": sidecar["base"],
+                "record": record,
+                "head": sidecar["head"],
+                "kept": kept,
+            }
+
+        last_pruned = records[len(records) - kept - 1]
+        base = {
+            "generation": last_pruned["checkpoint"]["generation"],
+            "hash": last_pruned["hash"],
+        }
+        rewritten = {
+            "v": HISTORY_VERSION,
+            "base": base,
+            "records": records[len(records) - kept :],
+            "head": sidecar["head"],
+        }
+        try:
+            original = _read_bytes_or_none(sidecar_path)
+        except OSError:
+            return {"ok": False, "error": ERR_IO}
+        try:
+            _atomic_write_history(sidecar_path, rewritten)
+        except OSError:
+            # Compensate: put the original bytes back best-effort.
+            _restore_bytes(sidecar_path, original)
+            return {"ok": False, "error": ERR_IO}
+        return {
+            "ok": True,
+            "base": base,
+            "record": record,
+            "head": sidecar["head"],
+            "kept": kept,
+        }
