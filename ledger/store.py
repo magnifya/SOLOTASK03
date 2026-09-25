@@ -1372,22 +1372,38 @@ class LedgerStore:
         Unlike candidate forks (re-validated and silently dropped when stale),
         the trust registry is authoritative configuration: a malformed entry
         is snapshot corruption and fails recovery rather than being dropped.
-        Each record needs a non-empty source, a 64-char lowercase hex public
+        Each record carries exactly ``{source, public_key, expires_at,
+        version, status}``: a non-empty source, a 64-char lowercase hex public
         key, an integer expiry, a positive integer version and a known status.
+        The array is sorted by source with no duplicates, exactly as the
+        writer persists it.
         """
         if raw is None:
             return {}
         if not isinstance(raw, list):
             raise StateRecoveryError(path, "'trust_sources' must be a list")
         sources: dict[str, dict] = {}
+        previous: str | None = None
         for entry in raw:
             if not isinstance(entry, dict):
                 raise StateRecoveryError(path, "trust source entry must be an object")
-            source = entry.get("source")
-            public_key = entry.get("public_key")
-            expires_at = entry.get("expires_at")
-            version = entry.get("version")
-            status = entry.get("status")
+            if set(entry) != {
+                "source",
+                "public_key",
+                "expires_at",
+                "version",
+                "status",
+            }:
+                raise StateRecoveryError(
+                    path,
+                    "trust source entry must contain exactly source, "
+                    "public_key, expires_at, version and status",
+                )
+            source = entry["source"]
+            public_key = entry["public_key"]
+            expires_at = entry["expires_at"]
+            version = entry["version"]
+            status = entry["status"]
             if not isinstance(source, str) or not source:
                 raise StateRecoveryError(path, "trust source must be a non-empty string")
             if not crypto.is_hex64(public_key):
@@ -1410,10 +1426,11 @@ class LedgerStore:
                 raise StateRecoveryError(
                     path, f"trust source {source!r} has invalid status {status!r}"
                 )
-            if source in sources:
+            if previous is not None and source <= previous:
                 raise StateRecoveryError(
-                    path, f"duplicate trust source {source!r} in snapshot"
+                    path, "trust sources must be unique and ascending by source"
                 )
+            previous = source
             sources[source] = {
                 "public_key": public_key,
                 "expires_at": expires_at,
@@ -1444,10 +1461,13 @@ class LedgerStore:
         the matching ``source_rotated`` event, in dense ascending order; a
         ``source_revoked`` event must reference the current latest key without
         adding one. The registry record's current version/public key must agree
-        with the reconstructed latest entry. Lifecycle events for sources
-        absent from the registry are ignored (the registry itself is parsed
-        strictly and never loses entries on a healthy node; an event for an
-        unknown source belongs to no reconstructed history). Any malformed
+        with the reconstructed latest entry, and its status must agree with
+        the reconstructed revocation (a revoked source has its
+        ``source_revoked`` event, an active source has none). Lifecycle events
+        for sources absent from the registry are ignored (the registry itself
+        is parsed strictly and never loses entries on a healthy node; an event
+        for an unknown source belongs to no reconstructed history and is
+        retained verbatim in the log, never discarded). Any malformed
         event payload of a registry source, a version gap, a non-register first
         event, a key rotation after revocation or a registry/history mismatch
         is snapshot corruption and fails recovery with StateRecoveryError.
@@ -1538,6 +1558,11 @@ class LedgerStore:
                     revoked = True
             if not entries:
                 fail(f"trust source {source!r} has no source_registered event")
+            if revoked != (record["status"] == TRUST_REVOKED):
+                fail(
+                    f"trust source {source!r} status does not match its "
+                    "key lifecycle events"
+                )
             if len(entries) != record["version"]:
                 fail(
                     f"trust source {source!r} version {record['version']} does "
@@ -1567,12 +1592,11 @@ class LedgerStore:
         therefore no recovery-time generation bump) is forced. A present
         section is strictly validated structurally and must equal that
         reconstruction entry for entry; any discrepancy — malformed items,
-        non-dense versions, wrong activation events or keys, or a registry
-        source missing from the section — is snapshot corruption and raises
-        StateRecoveryError, never silently rewritten. A history item whose
-        source vanished from the registry is orphan data (exactly like a sync
-        record whose source disappeared): it is pruned in memory rather than
-        failing canonical-chain recovery.
+        non-dense versions, non-positive or non-ascending activation ids,
+        wrong activation events or keys, a registry source missing from the
+        section, or a history item whose source is absent from the registry —
+        is snapshot corruption and raises StateRecoveryError, never silently
+        pruned or rewritten.
         """
 
         def fail(reason: str) -> None:
@@ -1591,15 +1615,22 @@ class LedgerStore:
         if not isinstance(raw, list):
             fail("'source_key_history' must be a list")
         history: dict[str, list[dict]] = {}
+        previous: str | None = None
         for item in raw:
             if not isinstance(item, dict):
                 fail("source_key_history entry must be an object")
-            source = item.get("source")
-            keys = item.get("keys")
+            if set(item) != {"source", "keys"}:
+                fail(
+                    "source_key_history entry must contain exactly source "
+                    "and keys"
+                )
+            source = item["source"]
+            keys = item["keys"]
             if not isinstance(source, str) or not source:
                 fail("source_key_history entry needs a non-empty source")
-            if source in history:
-                fail(f"duplicate source_key_history for source {source!r}")
+            if previous is not None and source <= previous:
+                fail("source_key_history sources must be unique and ascending")
+            previous = source
             if not isinstance(keys, list) or not keys:
                 fail(f"source_key_history for {source!r} must be a non-empty list")
             entries: list[dict] = []
@@ -1631,10 +1662,10 @@ class LedgerStore:
                         f"source_key_history item for {source!r} public_key "
                         "must be 64 lowercase hex characters"
                     )
-                if isinstance(activated, bool) or not isinstance(activated, int) or activated < 0:
+                if isinstance(activated, bool) or not isinstance(activated, int) or activated < 1:
                     fail(
                         f"source_key_history item for {source!r} "
-                        "activated_event_id must be a non-negative integer"
+                        "activated_event_id must be a positive integer"
                     )
                 if position > 0 and activated <= entries[-1]["activated_event_id"]:
                     fail(
@@ -1650,16 +1681,15 @@ class LedgerStore:
                 )
             history[source] = entries
         # Cross-check against the registry + audit-log reconstruction.
-        repaired = False
         for source in list(history):
             if source not in trust_sources:
-                # The registry source vanished (the snapshot may have been
-                # tampered by dropping a registry entry): its key history is
-                # orphan data, pruned exactly like the source's sync records
-                # rather than failing the canonical chain recovery.
-                del history[source]
-                repaired = True
-                continue
+                # A history item whose source is absent from the registry is
+                # orphan data: the persisted sections disagree, which is
+                # snapshot corruption — never silently pruned.
+                fail(
+                    f"source_key_history source {source!r} is absent from "
+                    "the trust registry"
+                )
             if history[source] != expected[source]:
                 fail(
                     f"source_key_history for {source!r} does not match its "
@@ -1671,7 +1701,7 @@ class LedgerStore:
                 # a present section missing a registry source is corruption
                 # rather than a legacy migration.
                 fail(f"source_key_history is missing source {source!r}")
-        return history, repaired
+        return history, False
 
     @staticmethod
     def _parse_persisted_allowlist(raw: object, path: str) -> dict[str, int]:

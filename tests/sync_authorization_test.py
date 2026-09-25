@@ -41,7 +41,7 @@ from ledger.cli import main as cli_main
 from ledger.models import Block, Transaction
 from ledger.server import build_handler
 from ledger.service import LedgerService
-from ledger.store import LedgerStore
+from ledger.store import LedgerStore, StateRecoveryError
 
 KEY_A = "a" * 64
 KEY_B = "b" * 64
@@ -463,15 +463,15 @@ class RestartReauthorizationTests(_ServiceCase):
         self._assert_prefix_plus_expiry(before, tip=tip, source=source)
 
     def test_restart_drops_record_when_registry_entry_missing(self) -> None:
-        # Simulate a snapshot whose trust entry vanished while the sync record
-        # and its reception event remain: the record is pruned, the event log
-        # (dense event_ids) is preserved exactly.
+        # Simulate a snapshot whose trust entry vanished while the sync
+        # record, the source's key history and its reception event remain:
+        # the orphaned key history disagrees with the registry, which is
+        # snapshot corruption — recovery raises StateRecoveryError rather
+        # than silently pruning the orphan data.
         self.assertEqual(self.register("node-1")[0], 201)
         doc = self.candidate(self.block())
         status, body = self.sync(doc)
         self.assertEqual(status, 201)
-        tip = body["tip_hash"]
-        before = self._events_snapshot()
 
         with open(self.state_path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -479,13 +479,10 @@ class RestartReauthorizationTests(_ServiceCase):
         with open(self.state_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
 
-        reopened = self._reopen()
-        self.assertNotIn(("node-1", "req-1"), reopened.syncs)
-        self.assertNotIn(tip, reopened.forks)
-        # A source that vanished from the registry invalidates the record while
-        # down: the record is pruned and one sync_expired is backfilled, while
-        # the prior event log is retained verbatim with dense event_ids.
-        self._assert_prefix_plus_expiry(before, tip=tip)
+        with self.assertRaises(StateRecoveryError) as ctx:
+            LedgerStore(self.state_path, initial_balance=1000)
+        self.assertTrue(ctx.exception.path)
+        self.assertTrue(ctx.exception.reason)
 
     def test_restart_adopted_tip_keeps_chain_and_history_after_revoke(self) -> None:
         # Canonical confirmed block 1 (A->B 10).
