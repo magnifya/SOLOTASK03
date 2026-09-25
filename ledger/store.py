@@ -109,6 +109,30 @@ EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 # the checkpoint sidecar) through the token-gated /v1/history endpoints.
 # service.EVENT_HISTORY_ACCESS mirrors this literal value.
 EVENT_HISTORY_ACCESS = "history_access"
+# Rotation/revocation of the persistent scoped history-access credential
+# (POST /v1/history/access). service.EVENT_HISTORY_CREDENTIAL_CHANGED mirrors
+# this literal value.
+EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
+
+# Permissions a scoped history-access credential may carry, in their canonical
+# order: reading the signer log, appending to it and exporting signed
+# checkpoint-history pages.
+HISTORY_PERMISSIONS = ("read", "update", "export")
+
+
+def valid_history_permissions(value: object) -> bool:
+    """True for a non-empty duplicate-free subsequence of HISTORY_PERMISSIONS."""
+    if not isinstance(value, list) or not value:
+        return False
+    position = -1
+    for item in value:
+        if item not in HISTORY_PERMISSIONS:
+            return False
+        index = HISTORY_PERMISSIONS.index(item)
+        if index <= position:
+            return False
+        position = index
+    return True
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -351,6 +375,11 @@ class LedgerStore:
         # audit_signer_rotated event id. Public keys are retained forever so
         # historical checkpoints stay verifiable offline.
         self.audit_signer_history: list[dict] = []
+        # Persistent scoped credential for the /v1/history endpoints, exactly
+        # the endpoint's response document {version, token_hash, permissions,
+        # status}; only the SHA-256 hash of the token is ever stored, never
+        # the plaintext. None until the first rotation.
+        self.history_credential: dict | None = None
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
@@ -404,6 +433,7 @@ class LedgerStore:
                 # first signer is activated at event 0 (the empty log).
                 self.audit_signer = self._make_audit_signer(1, 0)
                 self.audit_signer_history = [self._public_signer_entry(self.audit_signer)]
+                self.history_credential = None
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
@@ -428,7 +458,7 @@ class LedgerStore:
                 #           expired_records, audit_checkpoint, audit_repair,
                 #           signer_state, recorded_state_root, attested_syncs,
                 #           attested_expired_records, source_key_history,
-                #           key_history_repair)
+                #           key_history_repair, history_credential)
                 valid.append(
                     (
                         parsed[2],
@@ -450,6 +480,7 @@ class LedgerStore:
                         parsed[15],
                         parsed[16],
                         parsed[17],
+                        parsed[18],
                     )
                 )
 
@@ -470,7 +501,7 @@ class LedgerStore:
             # initial_balance, syncs, trust_sources, allowlist, audit_events,
             # expired_records, audit_checkpoint, audit_repair, signer_state,
             # recorded_state_root, attested_syncs, attested_expired_records,
-            # source_key_history, key_history_repair)
+            # source_key_history, key_history_repair, history_credential)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -485,6 +516,7 @@ class LedgerStore:
                 top[0][14],
                 top[0][15],
                 top[0][17],
+                top[0][19],
             )
             for item in top[1:]:
                 if (
@@ -502,6 +534,7 @@ class LedgerStore:
                         item[14],
                         item[15],
                         item[17],
+                        item[19],
                     )
                     != reference
                 ):
@@ -539,6 +572,7 @@ class LedgerStore:
                 attested_expired_records,
                 source_key_history,
                 key_history_repair,
+                history_credential,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -614,6 +648,7 @@ class LedgerStore:
             self.audit_checkpoint = audit_checkpoint
             self.audit_signer = audit_signer
             self.audit_signer_history = signer_history
+            self.history_credential = history_credential
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -675,17 +710,24 @@ class LedgerStore:
                 last_access = event
         if last_access is None:
             return
-        if (
-            last_access.get("trust_head") != trust_head
-            or last_access.get("history_head") != history_head
-        ):
+        # Path attribution: a trust_head drift names the signer log, a
+        # history_head drift names the checkpoint file (whose sidecar carries
+        # the generation history).
+        if last_access.get("trust_head") != trust_head:
+            raise StateRecoveryError(
+                self.history_trust_path or self.history_path,
+                "managed history files are out of sync with the last "
+                f"history_access event {last_access.get('event_id')}: "
+                f"event trust_head={last_access.get('trust_head')!r}, "
+                f"file trust_head={trust_head!r}",
+            )
+        if last_access.get("history_head") != history_head:
             raise StateRecoveryError(
                 self.history_path,
                 "managed history files are out of sync with the last "
                 f"history_access event {last_access.get('event_id')}: "
-                f"event trust_head={last_access.get('trust_head')!r} "
-                f"history_head={last_access.get('history_head')!r}, "
-                f"files trust_head={trust_head!r} history_head={history_head!r}",
+                f"event history_head={last_access.get('history_head')!r}, "
+                f"file history_head={history_head!r}",
             )
 
     def _discover_candidates(self, directory: str) -> list[str]:
@@ -739,6 +781,7 @@ class LedgerStore:
         state_root: str | None = None,
         attested_syncs: dict[tuple[str, str], dict] | None = None,
         source_key_history: dict[str, list[dict]] | None = None,
+        history_credential: dict | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -819,6 +862,10 @@ class LedgerStore:
                 or {"event_id": 0, "event_hash": "0" * 64},
                 "audit_signer_history": audit_signer_history or [],
                 "state_root": state_root,
+                # The scoped history-access credential (hash only) participates
+                # too: a twin disagreeing about the credential's version, hash,
+                # permissions or status is a conflict.
+                "history_credential": history_credential,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -882,6 +929,7 @@ class LedgerStore:
         list[tuple[str, str, dict]],
         dict[str, list[dict]],
         bool,
+        dict | None,
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -1116,6 +1164,9 @@ class LedgerStore:
         for tip in all_synced_tips - live_tips - canonical_hashes:
             forks.pop(tip, None)
         allowlist = self._parse_persisted_allowlist(data.get("allowlist", {}), path)
+        history_credential = self._parse_persisted_history_credential(
+            data.get("history_credential"), path
+        )
         return (
             chain,
             pending,
@@ -1135,6 +1186,7 @@ class LedgerStore:
             attested_expired,
             source_key_history,
             _key_history_repair,
+            history_credential,
         )
 
     @staticmethod
@@ -1852,6 +1904,58 @@ class LedgerStore:
         return allowlist
 
     @staticmethod
+    def _parse_persisted_history_credential(raw: object, path: str) -> dict | None:
+        """Strictly parse the persisted scoped history-access credential.
+
+        The section is exactly the endpoint's response document —
+        ``{version, token_hash, permissions, status}`` — and only ever carries
+        the token's SHA-256 hash, never the plaintext token. A missing section
+        means no credential was ever rotated; a malformed one is corruption
+        and fails recovery with StateRecoveryError.
+        """
+        if raw is None:
+            return None
+        if not isinstance(raw, dict) or set(raw) != {
+            "version",
+            "token_hash",
+            "permissions",
+            "status",
+        }:
+            raise StateRecoveryError(
+                path,
+                "'history_credential' must be a JSON object with exactly "
+                "version, token_hash, permissions and status",
+            )
+        version = raw["version"]
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise StateRecoveryError(
+                path, "'history_credential' version must be a positive integer"
+            )
+        if not crypto.is_hex64(raw["token_hash"]):
+            raise StateRecoveryError(
+                path,
+                "'history_credential' token_hash must be 64 lowercase hex "
+                "characters",
+            )
+        permissions = raw["permissions"]
+        if not valid_history_permissions(permissions):
+            raise StateRecoveryError(
+                path,
+                "'history_credential' permissions must be a non-empty "
+                "duplicate-free subsequence of read/update/export",
+            )
+        if raw["status"] not in (TRUST_ACTIVE, TRUST_REVOKED):
+            raise StateRecoveryError(
+                path, "'history_credential' status must be active or revoked"
+            )
+        return {
+            "version": version,
+            "token_hash": raw["token_hash"],
+            "permissions": list(permissions),
+            "status": raw["status"],
+        }
+
+    @staticmethod
     def _parse_persisted_audit_events(raw: object, path: str) -> list[dict]:
         """Strictly parse the append-only audit event log.
 
@@ -2018,6 +2122,47 @@ class LedgerStore:
                             f"audit event {event_id} ({kind}) {head_field} "
                             "must be 64 lowercase hex characters or null",
                         )
+            elif kind == EVENT_HISTORY_CREDENTIAL_CHANGED:
+                # history_credential_changed events record a rotate/revoke of
+                # the scoped history-access credential: the action followed by
+                # the exact response document (version, token_hash,
+                # permissions, status — hash only, never the plaintext token).
+                action = event.get("action")
+                if action not in ("rotate", "revoke"):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) has an invalid action",
+                    )
+                version = event.get("version")
+                if (
+                    isinstance(version, bool)
+                    or not isinstance(version, int)
+                    or version < 1
+                ):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) version must be a "
+                        "positive integer",
+                    )
+                if not crypto.is_hex64(event.get("token_hash")):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) token_hash must be "
+                        "64 lowercase hex characters",
+                    )
+                if not valid_history_permissions(event.get("permissions")):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) permissions must be "
+                        "a non-empty duplicate-free subsequence of "
+                        "read/update/export",
+                    )
+                if event.get("status") not in (TRUST_ACTIVE, TRUST_REVOKED):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) status must be "
+                        "active or revoked",
+                    )
             events.append(dict(event))
         return events
 
@@ -2903,6 +3048,12 @@ class LedgerStore:
             ]
         if self.allowlist:
             data["allowlist"] = dict(sorted(self.allowlist.items()))
+        # The scoped history-access credential is exactly the endpoint's
+        # response document (version, token_hash, permissions, status) — the
+        # token's SHA-256 hash only, never the plaintext — persisted in the
+        # same atomic document as its history_credential_changed audit event.
+        if self.history_credential is not None:
+            data["history_credential"] = dict(self.history_credential)
         # The audit trail is append-only; every trust change and every sync
         # reception/adoption/expiry is recorded here in write order.
         if self.audit_events:

@@ -29,6 +29,7 @@ transaction in an empty ledger could never be accepted.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import time
 
@@ -45,6 +46,7 @@ from .store import (
     attested_message,
     attested_range_fingerprint,
     attested_range_message,
+    valid_history_permissions,
 )
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
@@ -64,6 +66,7 @@ EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 EVENT_ALLOWLIST_ADDED = "allowlist_added"
 EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 EVENT_HISTORY_ACCESS = "history_access"
+EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
 
 
 def _parse_height(height: object) -> int | None:
@@ -3462,6 +3465,166 @@ class LedgerService:
                 for path, original in restore:
                     light_client.restore_file_bytes(path, original)
             raise
+
+    # -- scoped history-access credential ------------------------------------
+
+    # The permission each token-gated history route requires; "manage" names
+    # the credential-management route, which only the static token may use.
+    HISTORY_PERMISSION_MANAGE = "manage"
+
+    def history_authorization(
+        self, authorization: str | None, permission: str
+    ) -> str:
+        """Authorize one /v1/history/* request against the configured tokens.
+
+        Returns ``"ok"``, ``"unauthorized"`` or ``"forbidden"``. The static
+        ``--history-token`` is full-power and is the ONLY credential allowed
+        to manage the scoped credential (permission ``manage``). A scoped
+        bearer token authenticates only while its credential is ``active``
+        (the hash of the presented token is compared in constant time) and
+        then only for its recorded permissions; a valid active token lacking
+        the required permission is ``forbidden``, everything else —
+        missing/malformed header, unknown or revoked token — is
+        ``unauthorized``. No state is read or written beyond the persisted
+        credential record.
+        """
+        expected = (
+            f"Bearer {self.history_token}"
+            if self.history_token is not None
+            else None
+        )
+        # Compare bytes: a header containing non-ASCII (decoded latin-1 by
+        # the HTTP layer) must simply mismatch, never raise out of
+        # compare_digest (which rejects non-ASCII str inputs).
+        if (
+            expected is not None
+            and authorization is not None
+            and hmac.compare_digest(
+                authorization.encode("utf-8", errors="replace"),
+                expected.encode("utf-8"),
+            )
+        ):
+            return "ok"
+        with self.store.lock:
+            credential = self.store.history_credential
+        if (
+            authorization is not None
+            and credential is not None
+            and credential["status"] == "active"
+            and authorization.startswith("Bearer ")
+        ):
+            digest = hashlib.sha256(
+                authorization[len("Bearer ") :].encode("utf-8", errors="replace")
+            ).hexdigest()
+            if hmac.compare_digest(digest, credential["token_hash"]):
+                if (
+                    permission == self.HISTORY_PERMISSION_MANAGE
+                    or permission not in credential["permissions"]
+                ):
+                    return "forbidden"
+                return "ok"
+        return "unauthorized"
+
+    HISTORY_ACCESS_FIELDS = ("action", "token", "permissions", "expected_version")
+
+    def update_history_credential(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/history/access — rotate or revoke the scoped credential.
+
+        The body must be a JSON object containing exactly ``action, token,
+        permissions, expected_version``. For ``rotate`` the token must be a
+        non-empty string and permissions a non-empty duplicate-free
+        subsequence of read/update/export; for ``revoke`` both must be null.
+        ``expected_version`` is a non-boolean non-negative integer that must
+        equal the current version (0 before the first rotation) — a mismatch
+        is 409/state. Every shape defect is 400/input.
+
+        The first rotation returns 201; every later change returns 200 with
+        the version advanced by one. Revocation keeps the recorded hash and
+        permissions, flipping only the status to ``revoked``. The success
+        document has the contract key order
+        ``version, token_hash, permissions, status`` where ``token_hash`` is
+        the SHA-256 of the token's UTF-8 bytes; the plaintext token is never
+        stored. The new credential, its ``history_credential_changed`` audit
+        event (payload: the action followed by the response document) and the
+        generation land in one atomic snapshot; a write failure rolls all
+        three back and answers 500/io.
+        """
+        if not self.history_enabled:
+            return 404, {"ok": False, "error": "not found"}
+        if not isinstance(payload, dict) or set(payload) != set(
+            self.HISTORY_ACCESS_FIELDS
+        ):
+            return 400, {"ok": False, "error": "input"}
+        action = payload["action"]
+        if action not in ("rotate", "revoke"):
+            return 400, {"ok": False, "error": "input"}
+        expected_version = payload["expected_version"]
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            return 400, {"ok": False, "error": "input"}
+        token = payload["token"]
+        permissions = payload["permissions"]
+        if action == "rotate":
+            if not isinstance(token, str) or not token:
+                return 400, {"ok": False, "error": "input"}
+            if not valid_history_permissions(permissions):
+                return 400, {"ok": False, "error": "input"}
+        elif token is not None or permissions is not None:
+            return 400, {"ok": False, "error": "input"}
+
+        try:
+            with self.store.lock:
+                current = self.store.history_credential
+                current_version = (
+                    current["version"] if current is not None else 0
+                )
+                if expected_version != current_version:
+                    return 409, {"ok": False, "error": "state"}
+                if action == "revoke" and (
+                    current is None or current["status"] != TRUST_ACTIVE
+                ):
+                    # Nothing active to revoke.
+                    return 409, {"ok": False, "error": "state"}
+                if action == "rotate":
+                    credential = {
+                        "version": current_version + 1,
+                        "token_hash": hashlib.sha256(
+                            token.encode("utf-8")
+                        ).hexdigest(),
+                        "permissions": list(permissions),
+                        "status": TRUST_ACTIVE,
+                    }
+                else:
+                    # Revocation retains the hash and the permissions.
+                    credential = {
+                        "version": current_version + 1,
+                        "token_hash": current["token_hash"],
+                        "permissions": list(current["permissions"]),
+                        "status": TRUST_REVOKED,
+                    }
+                created = current is None
+                self.store.history_credential = credential
+                self.store.append_audit_event(
+                    EVENT_HISTORY_CREDENTIAL_CHANGED,
+                    {"action": action, **credential},
+                )
+                try:
+                    self.store.save()
+                except BaseException:
+                    # Roll the credential, its event and the generation back
+                    # together so a failed write leaves nothing behind.
+                    self.store.history_credential = current
+                    self.store.truncate_audit_events(1)
+                    raise
+        except OSError:
+            return 500, {"ok": False, "error": "io"}
+        except Exception:
+            # Defensive HTTP boundary, mirroring the other history endpoints.
+            return 500, {"ok": False, "error": "io"}
+        return (201 if created else 200), dict(credential)
 
     def read_history_trust(self) -> tuple[int, dict]:
         """GET /v1/history/trust — strictly read the durable signer log.

@@ -15,6 +15,8 @@ filesystem::
       # trust extensions, verified when present (a pre-feature snapshot
       # omits them and is accepted as legacy):
       "trust_sources" / "allowlist" / "source_key_history",
+      # scoped history-access credential, verified when present:
+      "history_credential",
       # extensions, accepted but not re-verified here:
       "forks" / "syncs" / "attested_syncs",
     }
@@ -88,6 +90,7 @@ from .store import (
     TRUST_ACTIVE,
     TRUST_REVOKED,
     LedgerStore,
+    valid_history_permissions,
 )
 
 # Public error categories.
@@ -110,6 +113,7 @@ KNOWN_OPTIONAL_SECTIONS = (
     "trust_sources",
     "allowlist",
     "source_key_history",
+    "history_credential",
 )
 
 # Raw keys every stored block document must carry ("status" defaults to
@@ -275,6 +279,9 @@ def _verify(data: dict) -> dict:
         data.get("source_key_history"),
         events,
     )
+
+    # -- scoped history-access credential -------------------------------------
+    _verify_history_credential(data.get("history_credential"))
 
     return {
         "generation": generation,
@@ -615,6 +622,40 @@ def _parse_allowlist(raw: object) -> None:
             raise _Failure(ERR_INPUT)
         if not _is_int(expires_at):
             raise _Failure(ERR_INPUT)
+
+
+def _verify_history_credential(raw: object) -> None:
+    """Validate the persisted scoped history-access credential.
+
+    The section is optional (a snapshot predating the feature, or one where
+    no credential was ever rotated, omits it); a present section is exactly
+    the endpoint's response document ``{version, token_hash, permissions,
+    status}`` — the token's SHA-256 hash only, never the plaintext. A
+    missing/extra key or a wrong primitive field type is an input error; an
+    invalid hash, version, permission sequence or status is integrity.
+    """
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise _Failure(ERR_INPUT)
+    if set(raw) != {"version", "token_hash", "permissions", "status"}:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["version"]):
+        raise _Failure(ERR_INPUT)
+    if raw["version"] < 1:
+        raise _Failure(ERR_INTEGRITY)
+    if not isinstance(raw["token_hash"], str):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["token_hash"]):
+        raise _Failure(ERR_INTEGRITY)
+    if not isinstance(raw["permissions"], list):
+        raise _Failure(ERR_INPUT)
+    if not valid_history_permissions(raw["permissions"]):
+        raise _Failure(ERR_INTEGRITY)
+    if not isinstance(raw["status"], str):
+        raise _Failure(ERR_INPUT)
+    if raw["status"] not in (TRUST_ACTIVE, TRUST_REVOKED):
+        raise _Failure(ERR_INTEGRITY)
 
 
 def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:

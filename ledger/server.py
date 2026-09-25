@@ -1,7 +1,6 @@
 """HTTP server exposing the ledger REST API using the Python standard library."""
 from __future__ import annotations
 
-import hmac
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote
@@ -10,14 +9,19 @@ from .service import LedgerService
 
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies
 
-# Token-gated checkpoint-history routes. Every request to one of these is
-# rejected 401 before the body is read or any state is touched unless the node
-# was started with --history* and the Authorization header carries the exact
-# configured bearer token.
+# Token-gated checkpoint-history routes, mapped to the permission each
+# requires. Every request to one of these is rejected 401 before the body is
+# read or any state is touched unless the node was started with --history*
+# and the Authorization header carries either the exact configured static
+# bearer token (full power, and the only credential allowed to manage the
+# scoped credential via "manage") or an active scoped credential whose
+# permissions cover the route; a valid scoped token lacking the permission
+# is rejected 403, likewise before the body is read.
 HISTORY_ROUTES = {
-    ("GET", "/v1/history/trust"),
-    ("POST", "/v1/history/trust"),
-    ("POST", "/v1/history/export"),
+    ("GET", "/v1/history/trust"): "read",
+    ("POST", "/v1/history/trust"): "update",
+    ("POST", "/v1/history/export"): "export",
+    ("POST", "/v1/history/access"): "manage",
 }
 
 
@@ -47,37 +51,30 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             Returns True when the request may proceed. When the feature is
             disabled the gate is open (the service answers 404); otherwise a
             missing/malformed/incorrect ``Authorization: Bearer TOKEN`` header
-            is answered 401 immediately, without reading the body or touching
-            any state (no audit event, no file access).
+            is answered 401 and a valid scoped token lacking the route's
+            permission is answered 403 — both immediately, without reading
+            the body or touching any state (no audit event, no file access).
             """
-            if (method, path) not in HISTORY_ROUTES:
+            permission = HISTORY_ROUTES.get((method, path))
+            if permission is None:
                 return True
             if not getattr(service, "history_enabled", False):
                 return True
-            expected = (
-                f"Bearer {service.history_token}"
-                if service.history_token is not None
-                else None
+            verdict = service.history_authorization(
+                self.headers.get("Authorization"), permission
             )
-            provided = self.headers.get("Authorization")
-            # Compare bytes: a header containing non-ASCII (decoded latin-1 by
-            # the HTTP layer) must simply mismatch, never raise out of
-            # compare_digest (which rejects non-ASCII str inputs).
-            if expected is None or provided is None or not hmac.compare_digest(
-                provided.encode("utf-8", errors="replace"),
-                expected.encode("utf-8"),
-            ):
-                self._send_json(
-                    401,
-                    {"ok": False, "error": "unauthorized"},
-                    sort_keys=False,
-                )
-                # The body was deliberately not consumed: close the
-                # connection so an unread Content-Length body cannot desync
-                # the next pipelined request on a keep-alive socket.
-                self.close_connection = True
-                return False
-            return True
+            if verdict == "ok":
+                return True
+            self._send_json(
+                401 if verdict == "unauthorized" else 403,
+                {"ok": False, "error": verdict},
+                sort_keys=False,
+            )
+            # The body was deliberately not consumed: close the
+            # connection so an unread Content-Length body cannot desync
+            # the next pipelined request on a keep-alive socket.
+            self.close_connection = True
+            return False
 
 
         def _read_json(self) -> tuple[bool, object]:
@@ -126,6 +123,18 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 status, body = service.export_history_page(payload)
+                self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/history/access":
+                # POST /v1/history/access — rotate/revoke the scoped history
+                # credential; the success document has the contract key order
+                # version, token_hash, permissions, status.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.update_history_credential(payload)
                 self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
