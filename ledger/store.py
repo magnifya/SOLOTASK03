@@ -1378,7 +1378,9 @@ class LedgerStore:
         the trust registry is authoritative configuration: a malformed entry
         is snapshot corruption and fails recovery rather than being dropped.
         Each record needs a non-empty source, a 64-char lowercase hex public
-        key, an integer expiry, a positive integer version and a known status.
+        key, an integer expiry, a positive integer version and a known status,
+        with the keys in exactly the sorted order the snapshot persists them
+        (``expires_at, public_key, source, status, version``).
         """
         if raw is None:
             return {}
@@ -1389,17 +1391,17 @@ class LedgerStore:
         for entry in raw:
             if not isinstance(entry, dict):
                 raise StateRecoveryError(path, "trust source entry must be an object")
-            if set(entry) != {
-                "source",
-                "public_key",
+            if tuple(entry) != (
                 "expires_at",
-                "version",
+                "public_key",
+                "source",
                 "status",
-            }:
+                "version",
+            ):
                 raise StateRecoveryError(
                     path,
-                    "trust source entry must contain exactly source, "
-                    "public_key, expires_at, version and status",
+                    "trust source entry must contain exactly expires_at, "
+                    "public_key, source, status and version in that order",
                 )
             source = entry["source"]
             public_key = entry["public_key"]
@@ -1617,7 +1619,8 @@ class LedgerStore:
         ordinary save — no migration write (and therefore no recovery-time
         generation bump) is forced. A present section is strictly validated
         structurally (source-ascending, exact ``{source, keys}`` and
-        ``{version, public_key, activated_event_id}`` key sets, dense positive
+        ``{version, public_key, activated_event_id}`` key sets with their
+        keys in the sorted order the snapshot persists them, dense positive
         versions, positive strictly-ascending activation ids) and must equal
         that reconstruction entry for entry. Any discrepancy — malformed items,
         non-dense versions, non-positive/non-ascending activation events, wrong
@@ -1646,10 +1649,10 @@ class LedgerStore:
         for item in raw:
             if not isinstance(item, dict):
                 fail("source_key_history entry must be an object")
-            if set(item) != {"source", "keys"}:
+            if tuple(item) != ("keys", "source"):
                 fail(
-                    "source_key_history entry must contain exactly source "
-                    "and keys"
+                    "source_key_history entry must contain exactly keys "
+                    "and source in that order"
                 )
             source = item["source"]
             keys = item["keys"]
@@ -1667,14 +1670,15 @@ class LedgerStore:
                 fail(f"source_key_history for {source!r} must be a non-empty list")
             entries: list[dict] = []
             for position, entry in enumerate(keys):
-                if not isinstance(entry, dict) or set(entry) != {
-                    "version",
-                    "public_key",
+                if not isinstance(entry, dict) or tuple(entry) != (
                     "activated_event_id",
-                }:
+                    "public_key",
+                    "version",
+                ):
                     fail(
                         f"source_key_history item for {source!r} must contain "
-                        "exactly version, public_key and activated_event_id"
+                        "exactly activated_event_id, public_key and version "
+                        "in that order"
                     )
                 version = entry["version"]
                 public_key = entry["public_key"]

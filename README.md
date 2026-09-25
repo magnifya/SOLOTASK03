@@ -650,6 +650,32 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
 退出 0；任何核验失败、文件不可读、JSON 解析失败或锚点参数非法均打印
 `{"ok":false,"error":"..."}` 退出 1。
 
+## 持久化区间检查点
+
+`ledger.light_client.advance(path, docs, trust, anchor, now) -> dict` 在
+`verify_range_exports` 的批量核验之上，把每一次成功核验固化为一个单调
+推进的**区间检查点文件**，轻客户端由此跨重启续进而无需重新钉锚。
+`now` 必须是非布尔的非负整数（Unix 秒）；首次调用必须传入合法的
+`anchor = {height, block_hash}`，此后传 `None` 或已存 tip（锚点形式
+`{height, block_hash}` 或完整 tip 描述符均可），与已存状态冲突的锚点归
+`state`。
+
+检查点文档为单个紧凑 JSON 对象，声明键序 `generation, anchor, tip,
+context, state_hash`：`generation` 自 1 起每次成功调用递增 1；`anchor` /
+`tip` 为本批核验的边界；`context`（键序 `verified_at, trust, documents,
+verified_tx_ids`）保存离线复验该批所需的全部材料；`state_hash` 为其余
+字段 canonical JSON（排序键、紧凑分隔、UTF-8、非 ASCII 不转义）字节的
+SHA-256。文件按声明键序紧凑写入、UTF-8、非 ASCII 不转义、末尾单个换行；
+同一路径的调用共用一把进程内锁，写入先落临时文件 fsync 再 `os.replace`
+原子换名，**失败不增代**。
+
+每次调用都会重新加载并严格校验既有检查点：声明键序、字段类型、
+`state_hash` 摘要，并按 `verified_at` 重放 `context` 完整复验；任何失配
+（含篡改、截断、键序错乱）都归 `state`——检查点**永不截断重建**。成功
+返回核验器的结果并末位追加 `generation`；失败仅返回
+`{ok: false, error}`，`error` 限 `input`/`auth`/`expired`/`integrity`/
+`state`/`io`。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -754,7 +780,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名） |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；持久化区间检查点 `advance`（单调 generation、state_hash 自检、按 verified_at 重放、同路径共锁原子写） |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
@@ -1096,6 +1122,7 @@ python tests/range_export_verify_test.py  # 区间导出离线核验 verify_rang
 python tests/range_export_batch_verify_test.py  # 多页增量区间离线连续核验 verify_range_exports（非空数组、逐页复验、首锚=expected_anchor 后锚=前页 tip{height,block_hash}、断锚/跳高/重叠 integrity、tx_id 跨页唯一、pending 只许末页、成功键序 ok,anchor,tip,pages,verified_tx_ids 升序、input/auth/expired/integrity 分类、CLI verify-range-batch 文件/stdin/退出码）
 python tests/source_key_history_test.py  # 来源公钥历史 source_key_history（注册写版本1及事件号、轮换递增记新事件、撤销保留历史、原子落盘回滚；GET /v1/trust 固定键序 genesis_hash,sources,allowlist,audit_signers,source_key_history 与项键序 version,public_key,activated_event_id；重启逐字节保留、旧快照内存重建不强制写盘、历史结构/事件不符 StateRecoveryError；verify_range_export 按 attestation.version 取历史公钥并匹配 attestation.public_key，未知项 auth、签名错 integrity、无历史旧规、畸形 input；HTTP 线序）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
+python tests/light_client_advance_test.py  # 持久化区间检查点 advance（首用钉锚、generation 自 1 递增、声明键序/state_hash/紧凑不转义单换行文件格式、后续 None 或已存 tip 续进、锚点冲突 state、篡改/截断/键序错乱 state 且不截断重建、io、now 非法 input、失败不增代；trust_sources/source_key_history/keys 项键序乱序 verify_snapshot 归 input、恢复抛 StateRecoveryError）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI

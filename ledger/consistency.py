@@ -55,7 +55,8 @@ Two failure categories are returned, never raised:
 * ``input`` — the document is not an object, a required section is missing or
   has the wrong JSON type, an unknown top-level key appears, or a field carries
   a non-integer/non-string value of the wrong kind before any recomputation
-  (including a trust record missing or adding a key);
+  (including a trust record missing or adding a key, or carrying its keys out
+  of the documented order);
 * ``integrity`` — the document parses but a recomputed value disagrees with
   the stored one (tx/merkle/block hashes, linkage, index, accounts, state_root,
   pending uniqueness or the audit chain/checkpoint), or the trust extensions
@@ -116,11 +117,12 @@ _BLOCK_KEYS = ("height", "prev_hash", "merkle_root", "block_hash", "transactions
 # Raw keys every stored transaction document must carry.
 _TX_KEYS = ("from", "to", "amount", "signature", "tx_id")
 
-# Exact key sets of the trust extension records.
-_TRUST_SOURCE_KEYS = ("source", "public_key", "expires_at", "version", "status")
+# Exact key sets of the trust extension records, in the sorted key order the
+# persisted snapshot carries them (snapshots are written with sort_keys=True).
+_TRUST_SOURCE_KEYS = ("expires_at", "public_key", "source", "status", "version")
 _TRUST_STATUSES = (TRUST_ACTIVE, TRUST_REVOKED)
-_HISTORY_ITEM_KEYS = ("source", "keys")
-_HISTORY_KEY_KEYS = ("version", "public_key", "activated_event_id")
+_HISTORY_ITEM_KEYS = ("keys", "source")
+_HISTORY_KEY_KEYS = ("activated_event_id", "public_key", "version")
 
 # Audit event kinds reconstructing a source's key history.
 _SOURCE_KEY_EVENT_KINDS = (
@@ -548,10 +550,11 @@ def _parse_trust_sources(raw: object) -> dict[str, dict]:
     """Validate the persisted source-trust registry as a raw JSON array.
 
     The array must be sorted by source with no duplicates; each record
-    carries exactly ``{source, public_key, expires_at, version, status}``.
-    A missing/extra key or a wrong primitive field type is an input error; an
-    invalid public key or status, a non-positive integer version, or an
-    unsorted/duplicate source is an integrity error.
+    carries exactly ``{source, public_key, expires_at, version, status}``
+    with its keys in the sorted order the snapshot persists them. A
+    missing/extra key, a wrong key order or a wrong primitive field type is
+    an input error; an invalid public key or status, a non-positive integer
+    version, or an unsorted/duplicate source is an integrity error.
     """
     if raw is None:
         return {}
@@ -562,7 +565,7 @@ def _parse_trust_sources(raw: object) -> dict[str, dict]:
     for entry in raw:
         if not isinstance(entry, dict):
             raise _Failure(ERR_INPUT)
-        if set(entry) != set(_TRUST_SOURCE_KEYS):
+        if tuple(entry) != _TRUST_SOURCE_KEYS:
             raise _Failure(ERR_INPUT)
         source = entry["source"]
         public_key = entry["public_key"]
@@ -618,11 +621,13 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
 
     The array must be sorted by source with no duplicates; each item is
     exactly ``{source, keys}`` with a non-empty ``keys`` list of
-    ``{version, public_key, activated_event_id}`` entries whose versions are
+    ``{version, public_key, activated_event_id}`` entries — both with their
+    keys in the sorted order the snapshot persists them — whose versions are
     dense from 1 and whose activation ids are positive and strictly ascend.
-    A missing/extra key or a wrong primitive field type is an input error; an
-    invalid public key, a non-positive/non-dense version, a non-positive or
-    non-ascending activation id, or a duplicate/unsorted source is integrity.
+    A missing/extra key, a wrong key order or a wrong primitive field type is
+    an input error; an invalid public key, a non-positive/non-dense version,
+    a non-positive or non-ascending activation id, or a duplicate/unsorted
+    source is integrity.
     """
     if not isinstance(raw, list):
         raise _Failure(ERR_INPUT)
@@ -631,7 +636,7 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
     for item in raw:
         if not isinstance(item, dict):
             raise _Failure(ERR_INPUT)
-        if set(item) != set(_HISTORY_ITEM_KEYS):
+        if tuple(item) != _HISTORY_ITEM_KEYS:
             raise _Failure(ERR_INPUT)
         source = item["source"]
         keys = item["keys"]
@@ -646,7 +651,7 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
         previous = source
         entries: list[dict] = []
         for position, entry in enumerate(keys):
-            if not isinstance(entry, dict) or set(entry) != set(_HISTORY_KEY_KEYS):
+            if not isinstance(entry, dict) or tuple(entry) != _HISTORY_KEY_KEYS:
                 raise _Failure(ERR_INPUT)
             version = entry["version"]
             public_key = entry["public_key"]
