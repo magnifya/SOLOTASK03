@@ -163,13 +163,13 @@ is a ``state`` failure; a missing or unreadable sidecar is ``io``.
 
 :func:`export_history` exports the retained sidecar pages as signed,
 offline-verifiable page documents. ``export_history(path, key, after=None,
-limit=50)`` strictly reloads both the checkpoint and its sidecar under the
-shared per-path lock and returns one page with the exact key order
-``base, records, next, head, checkpoint, auth``: ``base``/``records`` are the
-sidecar's own documents (nested key orders unchanged), ``head`` the sidecar
-head, ``checkpoint`` the persisted five-key checkpoint (identical to the last
-retained record's), ``next`` the page's last record generation when another
-page follows or ``null`` on the final page, and ``auth`` is
+limit=50, trust_path=None)`` strictly reloads both the checkpoint and its
+sidecar under the shared per-path lock and returns one page with the exact key
+order ``base, records, next, head, checkpoint, auth``: ``base``/``records``
+are the sidecar's own documents (nested key orders unchanged), ``head`` the
+sidecar head, ``checkpoint`` the persisted five-key checkpoint (identical to
+the last retained record's), ``next`` the page's last record generation when
+another page follows or ``null`` on the final page, and ``auth`` is
 ``{public_key, signature}`` where the Ed25519 signature is made by the 64-hex
 seed ``key`` over the SHA-256 of the canonical (sorted, compact,
 unescaped-non-ASCII) JSON of the page with ``auth`` removed. ``after`` is
@@ -177,7 +177,16 @@ unescaped-non-ASCII) JSON of the page with ``auth`` removed. ``after`` is
 either ``base.generation`` or a non-last retained generation; ``limit`` is a
 non-boolean integer in 1..200. Bad arguments are ``input``, a missing or
 unreadable file ``io`` and a corrupt checkpoint/sidecar or unmatched cursor
-``state``.
+``state``. With ``trust_path`` set to a signer log (see
+:func:`history_trust`), the log is strictly loaded first (a missing log is
+``io`` and a corrupt one ``state``) and the page is truncated to the longest
+prefix, starting at the cursor, whose checkpoints all carry the same key
+active at their ``verified_at``: it stops just before the first record that
+would straddle an authorization boundary and sets ``next`` (non-null) so the
+following page continues there. The seed ``key`` must derive to the public
+key covering that whole span — an unknown or revoked covering key is an
+``auth`` failure. A page ending exactly at the retained tail still closes
+with ``next: null``.
 
 :func:`verify_history` verifies an ordered, non-empty list of such pages
 offline against one pinned 64-hex Ed25519 ``public_key``. Every page must have
@@ -219,6 +228,22 @@ page signature, an unknown or revoked page key) and ``integrity`` (``at``
 not ascending, a bad ``prev``/``head``, a boundary crossing, or any
 record/pagination/checkpoint-replay defect); nothing is raised and success
 is ``{"ok": True}``.
+
+:func:`history_trust` persists such a signer log at its own file path.
+``history_trust(path)`` strictly loads and returns the ``{root, records,
+head}`` document; a missing file is an ``io`` failure and any damaged log a
+``state`` failure. ``history_trust(path, root_seed, at, key, status)``
+appends one root-signed certificate — the four update fields are all required
+or all absent — with ``root_seed`` a 64-hex Ed25519 seed (its public key is
+the log root), ``at`` a non-boolean positive integer, ``key`` a 64-hex public
+key and ``status`` ``active``/``revoked``. A fresh log must open with
+``active``; ``at`` must strictly ascend; a ``revoked`` entry must name the
+currently active key; re-appending the current tail's ``at``/``key``/
+``status`` is idempotent. A seed whose root does not match the existing log
+is ``auth``; bad argument shapes are ``input``; read-missing and read/write
+``io``. The file uses the same compact-UTF-8/unescaped/single-trailing-
+newline serialization and atomic per-path-locked replace as the checkpoint
+files, and a failed write restores the original bytes best-effort.
 """
 from __future__ import annotations
 
@@ -1990,6 +2015,7 @@ def export_history(
     key: object,
     after: object = None,
     limit: object = HISTORY_EXPORT_DEFAULT_LIMIT,
+    trust_path: object = None,
 ) -> dict:
     """Export one signed page of retained checkpoint history for offline use.
 
@@ -2014,6 +2040,19 @@ def export_history(
     ``input``; a missing or unreadable file is ``io``; a corrupt checkpoint or
     sidecar, a sidecar/checkpoint mismatch or an unmatched/terminal cursor is
     ``state``.
+
+    With ``trust_path`` naming a durable signer log (see
+    :func:`history_trust`), the log is strictly loaded under its own per-path
+    lock first (missing is ``io``; any shape/chain/certificate defect is
+    ``state``) and the page is cut at authorization boundaries: it keeps the
+    longest prefix, starting at the cursor, whose checkpoints all name one key
+    active at their ``verified_at``, stopping just before the first record a
+    single envelope key cannot cover and carrying a non-null ``next`` so the
+    following export continues there (a page ending exactly at the retained
+    tail still closes with ``null``). The seed ``key`` must derive to that one
+    covering key; an unknown or revoked covering key — no key is active at the
+    page's first record — is an ``auth`` failure. Without ``trust_path`` the
+    legacy single-key behavior is unchanged.
     """
     if not isinstance(path, str) or not path:
         return {"ok": False, "error": ERR_INPUT}
@@ -2025,6 +2064,10 @@ def export_history(
         not _is_int(limit)
         or limit < HISTORY_EXPORT_MIN_LIMIT
         or limit > HISTORY_EXPORT_MAX_LIMIT
+    ):
+        return {"ok": False, "error": ERR_INPUT}
+    if trust_path is not None and (
+        not isinstance(trust_path, str) or not trust_path
     ):
         return {"ok": False, "error": ERR_INPUT}
     public_key = crypto.derive_public_key(key)
@@ -2051,6 +2094,20 @@ def export_history(
             # The sidecar tip must pin the persisted checkpoint.
             return {"ok": False, "error": ERR_STATE}
 
+        signer_entries: list[dict] | None = None
+        if trust_path is not None:
+            # The log has its own per-path lock, shared with history_trust
+            # writers; when it names the same path it is the same reentrant
+            # lock. A missing log is an io defect, a damaged one state.
+            with _checkpoint_lock(trust_path):
+                try:
+                    signer_log = _load_signer_log(trust_path)
+                except _CheckpointError as failure:
+                    return {"ok": False, "error": failure.category}
+            if signer_log is None:
+                return {"ok": False, "error": ERR_IO}
+            signer_entries = signer_log["records"]
+
         if after is None or after == base["generation"]:
             start = 0
         else:
@@ -2068,8 +2125,34 @@ def export_history(
             if start is None or start >= len(records):
                 return {"ok": False, "error": ERR_STATE}
 
-        page_records = records[start : start + limit]
-        has_next = start + limit < len(records)
+        if signer_entries is None:
+            page_records = records[start : start + limit]
+            has_next = start + limit < len(records)
+        else:
+            # Keep only the maximal prefix one envelope key can sign: sample
+            # the log at the first record's verified_at and stop at the first
+            # record whose active key differs (a rotation or a revocation
+            # window opening or closing inside the page).
+            covering = _signer_active_key(
+                signer_entries,
+                records[start]["checkpoint"]["context"]["verified_at"],
+            )
+            end = start + 1
+            while end < len(records) and end < start + limit:
+                active = _signer_active_key(
+                    signer_entries,
+                    records[end]["checkpoint"]["context"]["verified_at"],
+                )
+                if active != covering:
+                    break
+                end += 1
+            page_records = records[start:end]
+            has_next = end < len(records)
+            if covering is None or public_key != covering:
+                # The page sits (or starts) in a revocation/pre-activation
+                # window, or names a key the log does not authorize for it.
+                return {"ok": False, "error": ERR_AUTH}
+
         next_value = (
             page_records[-1]["checkpoint"]["generation"] if has_next else None
         )
@@ -2545,3 +2628,184 @@ def _verify_signer_certificates(entries: list[dict], root: str) -> None:
         digest = hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
         if not crypto.verify_signature(root, digest, entry["signature"]):
             raise _Failure(ERR_AUTH)
+
+
+# -- durable signer trust log --------------------------------------------------
+
+
+def _load_signer_log(path: str) -> dict | None:
+    """Strictly load and verify the durable signer log at ``path``.
+
+    Returns None when no file exists. Otherwise the document is parsed with
+    the exact :func:`verify_history_trust` rules — top-level/record key order
+    and types (``input`` there), strictly ascending ``at`` and ``prev``/
+    ``head`` links (``integrity`` there) and every root certificate signature
+    (``auth`` there) — but every defect of a *persisted* log is reported as
+    ``state`` corruption, never as a verifier category. An unreadable file is
+    an ``io`` failure.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+
+    try:
+        data = json.loads(text)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    try:
+        entries, head, root = _parse_signer_trust(data)
+        _check_signer_log_chains(entries, head)
+        _verify_signer_certificates(entries, root)
+    except _Failure:
+        raise _CheckpointError(ERR_STATE) from None
+    return {
+        "root": root,
+        "records": [entry["raw"] for entry in entries],
+        "head": head,
+    }
+
+
+def _atomic_write_signer_log(path: str, document: dict) -> None:
+    """Write the signer log in declared key order and atomically replace."""
+    ordered = {
+        "root": document["root"],
+        "records": [
+            {key: record[key] for key in SIGNER_RECORD_KEYS}
+            for record in document["records"]
+        ],
+        "head": document["head"],
+    }
+    _atomic_write_bytes(path, _serialize_document(ordered))
+
+
+def history_trust(
+    path: object,
+    root_seed: object = None,
+    at: object = None,
+    key: object = None,
+    status: object = None,
+) -> dict:
+    """Read or append one entry of the durable checkpoint-history signer log.
+
+    The log file follows the exact :func:`verify_history_trust` document
+    contract: key order ``root, records, head``, records
+    ``at, key, status, prev, signature`` with 64-zero-anchored canonical-hash
+    links and root-signed certificates, serialized as compact UTF-8 JSON
+    (non-ASCII unescaped) with one trailing newline and atomically replaced
+    under the per-path lock shared with every other same-``path`` operation.
+
+    With only ``path`` given, the log is strictly loaded and returned in its
+    declared key order. An update requires all four of ``root_seed`` (a
+    64-lowercase-hex Ed25519 seed whose public key is the log root), ``at`` (a
+    plain non-boolean positive integer), ``key`` (the 64-lowercase-hex public
+    key the entry names) and ``status`` (``active``/``revoked``). Append
+    rules: a fresh log's first entry must be ``active``; ``at`` must strictly
+    exceed the last entry's; a ``revoked`` entry must name the key currently
+    active (the last item with a smaller ``at``); an entry byte-identical in
+    ``at``/``key``/``status`` to the current last one is an idempotent no-op.
+
+    Success returns the ``{root, records, head}`` document. Failure is
+    ``{"ok": False, "error": category}`` with category one of ``input``
+    (argument shape), ``auth`` (the seed's root does not match the existing
+    log), ``state`` (a corrupt or conflicting log) and ``io`` (the log is
+    missing on read or cannot be read/written; a failed write restores the
+    original bytes best-effort).
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    options = (root_seed, at, key, status)
+    given = [value is not None for value in options]
+    if any(given) and not all(given):
+        # An update needs all four fields; a partial option set never names a
+        # well-formed certificate.
+        return {"ok": False, "error": ERR_INPUT}
+    updating = any(given)
+
+    root_pub: str | None = None
+    if updating:
+        if not isinstance(root_seed, str) or not _HEX32_RE.fullmatch(root_seed):
+            return {"ok": False, "error": ERR_INPUT}
+        if not isinstance(key, str) or not crypto.is_hex64(key):
+            return {"ok": False, "error": ERR_INPUT}
+        if not _is_int(at) or at < 1:
+            return {"ok": False, "error": ERR_INPUT}
+        if status not in SIGNER_STATUSES:
+            return {"ok": False, "error": ERR_INPUT}
+        root_pub = crypto.derive_public_key(root_seed)
+        if root_pub is None:
+            return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            log = _load_signer_log(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+
+        if not updating:
+            if log is None:
+                # Reading a log that does not exist is an io defect.
+                return {"ok": False, "error": ERR_IO}
+            return log
+
+        assert root_pub is not None
+        if log is None:
+            # A fresh log starts with its first activation; anything else
+            # (including an opening revocation) is a state conflict.
+            if status != "active":
+                return {"ok": False, "error": ERR_STATE}
+            records: list[dict] = []
+            prev = SIGNER_ZERO_HASH
+        else:
+            if log["root"] != root_pub:
+                # Entries can only be certified by the log's own root key.
+                return {"ok": False, "error": ERR_AUTH}
+            records = log["records"]
+            last_record = records[-1]
+            if (
+                last_record["at"] == at
+                and last_record["key"] == key
+                and last_record["status"] == status
+            ):
+                # Same certificate replayed against the tail: idempotent, the
+                # file bytes stay exactly as they were.
+                return log
+            if at <= last_record["at"]:
+                # The log is append-only with a strictly ascending clock.
+                return {"ok": False, "error": ERR_STATE}
+            if status == "revoked":
+                # Only the key currently authorized may be withdrawn. Every
+                # existing item precedes the new strictly-larger ``at``.
+                current = _signer_active_key(records, at)
+                if current is None or current != key:
+                    return {"ok": False, "error": ERR_STATE}
+            prev = log["head"]
+
+        unsigned = {"at": at, "key": key, "status": status, "prev": prev}
+        digest = hashlib.sha256(_canonical_json_bytes(unsigned)).digest()
+        signature = crypto.sign_message(root_seed, digest)
+        if signature is None:
+            return {"ok": False, "error": ERR_INPUT}
+        record = dict(unsigned)
+        record["signature"] = signature
+        written = {
+            "root": root_pub,
+            "records": records + [record],
+            "head": _signer_record_hash(record),
+        }
+
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return {"ok": False, "error": ERR_IO}
+        try:
+            _atomic_write_signer_log(path, written)
+        except OSError:
+            # Compensate: put the original bytes back best-effort.
+            _restore_bytes(path, original)
+            return {"ok": False, "error": ERR_IO}
+        return written

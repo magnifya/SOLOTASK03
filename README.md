@@ -712,10 +712,10 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
 ### 检查点历史的签名分页导出与离线校验
 
 在 `history` 查询/裁剪之外，留存的代际历史还可以签名分页导出，供完全
-离线的一方校验（纯库 API，其余入口不变）：
+离线的一方校验：
 
-`ledger.light_client.export_history(path, key, after=None, limit=50)
--> dict`
+`ledger.light_client.export_history(path, key, after=None, limit=50,
+trust_path=None) -> dict`
 
 - `key` 必须是 **64 位小写十六进制**的 Ed25519 私钥种子；公钥由其推导。
 - `after` 为 `None`（从 `base` 之后起始）或**非布尔非负整数**，且必须
@@ -732,9 +732,17 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
   按 README canonical_json（`sort_keys`、紧凑分隔符、
   `ensure_ascii=False`）序列化为 UTF-8 字节，取 SHA-256 32 字节摘要，再
   用 `key` 做 Ed25519 签名（十六进制）。
-- 失败返回 `{ok:false,error}`：参数畸形（path/key/after/limit）为
-  `input`，侧车缺失或文件不可读写为 `io`，检查点/侧车损坏或游标无命中
-  （含指向末代）为 `state`。
+- 失败返回 `{ok:false,error}`：参数畸形（path/key/after/limit/trust_path）
+  为 `input`，侧车或信任日志缺失、文件不可读写为 `io`，检查点/侧车/信任
+  日志损坏或游标无命中（含指向末代）为 `state`。
+- 给 `trust_path` 时（一份持久签名者日志，见下节）：导出先在该日志自己的
+  按路径锁内**严格加载**（缺失为 `io`，任何形状/链接/证书失配为
+  `state`），再在**下一授权边界前截断**——从游标起保留最长的、其各检查点
+  `verified_at` 对应同一把有效 key 的前缀；首个越界记录不进入本页，
+  `next` 取本页末代代号（非 null）使下一页从该处继续，恰好取尽留存尾部
+  仍以 `null` 收口。页内全程必须有同一把有效 key，且种子 `key` 推导出的
+  公钥必须等于它；首条记录处于撤销/首激活前窗口，或页公钥未知/已撤销，为
+  `auth`。不给 `trust_path` 时行为与旧版完全一致。
 
 `ledger.light_client.verify_history(pages, public_key) -> dict` 离线
 校验按顺序排列的导出页：
@@ -800,6 +808,54 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
 - `auth`：`root` 与参数不符、证书签名或页面签名验不过、key 未知或已撤销；
 - `integrity`：`at` 不严格递增、`prev`/`head` 错、跨授权边界，以及记录
   链/分页/检查点重放等原 `verify_history` 的 integrity 错误。
+
+### 持久签名者日志 `history_trust`
+
+`ledger.light_client.history_trust(path, root_seed=None, at=None, key=None,
+status=None) -> dict` 在一个独立文件里维护上面那份签名者授权/撤销日志，
+使检查点历史的签名者轮换不依赖任何在线服务。
+
+**读取**：只给 `path`（其余四项缺省）时，严格加载并返回
+`verify_history_trust` 契约的 `{root, records, head}` 文档（沿用其键序、
+记录形状、`prev`/`head` 链接与根证书签名规则）。日志缺失为 `io`，文件
+存在但任何形状/链接/证书损坏为 `state`。
+
+**追加**：更新时 `root_seed`/`at`/`key`/`status` **四项必填**，缺一个或
+多一个都是 `input`：
+
+- `root_seed` 为 64 位小写 hex 的 Ed25519 私钥种子，其公钥即日志的
+  `root`；`key` 为 64 位小写 hex 公钥；`at` 为**非布尔正整数**；
+  `status` 仅取 `active`/`revoked`。
+- 首项必须是 `active`（全新日志以撤销开局为 `state` 冲突）；各项 `at`
+  **严格递增**；`revoked` 必须撤销**当前有效 key**（以不晚于新 `at` 的
+  最后一项为准，无有效 key 或撤销别的 key 为 `state`）；新项的
+  `at`/`key`/`status` 与当前末项完全相同为**幂等**成功（文件字节不变）。
+- 已存在日志的根公钥必须等于 `root_seed` 推导出的根，否则为 `auth`。
+- 文件按声明键序序列化为紧凑 UTF-8、非 ASCII 不转义、末尾恰好一个换行，
+  临时文件 fsync 后 `os.replace` 原子换入，同一 `path` 串行；写失败尽力
+  恢复原字节并返回 `io`。
+
+成功直接返回该 `{root, records, head}` 文档；失败返回
+`{ok:false,error}`：参数形状为 `input`，根不符为 `auth`，损坏/冲突为
+`state`，读取缺失或读写 `io`。
+
+### CLI：`history-trust` 与 `history-export`
+
+两个离线子命令（不连接服务端，其余 CLI 与 HTTP 不变），各打印**单行
+JSON**，成功/失败退出 0/1：
+
+- `python -m ledger.cli history-trust PATH [--root-key SEED --at N --key PUB
+  --status active|revoked]`：无四个选项时读取；更新时四项必填。成功打印
+  上述 `{root, records, head}` 文档（保持契约键序），失败打印
+  `{ok:false,error}`（退出 1）。`SEED`/`PUB` 为 64 位小写 hex，`N` 为
+  非bool 正整数；首项 active、`at` 严格递增、revoke 当前 key、同末项
+  幂等等规则同库函数。
+- `python -m ledger.cli history-export PATH --key SEED [--after N]
+  [--limit N] [--trust PATH]`：调用扩展后的 `export_history`；成功打印
+  单个页面文档（键序 `base, records, next, head, checkpoint, auth`），
+  失败打印 `{ok:false,error}`。给 `--trust` 时按持久签名者日志在下一
+  授权边界前截断并给 `next`，`--key` 必须覆盖页内各 `verified_at`；
+  未知/撤销覆盖 key 为 `auth`，坏日志为 `state`，日志缺失为 `io`。
 
 ## 审计导出的离线校验
 

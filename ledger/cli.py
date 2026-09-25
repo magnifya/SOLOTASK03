@@ -6,7 +6,8 @@ sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
-subcommands.
+subcommands, plus the offline checkpoint-history history-trust and
+history-export subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -702,6 +703,81 @@ def cmd_consistency(args: argparse.Namespace) -> int:
     return 0 if body.get("ok") is True else 1
 
 
+def _decimal_int(value: str) -> int | None:
+    """Parse a decimal CLI integer, or None for anything unparseable.
+
+    Kept manual (rather than an argparse ``type=int``) so a malformed option
+    reports the command's JSON ``input`` envelope and exit 1 instead of an
+    argparse usage error and exit 2.
+    """
+    try:
+        return int(value, 10)
+    except (TypeError, ValueError):
+        return None
+
+
+def _emit_result_document(body: dict) -> int:
+    """Print one JSON line preserving the document's contract key order.
+
+    A success is the document itself (a page or a ``{root, records, head}``
+    log) with no ``ok`` key; only a failure carries ``{"ok": false,
+    "error"}``. Insertion order is kept so declared key orders survive.
+    """
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 1 if body.get("ok") is False else 0
+
+
+def _input_failure() -> int:
+    return _emit_result_document({"ok": False, "error": "input"})
+
+
+def cmd_history_trust(args: argparse.Namespace) -> int:
+    """Read or update the durable checkpoint-history signer log.
+
+    No update options means read; an update requires all four of
+    ``--root-key/--at/--key/--status``. Prints the ``{root, records, head}``
+    document as one contract-ordered JSON line, exit 0/1 on success/failure.
+    """
+    from .light_client import history_trust
+
+    options = (args.root_key, args.at, args.key, args.status)
+    if not any(option is not None for option in options):
+        body = history_trust(args.path)
+        return _emit_result_document(body)
+
+    at_value = _decimal_int(args.at) if args.at is not None else None
+    if args.at is not None and at_value is None:
+        return _input_failure()
+    body = history_trust(
+        args.path, args.root_key, at_value, args.key, args.status
+    )
+    return _emit_result_document(body)
+
+
+def cmd_history_export(args: argparse.Namespace) -> int:
+    """Export one signed checkpoint-history page; no server contact is made."""
+    from .light_client import HISTORY_EXPORT_DEFAULT_LIMIT, export_history
+
+    after = None
+    if args.after is not None:
+        after = _decimal_int(args.after)
+        if after is None:
+            return _input_failure()
+    limit = HISTORY_EXPORT_DEFAULT_LIMIT
+    if args.limit is not None:
+        limit = _decimal_int(args.limit)
+        if limit is None:
+            return _input_failure()
+    body = export_history(
+        args.path,
+        args.key,
+        after=after,
+        limit=limit,
+        trust_path=args.trust,
+    )
+    return _emit_result_document(body)
+
+
 def cmd_audit_signer_rotate(args: argparse.Namespace) -> int:
     status, body = _request(
         "POST",
@@ -1300,6 +1376,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="current signer version (conflict 409 if stale)",
     )
     p_audit_signer.set_defaults(func=cmd_audit_signer_rotate)
+
+    p_history_trust = sub.add_parser(
+        "history-trust",
+        help="read or update the durable checkpoint-history signer log",
+    )
+    p_history_trust.add_argument(
+        "path", help="signer log file path (written with compact JSON + newline)"
+    )
+    p_history_trust.add_argument(
+        "--root-key",
+        help="64 lowercase hex Ed25519 seed of the log root key",
+    )
+    p_history_trust.add_argument(
+        "--at",
+        help="entry instant: a positive decimal integer (update field)",
+    )
+    p_history_trust.add_argument(
+        "--key",
+        help="64 lowercase hex Ed25519 public key named by the entry",
+    )
+    p_history_trust.add_argument(
+        "--status",
+        help="entry status: active or revoked (update field); all four "
+        "options update, none reads",
+    )
+    p_history_trust.set_defaults(func=cmd_history_trust)
+
+    p_history_export = sub.add_parser(
+        "history-export",
+        help="export one signed checkpoint-history page (offline)",
+    )
+    p_history_export.add_argument(
+        "path", help="advance checkpoint path (its .history sidecar is read)"
+    )
+    p_history_export.add_argument(
+        "--key",
+        required=True,
+        help="64 lowercase hex Ed25519 seed signing the page",
+    )
+    p_history_export.add_argument(
+        "--after",
+        help="cursor generation (non-negative decimal); omitted starts at base",
+    )
+    p_history_export.add_argument(
+        "--limit",
+        help="page size (decimal, 1-200, default 50)",
+    )
+    p_history_export.add_argument(
+        "--trust",
+        help="optional durable signer log (see history-trust); pages are cut "
+        "at authorization boundaries and --key must cover the page",
+    )
+    p_history_export.set_defaults(func=cmd_history_export)
 
     return parser
 
