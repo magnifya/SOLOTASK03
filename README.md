@@ -801,6 +801,60 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
 - `integrity`：`at` 不严格递增、`prev`/`head` 错、跨授权边界，以及记录
   链/分页/检查点重放等原 `verify_history` 的 integrity 错误。
 
+### 持久签名者日志 `history_trust` 与授权分页导出
+
+`verify_history_trust` 使用的 `{root, records, head}` 签名者日志可以持久
+落盘、追加维护，`export_history` 也可据此在授权边界处自动截断分页。
+
+`ledger.light_client.history_trust(path, root_seed=None, at=None, key=None,
+status=None) -> dict` 读取或追加该日志（纯文件操作，不接触服务端）：
+
+- 无任何更新选项时**读取**：严格重载日志（形状、`at` 严格递增、
+  `prev`/`head` 链、全部根证书签名，规则与 `verify_history_trust` 完全
+  一致）。成功按键序 `ok, root, records, head` 返回；文件缺失或不可读为
+  `io`；磁盘日志通不过校验契约一律为 `state`。
+- 更新时**四项必填**（只给一部分为 `input`）：`root_seed` 为 64 位小写
+  hex 根私钥种子，`key` 为 64 位小写 hex 公钥，`at` 为**非布尔正整数**，
+  `status` 仅取 `active`/`revoked`；形状不符为 `input`。
+- 日志不存在时以第一条 `active` 记录创建，其根公钥由 `root_seed` 推导；
+  首条为 `revoked` 为 `state`。日志已存在时：种子推导出的根必须与日志
+  根一致，否则为 `auth`；`at` 必须严格大于末项 `at`，否则为 `state`；
+  `revoked` 必须撤销**当前有效 key**（新 `at` 之前最后一项给出的有效
+  key），撤销其他 key 或在无有效 key 时撤销均为 `state`；轮换到新 key、
+  重新激活已撤销 key 均允许。
+- 追加项的 `(at, key, status)` 与末项完全相同为**幂等空操作**，成功返回
+  且文件字节不变。
+- 文件按键序 `root, records, head` 以紧凑 UTF-8 JSON、非 ASCII 不转义、
+  末尾恰好一个换行写出（临时文件 fsync 后 `os.replace` 原子替换），同一
+  `path` 的操作共用一把按路径锁串行执行；写失败尽力恢复原字节并归 `io`。
+
+`ledger.light_client.export_history(path, key, after=None, limit=50,
+trust_path=None) -> dict` 在原有契约上扩展可选 `trust_path`：
+
+- 不给 `trust_path` 时行为与以前完全一致。
+- 给定时加载该持久签名者日志：缺失为 `io`，损坏（通不过严格校验）为
+  `state`。页内首条记录检查点的 `verified_at` 所对应的有效 key 必须等于
+  `key` 推导出的公钥——该时刻无有效 key（首次激活之前或撤销窗口内）或为
+  其他 key，均为 `auth`。
+- 页面在**下一授权边界之前**（轮换到另一把 key，或进入/离开撤销窗口）
+  自动截断，使一页上的全部记录处于同一授权窗口、可由一把 key 的信封签名
+  统一认证；截断与 `limit` 一样只是提前结束本页，`next` 取本页末代代号，
+  调用方持相应窗口的 key 继续翻页。
+
+CLI（均输出单行 JSON）：
+
+- `python -m ledger.cli history-trust PATH [--root-key SEED --at N --key
+  PUB --status active|revoked]`：无选项读取并原样输出 `{root, records,
+  head}`（退出 0）；更新四项必填。失败输出 `{"ok": false, "error": ...}`
+  并退出 1，错误类别同库 API（`input`/`auth`/`state`/`io`）。
+- `python -m ledger.cli history-export PATH --key SEED [--after N]
+  [--limit N] [--trust PATH]`：输出一页导出 JSON（成功退出 0），失败输出
+  `{"ok": false, "error": ...}` 并退出 1。`--after` 为非负十进制整数，
+  `--limit` 为 1–200 的正整数，非法值按 `input` 处理（退出 1，而非用法
+  错误）。
+
+其余 CLI 与 HTTP 接口不变。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -905,8 +959,9 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`（支持 `trust_path` 授权窗口截断）、多页离线连续校验 `verify_history`、带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust`，以及该签名者日志的持久读取/追加 `history_trust` |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` / 本地 `history-trust`（读取或追加持久签名者日志）/
+本地 `history-export`（带可选 `--trust` 授权分页的检查点历史签名导出）子命令 |
 
 约定：
 
@@ -1217,6 +1272,18 @@ cat range-exports.json | python -m ledger.cli verify-range-batch --exports - --t
 # -> 成功单行 {"ok":true,"anchor":{...},"tip":{...},"pages":N,
 #    "verified_tx_ids":[...]} 退出 0；
 #    失败单行 {"ok":false,"error":"input"|"auth"|"expired"|"integrity"} 退出 1
+
+# 检查点历史签名者日志：读取 / 首激活 / 轮换 / 撤销（四项更新参数必填；
+# 成功单行 {root,records,head} 退出 0，失败 {"ok":false,"error":...} 退出 1）
+python -m ledger.cli history-trust cp.trust
+python -m ledger.cli history-trust cp.trust --root-key <64hex-seed> --at 50 \
+    --key <64hex-pubkey> --status active
+python -m ledger.cli history-trust cp.trust --root-key <64hex-seed> --at 150 \
+    --key <64hex-pubkey-2> --status active
+# 检查点历史签名分页导出（--trust 给定时按授权窗口截断；--key 须是该窗口的
+# 有效签名种子；成功单行导出页退出 0，失败 {"ok":false,"error":...} 退出 1）
+python -m ledger.cli history-export cp.json --key <64hex-seed> --trust cp.trust
+python -m ledger.cli history-export cp.json --key <64hex-seed> --after N --limit 50
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。

@@ -4,9 +4,10 @@ state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
-(add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
-verify/audit-verify/consistency and offline verify-range/verify-range-batch
-subcommands.
+(add/rotate/revoke/export/allowlist-add/allowlist-remove), offline
+verify/audit-verify/consistency and offline verify-range/verify-range-batch,
+plus the local checkpoint-history signer log (history-trust) and signed
+history export (history-export) subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -822,6 +823,102 @@ def cmd_verify_range_batch(args: argparse.Namespace) -> int:
     return 0 if body.get("ok") is True else 1
 
 
+# -- local checkpoint-history signer log / signed export --------------------
+
+
+def _positive_int_arg(value: str) -> int | None:
+    """Parse a CLI decimal positive integer, rejecting bools/leading zeros.
+
+    Mirrors the library's non-boolean positive-int rule; the bool case is
+    irrelevant on the command line but leading zeros, signs and non-digits are
+    rejected so the parsed value never silently differs from the literal.
+    """
+    if not isinstance(value, str) or not value or not value.isdigit():
+        return None
+    if len(value) > 1 and value[0] == "0":
+        return None
+    parsed = int(value)
+    return parsed if parsed >= 1 else None
+
+
+def cmd_history_trust(args: argparse.Namespace) -> int:
+    """Read or update the durable signer log; prints one fixed-order JSON line.
+
+    No ``--root-key/--at/--key/--status`` means a read. On an update the four
+    options are all required; the result's key order is
+    ``ok, root, records, head`` and failures are ``{"ok": false, "error"}``
+    with exit 1.
+    """
+    from .light_client import history_trust
+
+    options = (args.root_key, args.at, args.key, args.status)
+    updating = any(option is not None for option in options)
+    if updating and not all(option is not None for option in options):
+        body = {"ok": False, "error": "input"}
+    elif updating:
+        at_value = _positive_int_arg(args.at)
+        if at_value is None:
+            body = {"ok": False, "error": "input"}
+        else:
+            body = history_trust(
+                args.path,
+                root_seed=args.root_key,
+                at=at_value,
+                key=args.key,
+                status=args.status,
+            )
+    else:
+        body = history_trust(args.path)
+    if body.get("ok") is not True:
+        print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+        return 1
+    # Success prints the verify_history_trust document itself — exactly the
+    # ``root, records, head`` key order — rather than the ok-wrapped result.
+    document = {name: body[name] for name in ("root", "records", "head")}
+    print(json.dumps(document, sort_keys=False, ensure_ascii=False))
+    return 0
+
+
+def cmd_history_export(args: argparse.Namespace) -> int:
+    """Export one signed checkpoint-history page; prints one JSON line.
+
+    Invokes :func:`ledger.light_client.export_history` with ``--trust``
+    selecting the durable signer log; exits 0 on success, 1 on failure.
+    """
+    from .light_client import export_history
+
+    after_value = None
+    if args.after is not None:
+        # ``--after`` accepts non-negative decimal integers only.
+        if not args.after.isdigit() or (
+            len(args.after) > 1 and args.after[0] == "0"
+        ):
+            body = {"ok": False, "error": "input"}
+            print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+            return 1
+        after_value = int(args.after)
+    limit_value = 50
+    if args.limit is not None:
+        limit_value = _positive_int_arg(args.limit)
+        if limit_value is None or limit_value > 200:
+            body = {"ok": False, "error": "input"}
+            print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+            return 1
+    body = export_history(
+        args.path,
+        args.key,
+        after=after_value,
+        limit=limit_value,
+        trust_path=args.trust,
+    )
+    # The page itself has a contract-fixed key order, so it is printed in
+    # insertion order (error bodies are single-purpose ``{ok,error}``). A
+    # successful page carries no ``ok`` key, so failure is detected by the
+    # presence of ``error`` rather than the verifier-style ``ok is True``.
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 1 if "error" in body else 0
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -1300,6 +1397,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="current signer version (conflict 409 if stale)",
     )
     p_audit_signer.set_defaults(func=cmd_audit_signer_rotate)
+
+    p_history_trust = sub.add_parser(
+        "history-trust",
+        help="read or update the durable checkpoint-history signer log",
+    )
+    p_history_trust.add_argument(
+        "path", help="signer log file path (created on the first activation)"
+    )
+    p_history_trust.add_argument(
+        "--root-key",
+        help="64 lowercase hex Ed25519 root seed; required for every update",
+    )
+    p_history_trust.add_argument(
+        "--at",
+        help="record time as a positive decimal integer; must strictly ascend",
+    )
+    p_history_trust.add_argument(
+        "--key",
+        help="authorized/revoked signer public key (64 lowercase hex)",
+    )
+    p_history_trust.add_argument(
+        "--status",
+        help="active or revoked; the log's first record must be active and a "
+        "revoke must name the current key",
+    )
+    p_history_trust.set_defaults(func=cmd_history_trust)
+
+    p_history_export = sub.add_parser(
+        "history-export",
+        help="export one signed checkpoint-history page",
+    )
+    p_history_export.add_argument(
+        "path", help="advance checkpoint file path (its sidecar is read too)"
+    )
+    p_history_export.add_argument(
+        "--key",
+        required=True,
+        help="64 lowercase hex Ed25519 seed signing the page",
+    )
+    p_history_export.add_argument(
+        "--after",
+        help="cursor generation (non-negative decimal); default starts at base",
+    )
+    p_history_export.add_argument(
+        "--limit", help="page size (decimal, 1-200, default 50)"
+    )
+    p_history_export.add_argument(
+        "--trust",
+        help="durable signer log path; when given the page is scoped to one "
+        "authorization window and --key must be its active key",
+    )
+    p_history_export.set_defaults(func=cmd_history_export)
 
     return parser
 
