@@ -2809,3 +2809,87 @@ def history_trust(
             _restore_bytes(path, original)
             return {"ok": False, "error": ERR_IO}
         return written
+
+
+# -- shared filesystem access for the online /v1/history endpoints -------------
+
+
+def history_file_lock(path: str) -> threading.RLock:
+    """The re-entrant per-path lock used by every checkpoint-history file op.
+
+    Online endpoints sharing a file with offline :func:`advance` /
+    :func:`history` / :func:`export_history` / :func:`history_trust` callers
+    take this same lock so all access to one path serializes within a process.
+    """
+    return _checkpoint_lock(path)
+
+
+def history_sidecar_path(path: str) -> str:
+    """The sidecar path (``path + ".history"``) of an advance checkpoint."""
+    return _history_path(path)
+
+
+def history_trust_head(path: str) -> tuple[str | None, str | None]:
+    """Strictly load the signer log head hash without taking the per-path lock.
+
+    Returns ``(root, head)`` when the log exists and passes the exact
+    :func:`verify_history_trust` validation, or ``(None, None)`` when the file
+    is absent. Raises :class:`_CheckpointError` (``state``/``io``) on a present
+    but corrupt or unreadable log. Callers are expected to hold
+    :func:`history_file_lock` (directly or via a surrounding store lock).
+    """
+    log = _load_signer_log(path)
+    if log is None:
+        return None, None
+    return log["root"], log["head"]
+
+
+def history_checkpoint(checkpoint_path: str) -> dict | None:
+    """Strictly load the advance checkpoint (None when absent), no locking."""
+    return _load_checkpoint(checkpoint_path)
+
+
+def history_sidecar_document(checkpoint_path: str) -> dict | None:
+    """Strictly replay and return the full sidecar document (None if absent)."""
+    return _load_history(_history_path(checkpoint_path))
+
+
+def history_head(path: str) -> str | None:
+    """Strictly load the sidecar head (None when absent), no locking.
+
+    The sidecar is fully replayed like :func:`history`/:func:`export_history`;
+    a present-but-corrupt file raises :class:`_CheckpointError` (``state``), an
+    unreadable one ``io``. When the sidecar exists its last record's
+    checkpoint must also reproduce the actual advance checkpoint file at
+    ``path`` exactly (a missing or mismatched checkpoint is ``state``), so an
+    offline edit of either file is detected here. Callers hold
+    :func:`history_file_lock`.
+    """
+    sidecar = _load_history(_history_path(path))
+    if sidecar is None:
+        return None
+    checkpoint = _load_checkpoint(path)
+    if checkpoint is None or checkpoint != sidecar["records"][-1]["checkpoint"]:
+        # A sidecar without its matching checkpoint tip is unrecoverable:
+        # export_history refuses the same state, and the bound audit event
+        # would otherwise pin a history the files no longer reproduce.
+        raise _CheckpointError(ERR_STATE)
+    return sidecar["head"]
+
+
+def history_checkpoint_present(path: str) -> bool:
+    """Whether an advance checkpoint file exists at ``path`` (no validation)."""
+    return os.path.exists(path)
+
+
+def history_file_bytes(path: str) -> bytes | None:
+    """Raw bytes of a history file (None when absent); OSError becomes ``io``."""
+    try:
+        return _read_bytes_or_none(path)
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+
+
+def restore_history_file(path: str, original: bytes | None) -> None:
+    """Best-effort restore of ``path`` to ``original`` bytes (None = absent)."""
+    _restore_bytes(path, original)

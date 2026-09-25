@@ -18,6 +18,39 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         # -- helpers --------------------------------------------------------
 
+        def _check_history_authorization(self) -> bool:
+            """Gate the /v1/history routes on the configured bearer token.
+
+            The check runs before any body is read or state touched, so a
+            wrong/missing token answers 401 with no side effects. Returns
+            whether the request may proceed.
+            """
+            expected = service.history_token
+            if expected is None:
+                # The history routes exist only when configured at startup.
+                self._send_json(404, {"error": "not found"})
+                return False
+            authorization = self.headers.get("Authorization", "")
+            if authorization != f"Bearer {expected}":
+                # Drain any request body (without parsing or acting on it) so
+                # a keep-alive connection stays usable; this has no state side
+                # effect. The {"ok", "error"} envelope keeps that key order.
+                self._drain_body()
+                self._send_json(
+                    401, {"ok": False, "error": "auth"}, sort_keys=False
+                )
+                return False
+            return True
+
+        def _drain_body(self) -> None:
+            """Read and discard a request body so the connection stays clean."""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return
+            if 0 < length <= MAX_BODY_BYTES:
+                self.rfile.read(length)
+
         def _send_json(
             self, status: int, body: dict, sort_keys: bool = True
         ) -> None:
@@ -49,7 +82,36 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
             path = self.path.split("?", 1)[0]
-            if path == "/v1/transactions":
+            if path == "/v1/history/trust":
+                # POST /v1/history/trust — append one signer-log entry. Auth
+                # precedes any body read or state access (401, no side
+                # effects); the {root, records, head} document keeps its
+                # contract key order.
+                if not self._check_history_authorization():
+                    return
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}
+                    )
+                    return
+                status, body = service.update_history_trust(payload)
+                self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/history/export":
+                # POST /v1/history/export — one signed history page. Auth
+                # precedes any body read (401, no side effects); the page
+                # keeps its contract key order.
+                if not self._check_history_authorization():
+                    return
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}
+                    )
+                    return
+                status, body = service.export_history_page(payload)
+                self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
@@ -191,7 +253,15 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
             path, _, query = self.path.partition("?")
-            if path.startswith("/v1/transactions/"):
+            if path == "/v1/history/trust":
+                # GET /v1/history/trust — read the signer log. Auth precedes
+                # any state access (401, no side effects); the document keeps
+                # its contract key order {root, records, head}.
+                if not self._check_history_authorization():
+                    return
+                status, body = service.read_history_trust()
+                self._send_json(status, body, sort_keys=False)
+            elif path.startswith("/v1/transactions/"):
                 # GET /v1/transactions/{tx_id} — a transaction receipt; a
                 # malformed or unknown tx_id returns 404.
                 tx_id = unquote(path[len("/v1/transactions/") :])

@@ -346,7 +346,9 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   审计检查点密钥轮换记录 `audit_signer_rotated`（携带新版本号与新公钥，
   其事件 id 即新密钥的 `activated_event_id`）；keyless allowlist 的新增与
   删除记录 `allowlist_added` / `allowlist_removed`（均携带 `source` 与
-  `expires_at`）。事件一旦写入永不删除：候选
+  `expires_at`）；在线检查点历史访问记录 `history_access`（服务以
+  `--history*` 启动时，每次成功的 `read`/`update`/`export` 一条，载荷键序
+  `action, trust_head, history_head`，无值为 `null`）。事件一旦写入永不删除：候选
   **采用或过期之后仍可按 source/kind 分页查询**。
 - **恢复语义**：信任注册表、allowlist、来源公钥历史与审计流是权威配置而非
   可丢弃缓存，快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；
@@ -857,6 +859,57 @@ JSON**，成功/失败退出 0/1：
   授权边界前截断并给 `next`，`--key` 必须覆盖页内各 `verified_at`；
   未知/撤销覆盖 key 为 `auth`，坏日志为 `state`，日志缺失为 `io`。
 
+### HTTP：`history_trust` 与 `export_history` 的在线接口
+
+同一份签名者日志与检查点历史也可由运行中的服务在 Bearer 令牌保护下访问，
+复用上面两个纯库函数的全部契约（类型、键序、签名与截页规则），其余接口
+不受影响。启动服务时增加三个参数：
+
+```bash
+python -m ledger --host 0.0.0.0 --port 8080 --state ledger_state.json \
+  --history PATH --history-trust TRUST --history-token TOKEN
+```
+
+- 三者**全给或全不给**：给了一个或两个、或任一值为空串，进程在打开任何
+  文件前以退出码 **2** 结束；三个都缺省时行为与旧版完全一致（不挂载
+  `/v1/history` 路由，访问返回 404）。`PATH` 是 `advance` 检查点路径
+  （侧车为 `PATH + ".history"`），`TRUST` 是持久签名者日志路径。
+- 两个路由在任何解析或状态操作之前先核对
+  `Authorization: Bearer TOKEN`：缺失或不符返回 **401** 与
+  `{"ok":false,"error":"auth"}`（保持该键序），**无任何副作用**
+  （不读请求体语义、不碰文件、不写事件）。
+- **读日志**：`GET /v1/history/trust` 严格加载并返回契约文档
+  `{root, records, head}`，成功 **200**；日志缺失为 500/io。
+- **追加日志**：`POST /v1/history/trust` 的 JSON **仅含**
+  `root_seed, at, key, status` 四字段；真正新增返回 **201** 与
+  `{root, records, head}`，与当前末项的 `at/key/status` 完全相同的重试
+  **幂等返回 200**（文件字节、审计事件、generation 都不变）。
+- **导出页面**：`POST /v1/history/export` 的 JSON **仅含**
+  `key, after, limit`（`after`/`limit` 可显式为 `null` 取库缺省）；始终
+  以配置的 `--history-trust` 日志做授权边界截页，成功 **200** 返回
+  `base, records, next, head, checkpoint, auth` 页面文档。
+- **错误映射**：两库函数的 `{ok:false,error}` 分类按
+  `input→400`、`auth→403`、`state→409`、`io→500` 映射，响应体即
+  `{"ok":false,"error":类别}`；请求体畸形/键缺失或额外/类型错误均为
+  400/input。
+- **审计事件**：每次成功的读、追加（幂等 200 除外）与导出都在同一次原子
+  写入中追加恰好一条 `history_access` 事件，载荷键序固定为
+  `action, trust_head, history_head`：`action` 取 `read`/`update`/
+  `export`，两个 head 为本次操作严格重验出的签名者日志头与侧车头（文件
+  尚不存在为 `null`）。
+- **共锁与落盘**：信任日志、检查点/侧车文件、`history_access` 事件、
+  `audit_checkpoint` 与 `generation` 在同一临界区（账本锁内含两路径的
+  按路径锁）串行化；外部文件已落盘后再原子写快照，**落盘成功后才响应**。
+  追加时快照写失败会尽力恢复信任日志原字节并回滚内存中的事件、检查点、
+  记录的 head 与 generation，返回 500/io；导出为只读，不改动历史文件。
+- **重启绑定**：恢复时在唯一胜出快照上严格重验签名者日志、侧车（逐代
+  形状/哈希/锚点/context 重放）与检查点文件（侧车末条必须逐字复现当前
+  检查点）；存在 `history_access` 事件时，末条同类事件的 `trust_head`/
+  `history_head` 必须与实际文件头一致。任一失配（含最后一次在线访问后
+  离线改动日志）都抛出携带 `path`（具体失配文件）与 `reason` 的
+  `ledger.store.StateRecoveryError`，绝不静默重建；无历史标志启动则完全
+  不校验这些文件。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -958,9 +1011,9 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
-| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
-| `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
+| `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复；配置在线 `/v1/history` 时还记录两外部文件头并在恢复时严格重验、绑定末条 `history_access` 事件 |
+| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记；在线检查点历史的 Bearer 令牌、`history_trust` 读/追加（201/幂等200）与 `export_history` 截页、错误分类映射与 `history_access` 事件的共锁原子提交 |
+| `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口（含 `/v1/history/trust` 与 `/v1/history/export` 的先授权 401 闸门） |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
@@ -1009,6 +1062,10 @@ pip install -r requirements.txt
 ```bash
 python -m ledger --host 0.0.0.0 --port 8080 --state ledger_state.json
 ```
+
+在线暴露检查点历史时另加 `--history PATH --history-trust TRUST
+--history-token TOKEN`（三者必须同时给且非空，否则退出码 2；全缺省行为
+不变，详见后文「HTTP：`history_trust` 与 `export_history` 的在线接口」）。
 
 环境变量 `LEDGER_HOST` / `LEDGER_PORT` / `LEDGER_STATE` / `LEDGER_INITIAL_BALANCE`
 可提供同样的默认值。
@@ -1170,6 +1227,24 @@ curl -s 'localhost:8080/v1/audit/export?limit=50&cursor=0'
 # -> 200 {"items":[{event_id,kind,at,prev_hash,event_hash,...}...],
 #         "total":N,"next_cursor":null,
 #         "anchor_hash":"<本页首条的前一哈希>","checkpoint":{event_id,event_hash}}
+
+# 在线检查点历史（仅在服务以 --history/--history-trust/--history-token
+# 启动时挂载；先过 Bearer 令牌，错误 401 且无副作用）
+curl -s localhost:8080/v1/history/trust \
+  -H 'Authorization: Bearer TOKEN'
+# -> 200 {"root":"...","records":[{at,key,status,prev,signature}...],"head":"..."}
+curl -s -X POST localhost:8080/v1/history/trust \
+  -H 'Authorization: Bearer TOKEN' -H 'Content-Type: application/json' \
+  -d '{"root_seed":"<64hex-seed>","at":100,"key":"<64hex-pub>","status":"active"}'
+# -> 201 {root,records,head}（新增）；与末项完全相同的重试 200（幂等，无写入）
+curl -s -X POST localhost:8080/v1/history/export \
+  -H 'Authorization: Bearer TOKEN' -H 'Content-Type: application/json' \
+  -d '{"key":"<64hex-seed>","after":null,"limit":50}'
+# -> 200 {"base":...,"records":[...],"next":null,"head":"...",
+#         "checkpoint":{...},"auth":{"public_key":"...","signature":"..."}}
+# 错误体恒为 {"ok":false,"error":"input|auth|state|io"}
+# （400/403/409/500）；每次成功访问追加一条 action=read|update|export 的
+# history_access 事件（载荷 action,trust_head,history_head）
 ```
 
 ## 命令行
@@ -1308,4 +1383,5 @@ python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI
 python tests/strict_type_validation_test.py  # 跨入口严格类型校验：height/amount 的字符串/浮点/布尔伪装在候选分叉与同步入口 400（不写状态、不回放 200）、离线 verify 返回 input、canonical/pending 恢复抛 StateRecoveryError、持久化候选/同步记录按缓存规则丢弃、旧快照缺省 status 兼容
 python tests/consistency_verify_test.py   # 离线快照整体一致性 verify_snapshot：成功摘要与固定键序、缺区段/未知顶层键/类型伪装 input、交易/签名/Merkle/区块哈希/链接/索引/账户/state_root/pending 唯一性/审计链与检查点篡改 integrity、CLI consistency（退出码 1/0/1，IO/非 JSON 为 input）
+python tests/http_history_test.py         # history_trust/export_history 接入 HTTP：--history/--history-trust/--history-token 全给或全缺（部分/空值退出 2，全缺省其余接口不变）；Bearer 401 无副作用；GET 读 200、POST 新增 201/幂等 200、export 200；input/auth/state/io→400/403/409/500 与 {"ok":false,"error"}；history_access 事件键序 action,trust_head,history_head（无值 null）；信任/历史文件/事件/checkpoint/generation 共锁、落盘后响应、失败恢复原字节与内存；重启重验文件并绑定末条同类事件，失配抛含 path、reason 的 StateRecoveryError
 ```

@@ -63,6 +63,26 @@ EVENT_SYNC_EXPIRED = "sync_expired"
 EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 EVENT_ALLOWLIST_ADDED = "allowlist_added"
 EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
+EVENT_HISTORY_ACCESS = "history_access"
+
+# Actions carried by the history_access audit event.
+HISTORY_ACTION_READ = "read"
+HISTORY_ACTION_UPDATE = "update"
+HISTORY_ACTION_EXPORT = "export"
+
+# Exact request-body key sets of the two POST history endpoints.
+HISTORY_TRUST_UPDATE_KEYS = ("root_seed", "at", "key", "status")
+HISTORY_EXPORT_KEYS = ("key", "after", "limit")
+
+# The two library functions' error categories mapped onto HTTP statuses:
+# malformed input 400, authorization failure 403, corrupt/conflicting state
+# 409, filesystem failure 500.
+HISTORY_ERROR_STATUS = {
+    "input": 400,
+    "auth": 403,
+    "state": 409,
+    "io": 500,
+}
 
 
 def _parse_height(height: object) -> int | None:
@@ -90,8 +110,17 @@ def _parse_decimal(value: object) -> int | None:
 
 
 class LedgerService:
-    def __init__(self, store: LedgerStore, initial_balance: int = DEFAULT_INITIAL_BALANCE) -> None:
+    def __init__(
+        self,
+        store: LedgerStore,
+        initial_balance: int = DEFAULT_INITIAL_BALANCE,
+        history_token: str | None = None,
+    ) -> None:
         self.store = store
+        # Bearer token guarding the online /v1/history endpoints; the routes
+        # exist only when a token is configured (all three --history* flags
+        # are given together at startup).
+        self.history_token = history_token
         # The snapshot-recorded endowment is the only balance-replay / balance
         # reporting parameter: a recovered store already knows its endowment, so
         # restarting with a different --initial-balance must not change any
@@ -3353,3 +3382,226 @@ class LedgerService:
                 "checkpoint_auth": self.store.sign_checkpoint(),
             }
         return 200, body
+
+    # -- online checkpoint history (/v1/history) ----------------------------
+
+    @property
+    def history_enabled(self) -> bool:
+        """Whether the /v1/history routes are configured on this service."""
+        return self.history_token is not None
+
+    @staticmethod
+    def _history_failure(category: str) -> tuple[int, dict]:
+        """Map a light-client error category to its HTTP status and body."""
+        return (
+            HISTORY_ERROR_STATUS.get(category, 500),
+            {"ok": False, "error": category},
+        )
+
+    def _history_heads(self) -> tuple[str | None, str | None]:
+        """Strictly load both history files' heads under the held locks.
+
+        Must be called with the store lock (which also covers both per-path
+        file locks). Returns ``(history_head, trust_head)`` (each None when
+        that file is absent) or raises :class:`HistoryAccessError`.
+        """
+        from . import light_client
+
+        trust_path = self.store.history_trust_path
+        history_path = self.store.history_path
+        assert trust_path is not None and history_path is not None
+        try:
+            _, trust_head = light_client.history_trust_head(trust_path)
+            history_head = light_client.history_head(history_path)
+        except light_client._CheckpointError as failure:
+            raise HistoryAccessError(failure.category) from None
+        return history_head, trust_head
+
+    def _record_history_access(
+        self, action: str, history_head: str | None, trust_head: str | None
+    ) -> dict:
+        """Append a history_access event and persist event/heads/generation.
+
+        The external files, the audit event, the checkpoint and the generation
+        commit together: the external bytes are already on disk when this is
+        called, then the snapshot is written. Any failure rolls the in-memory
+        event, checkpoint and recorded heads back (generation only advances on
+        a promoted write); the caller restores any external bytes it mutated.
+        """
+        prev_history_head = self.store.history_head
+        prev_trust_head = self.store.history_trust_head
+        event = self.store.append_audit_event(
+            EVENT_HISTORY_ACCESS,
+            {
+                "action": action,
+                "trust_head": trust_head,
+                "history_head": history_head,
+            },
+        )
+        self.store.history_head = history_head
+        self.store.history_trust_head = trust_head
+        try:
+            self.store.save()
+        except BaseException:
+            self.store.history_head = prev_history_head
+            self.store.history_trust_head = prev_trust_head
+            self.store.truncate_audit_events(1)
+            raise
+        return event
+
+    def read_history_trust(self) -> tuple[int, dict]:
+        """GET /v1/history/trust — read the durable signer log.
+
+        Returns the exact ``{root, records, head}`` document (200). The log is
+        strictly validated and a ``read`` history_access event bound to both
+        files' heads is persisted in the same transaction as the response.
+        """
+        from . import light_client
+
+        try:
+            with self.store.lock:
+                with light_client.history_file_lock(self.store.history_trust_path):
+                    with light_client.history_file_lock(self.store.history_path):
+                        log = light_client.history_trust(self.store.history_trust_path)
+                        if "root" not in log:
+                            # Failure envelope {"ok": false, "error": ...}.
+                            return self._history_failure(log["error"])
+                        try:
+                            history_head, trust_head = self._history_heads()
+                            self._record_history_access(
+                                HISTORY_ACTION_READ, history_head, trust_head
+                            )
+                        except HistoryAccessError as failure:
+                            return self._history_failure(failure.category)
+                        return 200, log
+        except Exception:
+            # Any persistence failure answers 500/io rather than crashing the
+            # handler; the in-memory rollback above has already run.
+            return 500, {"ok": False, "error": "io"}
+
+    def update_history_trust(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/history/trust — append one signer-log entry.
+
+        The body must be a JSON object with exactly
+        ``root_seed, at, key, status``. A genuinely new entry returns 201 with
+        the ``{root, records, head}`` document; a byte-identical replay of the
+        current tail is idempotent (200) with no write and no audit event.
+        """
+        from . import light_client
+
+        if not isinstance(payload, dict):
+            return 400, {"ok": False, "error": "input"}
+        if set(payload) != set(HISTORY_TRUST_UPDATE_KEYS):
+            return 400, {"ok": False, "error": "input"}
+        try:
+            with self.store.lock:
+                with light_client.history_file_lock(self.store.history_trust_path):
+                    with light_client.history_file_lock(self.store.history_path):
+                        return self._update_history_trust_locked(payload)
+        except Exception:
+            # Persistence failure: the external bytes were restored and the
+            # in-memory event/generation rolled back by the locked helper.
+            return 500, {"ok": False, "error": "io"}
+
+    def _update_history_trust_locked(self, payload: dict) -> tuple[int, dict]:
+        from . import light_client
+
+        trust_path = self.store.history_trust_path
+        # Capture the current bytes (None when the file does not yet exist) so
+        # a failure after the library appended can be fully compensated.
+        try:
+            original_bytes = light_client.history_file_bytes(trust_path)
+        except light_client._CheckpointError as failure:
+            return self._history_failure(failure.category)
+        previous_log = None
+        if original_bytes is not None:
+            loaded = light_client.history_trust(trust_path)
+            if "root" not in loaded:
+                return self._history_failure(loaded["error"])
+            previous_log = loaded
+
+        result = light_client.history_trust(
+            trust_path,
+            root_seed=payload["root_seed"],
+            at=payload["at"],
+            key=payload["key"],
+            status=payload["status"],
+        )
+        if "root" not in result:
+            # Validation/library failure: the library writes nothing (and
+            # self-restores on its own io failure), so no compensation here.
+            return self._history_failure(result["error"])
+
+        if previous_log is not None and result == previous_log:
+            # Idempotent replay against an identical tail: file bytes, audit
+            # log, checkpoint and generation all stay exactly as they were.
+            return 200, result
+
+        # A new entry is on disk; bind both files and the event atomically. If
+        # anything fails from here, restore the signer log's original bytes.
+        try:
+            history_head, trust_head = self._history_heads()
+            self._record_history_access(
+                HISTORY_ACTION_UPDATE, history_head, trust_head
+            )
+        except HistoryAccessError as failure:
+            light_client.restore_history_file(trust_path, original_bytes)
+            return self._history_failure(failure.category)
+        except BaseException:
+            light_client.restore_history_file(trust_path, original_bytes)
+            raise
+        return 201, result
+
+    def export_history_page(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/history/export — one signed checkpoint-history page.
+
+        The body must be a JSON object with exactly ``key, after, limit``
+        (``after``/``limit`` may be null for the library defaults). Returns 200
+        with one ``base, records, next, head, checkpoint, auth`` page cut at
+        the configured durable signer log's authorization boundary, and
+        records an ``export`` history_access event in the same transaction.
+        """
+        from . import light_client
+
+        if not isinstance(payload, dict):
+            return 400, {"ok": False, "error": "input"}
+        if set(payload) != set(HISTORY_EXPORT_KEYS):
+            return 400, {"ok": False, "error": "input"}
+        try:
+            with self.store.lock:
+                with light_client.history_file_lock(self.store.history_trust_path):
+                    with light_client.history_file_lock(self.store.history_path):
+                        return self._export_history_locked(payload)
+        except Exception:
+            # The export is read-only; any failure maps to 500/io.
+            return 500, {"ok": False, "error": "io"}
+
+    def _export_history_locked(self, payload: dict) -> tuple[int, dict]:
+        from . import light_client
+
+        result = light_client.export_history(
+            self.store.history_path,
+            payload["key"],
+            after=payload["after"],
+            limit=payload["limit"],
+            trust_path=self.store.history_trust_path,
+        )
+        if "base" not in result:
+            # Failure envelope; the export is read-only and mutated no files.
+            return self._history_failure(result["error"])
+        try:
+            history_head, trust_head = self._history_heads()
+            self._record_history_access(
+                HISTORY_ACTION_EXPORT, history_head, trust_head
+            )
+        except HistoryAccessError as failure:
+            return self._history_failure(failure.category)
+        return 200, result
+
+
+class HistoryAccessError(Exception):
+    """Internal: a strictly-loaded history file failed during an access."""
+
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(category)

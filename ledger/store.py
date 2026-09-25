@@ -106,6 +106,11 @@ EVENT_AUDIT_SIGNER_ROTATED = "audit_signer_rotated"
 EVENT_ALLOWLIST_ADDED = "allowlist_added"
 EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 
+# Online /v1/history access audit event: every authorized read/update/export of
+# the checkpoint history or its durable signer log is bound to both files'
+# heads by one such event. service.EVENT_HISTORY_ACCESS mirrors this literal.
+EVENT_HISTORY_ACCESS = "history_access"
+
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
 SNAPSHOT_PREFIX = ".ledger-"
@@ -271,8 +276,25 @@ class StateRecoveryError(ValueError):
 
 
 class LedgerStore:
-    def __init__(self, path: str, initial_balance: int | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        initial_balance: int | None = None,
+        history_path: str | None = None,
+        history_trust_path: str | None = None,
+    ) -> None:
         self.path = path
+        # Optional online checkpoint-history files exposed via /v1/history.
+        # When configured, the two files are strictly revalidated on startup
+        # and cross-bound to the last ``history_access`` audit event; they are
+        # otherwise left entirely untouched.
+        self.history_path = history_path
+        self.history_trust_path = history_trust_path
+        # The heads observed at the most recent online access: each a 64-hex
+        # string or None (file absent). Persisted in every snapshot so recovery
+        # can rebind the last same-kind audit event to the actual files.
+        self.history_head: str | None = None
+        self.history_trust_head: str | None = None
         self.chain: list[Block] = []
         self.pending: dict[str, Transaction] = {}
         # Candidate fork chains keyed by tip block hash. Each value is the
@@ -385,6 +407,8 @@ class LedgerStore:
                 self.audit_signer = self._make_audit_signer(1, 0)
                 self.audit_signer_history = [self._public_signer_entry(self.audit_signer)]
                 self.generation = 0
+                self.history_head = None
+                self.history_trust_head = None
                 self.rebuild_derived()
                 self.save()
                 return
@@ -403,7 +427,7 @@ class LedgerStore:
                 #           expired_records, audit_checkpoint, audit_repair,
                 #           signer_state, recorded_state_root, attested_syncs,
                 #           attested_expired_records, source_key_history,
-                #           key_history_repair)
+                #           key_history_repair, history_heads)
                 valid.append(
                     (
                         parsed[2],
@@ -425,6 +449,7 @@ class LedgerStore:
                         parsed[15],
                         parsed[16],
                         parsed[17],
+                        parsed[18],
                     )
                 )
 
@@ -460,6 +485,7 @@ class LedgerStore:
                 top[0][14],
                 top[0][15],
                 top[0][17],
+                top[0][19],
             )
             for item in top[1:]:
                 if (
@@ -477,6 +503,7 @@ class LedgerStore:
                         item[14],
                         item[15],
                         item[17],
+                        item[19],
                     )
                     != reference
                 ):
@@ -514,6 +541,7 @@ class LedgerStore:
                 attested_expired_records,
                 source_key_history,
                 key_history_repair,
+                recorded_history_heads,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -577,6 +605,14 @@ class LedgerStore:
                 audit_signer = self._make_audit_signer(1, 0)
                 signer_history = [self._public_signer_entry(audit_signer)]
 
+            # When the online /v1/history endpoints are configured, strictly
+            # revalidate the external signer log and checkpoint-history files
+            # and bind them to the last history_access audit event and the
+            # heads recorded by this snapshot. Any mismatch is fatal.
+            actual_history_heads = self._revalidate_history_files(
+                recorded_history_heads, audit_events, winner_path
+            )
+
             self.chain = chain
             self.pending = pending
             self.forks = forks
@@ -590,6 +626,7 @@ class LedgerStore:
             self.audit_signer = audit_signer
             self.audit_signer_history = signer_history
             self.generation = generation
+            self.history_head, self.history_trust_head = actual_history_heads
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
             # service default, so older snapshots without the field still
@@ -607,6 +644,136 @@ class LedgerStore:
             # the next ordinary mutating save, never forced here.)
             if backfilled or audit_repair or signer_migration:
                 self.save()
+
+    def _revalidate_history_files(
+        self,
+        recorded_heads: tuple[str | None, str | None],
+        audit_events: list[dict],
+        snapshot_path: str,
+    ) -> tuple[str | None, str | None]:
+        """Strictly revalidate the online /v1/history files after recovery.
+
+        The durable signer log (``--history-trust``) and the checkpoint
+        history sidecar (``--history`` + ``.history``) are externally managed
+        files. On the single winning snapshot each is strictly reloaded
+        (shape/types/hash links/certificates/state-hash context replay), and
+        both are bound two ways:
+
+        * the heads recorded in the snapshot must equal the files' actual
+          heads;
+        * the last ``history_access`` audit event, if any, must name those
+          same heads — an offline change to either file after the final online
+          access therefore fails recovery.
+
+        Any mismatch raises StateRecoveryError carrying the offending file's
+        ``path`` and a ``reason``; no online history state is ever silently
+        rebuilt. Returns ``(history_head, trust_head)`` (each None when the
+        corresponding file does not yet exist).
+        """
+        recorded_history_head, recorded_trust_head = recorded_heads
+        if self.history_path is None and self.history_trust_path is None:
+            return None, None
+        # Imported lazily: light_client imports this package at module load.
+        from . import light_client
+
+        actual_trust_head: str | None = None
+        if self.history_trust_path is not None:
+            try:
+                _, actual_trust_head = light_client.history_trust_head(
+                    self.history_trust_path
+                )
+            except light_client._CheckpointError as failure:
+                raise StateRecoveryError(
+                    self.history_trust_path,
+                    f"history trust log failed validation ({failure.category})",
+                ) from None
+
+        actual_history_head: str | None = None
+        if self.history_path is not None:
+            sidecar_path = light_client.history_sidecar_path(self.history_path)
+            # The sidecar is strictly replayed first; a sidecar defect is
+            # reported against the sidecar path.
+            try:
+                sidecar = light_client.history_sidecar_document(self.history_path)
+            except light_client._CheckpointError as failure:
+                raise StateRecoveryError(
+                    sidecar_path,
+                    f"checkpoint history failed validation ({failure.category})",
+                ) from None
+            if sidecar is not None:
+                actual_history_head = sidecar["head"]
+                # A present sidecar's tip must reproduce the advance checkpoint
+                # file exactly (the same export_history binding); a missing or
+                # mismatched checkpoint is reported against its own path.
+                try:
+                    checkpoint = light_client.history_checkpoint(self.history_path)
+                except light_client._CheckpointError as failure:
+                    raise StateRecoveryError(
+                        self.history_path,
+                        f"checkpoint failed validation ({failure.category})",
+                    ) from None
+                if checkpoint != sidecar["records"][-1]["checkpoint"]:
+                    raise StateRecoveryError(
+                        self.history_path,
+                        "checkpoint does not match the sidecar tip record",
+                    )
+
+        last_access = next(
+            (
+                event
+                for event in reversed(audit_events)
+                if event.get("kind") == EVENT_HISTORY_ACCESS
+            ),
+            None,
+        )
+        if last_access is None:
+            # No online access has ever been bound: the externally managed
+            # files are still strictly revalidated above, but nothing pins
+            # their heads yet (a fresh deployment may point --history at an
+            # offline-created checkpoint). A recorded head without its binding
+            # event can only come from a hand-forged snapshot.
+            if recorded_history_head is not None or recorded_trust_head is not None:
+                raise StateRecoveryError(
+                    snapshot_path,
+                    "recorded history heads without a history_access audit event",
+                )
+            return None, None
+
+        # A binding event exists: the actual files and the event's heads must
+        # agree per configured file. The recorded heads are additionally
+        # checked when present; they may be None when the snapshot was last
+        # written during a no---history-flags interlude, but a present recorded
+        # head was written in the same atomic write as the event and cannot
+        # contradict it.
+        if self.history_trust_path is not None:
+            if last_access.get("trust_head") != actual_trust_head:
+                raise StateRecoveryError(
+                    self.history_trust_path,
+                    "signer log is not bound to the last history_access event",
+                )
+            if (
+                recorded_trust_head is not None
+                and recorded_trust_head != last_access.get("trust_head")
+            ):
+                raise StateRecoveryError(
+                    snapshot_path,
+                    "recorded history_trust_head does not match the bound event",
+                )
+        if self.history_path is not None:
+            if last_access.get("history_head") != actual_history_head:
+                raise StateRecoveryError(
+                    light_client.history_sidecar_path(self.history_path),
+                    "checkpoint history is not bound to the last history_access event",
+                )
+            if (
+                recorded_history_head is not None
+                and recorded_history_head != last_access.get("history_head")
+            ):
+                raise StateRecoveryError(
+                    snapshot_path,
+                    "recorded history_head does not match the bound event",
+                )
+        return actual_history_head, actual_trust_head
 
     def _discover_candidates(self, directory: str) -> list[str]:
         """List the main file and sibling .ledger-* snapshots (if any)."""
@@ -641,6 +808,7 @@ class LedgerStore:
         state_root: str | None = None,
         attested_syncs: dict[tuple[str, str], dict] | None = None,
         source_key_history: dict[str, list[dict]] | None = None,
+        history_heads: tuple[str | None, str | None] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -702,6 +870,7 @@ class LedgerStore:
             {"source": source, "keys": [dict(entry) for entry in history]}
             for source, history in sorted((source_key_history or {}).items())
         ]
+        heads = history_heads or (None, None)
         return json.dumps(
             {
                 "initial_balance": initial_balance,
@@ -721,6 +890,8 @@ class LedgerStore:
                 or {"event_id": 0, "event_hash": "0" * 64},
                 "audit_signer_history": audit_signer_history or [],
                 "state_root": state_root,
+                "history_head": heads[0],
+                "history_trust_head": heads[1],
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -784,6 +955,7 @@ class LedgerStore:
         list[tuple[str, str, dict]],
         dict[str, list[dict]],
         bool,
+        tuple[str | None, str | None],
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -836,6 +1008,24 @@ class LedgerStore:
             recorded_state_root
         ):
             fail("state.state_root must be 64 lowercase hex characters")
+        # Heads of the external online /v1/history files (signer log and
+        # checkpoint-history sidecar) recorded by the most recent history
+        # access. Shape-checked on every candidate; the cross-check against
+        # the actual files and the last history_access event runs once on the
+        # single winning snapshot.
+        recorded_history_head = state.get("history_head")
+        if recorded_history_head is not None and not crypto.is_hex64(
+            recorded_history_head
+        ):
+            fail("state.history_head must be 64 lowercase hex characters or null")
+        recorded_history_trust_head = state.get("history_trust_head")
+        if recorded_history_trust_head is not None and not crypto.is_hex64(
+            recorded_history_trust_head
+        ):
+            fail(
+                "state.history_trust_head must be 64 lowercase hex characters "
+                "or null"
+            )
 
         chain: list[Block] = []
         seen_tx_ids: set[str] = set()
@@ -1037,6 +1227,7 @@ class LedgerStore:
             attested_expired,
             source_key_history,
             _key_history_repair,
+            (recorded_history_head, recorded_history_trust_head),
         )
 
     @staticmethod
@@ -1787,6 +1978,10 @@ class LedgerStore:
             EVENT_ALLOWLIST_ADDED,
             EVENT_ALLOWLIST_REMOVED,
         }
+        # Online /v1/history access events bind one action to the two external
+        # history files' heads; the heads themselves are cross-checked against
+        # the actual files by load() on the single winning snapshot.
+        history_actions = ("read", "update", "export")
         events: list[dict] = []
         for i, event in enumerate(raw):
             if not isinstance(event, dict):
@@ -1891,6 +2086,43 @@ class LedgerStore:
                         path,
                         f"audit event {event_id} ({kind}) expires_at must be an integer",
                     )
+            elif kind == EVENT_HISTORY_ACCESS:
+                # A history_access event's payload is exactly the declared
+                # {action, trust_head, history_head} order: action one of
+                # read/update/export and each head a 64-hex string or null.
+                payload_fields = ("action", "trust_head", "history_head")
+                extra = set(event) - {
+                    "event_id",
+                    "kind",
+                    "at",
+                    "prev_hash",
+                    "event_hash",
+                    *payload_fields,
+                }
+                if extra:
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} (history_access) has extra fields",
+                    )
+                action = event.get("action")
+                if not all(field in event for field in payload_fields):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} (history_access) is missing payload fields",
+                    )
+                if action not in history_actions:
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} (history_access) has invalid action",
+                    )
+                for head_field in ("trust_head", "history_head"):
+                    head_value = event.get(head_field)
+                    if head_value is not None and not crypto.is_hex64(head_value):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (history_access) has invalid "
+                            f"{head_field}",
+                        )
             events.append(dict(event))
         return events
 
@@ -2706,6 +2938,15 @@ class LedgerStore:
             data["state"]["audit_signer_history"] = [
                 dict(entry) for entry in self.audit_signer_history
             ]
+        # When the online /v1/history endpoints are configured, the two
+        # externally-managed history files are bound to this snapshot by the
+        # heads observed at the most recent access. Recovery strictly reloads
+        # the files and cross-checks the last history_access event against
+        # these values.
+        if self.history_path is not None:
+            data["state"]["history_head"] = self.history_head
+        if self.history_trust_path is not None:
+            data["state"]["history_trust_head"] = self.history_trust_head
         # Only persist a forks section when candidates exist so a chain with
         # no forks keeps the canonical snapshot layout; loads default to [].
         if self.forks:
