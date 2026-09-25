@@ -709,6 +709,48 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
   被删记录的 `{generation, hash}` 并重写侧车——检查点文件本身永不被
   裁剪改动。
 
+### 检查点历史的签名分页导出与离线校验
+
+在纯库 API 上新增一对入口，其余入口不变；导出**只读**侧车与检查点，
+绝不改动任何文件。
+
+`ledger.light_client.export_history(path, key, after=None, limit=50)
+-> dict`：
+
+- `key` 为导出方 Ed25519 私钥种子，必须是 **64 位小写 hex**；`after` 为
+  `None`（从留存 `base` 起）或**非布尔非负整数**游标，且必须命中
+  `base.generation`（从首条留存记录重新开始）或某条**非末代**留存记录的
+  代号（从其后继续）；命末代、命中断点后已裁剪掉的代号或越界均归
+  `state`；`limit` 为 **1–200 的非布尔整数**。参数畸形归 `input`，侧车
+  缺失/不可读归 `io`，侧车严格重放失败归 `state`。
+- 成功返回单页，顶层键序固定为
+  `base, records, next, head, checkpoint, auth`：`base`/`records` 等嵌套
+  结构与侧车既有形状完全一致，`records` 非空；有后页时 `next` 取本页末项
+  代号，否则为 `null`；`head` 为侧车头；`checkpoint` 为末条留存记录的
+  检查点（即当前活检查点）。
+- `auth = {public_key, signature}`：`public_key` 为 `key` 推导的 64 位小写
+  hex 公钥；先对**去掉 `auth`** 的整页取 README canonical JSON（排序键、
+  紧凑分隔符、非 ASCII 不转义），再取 SHA-256 摘要作 Ed25519 签名消息。
+
+`ledger.light_client.verify_history(pages, public_key) -> dict` 在离线、
+无任何本地状态的情况下核验一次（可能跨多页的）导出：
+
+- `pages` 必须为**非空数组**，`public_key` 必须是 64 位小写 hex；逐页核对
+  精确键序/类型与 Ed25519 签名，且所有页的 `base`、`head`、`checkpoint`
+  与 `auth.public_key` 必须彼此相同，`auth.public_key` 还必须等于调用方钉
+  住的公钥——签名或公钥不符归 `auth`，文档结构畸形归 `input`。
+- 记录必须自 `base` 跨页按 `next` 连续：代号自 `base.generation + 1`
+  连续，首页 `prev = base.hash`，逐条重算
+  `hash = SHA256(ASCII(prev) ‖ canonical_json(checkpoint))`，相邻检查点
+  锚点连续（后一检查点 anchor = 前一检查点 tip）；非末页 `next` 必须恰为
+  该页末项代号，缺页、重页、乱序页均会在链接处断裂。
+- 末页必须 `next = null`，其末项 `hash = head`、末项检查点 = 共享
+  `checkpoint`；最后对该检查点做完整重放（重算 `state_hash`，并按其
+  context 的 `verified_at`/`trust`/`documents` 重放内嵌批次，复现
+  anchor/tip/verified_tx_ids）。任一链接、分页或重放失配归 `integrity`。
+- 成功仅返回 `{"ok": true}`；失败为 `{"ok": false, "error": ...}`，
+  `error` 仅取 `input`/`auth`/`integrity`，且**不抛异常**。
+
 
 ## 审计导出的离线校验
 

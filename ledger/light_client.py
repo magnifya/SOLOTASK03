@@ -160,6 +160,40 @@ record's ``{generation, hash}`` and the sidecar is rewritten (the checkpoint
 file itself never changes). Loading replays every retained generation —
 shape, state hash, context replay and anchor continuity — so any tampering
 is a ``state`` failure; a missing or unreadable sidecar is ``io``.
+
+:func:`export_history` exports one signed page of the retained sidecar
+without mutating either file. ``export_history(path, key, after=None,
+limit=50)`` takes the exporter's 64-lowercase-hex Ed25519 seed ``key``;
+``after`` is ``None`` (start at the retained ``base``) or a non-boolean
+non-negative integer that must hit ``base.generation`` (restart at the first
+retained record) or a retained *non-last* record's generation (continue after
+it) — a cursor past the retained records or naming the last record is
+``state``; ``limit`` is a non-boolean integer in ``1..200``. Success returns a
+page with exact key order ``base, records, next, head, checkpoint, auth``:
+nested documents keep their existing shapes, ``records`` is non-empty,
+``next`` is the last record's generation when another page follows (else
+``null``), ``head`` the sidecar head and ``checkpoint`` the last retained
+record's checkpoint; ``auth = {"public_key", "signature"}`` carries the
+seed's public key and an Ed25519 signature over the SHA-256 digest of the
+canonical (sorted, compact, unescaped-non-ASCII) JSON of the page with
+``auth`` removed. Failures are ``input`` (arguments), ``io`` (file) and
+``state`` (sidecar or cursor).
+
+:func:`verify_history` verifies a non-empty ordered list of such pages
+offline against a caller-pinned 64-lowercase-hex public key. Each page must
+have the exact key order/types, every page's signature must verify and all
+pages must pin the same ``base``, ``head``, ``checkpoint`` and
+``auth.public_key`` (which must equal the pinned key). Records must run
+consecutively from ``base.generation + 1`` across the pages: the first
+``prev`` is ``base.hash``, every record's chain hash is recomputed,
+checkpoint anchors stay continuous and each non-final page's ``next`` must
+name its own last record. The final page must carry ``next = null``, its last
+record's ``hash`` must equal ``head`` and its checkpoint must equal the shared
+pinned ``checkpoint``, which is itself replayed (state hash plus embedded
+range batch). A missing, duplicated, shuffled or tampered page is rejected.
+Success is ``{"ok": True}``; failure is ``{"ok": False, "error":
+category}`` — ``input`` (structure), ``auth`` (key/signature) or
+``integrity`` (chain, pagination, replay) — and nothing is raised.
 """
 from __future__ import annotations
 
@@ -1257,6 +1291,18 @@ HISTORY_KEYS = ("v", "base", "records", "head")
 HISTORY_BASE_KEYS = ("generation", "hash")
 HISTORY_RECORD_KEYS = ("checkpoint", "prev", "hash")
 
+# The exact top-level key order of one signed history-export page, and the
+# key order of its trailing authenticator.
+HISTORY_PAGE_KEYS = (
+    "base",
+    "records",
+    "next",
+    "head",
+    "checkpoint",
+    "auth",
+)
+HISTORY_AUTH_KEYS = ("public_key", "signature")
+
 # The sidecar format version.
 HISTORY_VERSION = 1
 
@@ -1905,3 +1951,316 @@ def history(path: str, generation: object = None, keep: object = None) -> dict:
             "head": sidecar["head"],
             "kept": kept,
         }
+
+
+# -- signed paginated history export and offline verification -----------------
+
+
+def _history_canonical_bytes(page: dict) -> bytes:
+    """Canonical README JSON bytes of one page with its ``auth`` removed.
+
+    Sorted keys, compact separators, unescaped non-ASCII — the same canonical
+    form as the checkpoint ``state_hash``. Its SHA-256 digest is the exact
+    Ed25519 message the export seed signs.
+    """
+    unsigned = {key: value for key, value in page.items() if key != "auth"}
+    return _canonical_json_bytes(unsigned)
+
+
+def export_history(
+    path: object,
+    key: object,
+    after: object = None,
+    limit: object = 50,
+) -> dict:
+    """Export one signed page of the retained checkpoint-history sidecar.
+
+    The sidecar at ``path + ".history"`` is strictly loaded and replayed
+    exactly as :func:`history` loads it; this entry point never mutates either
+    file. ``key`` is the exporter's 64-lowercase-hex Ed25519 seed (the
+    matching public key authenticates the page); ``after`` is ``None`` (start
+    at the retained ``base``) or a non-boolean non-negative integer naming a
+    hit: either ``base.generation`` (restart at the first retained record) or a
+    retained *non-last* record's generation (continue with the following
+    record) — naming the last record or a generation the pruned sidecar no
+    longer retains is a ``state`` failure. ``limit`` is a non-boolean integer
+    in ``1..200``.
+
+    Success returns a page dict with the exact key order
+    ``base, records, next, head, checkpoint, auth``: the nested documents keep
+    their existing sidecar shapes, ``records`` is non-empty, ``next`` is the
+    last record's generation when another page follows and ``null`` otherwise,
+    ``head`` is the sidecar head, ``checkpoint`` is the last retained record's
+    (live) checkpoint and ``auth = {"public_key", "signature"}`` is the
+    seed's public key plus an Ed25519 signature over the SHA-256 digest of the
+    canonical (sorted, compact, unescaped-non-ASCII) JSON of the page without
+    ``auth``.
+
+    Every failure is ``{"ok": False, "error": category}`` with category one of
+    ``input`` (bad arguments), ``io`` (a missing or unreadable sidecar) and
+    ``state`` (a sidecar failing validation or an ``after`` cursor that does
+    not hit ``base``/a non-last retained generation).
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not isinstance(key, str) or not _HEX32_RE.fullmatch(key):
+        return {"ok": False, "error": ERR_INPUT}
+    if after is not None and (not _is_int(after) or after < 0):
+        return {"ok": False, "error": ERR_INPUT}
+    if not _is_int(limit) or limit < 1 or limit > 200:
+        return {"ok": False, "error": ERR_INPUT}
+
+    public_key = crypto.derive_public_key(key)
+    if public_key is None:
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            sidecar = _load_history(_history_path(path))
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        if sidecar is None:
+            return {"ok": False, "error": ERR_IO}
+
+        base = sidecar["base"]
+        records = sidecar["records"]
+        if after is None or after == base["generation"]:
+            start = 0
+        else:
+            position = next(
+                (
+                    index
+                    for index, record in enumerate(records)
+                    if record["checkpoint"]["generation"] == after
+                ),
+                None,
+            )
+            # The cursor must name a retained record that actually has a
+            # successor: the last retained generation has no following page.
+            if position is None or position >= len(records) - 1:
+                return {"ok": False, "error": ERR_STATE}
+            start = position + 1
+
+        page_records = records[start : start + limit]
+        cursor = (
+            page_records[-1]["checkpoint"]["generation"]
+            if start + limit < len(records)
+            else None
+        )
+        checkpoint = records[-1]["checkpoint"]
+        page = {
+            "base": base,
+            "records": page_records,
+            "next": cursor,
+            "head": sidecar["head"],
+            "checkpoint": checkpoint,
+        }
+        digest = hashlib.sha256(_history_canonical_bytes(page)).digest()
+        signature = crypto.sign_message(key, digest)
+        if signature is None:
+            return {"ok": False, "error": ERR_INPUT}
+        page["auth"] = {"public_key": public_key, "signature": signature}
+        return page
+
+
+def verify_history(pages: object, public_key: object) -> dict:
+    """Verify a non-empty ordered batch of signed history-export pages offline.
+
+    ``pages`` is a list (non-empty) of :func:`export_history` page documents,
+    each with the exact key order ``base, records, next, head, checkpoint,
+    auth``; ``public_key`` is the 64-lowercase-hex Ed25519 public key pinned by
+    the caller. Every page is checked for exact key order and JSON types, the
+    Ed25519 signature is verified over the SHA-256 digest of the page's
+    canonical JSON with ``auth`` removed, and every page must pin the same
+    ``base``, ``head``, ``checkpoint`` and authenticator ``public_key`` (which
+    must equal the caller-pinned key).
+
+    Records must run consecutively from ``base.generation + 1`` across the
+    whole batch: the first page starts at ``base.hash``, each record's
+    ``prev``/``hash`` chain is recomputed
+    (``SHA256(ASCII(prev) || canonical_json(checkpoint))``) and each later
+    page starts one generation after the previous page's ``next`` cursor.
+    Every page but the last must carry a non-null ``next`` naming its own last
+    record (a missing, duplicated or shuffled page breaks the run); the last
+    page must carry ``next = null``, its last record's ``hash`` must equal
+    ``head`` and its checkpoint must equal the shared pinned ``checkpoint``,
+    which is finally replayed (state hash plus its embedded range batch).
+
+    Returns ``{"ok": True}`` on success or ``{"ok": False, "error":
+    category}`` on failure with category one of ``input`` (page structure or
+    argument shape), ``auth`` (the pinned/embedded public key or a signature)
+    and ``integrity`` (the record chain, pagination or checkpoint replay).
+    Never raises for malformed input.
+    """
+    try:
+        _verify_history_pages(pages, public_key)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {"ok": True}
+
+
+def _verify_history_pages(pages: object, public_key: object) -> None:
+    """Raise :class:`_Failure` with the public category on any page defect."""
+    if not isinstance(pages, list) or not pages:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(public_key, str) or not _HEX32_RE.fullmatch(public_key):
+        raise _Failure(ERR_INPUT)
+
+    shared_base = None
+    shared_head = None
+    shared_checkpoint = None
+    shared_signer = None
+    expected_generation = None
+    expected_prev = None
+    previous_tip = None
+
+    for position, raw_page in enumerate(pages):
+        is_last = position == len(pages) - 1
+        page = _validate_history_page(raw_page)
+        base = page["base"]
+        records = page["records"]
+        head = page["head"]
+        checkpoint = page["checkpoint"]
+        auth = page["auth"]
+
+        # Authenticity binds the page bytes (and hence everything below).
+        if auth["public_key"] != public_key:
+            raise _Failure(ERR_AUTH)
+        digest = hashlib.sha256(_history_canonical_bytes(page)).digest()
+        if not crypto.verify_signature(
+            public_key, digest, auth["signature"]
+        ):
+            raise _Failure(ERR_AUTH)
+
+        if shared_base is None:
+            shared_base = base
+            expected_generation = base["generation"] + 1
+            expected_prev = base["hash"]
+        elif base != shared_base:
+            raise _Failure(ERR_INTEGRITY)
+        if shared_head is not None and head != shared_head:
+            raise _Failure(ERR_INTEGRITY)
+        if shared_checkpoint is not None and checkpoint != shared_checkpoint:
+            raise _Failure(ERR_INTEGRITY)
+        if shared_signer is not None and auth["public_key"] != shared_signer:
+            raise _Failure(ERR_INTEGRITY)
+        shared_head = head
+        shared_checkpoint = checkpoint
+        shared_signer = auth["public_key"]
+
+        for record in records:
+            record_checkpoint = record["checkpoint"]
+            if record_checkpoint["generation"] != expected_generation:
+                raise _Failure(ERR_INTEGRITY)
+            if record["prev"] != expected_prev:
+                raise _Failure(ERR_INTEGRITY)
+            if record != _history_record(record_checkpoint, expected_prev):
+                raise _Failure(ERR_INTEGRITY)
+            # Every carried checkpoint is self-verifying — state hash plus a
+            # full replay of its embedded, signed range batch at its recorded
+            # verification time — exactly as the sidecar's own loader replays
+            # each retained generation.
+            try:
+                _verify_checkpoint_document(record_checkpoint)
+            except _CheckpointError:
+                raise _Failure(ERR_INTEGRITY) from None
+            if previous_tip is not None:
+                # Consecutive checkpoints chain, exactly as the sidecar's own
+                # replay requires: each anchor names the previous tip.
+                expected_anchor = {
+                    "height": previous_tip["height"],
+                    "block_hash": previous_tip["tip_hash"],
+                }
+                if record_checkpoint["anchor"] != expected_anchor:
+                    raise _Failure(ERR_INTEGRITY)
+            previous_tip = record_checkpoint["tip"]
+            expected_generation += 1
+            expected_prev = record["hash"]
+
+        last_generation = records[-1]["checkpoint"]["generation"]
+        if is_last:
+            if page["next"] is not None:
+                raise _Failure(ERR_INTEGRITY)
+            if records[-1]["hash"] != head:
+                raise _Failure(ERR_INTEGRITY)
+            if records[-1]["checkpoint"] != checkpoint:
+                raise _Failure(ERR_INTEGRITY)
+        else:
+            # A non-final page must name its own last record as the cursor, and
+            # the following page must resume exactly one generation later
+            # (enforced when its first record is chained above).
+            if not _is_int(page["next"]):
+                raise _Failure(ERR_INTEGRITY)
+            if page["next"] != last_generation:
+                raise _Failure(ERR_INTEGRITY)
+
+    # The pinned live checkpoint is self-verifying: state hash plus a full
+    # replay of its embedded, signed range batch at its recorded verification
+    # time.
+    try:
+        _verify_checkpoint_document(shared_checkpoint)
+    except _CheckpointError:
+        raise _Failure(ERR_INTEGRITY) from None
+
+
+def _validate_history_page(raw_page: object) -> dict:
+    """Validate the exact key order and JSON types of one export page.
+
+    Nested documents reuse the sidecar's own strict shape validators; any
+    defect is a structural ``input`` failure rather than an integrity one.
+    """
+    if not isinstance(raw_page, dict) or tuple(raw_page.keys()) != HISTORY_PAGE_KEYS:
+        raise _Failure(ERR_INPUT)
+
+    raw_base = raw_page["base"]
+    if not isinstance(raw_base, dict) or tuple(raw_base.keys()) != HISTORY_BASE_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_base["generation"]) or raw_base["generation"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_base["hash"]):
+        raise _Failure(ERR_INPUT)
+    base = {
+        "generation": raw_base["generation"],
+        "hash": raw_base["hash"],
+    }
+
+    raw_records = raw_page["records"]
+    if not isinstance(raw_records, list) or not raw_records:
+        raise _Failure(ERR_INPUT)
+    try:
+        records = [_validate_history_record(raw) for raw in raw_records]
+    except _CheckpointError:
+        raise _Failure(ERR_INPUT) from None
+
+    cursor = raw_page["next"]
+    if cursor is not None and (not _is_int(cursor) or cursor < 0):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_page["head"]):
+        raise _Failure(ERR_INPUT)
+
+    try:
+        checkpoint = _validate_checkpoint_shape(raw_page["checkpoint"])
+    except _CheckpointError:
+        raise _Failure(ERR_INPUT) from None
+
+    auth = raw_page["auth"]
+    if not isinstance(auth, dict) or tuple(auth.keys()) != HISTORY_AUTH_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(auth["public_key"]):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex128(auth["signature"]):
+        raise _Failure(ERR_INPUT)
+
+    return {
+        "base": base,
+        "records": records,
+        "next": cursor,
+        "head": raw_page["head"],
+        "checkpoint": checkpoint,
+        "auth": {"public_key": auth["public_key"], "signature": auth["signature"]},
+    }
