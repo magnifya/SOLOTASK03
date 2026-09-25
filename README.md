@@ -665,9 +665,10 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
   `verified_at, trust, documents, verified_tx_ids`，`state_hash =
   SHA256(其余字段 canonical_json 字节)`（`sort_keys`、紧凑分隔符、
   `ensure_ascii=False`）。
-- 同一 `path` 共用一把锁，临时文件 fsync 后 `os.replace` 原子换入；**核验
-  失败不增代、不改动文件**。成功在 `verify_range_exports` 结果末尾追加
-  `generation`。
+- 同一 `path` 共用一把锁（与 `history` 共锁），临时文件 fsync 后
+  `os.replace` 原子换入；**核验失败不增代、不改动文件**。成功在
+  `verify_range_exports` 结果末尾追加 `generation`。
+- 每次成功推进还在侧车文件 `path + ".history"` **追加一条代际记录**（见下）。
 - 每次推进先严格加载既有检查点：校验顶层/context 键序、字段类型、重算
   `state_hash`，并按 context 的 `verified_at` 用其保存的 `trust` 与
   `documents` 重放（必须复现 anchor/tip/verified_tx_ids）。任何失配归
@@ -676,6 +677,42 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
   `input`/`auth`/`expired`/`integrity`/`state`/`io`：参数畸形为 `input`，
   批次核验沿用四类，已存检查点失配为 `state`（JSON 解析失败也是 `state`），
   文件无法读/写/原子替换为 `io`。
+
+### 检查点代际历史侧车与 `history`
+
+每次 `advance` 成功，除写 `path` 外还把新检查点作为一条记录追加到侧车
+`path + ".history"`。侧车与 `path` **同一序列化**（紧凑 UTF-8 JSON、非 ASCII
+不转义、末尾恰好一个换行），顶层键序固定为 `v, base, records, head`：
+
+- `v = 1`；`base` 键序固定为 `generation, hash`；每条记录键序固定为
+  `checkpoint, prev, hash`，其中 `checkpoint` 即**原五键**检查点。
+- 记录自 `base.generation + 1` 起**逐代连续**；首记录的 `prev = base.hash`，
+  其后每条 `prev` 取前一条的 `hash`；
+  `hash = SHA256(ASCII(prev) ∥ canonical_json(checkpoint))`，
+  `head` = 末条 `hash`，均为 64 位小写 hex。
+- 全新历史的 `base = (0, Z)`（`Z` 为 64 个 0）。**旧 g 代检查点无侧车**时，
+  视为 `base = (g-1, Z)`、该旧检查点为**首条记录**（`prev = Z`）；下一次
+  `advance` 在其后追加。
+- 裁剪只删记录**前缀**：保留的后缀原地重排（其 `prev`/`hash` 链接不变），
+  `base` 变为「最后一条被删记录」的 `generation/hash`。
+
+`ledger.light_client.history(path, generation=None, keep=None) -> dict` 读回
+或裁剪代际历史（纯库 API）：
+
+- `generation` 与 `keep` **互斥**；给出时任一都必须是**非布尔正整数**。二者
+  皆缺省即查询末代。查询前**逐代重放**（每条嵌入检查点都重算 `state_hash`
+  并按其 `verified_at` 重放，链接哈希逐条重算）。
+- 查询成功键序固定为 `ok, base, record, head, kept`：`record` 为指定代
+  （缺省为末代）的记录，`kept = null`。
+- 给 `keep` 时保留**末 `min(keep, 原记录数)` 条**：`kept` 为实际保留条数、
+  `record` 为保留末项；一条都没删则两文件**字节不变**，否则 `base` 变为最后
+  一条删除项的 `generation/hash`，而 `path` 文件**始终不变**。
+- 失败只返回 `{ok:false,error}`，`error` 仅取 `input`/`io`/`state`：参数畸形
+  为 `input`；文件缺失/不可读/不可写为 `io`；目标代不存在、侧车结构/链接/
+  重放失配（含无检查点的孤儿侧车）为 `state`。
+- 与 `advance` **共锁成一个事务**：提交中任一文件写失败，已替换的文件按
+  原字节补偿还原（原本不存在则删除）；若补偿也失败，则重读落盘状态后再返回
+  `io`，绝不据陈旧缓存继续。**不保证崩溃/断电中途的原子性**。
 
 
 ## 审计导出的离线校验
@@ -782,7 +819,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复 |
 | `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名） |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；持久化区间检查点 `advance` 及其 `path+".history"` 代际历史侧车（`v,base,records,head` 哈希链、旧检查点兼容、`history` 逐代重放查询与 `keep` 前缀裁剪、共锁事务与失败补偿） |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
@@ -1122,6 +1159,7 @@ python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/range_export_verify_test.py  # 区间导出离线核验 verify_range_export（固定顶层键序、expected_anchor 严格相等、尾部重算与 pending 末块、tip 摘要、plain allowlist+attestation null、attested 钉住公钥+ledger-sync-range-v1 签名、input/auth/expired/integrity 分类、CLI verify-range 文件/stdin/退出码）
 python tests/range_export_batch_verify_test.py  # 多页增量区间离线连续核验 verify_range_exports（非空数组、逐页复验、首锚=expected_anchor 后锚=前页 tip{height,block_hash}、断锚/跳高/重叠 integrity、tx_id 跨页唯一、pending 只许末页、成功键序 ok,anchor,tip,pages,verified_tx_ids 升序、input/auth/expired/integrity 分类、CLI verify-range-batch 文件/stdin/退出码）
+python tests/checkpoint_history_test.py  # 检查点代际历史侧车与 history（advance 写 path+".history" 固定 v,base,records,head 键序与 base/记录键序；全新 base=(0,Z)、记录自 base+1 连续、prev 链与 hash=SHA256(ASCII(prev)∥canonical checkpoint)、head=末hash；同 path 序列化；旧 g 代无侧车视为 base=(g-1,Z)+首记录并在推进时追加；history 缺省查末代/指定代逐代重放、成功键序 ok,base,record,head,kept、kept=null；keep 保留末 min(keep,原数) 条、无删字节不变否则 base=末删项 generation/hash 且 path 不变；参数互斥/非布尔正整数 input、缺文件/读写失败 io、目标缺/校验失配/孤儿侧车 state；共锁事务、写失败按原字节补偿、崩溃断电不保证原子）
 python tests/source_key_history_test.py  # 来源公钥历史 source_key_history（注册写版本1及事件号、轮换递增记新事件、撤销保留历史、原子落盘回滚；GET /v1/trust 固定键序 genesis_hash,sources,allowlist,audit_signers,source_key_history 与项键序 version,public_key,activated_event_id；重启逐字节保留、旧快照内存重建不强制写盘、历史结构/事件不符 StateRecoveryError；verify_range_export 按 attestation.version 取历史公钥并匹配 attestation.public_key，未知项 auth、签名错 integrity、无历史旧规、畸形 input；HTTP 线序）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
