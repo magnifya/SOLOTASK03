@@ -109,12 +109,36 @@ block after a pending one is an ``integrity`` failure. Success returns
 the last page's tip, ``pages`` the page count and ``verified_tx_ids``
 ascending; failure is ``{"ok": False, "error": category}`` with category one
 of ``input/auth/expired/integrity``.
+
+:func:`advance` durably checkpoints a verified batch to ``path``. The
+checkpoint file is one compact UTF-8 JSON document with the exact declared key
+order ``generation, anchor, tip, context, state_hash`` and a single trailing
+newline (non-ASCII written unescaped); ``generation`` starts at 1 and
+increments per successful advance, ``anchor``/``tip`` are the batch's pinned
+anchor and closed tip, ``context`` has the exact key order
+``verified_at, trust, documents, verified_tx_ids`` (the ``now`` at verification,
+the trust document and the re-verifiable batch verbatim) and ``state_hash`` is
+the SHA-256 of the canonical (sorted, compact) JSON of the other four fields.
+The first advance requires a legal ``anchor``; later advances accept ``None``
+(continue from the stored tip) or the stored tip's ``{height, block_hash}``.
+Verification itself is :func:`verify_range_exports` unchanged. Same-path
+advances share one lock and the new file is atomically replaced into place; a
+failed verification never bumps the generation. An existing checkpoint is
+strictly reloaded (key order, types, state hash and a context replay at its
+``verified_at``); any mismatch is a ``state`` failure and the file is never
+truncated or rebuilt. Failures return only ``{"ok": False, "error":
+category}`` with category one of
+``input/auth/expired/integrity/state/io``; success appends the new
+``generation`` as the final result key.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
+import threading
 import time
 
 from . import crypto
@@ -127,6 +151,8 @@ ERR_AUTH = "auth"
 ERR_EXPIRED = "expired"
 ERR_INTEGRITY = "integrity"
 ERR_PROOF = "proof"
+ERR_STATE = "state"
+ERR_IO = "io"
 
 # Descriptor fields of a chain tip, exactly as GET /v1/chain reports them.
 DESCRIPTOR_FIELDS = ("tip_hash", "height", "length", "status")
@@ -1178,3 +1204,339 @@ def _verify_range_attestation(document: dict, trust: dict) -> None:
     digest = hashlib.sha256(message).digest()
     if not crypto.verify_signature(pinned, digest, attestation["signature"]):
         raise _Failure(ERR_INTEGRITY)
+
+
+# -- durable range checkpoint -------------------------------------------------
+
+# The exact top-level key order of one persisted advance checkpoint.
+CHECKPOINT_KEYS = ("generation", "anchor", "tip", "context", "state_hash")
+
+# The exact key order of the checkpoint's re-verifiable context.
+CHECKPOINT_CONTEXT_KEYS = (
+    "verified_at",
+    "trust",
+    "documents",
+    "verified_tx_ids",
+)
+
+# One lock per checkpoint path serializes same-path advances (and their
+# atomic replace) across threads within one process.
+_checkpoint_locks: dict[str, threading.RLock] = {}
+_checkpoint_locks_guard = threading.Lock()
+
+
+def _checkpoint_lock(path: str) -> threading.RLock:
+    key = os.path.abspath(path)
+    with _checkpoint_locks_guard:
+        lock = _checkpoint_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _checkpoint_locks[key] = lock
+        return lock
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    """Sorted-key, compact, unescaped-non-ASCII UTF-8 canonical JSON bytes."""
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _checkpoint_state_hash(generation: int, anchor: dict, tip: dict, context: dict) -> str:
+    """SHA-256 over the canonical JSON bytes of every field but state_hash."""
+    body = {
+        "generation": generation,
+        "anchor": anchor,
+        "tip": tip,
+        "context": context,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def _failed_advance(category: str) -> dict:
+    return {"ok": False, "error": category}
+
+
+def advance(
+    path: str,
+    docs: object,
+    trust: object,
+    anchor: object,
+    now: object,
+) -> dict:
+    """Verify a range-export batch and durably checkpoint it at ``path``.
+
+    ``docs`` is an ordered, non-empty batch of range deliveries verified with
+    :func:`verify_range_exports` against ``trust`` and ``anchor`` at time
+    ``now``: ``now`` must be a plain (non-boolean) non-negative integer; the
+    first use of ``path`` requires a legal ``anchor`` (``{height, block_hash}``),
+    while a later advance passes ``None`` (continue from the stored tip) or the
+    stored tip's ``{height, block_hash}``.
+
+    On success the checkpoint is written atomically (a uniquely named temp file
+    in the same directory, fsynced and ``os.replace``d under a per-path lock)
+    with key order ``generation, anchor, tip, context, state_hash``; generation
+    starts at 1 and increments once per successful advance, so a failed
+    verification never bumps it. The return value is the verifier result with
+    the new ``generation`` appended as the final key.
+
+    Every failure is ``{"ok": False, "error": category}`` with category one of
+    ``input`` (bad arguments or checkpoint shape), ``auth``/``expired``/
+    ``integrity`` (batch verification), ``state`` (an existing checkpoint fails
+    its key-order/type/hash/replay checks; it is never truncated or rebuilt) and
+    ``io`` (the checkpoint cannot be read or written).
+    """
+    # Argument shape is validated before any file or verification work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    if not _is_int(now) or now < 0:
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            previous = _load_checkpoint(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+
+        if previous is None:
+            # First use: the caller must pin a legal anchor.
+            expected_anchor = _validate_advance_anchor(anchor)
+            if expected_anchor is None:
+                return _failed_advance(ERR_INPUT)
+            generation = 0
+        else:
+            generation = previous["generation"]
+            stored_tip = previous["tip"]
+            if anchor is None:
+                # Continue the continuous chain from the stored closed tip.
+                expected_anchor = {
+                    "height": stored_tip["height"],
+                    "block_hash": stored_tip["tip_hash"],
+                }
+            else:
+                expected_anchor = _validate_advance_anchor(anchor)
+                if (
+                    expected_anchor is None
+                    or expected_anchor
+                    != {
+                        "height": stored_tip["height"],
+                        "block_hash": stored_tip["tip_hash"],
+                    }
+                ):
+                    return _failed_advance(ERR_INPUT)
+
+        result = verify_range_exports(docs, expected_anchor, trust, now)
+        if not result.get("ok"):
+            return {"ok": False, "error": result["error"]}
+
+        context = {
+            "verified_at": now,
+            "trust": trust,
+            "documents": docs,
+            "verified_tx_ids": result["verified_tx_ids"],
+        }
+        next_generation = generation + 1
+        checkpoint = {
+            "generation": next_generation,
+            "anchor": result["anchor"],
+            "tip": result["tip"],
+            "context": context,
+        }
+        checkpoint["state_hash"] = _checkpoint_state_hash(
+            next_generation,
+            checkpoint["anchor"],
+            checkpoint["tip"],
+            checkpoint["context"],
+        )
+        try:
+            _atomic_write_checkpoint(path, checkpoint)
+        except OSError:
+            return _failed_advance(ERR_IO)
+
+        advanced = dict(result)
+        advanced["generation"] = next_generation
+        return advanced
+
+
+def _validate_advance_anchor(raw: object) -> dict | None:
+    """Validate an advance anchor as ``{height: non-negative int, block_hash}``.
+
+    Mirrors the range verifier's raw-value rules (booleans rejected); returns a
+    fresh closed document or None on any shape/type defect.
+    """
+    if not isinstance(raw, dict) or set(raw) != {"height", "block_hash"}:
+        return None
+    height = raw["height"]
+    if not _is_int(height) or height < 0:
+        return None
+    if not crypto.is_hex64(raw["block_hash"]):
+        return None
+    return {"height": height, "block_hash": raw["block_hash"]}
+
+
+class _CheckpointError(Exception):
+    """Internal control-flow exception carrying the public error category."""
+
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(category)
+
+
+def _load_checkpoint(path: str) -> dict | None:
+    """Strictly load and re-verify an existing advance checkpoint.
+
+    Returns None when no file exists at ``path``. Otherwise validates the exact
+    key order and JSON types, recomputes ``state_hash`` over the other fields,
+    and replays the stored batch through :func:`verify_range_exports` at the
+    context's ``verified_at`` — the batch must chain from the stored anchor to
+    the stored tip and reproduce the stored verified tx ids. Any defect is a
+    ``state`` failure (unreadable JSON is ``io``); the file is never truncated
+    or rebuilt.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+
+    try:
+        data = json.loads(text)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    checkpoint = _validate_checkpoint_shape(data)
+
+    # The recorded state hash pins the document before any replay: a tampered
+    # generation, anchor, tip or context is state corruption, not re-verified.
+    recomputed = _checkpoint_state_hash(
+        checkpoint["generation"],
+        checkpoint["anchor"],
+        checkpoint["tip"],
+        checkpoint["context"],
+    )
+    if recomputed != checkpoint["state_hash"]:
+        raise _CheckpointError(ERR_STATE)
+
+    context = checkpoint["context"]
+    replay = verify_range_exports(
+        context["documents"],
+        checkpoint["anchor"],
+        context["trust"],
+        context["verified_at"],
+    )
+    if not replay.get("ok"):
+        raise _CheckpointError(ERR_STATE)
+    if replay["anchor"] != checkpoint["anchor"]:
+        raise _CheckpointError(ERR_STATE)
+    if replay["tip"] != checkpoint["tip"]:
+        raise _CheckpointError(ERR_STATE)
+    if replay["verified_tx_ids"] != context["verified_tx_ids"]:
+        raise _CheckpointError(ERR_STATE)
+    return checkpoint
+
+
+def _validate_checkpoint_shape(data: object) -> dict:
+    """Validate the exact key order and JSON types of one checkpoint document."""
+    if not isinstance(data, dict) or tuple(data.keys()) != CHECKPOINT_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    generation = data["generation"]
+    anchor = data["anchor"]
+    tip = data["tip"]
+    context = data["context"]
+    state_hash = data["state_hash"]
+
+    if not _is_int(generation) or generation < 1:
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(anchor, dict):
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(tip, dict):
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(context, dict) or tuple(context.keys()) != CHECKPOINT_CONTEXT_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(state_hash):
+        raise _CheckpointError(ERR_STATE)
+
+    verified_at = context["verified_at"]
+    trust = context["trust"]
+    documents = context["documents"]
+    verified_tx_ids = context["verified_tx_ids"]
+    if not _is_int(verified_at) or verified_at < 0:
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(trust, dict):
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(documents, list) or not documents:
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(verified_tx_ids, list) or any(
+        not isinstance(tx_id, str) for tx_id in verified_tx_ids
+    ):
+        raise _CheckpointError(ERR_STATE)
+
+    # The anchor and tip are additionally shape-checked so a corrupt document
+    # can never reach the replay (which treats them as trusted call arguments).
+    if _validate_advance_anchor(anchor) is None:
+        raise _CheckpointError(ERR_STATE)
+    if set(tip) != set(DESCRIPTOR_FIELDS):
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(tip.get("height")) or tip["height"] < 0:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(tip.get("length")) or tip["length"] < 1:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(tip.get("tip_hash")):
+        raise _CheckpointError(ERR_STATE)
+    if tip.get("status") not in (STATUS_CONFIRMED, STATUS_PENDING):
+        raise _CheckpointError(ERR_STATE)
+
+    return {
+        "generation": generation,
+        "anchor": anchor,
+        "tip": tip,
+        "context": context,
+        "state_hash": state_hash,
+    }
+
+
+def _atomic_write_checkpoint(path: str, checkpoint: dict) -> None:
+    """Write the checkpoint in declared key order and atomically replace ``path``.
+
+    The document is compact UTF-8 JSON with non-ASCII unescaped and exactly one
+    trailing newline. The temp file is fsynced before the replace and the
+    directory afterwards, mirroring the main store's durability rules.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    ordered = {key: checkpoint[key] for key in CHECKPOINT_KEYS}
+    payload = (
+        json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(prefix=".light-checkpoint-", dir=directory)
+    promoted = False
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+        promoted = True
+        _fsync_dir(directory)
+    finally:
+        if not promoted and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _fsync_dir(directory: str) -> None:
+    """Best-effort directory fsync so the checkpoint rename survives a crash."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)

@@ -55,15 +55,18 @@ Two failure categories are returned, never raised:
 * ``input`` — the document is not an object, a required section is missing or
   has the wrong JSON type, an unknown top-level key appears, or a field carries
   a non-integer/non-string value of the wrong kind before any recomputation
-  (including a trust record missing or adding a key);
+  (including a trust record missing or adding a key), or a trust extension
+  array is out of its declared order (``trust_sources`` items not
+  source-ascending, ``source_key_history`` items not source-ascending, or
+  ``keys`` items whose versions are not dense from 1 with strictly ascending
+  activation ids);
 * ``integrity`` — the document parses but a recomputed value disagrees with
   the stored one (tx/merkle/block hashes, linkage, index, accounts, state_root,
   pending uniqueness or the audit chain/checkpoint), or the trust extensions
   disagree among themselves, the registry or the audit event log (an invalid
-  public key or status, a non-positive version, unsorted or duplicate sources,
-  non-dense versions, a non-positive/non-ascending activation id, an orphan
-  source or lifecycle event, a missing lifecycle event, or a revoked-status
-  mismatch).
+  public key or status, a non-positive version, a non-positive activation id,
+  an orphan source or lifecycle event, a missing lifecycle event, or a
+  revoked-status mismatch).
 """
 from __future__ import annotations
 
@@ -549,9 +552,9 @@ def _parse_trust_sources(raw: object) -> dict[str, dict]:
 
     The array must be sorted by source with no duplicates; each record
     carries exactly ``{source, public_key, expires_at, version, status}``.
-    A missing/extra key or a wrong primitive field type is an input error; an
-    invalid public key or status, a non-positive integer version, or an
-    unsorted/duplicate source is an integrity error.
+    A missing/extra key, a wrong primitive field type or an
+    unsorted/duplicate source is an input error; an invalid public key or
+    status, or a non-positive integer version, is an integrity error.
     """
     if raw is None:
         return {}
@@ -588,8 +591,9 @@ def _parse_trust_sources(raw: object) -> dict[str, dict]:
         if status not in _TRUST_STATUSES:
             raise _Failure(ERR_INTEGRITY)
         if previous is not None and source <= previous:
-            # Sources must be unique and strictly ascending.
-            raise _Failure(ERR_INTEGRITY)
+            # Sources must be unique and strictly ascending; an out-of-order
+            # item is a key-order (shape) defect, not a value mismatch.
+            raise _Failure(ERR_INPUT)
         previous = source
         registry[source] = {
             "public_key": public_key,
@@ -620,9 +624,10 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
     exactly ``{source, keys}`` with a non-empty ``keys`` list of
     ``{version, public_key, activated_event_id}`` entries whose versions are
     dense from 1 and whose activation ids are positive and strictly ascend.
-    A missing/extra key or a wrong primitive field type is an input error; an
-    invalid public key, a non-positive/non-dense version, a non-positive or
-    non-ascending activation id, or a duplicate/unsorted source is integrity.
+    A missing/extra key, a wrong primitive field type, a duplicate/unsorted
+    source, non-dense versions or non-ascending activation ids is an input
+    error; an invalid public key, a non-positive version or a non-positive
+    activation id is integrity.
     """
     if not isinstance(raw, list):
         raise _Failure(ERR_INPUT)
@@ -641,8 +646,9 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
             raise _Failure(ERR_INPUT)
         if previous is not None and source <= previous:
             # History items must be unique and source-ascending like the
-            # registry they mirror.
-            raise _Failure(ERR_INTEGRITY)
+            # registry they mirror; an out-of-order item is a key-order
+            # (shape) defect, not a value mismatch.
+            raise _Failure(ERR_INPUT)
         previous = source
         entries: list[dict] = []
         for position, entry in enumerate(keys):
@@ -659,15 +665,21 @@ def _parse_source_key_history(raw: object) -> dict[str, list[dict]]:
                 raise _Failure(ERR_INPUT)
             if not crypto.is_hex64(public_key):
                 raise _Failure(ERR_INTEGRITY)
-            if version < 1 or version != position + 1:
-                # Key versions are positive integers dense from 1.
+            if version < 1:
+                # A structurally integer but non-positive version is a corrupt
+                # value, not a wrong-shape document.
                 raise _Failure(ERR_INTEGRITY)
+            if version != position + 1:
+                # Key versions are dense from 1; an out-of-order keys item is
+                # a key-order (shape) defect, not a value mismatch.
+                raise _Failure(ERR_INPUT)
             if activated < 1:
                 # Every key is activated by a real, positive audit event id.
                 raise _Failure(ERR_INTEGRITY)
             if position > 0 and activated <= entries[-1]["activated_event_id"]:
-                # Activation event ids strictly ascend with the version.
-                raise _Failure(ERR_INTEGRITY)
+                # Activation event ids strictly ascend with the version; an
+                # out-of-order keys item is a key-order (shape) defect.
+                raise _Failure(ERR_INPUT)
             entries.append(
                 {
                     "version": version,

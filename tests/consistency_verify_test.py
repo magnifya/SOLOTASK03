@@ -39,7 +39,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ledger import audit, crypto
 from ledger.consistency import verify_snapshot
 from ledger.service import LedgerService
-from ledger.store import LedgerStore
+from ledger.store import LedgerStore, StateRecoveryError
 
 FUTURE = 1_900_000_000
 RESULT_KEYS = (
@@ -357,6 +357,94 @@ class IntegrityErrorTests(SnapshotFixture):
             # Checkpoint still pins the original head.
 
         self.assert_integrity(mutate)
+
+
+class TrustKeyOrderTests(SnapshotFixture):
+    """Out-of-order trust extension arrays are shape (input) errors."""
+
+    def _trust_snapshot(self) -> dict:
+        # Register two sources so the stored arrays have two ascending items.
+        self.assertEqual(
+            self.svc.register_trust_source(
+                {"source": "node-a", "public_key": "a" * 64, "expires_at": FUTURE}
+            )[0],
+            201,
+        )
+        self.assertEqual(
+            self.svc.register_trust_source(
+                {"source": "node-b", "public_key": "b" * 64, "expires_at": FUTURE}
+            )[0],
+            201,
+        )
+        return self.load_snapshot()
+
+    def test_unsorted_trust_sources_item_is_input(self) -> None:
+        doc = self._trust_snapshot()
+        doc["trust_sources"] = list(reversed(doc["trust_sources"]))
+        self.assertEqual(
+            verify_snapshot(doc), _failure_shape("input"), doc
+        )
+
+    def test_duplicate_trust_sources_item_is_input(self) -> None:
+        doc = self._trust_snapshot()
+        doc["trust_sources"] = [
+            dict(doc["trust_sources"][0]),
+            dict(doc["trust_sources"][0]),
+        ]
+        self.assertEqual(verify_snapshot(doc), _failure_shape("input"))
+
+    def test_unsorted_source_key_history_item_is_input(self) -> None:
+        doc = self._trust_snapshot()
+        doc["source_key_history"] = list(reversed(doc["source_key_history"]))
+        self.assertEqual(verify_snapshot(doc), _failure_shape("input"))
+
+    def test_non_dense_keys_versions_are_input(self) -> None:
+        doc = self._trust_snapshot()
+        # Rotate node-a so its keys list has two versions, then make the
+        # versions non-dense (out of order) without changing any value type.
+        self.svc.rotate_trust_source(
+            "node-a",
+            {"public_key": "c" * 64, "expires_at": FUTURE, "expected_version": 1},
+        )
+        doc = self.load_snapshot()
+        for item in doc["source_key_history"]:
+            if item["source"] == "node-a":
+                item["keys"] = list(reversed(item["keys"]))
+                # Reversed versions/activations are out of order; the audit
+                # reconciliation would also notice, but ordering is input first.
+        self.assertEqual(verify_snapshot(doc)["error"], "input")
+
+    def test_value_corruption_stays_integrity(self) -> None:
+        # An invalid public key (a value defect) remains integrity, distinct
+        # from the key-order/shape defects above.
+        doc = self._trust_snapshot()
+        doc["trust_sources"][0]["public_key"] = "z" * 64
+        self.assertEqual(verify_snapshot(doc), _failure_shape("integrity"))
+
+    def test_recovery_rejects_out_of_order_arrays_with_path_and_reason(self) -> None:
+        # The same key-order defects that verify_snapshot reports as input are
+        # fatal at startup: recovery raises StateRecoveryError carrying the
+        # offending path and a non-empty reason.
+        doc = self._trust_snapshot()
+        for mutate in (
+            lambda d: d.__setitem__(
+                "trust_sources", list(reversed(d["trust_sources"]))
+            ),
+            lambda d: d.__setitem__(
+                "source_key_history", list(reversed(d["source_key_history"]))
+            ),
+        ):
+            with self.subTest(mutate=mutate):
+                broken = json.loads(json.dumps(doc))
+                mutate(broken)
+                broken_path = os.path.join(self.tmp, "broken.json")
+                with open(broken_path, "w", encoding="utf-8") as fh:
+                    json.dump(broken, fh)
+                with self.assertRaises(StateRecoveryError) as ctx:
+                    LedgerStore(broken_path, initial_balance=1000)
+                self.assertEqual(ctx.exception.path, broken_path)
+                self.assertTrue(ctx.exception.reason)
+                os.unlink(broken_path)
 
 
 class AuditChainAcceptanceTests(SnapshotFixture):

@@ -650,6 +650,34 @@ JSON 数组，`-` 从标准输入读取；锚点参数钉住首页。成功打�
 退出 0；任何核验失败、文件不可读、JSON 解析失败或锚点参数非法均打印
 `{"ok":false,"error":"..."}` 退出 1。
 
+### 持久化区间检查点 `advance`
+
+`ledger.light_client.advance(path, docs, trust, anchor, now) -> dict` 在
+`verify_range_exports` 之上把每批**已核验**的增量落盘为一个可继续的检查点
+文件（纯库 API，verify-range 系列 CLI 不变）：
+
+- `now` 必须是**非布尔、非负整数**；`anchor` 首次使用 `path` 时必须给合法的
+  `{height, block_hash}`，之后可传 `None`（从已存 tip 继续）或已存 tip 的
+  `{height, block_hash}`。核验逻辑与 `verify_range_exports` 完全一致。
+- 文件为单个紧凑 UTF-8 JSON 文档（非 ASCII 不转义），顶层键序固定为
+  `generation, anchor, tip, context, state_hash`，末尾恰好一个换行；
+  `generation` 从 **1** 起每次成功 +1，`context` 键序固定为
+  `verified_at, trust, documents, verified_tx_ids`，`state_hash =
+  SHA256(其余字段 canonical_json 字节)`（`sort_keys`、紧凑分隔符、
+  `ensure_ascii=False`）。
+- 同一 `path` 共用一把锁，临时文件 fsync 后 `os.replace` 原子换入；**核验
+  失败不增代、不改动文件**。成功在 `verify_range_exports` 结果末尾追加
+  `generation`。
+- 每次推进先严格加载既有检查点：校验顶层/context 键序、字段类型、重算
+  `state_hash`，并按 context 的 `verified_at` 用其保存的 `trust` 与
+  `documents` 重放（必须复现 anchor/tip/verified_tx_ids）。任何失配归
+  `state`，且**禁止截断或重建**该文件。
+- 失败只返回 `{ok:false,error}`，`error` 仅取
+  `input`/`auth`/`expired`/`integrity`/`state`/`io`：参数畸形为 `input`，
+  批次核验沿用四类，已存检查点失配为 `state`（JSON 解析失败也是 `state`），
+  文件无法读/写/原子替换为 `io`。
+
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
