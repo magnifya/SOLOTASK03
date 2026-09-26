@@ -281,6 +281,37 @@ backwards or sideways), ``state`` (the checkpoint fails its parse,
 key-order, digest, ownership or replay checks) and ``io`` (the checkpoint
 is missing or cannot be read or written); nothing is raised.
 
+:func:`apply_finality` applies a signed ``GET /v1/chain/finality``
+credential to a checkpoint written by :func:`advance_headers` or
+:func:`reorg_headers`. ``apply_finality(path, document, trust)`` takes no
+default arguments: ``path`` must be a non-empty string; ``document`` is
+the decoded response with the exact top-level key order
+``finalized, tip, auth`` — ``finalized`` a closed ``{height, block_hash}``
+(key order ``height, block_hash``, hash 64 lowercase hex), ``tip`` the
+chain descriptor S and ``auth`` ``{key_version, signature}`` (a
+non-boolean positive version and a 128-char lowercase hex signature);
+``trust`` must carry ``audit_signers`` exactly as for
+:func:`verify_header_page`. Structural and type defects are ``input``.
+The checkpoint is then strictly reloaded and replayed under the shared
+per-path lock (a missing file is ``io``; a parse, key-order, digest or
+replay defect is ``state``) before the credential is judged: an unknown
+key version or a failed Ed25519 verification over
+``SHA256(UTF8("ledger-finality-v1") || canonical_json(document without
+auth))`` is ``auth``; afterwards the credential's ``tip`` must be
+field-for-field identical to the locally replayed tip, and its
+``finalized`` target must name that branch's anchor or one of its
+confirmed headers and must not move the stored boundary backwards or
+sideways (a mismatched tip, an unknown, pending or dropped-fork target,
+or a regressing boundary is ``integrity``). Applying the exact stored
+boundary is idempotent — it returns the current generation and leaves
+the file bytes untouched; raising the boundary increments the
+generation once and atomically rewrites the file in the version-3
+format (same serialization and hash rules as
+:func:`finalize_headers`). Success returns
+``{"ok": True, "generation", "finalized"}`` in that key order; failure
+returns only ``{"ok": False, "error": category}`` and nothing is raised;
+a failed application never changes the file bytes.
+
 :func:`header_locators` derives a fork-location locator request from a
 checkpoint written by :func:`advance_headers` or :func:`reorg_headers`. The
 file is strictly
@@ -3100,6 +3131,44 @@ def restore_file_bytes(path: str, original: bytes | None) -> None:
 # Domain separator prefixing every signed header page.
 HEADER_PAGE_DOMAIN = "ledger-headers-v1"
 
+# Domain separator prefixing every signed finality credential.
+FINALITY_DOMAIN = "ledger-finality-v1"
+
+# The exact contract key order of a signed finality credential and of its
+# nested documents (mirrors GET /v1/chain/finality).
+FINALITY_KEYS = ("finalized", "tip", "auth")
+FINALITY_AUTH_KEYS = ("key_version", "signature")
+
+# Note: the success document of :func:`apply_finality` reuses
+# FINALIZE_HEADERS_RESULT_KEYS (``ok, generation, finalized``).
+
+
+def _finality_bytes(unsigned: dict) -> bytes:
+    """The signed bytes of a finality credential without its ``auth`` envelope:
+    ``UTF8("ledger-finality-v1") || canonical_json({finalized, tip})``.
+    """
+    return FINALITY_DOMAIN.encode("utf-8") + _canonical_json_bytes(unsigned)
+
+
+def sign_finality(
+    private_key_hex: str,
+    key_version: int,
+    finalized: dict,
+    tip: dict,
+) -> dict | None:
+    """Build the ``{key_version, signature}`` envelope of a finality credential.
+
+    The signature is an Ed25519 signature over
+    ``SHA256(UTF8("ledger-finality-v1") || canonical_json({finalized, tip}))``.
+    Returns None when the private key is malformed.
+    """
+    unsigned = {"finalized": finalized, "tip": tip}
+    digest = hashlib.sha256(_finality_bytes(unsigned)).digest()
+    signature = crypto.sign_message(private_key_hex, digest)
+    if signature is None:
+        return None
+    return {"key_version": key_version, "signature": signature}
+
 # The exact contract key order of a signed header page and of its nested
 # closed documents.
 HEADER_PAGE_KEYS = ("anchor", "headers", "tip", "auth")
@@ -4607,6 +4676,214 @@ def finalize_headers(path: object, height: object, block_hash: object) -> dict:
             return _failed_advance(ERR_INTEGRITY)
 
         # The target must be a confirmed header of the current replayed
+        # branch (or its anchor). An unknown height (including a height
+        # past the tip), a dropped-fork hash or a pending header cannot be
+        # finalized.
+        entry = branch.get(target["height"])
+        if entry is None or entry[0] != target["block_hash"]:
+            return _failed_advance(ERR_INTEGRITY)
+        if target != checkpoint["anchor"] and entry[1] != STATUS_CONFIRMED:
+            return _failed_advance(ERR_INTEGRITY)
+
+        next_generation = checkpoint["generation"] + 1
+        rewritten = {
+            "v": HEADER_CHECKPOINT_VERSION,
+            "generation": next_generation,
+            "anchor": checkpoint["anchor"],
+            "tip": checkpoint["tip"],
+            "finalized": target,
+            "steps": checkpoint["steps"],
+        }
+        rewritten["hash"] = _header_checkpoint_hash(
+            HEADER_CHECKPOINT_VERSION,
+            next_generation,
+            checkpoint["anchor"],
+            checkpoint["tip"],
+            target,
+            checkpoint["steps"],
+        )
+
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        try:
+            _atomic_write_header_checkpoint(path, rewritten)
+        except OSError:
+            # Compensate: put the original bytes back best-effort.
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_IO)
+        except (TypeError, ValueError):
+            # A stored value JSON cannot re-serialize is a file defect.
+            return _failed_advance(ERR_STATE)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "finalized": {key: target[key] for key in HEADER_ANCHOR_KEYS},
+        }
+
+
+# -- signed finality credentials (GET /v1/chain/finality) ----------------------
+
+
+def _parse_finality_document(document: object) -> tuple[dict, dict, int, str]:
+    """Stage 1 of the finality contract: exact key order and raw types.
+
+    Every defect here is an input error. Returns the closed finalized
+    boundary, the closed tip descriptor, the envelope's key version and its
+    signature.
+    """
+    if not isinstance(document, dict) or tuple(document.keys()) != FINALITY_KEYS:
+        raise _Failure(ERR_INPUT)
+    finalized = _validate_header_anchor(document["finalized"])
+    raw_tip = document["tip"]
+    if not isinstance(raw_tip, dict) or tuple(raw_tip.keys()) != HEADER_TIP_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_tip["tip_hash"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_tip["height"]) or raw_tip["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_tip["length"]) or raw_tip["length"] < 1:
+        raise _Failure(ERR_INPUT)
+    if raw_tip["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
+        raise _Failure(ERR_INPUT)
+    tip = {key: raw_tip[key] for key in HEADER_TIP_KEYS}
+    raw_auth = document["auth"]
+    if not isinstance(raw_auth, dict) or tuple(raw_auth.keys()) != FINALITY_AUTH_KEYS:
+        raise _Failure(ERR_INPUT)
+    key_version = raw_auth["key_version"]
+    signature = raw_auth["signature"]
+    if not _is_int(key_version) or key_version < 1:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(signature, str) or not crypto.is_hex128(signature):
+        raise _Failure(ERR_INPUT)
+    return finalized, tip, key_version, signature
+
+
+def _authenticate_finality(
+    document: dict, key_version: int, signature: str, signers: dict
+) -> None:
+    """Stage 2 of the finality contract: signer lookup and signature.
+
+    Mirrors :func:`_authenticate_header_page`: the envelope's
+    ``key_version`` selects the public key from ``trust.audit_signers``; an
+    unknown version or an Ed25519 signature that does not verify over the
+    domain-prefixed canonical bytes of the document without its ``auth`` is
+    an auth failure.
+    """
+    public_key = signers.get(key_version)
+    if public_key is None:
+        raise _Failure(ERR_AUTH)
+    unsigned = {key: document[key] for key in FINALITY_KEYS if key != "auth"}
+    digest = hashlib.sha256(_finality_bytes(unsigned)).digest()
+    if not crypto.verify_signature(public_key, digest, signature):
+        raise _Failure(ERR_AUTH)
+
+
+def apply_finality(path: object, document: object, trust: object) -> dict:
+    """Apply a signed ``GET /v1/chain/finality`` credential to a checkpoint.
+
+    The credential document has the exact top-level key order
+    ``finalized, tip, auth``: ``finalized`` the irreversible boundary as
+    ``{height, block_hash}``, ``tip`` the chain descriptor S and ``auth``
+    the ``{key_version, signature}`` envelope signed under the
+    ``ledger-finality-v1`` domain by the version selected from
+    ``trust.audit_signers``.
+
+    The checkpoint at ``path`` is strictly loaded and fully replayed under
+    the per-path lock shared with every other same-path operation (a
+    missing file is ``io``; a parse, key-order, digest or replay defect is
+    ``state``) — persisted state is settled before the credential is
+    judged. Authentication follows: the envelope's ``key_version`` must
+    resolve in ``trust.audit_signers`` and its Ed25519 signature must
+    verify under the ``ledger-finality-v1`` domain (an unknown version or
+    a failed signature is ``auth``). The credential's ``tip`` must then be
+    field-for-field identical to the locally replayed tip; the finalized
+    target must name the replayed branch's anchor or one of its confirmed
+    headers and may not move the stored boundary backwards or sideways. A
+    credential naming the exact stored boundary is idempotent (the file
+    bytes are untouched and the generation holds); a higher boundary
+    increments the generation once and atomically rewrites the file in
+    the version-3 format.
+
+    Success returns ``{"ok": True, "generation", "finalized"}`` in that
+    key order. Failure returns only ``{"ok": False, "error": category}``
+    with category one of ``input`` (argument/document/trust shape or
+    types), ``auth`` (unknown key version or a failed signature),
+    ``integrity`` (tip, branch-ownership or boundary-regression defects),
+    ``state`` (an existing checkpoint fails its parse, key-order, digest
+    or replay checks) and ``io`` (the checkpoint is missing or cannot be
+    read or written; a failed write restores the original bytes
+    best-effort). Nothing is raised and a failed application never
+    changes the file bytes.
+    """
+    # Argument shape is validated before any file work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Stage 1 (input): exact document/trust key order and raw types.
+        # Structural argument validation precedes any file work, exactly as
+        # finalize_headers validates its arguments before loading.
+        try:
+            target, cred_tip, key_version, signature = _parse_finality_document(
+                document
+            )
+            signers = _validate_header_trust(trust)
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+
+        # The persisted checkpoint is strictly loaded and fully replayed
+        # before the credential is judged: a corrupt or missing file is
+        # state/io regardless of the credential it arrives with (mirrors
+        # advance_headers/reorg_headers/finalize_headers and the
+        # load-before-authenticate ordering of history_trust).
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_STATE)
+        if loaded is None:
+            # Finality can only be applied to an existing checkpoint.
+            return _failed_advance(ERR_IO)
+        checkpoint, _step_tips, branch = loaded
+
+        # Stage 2 (auth): signer lookup and the domain signature.
+        try:
+            _authenticate_finality(document, key_version, signature, signers)
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+
+        # Stage 3 (integrity): the credential must describe exactly the
+        # locally replayed state.
+        if cred_tip != checkpoint["tip"]:
+            return _failed_advance(ERR_INTEGRITY)
+
+        finalized = checkpoint["finalized"]
+        if target == finalized:
+            # The exact current boundary replayed: idempotent, the file
+            # bytes stay exactly as they were and the generation holds.
+            return {
+                "ok": True,
+                "generation": checkpoint["generation"],
+                "finalized": {key: finalized[key] for key in HEADER_ANCHOR_KEYS},
+            }
+
+        # The boundary may only advance: a lower height, or the same
+        # height with a different hash, is an integrity failure.
+        if target["height"] < finalized["height"]:
+            return _failed_advance(ERR_INTEGRITY)
+        if target["height"] == finalized["height"]:
+            return _failed_advance(ERR_INTEGRITY)
+
+        # The target must be a confirmed header of the replayed current
         # branch (or its anchor). An unknown height (including a height
         # past the tip), a dropped-fork hash or a pending header cannot be
         # finalized.

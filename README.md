@@ -360,6 +360,39 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   时须重验 finalized 的分支归属（落在已丢弃分叉或 pending 头为
   `state`）。
 
+- **签名最终化凭证**：`GET /v1/chain/finality`（**无参数**，携带任何查询
+  参数——含空值或重复参数——一律 `400`；裸 `?` 无参数照常接受）。主链与
+  审计签名者在**同一把锁**内取快照，`200` 文档键序固定为
+  `finalized, tip, auth`：
+  - `finalized` 键序 `height, block_hash`，取当前主链**最后一个 confirmed
+    块**（genesis 出生即 confirmed；pending 链尾不计入）；
+  - `tip` 沿用链描述符 S（与 `GET /v1/chain/headers` 的 `tip` 完全相同，
+    故链尾 pending 时 `tip` 为 pending 而 `finalized` 仍指上一 confirmed
+    块）；
+  - `auth` 键序 `key_version, signature`：由节点当前审计签名者按
+    **SHA-256 摘要**做出的 Ed25519 签名，签名消息为
+    `UTF8("ledger-finality-v1") ‖ canonical_json(去掉 auth 的文档)`
+    （`canonical_json` 规则与头页一致；签名 128 位小写 hex），版本取
+    `GET /v1/trust` 的 `audit_signers`，轮换后旧凭证仍可按其
+    `key_version` 的历史公钥验证。
+- **应用签名最终化凭证**：`ledger.light_client.apply_finality(path,
+  document, trust) -> dict`（纯库 API，参数无默认值）。`path` 为非空串，
+  `document` 为上述凭证（顶层键序恰为 `finalized, tip, auth`：非布尔整数、
+  64 位小写 hex 哈希、128 位小写 hex 签名），`trust` 须携带
+  `audit_signers`。结构或类型错误为 `input`。随后检查点在同一把
+  per-path 锁下被严格加载与完整重放（文件缺失为 `io`，已存文件解析、
+  键序、摘要或重放失配为 `state`，先于凭证判定）；再验凭证：
+  `key_version` 未知或按 `ledger-finality-v1` 域验签失败为 `auth`。
+  凭证 `tip` 必须与本地重放 tip **逐字段相同**，`finalized` 必须命名
+  重放分支的 anchor 或某一 **confirmed** 头，且不得使边界倒退（更低
+  高度）或横移（同高异 hash）——tip 不符、未知/pending/已丢弃分叉目标
+  或边界倒退均为 `integrity`。凭证边界与已存边界完全
+  相同则**幂等**：返回当前 generation 且文件字节不动；提高边界时
+  `generation + 1` 并沿用 v3 格式（与 `finalize_headers` 相同的序列化与
+  哈希规则）原子换入。成功键序固定为 `ok, generation, finalized`，
+  `finalized` 键序 `height, block_hash`；失败仅返回
+  `{"ok": false, "error"}`、**不抛异常**且**不改变文件字节**。
+
 ## 签名认证的增量区间协议
 
 增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
@@ -1362,6 +1395,13 @@ curl -s 'localhost:8080/v1/chain/range?after_height=2&after_hash=<block-hash>&li
 curl -s 'localhost:8080/v1/chain/headers?after_height=2&after_hash=<block-hash>&limit=100'
 # -> 200 {"anchor":{"height":2,"block_hash":"..."},"headers":[{"height":3,"prev_hash":"...","merkle_root":"...","block_hash":"...","status":"confirmed"}],"tip":{"tip_hash":"...","height":3,"length":4,"status":"confirmed"},"auth":{"key_version":1,"signature":"..."}}
 
+# 签名最终化凭证（无参数，携带任意查询参数 400；200 键序 finalized,tip,auth；
+# finalized 取最后 confirmed 块，pending 链尾只体现在 tip；auth.signature =
+# Ed25519(SHA256(UTF8("ledger-finality-v1") || canonical_json(去auth)))，
+# 离线用 apply_finality(path, document, trust) 落盘推进 finalized 边界）
+curl -s localhost:8080/v1/chain/finality
+# -> 200 {"finalized":{"height":2,"block_hash":"..."},"tip":{"tip_hash":"...","height":3,"length":4,"status":"pending"},"auth":{"key_version":1,"signature":"..."}}
+
 # 增量区间：仅推送锚点之后的尾部区块（拼接 canonical 前缀做整链重验；
 # 状态优先级 400→403→410→锚点 409→重验/tip 400→重复 409；201 五字段，
 # 同 source+request_id 同内容重试 200 首次结果、异内容 409）
@@ -1598,6 +1638,7 @@ python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range
 python tests/header_page_test.py      # 签名区块头分页 GET /v1/chain/headers（after_height/after_hash 必填、limit 1–500 默认 100、400/404/409；固定键序 anchor,headers,tip,auth 与头项 height,prev_hash,merkle_root,block_hash,status；anchor=tip 时空 headers；pending 仅链尾；domain=ledger-headers-v1 的 SHA-256+Ed25519 签名；verify_header_page input/auth/integrity、锚点/tip 钉住、重算哈希与链接、分页串联、轮换历史验签）与 HTTP
 python tests/header_pages_test.py     # 多页签名区块头离线连续校验 verify_header_pages（非空数组逐页复验、各页 tip 逐字段相同且等于钉住 tip_hash、首锚=入参后锚=前页末头、跨页高度/prev_hash 连续、缺页/重页/乱序/pending 后续页 integrity、pending 只许全批末头、末页必达 tip、空页仅锚点即 tip、成功键序 ok,anchor,tip,pages,verified_block_hashes 按链序不含锚点、input/auth/integrity 分类、跨轮换版本混排可验）
 python tests/header_locator_test.py    # 签名区块头分叉定位 POST /v1/chain/headers/locate（仅含顺序键 locators,limit；locators 1–64 项 height,block_hash 严格降序非布尔非负整数/64hex；limit 1–500 默认100、拒布尔；解析/键值非法 400 无副作用；顺序取首个主链同高同哈希命中否则 409；200 键序 anchor,headers,tip,auth 升序至多 limit 空页照签；主链+签名者同锁快照；verify_header_locator_page 成功 ok,anchor,tip,matched_index,verified_block_hashes 索引从0、失败仅 ok,error input/auth/integrity 不抛异常）与 HTTP
+python tests/light_client_apply_finality_test.py  # 签名最终化凭证 GET /v1/chain/finality（无参数否则 400；锁内同快照取链与签名者；200 固定键序 finalized,tip,auth，finalized=最后 confirmed 块键序 height,block_hash、tip 沿用 S、auth 键序 key_version,signature；domain=ledger-finality-v1 的 SHA-256+Ed25519 签名、轮换历史可验）与 apply_finality（键序/非布尔整数/64hex/128hex input、未知版本或坏签名 auth、tip 须等于本地重放 tip、finalized 须为分支 anchor/confirmed 头且不倒退否则 integrity、存量解析/键序/摘要/重放 state、缺文件或读写失败 io；同目标幂等不写文件、提高边界 generation+1 沿用 v3 原子换入；失败仅 ok,error、不抛异常、字节不变）与 HTTP
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
