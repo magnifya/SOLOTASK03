@@ -6,8 +6,8 @@ sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
-subcommands, plus the offline checkpoint-history history-trust and
-history-export subcommands.
+subcommands, plus the offline checkpoint-history history-trust,
+history-export and header-locators subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
 a single line of JSON with exactly the same field names as the HTTP API.
@@ -778,6 +778,29 @@ def cmd_history_export(args: argparse.Namespace) -> int:
     return _emit_result_document(body)
 
 
+def cmd_header_locators(args: argparse.Namespace) -> int:
+    """Build a fork-location locator request from an advance_headers checkpoint.
+
+    No server contact is made: the checkpoint file is strictly reloaded and
+    replayed (never rewritten) and the derived ``{"locators", "limit"}``
+    request document is printed as one contract-ordered JSON line, ready to
+    POST to ``/v1/chain/headers/locate``. Success exits 0; any failure
+    prints ``{"ok": false, "error": "input"|"io"|"state"}`` and exits 1.
+    """
+    from .light_client import HEADER_LOCATORS_DEFAULT_LIMIT, header_locators
+
+    limit = HEADER_LOCATORS_DEFAULT_LIMIT
+    if args.limit is not None:
+        limit = _decimal_int(args.limit)
+        if limit is None:
+            return _input_failure()
+    body = header_locators(args.path, limit)
+    if not body.get("ok"):
+        return _emit_result_document(body)
+    print(json.dumps(body["request"], sort_keys=False, ensure_ascii=False))
+    return 0
+
+
 def cmd_audit_signer_rotate(args: argparse.Namespace) -> int:
     status, body = _request(
         "POST",
@@ -1429,6 +1452,21 @@ def build_parser() -> argparse.ArgumentParser:
         "at authorization boundaries and --key must cover the page",
     )
     p_history_export.set_defaults(func=cmd_history_export)
+
+    p_header_locators = sub.add_parser(
+        "header-locators",
+        help="derive a fork-location locator request from an advance_headers "
+        "checkpoint file (offline)",
+    )
+    p_header_locators.add_argument(
+        "path", help="advance_headers checkpoint file path (read only)"
+    )
+    p_header_locators.add_argument(
+        "--limit",
+        help="locate page size carried into the request (decimal, 1-500, "
+        "default 100)",
+    )
+    p_header_locators.set_defaults(func=cmd_header_locators)
 
     return parser
 
