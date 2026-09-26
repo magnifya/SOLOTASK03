@@ -9,8 +9,8 @@ Covers:
 * the reorg boundary (the last stored step whose closing tip matches the
   batch anchor, else the checkpoint's initial anchor), the dropped suffix
   count reported as ``replaced`` and the appended ``locator`` step;
-* the v2 file shape: top-level key order ``v, generation, anchor, tip,
-  steps, hash`` with ``v = 2`` and step key order
+* the v3 file shape: top-level key order ``v, generation, anchor, tip,
+  finalized, steps, hash`` with ``v = 3`` and step key order
   ``kind, tip_hash, trust, documents, locators`` (``linear`` steps carry
   ``locators: null``), the self-excluding canonical-json SHA-256 ``hash``,
   and a generation that may exceed the step count after a replacement;
@@ -58,7 +58,7 @@ from ledger.light_client import (
 from ledger.service import LedgerService
 from ledger.store import LedgerStore
 
-CHECKPOINT_KEYS = ["v", "generation", "anchor", "tip", "steps", "hash"]
+CHECKPOINT_KEYS = ["v", "generation", "anchor", "tip", "finalized", "steps", "hash"]
 STEP_KEYS = ["kind", "tip_hash", "trust", "documents", "locators"]
 V1_STEP_KEYS = ["tip_hash", "trust", "documents"]
 
@@ -190,7 +190,7 @@ class ReorgHeadersFixture(unittest.TestCase):
 
     def rehash(self, data: dict) -> None:
         """Recompute the checkpoint hash after a tamper, pinning the damage."""
-        body = {key: data[key] for key in CHECKPOINT_KEYS if key != "hash"}
+        body = {key: value for key, value in data.items() if key != "hash"}
         data["hash"] = hashlib.sha256(
             json.dumps(
                 body, sort_keys=True, ensure_ascii=False, separators=(",", ":")
@@ -248,9 +248,10 @@ class ReorgHeadersSuccessTests(ReorgHeadersFixture):
 
         data = self.read_checkpoint()
         self.assertEqual(list(data.keys()), CHECKPOINT_KEYS)
-        self.assertEqual(data["v"], 2)
+        self.assertEqual(data["v"], 3)
         self.assertEqual(data["generation"], 2)
         self.assertEqual(data["anchor"], self.anchor)
+        self.assertEqual(data["finalized"], self.anchor)
         self.assertEqual(data["tip"], result["tip"])
         # The boundary is the initial anchor, so the one stored linear step
         # is dropped and only the appended locator step remains.
@@ -392,7 +393,7 @@ class ReorgHeadersSuccessTests(ReorgHeadersFixture):
         self.assertEqual(data["steps"][1]["documents"], [page])
         self.assertIsNone(data["steps"][1]["locators"])
 
-    def test_version_one_checkpoint_reorgs_and_rewrites_as_v2(self) -> None:
+    def test_version_one_checkpoint_reorgs_and_rewrites_as_v3(self) -> None:
         self.advance(self.paged(2), self.anchor, tip_hash=self.tip_hash)
         data = self.read_checkpoint()
         legacy = {
@@ -415,7 +416,8 @@ class ReorgHeadersSuccessTests(ReorgHeadersFixture):
         self.assertEqual(result["generation"], 2)
         self.assertEqual(result["replaced"], 1)
         rewritten = self.read_checkpoint()
-        self.assertEqual(rewritten["v"], 2)
+        self.assertEqual(rewritten["v"], 3)
+        self.assertEqual(rewritten["finalized"], self.anchor)
         # The legacy linear step was replaced at the initial anchor.
         self.assertEqual(
             [list(step.keys()) for step in rewritten["steps"]], [STEP_KEYS]
