@@ -291,6 +291,22 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `integrity`。函数**不抛异常**；成功键序固定为
   `ok, anchor, tip, matched_index, verified_block_hashes`，失败仅
   `{"ok": false, "error"}`，`error` 仅取 `input`/`auth`/`integrity`。
+- **定位页多页连续校验**：`ledger.light_client.verify_header_locator_pages(
+  documents, locators, tip_hash, trust) -> dict`。`documents` 为**非空有
+  序数组**，每页沿用定位页（即 `verify_header_page`）的键序、类型、签名
+  者历史、`ledger-headers-v1` 域签名与头哈希契约逐页复验；`locators`
+  沿用 **1–64 项**、`height,block_hash` 键序及高度严格降序契约。仅首页
+  按定位页规则在 `locators` 中确定锚点，其下标（**从 0 起**）作为
+  `matched_index` 返回；后页 `anchor` 必须等于前页末头的
+  `{height, block_hash}`，高度与 `prev_hash` 跨页连续——缺页、重页、乱
+  序均断链。各页 `tip` 必须逐字段相同且 `tip_hash` 等于入参，非末页
+  `headers` 不得为空，末页必须到达钉住的 tip，pending 只许为全批末头
+  （pending 之后不允许再有后续页）；首页为空时必须是唯一页且其锚点即
+  tip。函数**不抛异常**：预检参数及各页键序、原始类型、hex 错误为
+  `input`，未知签名版本或坏签名为 `auth`，锚点不在 locators、哈希/链
+  接/tip 不符、缺重乱页或 pending 越位为 `integrity`。成功键序固定为
+  `ok, anchor, tip, matched_index, pages, verified_block_hashes`，`pages`
+  为页数，哈希按链序且不含锚点；失败仅 `{"ok": false, "error"}`。
 - **持久化头检查点**：`ledger.light_client.advance_headers(path,
   documents, anchor, tip_hash, trust) -> dict` 把每批**已核验**的签名头页
   落盘为可继续的头检查点（纯库 API，其余入口不变）。首次使用 `path` 时
@@ -1553,6 +1569,7 @@ python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range
 python tests/header_page_test.py      # 签名区块头分页 GET /v1/chain/headers（after_height/after_hash 必填、limit 1–500 默认 100、400/404/409；固定键序 anchor,headers,tip,auth 与头项 height,prev_hash,merkle_root,block_hash,status；anchor=tip 时空 headers；pending 仅链尾；domain=ledger-headers-v1 的 SHA-256+Ed25519 签名；verify_header_page input/auth/integrity、锚点/tip 钉住、重算哈希与链接、分页串联、轮换历史验签）与 HTTP
 python tests/header_pages_test.py     # 多页签名区块头离线连续校验 verify_header_pages（非空数组逐页复验、各页 tip 逐字段相同且等于钉住 tip_hash、首锚=入参后锚=前页末头、跨页高度/prev_hash 连续、缺页/重页/乱序/pending 后续页 integrity、pending 只许全批末头、末页必达 tip、空页仅锚点即 tip、成功键序 ok,anchor,tip,pages,verified_block_hashes 按链序不含锚点、input/auth/integrity 分类、跨轮换版本混排可验）
 python tests/header_locator_test.py    # 签名区块头分叉定位 POST /v1/chain/headers/locate（仅含顺序键 locators,limit；locators 1–64 项 height,block_hash 严格降序非布尔非负整数/64hex；limit 1–500 默认100、拒布尔；解析/键值非法 400 无副作用；顺序取首个主链同高同哈希命中否则 409；200 键序 anchor,headers,tip,auth 升序至多 limit 空页照签；主链+签名者同锁快照；verify_header_locator_page 成功 ok,anchor,tip,matched_index,verified_block_hashes 索引从0、失败仅 ok,error input/auth/integrity 不抛异常）与 HTTP
+python tests/header_locator_pages_test.py # 多页定位页离线连续校验 verify_header_locator_pages（非空有序数组逐页复验、locators 1–64 项严格降序仅首页定位锚点返回 matched_index 从0、后锚=前页末头跨页高度/prev_hash 连续、各页 tip 逐字段相同且等于钉住 tip_hash、缺页/重页/乱序/pending 后续页 integrity、pending 只许全批末头、末页必达 tip、空首页必须为唯一页且锚点即 tip、成功键序 ok,anchor,tip,matched_index,pages,verified_block_hashes 按链序不含锚点、input/auth/integrity 分类、跨轮换版本混排可验）
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
