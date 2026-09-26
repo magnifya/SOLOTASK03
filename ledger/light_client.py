@@ -3755,6 +3755,27 @@ HEADER_LOCATOR_PAGES_RESULT_KEYS = (
 )
 
 
+def _parse_header_locator_batch(
+    documents: object, locators: object, tip_hash: object, trust: object
+) -> tuple[list[dict], dict, list]:
+    """Stage 1 of the locator-pages contract: shapes, raw types and hex.
+
+    Settles the non-empty ``documents`` list, the 1-64 ``locators``
+    request, the pinned ``tip_hash``, the trust signers and every page's
+    exact key order and raw types before any signature or chain work.
+    Returns the closed locators, the ``{version: public_key}`` signer
+    map and the parsed pages. Every defect is an input error.
+    """
+    if not isinstance(documents, list) or not documents:
+        raise _Failure(ERR_INPUT)
+    closed_locators = _validate_header_locators(locators)
+    if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
+        raise _Failure(ERR_INPUT)
+    signers = _validate_header_trust(trust)
+    parsed = [_parse_header_page(document) for document in documents]
+    return closed_locators, signers, parsed
+
+
 def verify_header_locator_pages(
     documents: object,
     locators: object,
@@ -3799,76 +3820,99 @@ def verify_header_locator_pages(
     try:
         # Stage 1 (input): the parameters and every page's exact key order,
         # raw types and hex are all settled before any signature work.
-        if not isinstance(documents, list) or not documents:
-            raise _Failure(ERR_INPUT)
-        closed_locators = _validate_header_locators(locators)
-        if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
-            raise _Failure(ERR_INPUT)
-        signers = _validate_header_trust(trust)
-        parsed = [_parse_header_page(document) for document in documents]
+        closed_locators, signers, parsed = _parse_header_locator_batch(
+            documents, locators, tip_hash, trust
+        )
 
         # Stage 2 (auth): every page's envelope must resolve a signer version
         # and verify under the ledger-headers-v1 domain signature.
-        for document, (_, _, _, key_version, signature) in zip(documents, parsed):
-            _authenticate_header_page(document, key_version, signature, signers)
+        _authenticate_header_locator_batch(documents, parsed, signers)
 
         # Stage 3 (integrity): the first page anchors at one of the locators,
         # every later page anchors at the previous page's last header, every
         # page names the same caller-pinned tip and the batch reaches it.
-        pages = len(parsed)
-        matched_index: int | None = None
-        first_anchor: dict | None = None
-        shared_tip: dict | None = None
-        verified_hashes: list[str] = []
-        expected_anchor: dict | None = None
-        for position, (page_anchor, headers, tip, _, _) in enumerate(parsed):
-            if position == 0:
-                for index, locator in enumerate(closed_locators):
-                    if locator == page_anchor:
-                        matched_index = index
-                        break
-                if matched_index is None:
-                    # The batch anchors at a block the client never offered
-                    # as a known chain point.
-                    raise _Failure(ERR_INTEGRITY)
-                first_anchor = page_anchor
-            elif page_anchor != expected_anchor:
-                # A missing, duplicated or reordered page breaks the seam.
-                raise _Failure(ERR_INTEGRITY)
-            page_hashes = _check_header_page_chain(page_anchor, headers, tip, tip_hash)
-            if shared_tip is None:
-                shared_tip = tip
-            elif tip != shared_tip:
-                # Every page must carry the same chain descriptor, not
-                # merely the same tip hash.
-                raise _Failure(ERR_INTEGRITY)
-            last = position == pages - 1
-            if not page_hashes:
-                # An empty page (already pinned to the tip by the per-page
-                # rules) can only close the batch; a non-final empty page is
-                # a pagination defect and leaves no anchor to chain from.
-                if not last:
-                    raise _Failure(ERR_INTEGRITY)
-            else:
-                if last:
-                    # The final page must reach the pinned tip.
-                    if page_hashes[-1] != tip["tip_hash"]:
-                        raise _Failure(ERR_INTEGRITY)
-                elif headers[-1]["status"] != STATUS_CONFIRMED:
-                    # A pending header may only be the batch's very last
-                    # header: no page may follow it.
-                    raise _Failure(ERR_INTEGRITY)
-                expected_anchor = {
-                    "height": headers[-1]["height"],
-                    "block_hash": page_hashes[-1],
-                }
-            verified_hashes.extend(page_hashes)
+        return _check_header_locator_batch_chain(parsed, closed_locators, tip_hash)
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
         # Defensive: structurally unforeseeable inputs must report rather
         # than crash the verifying process.
         return {"ok": False, "error": ERR_INPUT}
+
+
+def _authenticate_header_locator_batch(
+    documents: list, parsed: list, signers: dict
+) -> None:
+    """Stage 2 of the locator-pages contract: every page's envelope.
+
+    Each page's ``key_version`` must resolve a signer and its Ed25519
+    signature must verify under the ``ledger-headers-v1`` domain; an
+    unknown version or a failed signature is an auth error.
+    """
+    for document, (_a, _h, _t, key_version, signature) in zip(documents, parsed):
+        _authenticate_header_page(document, key_version, signature, signers)
+
+
+def _check_header_locator_batch_chain(
+    parsed: list, closed_locators: list, tip_hash: str
+) -> dict:
+    """Stage 3 of the locator-pages contract: anchors, links and the tip.
+
+    The first page anchors at one of the locators (its position, starting
+    at 0, is the returned ``matched_index``), every later page anchors at
+    the previous page's last header so heights and prev_hash links
+    continue across the seams, every page carries the same descriptor and
+    the batch reaches the pinned ``tip_hash``. Returns the shared success
+    document. Any chain defect is an integrity error.
+    """
+    pages = len(parsed)
+    matched_index: int | None = None
+    first_anchor: dict | None = None
+    shared_tip: dict | None = None
+    verified_hashes: list[str] = []
+    expected_anchor: dict | None = None
+    for position, (page_anchor, headers, tip, _, _) in enumerate(parsed):
+        if position == 0:
+            for index, locator in enumerate(closed_locators):
+                if locator == page_anchor:
+                    matched_index = index
+                    break
+            if matched_index is None:
+                # The batch anchors at a block the client never offered
+                # as a known chain point.
+                raise _Failure(ERR_INTEGRITY)
+            first_anchor = page_anchor
+        elif page_anchor != expected_anchor:
+            # A missing, duplicated or reordered page breaks the seam.
+            raise _Failure(ERR_INTEGRITY)
+        page_hashes = _check_header_page_chain(page_anchor, headers, tip, tip_hash)
+        if shared_tip is None:
+            shared_tip = tip
+        elif tip != shared_tip:
+            # Every page must carry the same chain descriptor, not
+            # merely the same tip hash.
+            raise _Failure(ERR_INTEGRITY)
+        last = position == pages - 1
+        if not page_hashes:
+            # An empty page (already pinned to the tip by the per-page
+            # rules) can only close the batch; a non-final empty page is
+            # a pagination defect and leaves no anchor to chain from.
+            if not last:
+                raise _Failure(ERR_INTEGRITY)
+        else:
+            if last:
+                # The final page must reach the pinned tip.
+                if page_hashes[-1] != tip["tip_hash"]:
+                    raise _Failure(ERR_INTEGRITY)
+            elif headers[-1]["status"] != STATUS_CONFIRMED:
+                # A pending header may only be the batch's very last
+                # header: no page may follow it.
+                raise _Failure(ERR_INTEGRITY)
+            expected_anchor = {
+                "height": headers[-1]["height"],
+                "block_hash": page_hashes[-1],
+            }
+        verified_hashes.extend(page_hashes)
     return {
         "ok": True,
         "anchor": first_anchor,
@@ -5528,6 +5572,345 @@ def advance_finalized_headers(
             "generation": next_generation,
             "tip": new_tip,
             "finalized": {key: last_target[key] for key in HEADER_ANCHOR_KEYS},
+            "applied": len(parsed),
+        }
+
+
+# Fixed success key order returned by :func:`reorg_finalized_headers`.
+REORG_FINALIZED_HEADERS_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "tip",
+    "finalized",
+    "replaced",
+    "applied",
+)
+
+
+def reorg_finalized_headers(
+    path: object,
+    documents: object,
+    finalities: object,
+    locators: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Reorganize a header checkpoint and its finality boundary atomically.
+
+    ``reorg_finalized_headers`` is the atomic combination of
+    :func:`reorg_headers` and :func:`apply_finalities`: ``documents`` is an
+    ordered, non-empty batch of ``POST /v1/chain/headers/locate`` pages
+    kept under the exact :func:`reorg_headers` contract (verified with
+    :func:`verify_header_locator_pages` against the caller's ``locators``
+    and the pinned ``tip_hash``), and ``finalities`` must be a non-empty
+    array of signed ``GET /v1/chain/finality`` credentials kept under the
+    exact :func:`apply_finalities` key order, types, signature and trust
+    contract (top-level key order ``finalized, tip, auth``, nested types,
+    the ``ledger-finality-v1`` Ed25519 envelope against
+    ``trust.audit_signers``). No parameter has a default value. Only an
+    existing checkpoint is accepted — a missing file is ``io`` and there
+    is no first use, exactly as for :func:`reorg_headers`.
+
+    Processing is staged and all-or-nothing:
+
+    1. **input** — ``path``/``tip_hash``, the non-empty ``documents`` and
+       ``finalities`` arrays, every credential's exact key order and raw
+       types and the trust signers are settled before any file or
+       signature work.
+    2. **state/io** — the checkpoint at ``path`` is then strictly loaded
+       and fully replayed under the per-path lock shared with every other
+       same-path operation (a missing file is ``io``; a parse, key-order,
+       digest or replay defect is ``state``).
+    3. **auth** — every credential envelope is verified in array order
+       (an unknown key version or a failed signature is ``auth``).
+    4. **integrity** — the locator batch is verified and applied under
+       the :func:`reorg_headers` rules first (its anchor must bound the
+       reorg at the last matching stored step tip or at the initial
+       anchor, and must not precede the stored finalized boundary; the
+       suffix after the boundary is dropped; the new tip may never drop
+       in height), the dropped fork is pruned from the branch and the
+       new headers recorded. The credentials then walk that branch in
+       order exactly as :func:`apply_finalities` walks a replayed one:
+       each item's ``tip`` must match the same-height header's hash and
+       status, tip heights must not decrease, finalized heights must
+       strictly increase, and each target must name the checkpoint
+       anchor or a confirmed header no higher than its own tip. The last
+       target may not move the stored boundary backwards or sideways.
+
+    When the batch differs from the stored last locator step, exactly
+    one ``locator`` step (carrying ``locators``) is appended after the
+    dropped suffix, the last credential's boundary is written and the
+    generation is incremented exactly once in the version-3 atomic
+    rewrite. When the batch equals the stored last step, it is neither
+    re-verified nor appended again: if the last credential's boundary
+    also equals the stored one, the call is fully idempotent — the file
+    bytes stay exactly as they were, the generation holds and
+    ``replaced`` is 0; otherwise only the boundary advances, once, with
+    ``replaced`` still 0. Success returns ``{"ok": True, "generation",
+    "tip", "finalized", "replaced", "applied"}`` in that key order with
+    ``finalized`` the last credential's closed boundary (key order
+    ``height, block_hash``), ``replaced`` the number of steps dropped
+    by the suffix deletion and ``applied`` the number of credentials.
+    Failure returns only ``{"ok": False, "error": category}`` with
+    category one of ``input`` (parameters, arrays or document
+    shape/types), ``auth`` (an unknown version or a failed signature),
+    ``integrity`` (finality, boundary, chain, tip, ordering, branch or
+    boundary defects), ``state`` (an existing checkpoint fails its
+    parse, key-order, digest, ownership or replay checks; it is never
+    truncated or rebuilt) and ``io`` (the checkpoint is missing or
+    cannot be read or written; a failed write restores the original
+    bytes best-effort). Nothing is raised and a failed call never
+    changes the file bytes or the generation.
+    """
+    # Argument shape is validated before any file or verification work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Stage 1 (input): every credential's exact key order and raw
+        # types and the locator batch's structure — the non-empty
+        # documents list, the 1-64 locators request, the pinned tip_hash,
+        # the trust signers and every page's exact key order and raw
+        # types — are all settled before any file or signature work.
+        if not isinstance(finalities, list) or not finalities:
+            return _failed_advance(ERR_INPUT)
+        try:
+            parsed = [
+                _parse_finality_document(document) for document in finalities
+            ]
+            _closed_locators, signers, parsed_pages = (
+                _parse_header_locator_batch(
+                    documents, locators, tip_hash, trust
+                )
+            )
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+
+        # Stage 2 (state/io): the persisted checkpoint is strictly
+        # loaded and fully replayed before any envelope or batch is
+        # judged — a reorg rewrites an existing checkpoint, so a
+        # missing file is io and there is no first use.
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_STATE)
+        if loaded is None:
+            return _failed_advance(ERR_IO)
+        checkpoint, step_tips, branch = loaded
+
+        steps = checkpoint["steps"]
+        finalized = checkpoint["finalized"]
+        step = {
+            "kind": "locator",
+            "tip_hash": tip_hash,
+            "trust": trust,
+            "documents": documents,
+            "locators": locators,
+        }
+        # An exact resubmission of the stored last locator step was
+        # verified when it was stored and re-verified by the load replay
+        # above, so it is neither re-verified nor appended again.
+        same_step = step == steps[-1]
+
+        # Stage 3 (auth): the locator pages' ledger-headers-v1 envelopes
+        # and every credential's ledger-finality-v1 envelope are
+        # verified in order against the trust signers. A later envelope
+        # is never trusted because an earlier one was.
+        try:
+            if not same_step:
+                _authenticate_header_locator_batch(
+                    documents, parsed_pages, signers
+                )
+            for document, (_target, _tip, key_version, signature) in zip(
+                finalities, parsed
+            ):
+                _authenticate_finality(
+                    document, key_version, signature, signers
+                )
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+
+        # Stage 4 (integrity). The locator batch is chained and applied
+        # under the reorg_headers rules; the credentials are then walked
+        # against the reorganized branch.
+        try:
+            if same_step:
+                new_tip = checkpoint["tip"]
+                replaced = 0
+                new_steps = steps
+            else:
+                result = _check_header_locator_batch_chain(
+                    parsed_pages, _closed_locators, tip_hash
+                )
+
+                # The boundary is the closing tip of the last step
+                # matching the batch's anchor; only when no step matches
+                # may the checkpoint's initial anchor bound the reorg.
+                batch_anchor = result["anchor"]
+                boundary_index: int | None = None
+                for index, step_tip in enumerate(step_tips):
+                    if (
+                        step_tip["height"] == batch_anchor["height"]
+                        and step_tip["tip_hash"] == batch_anchor["block_hash"]
+                    ):
+                        boundary_index = index
+                if boundary_index is None:
+                    if batch_anchor != checkpoint["anchor"]:
+                        return _failed_advance(ERR_INTEGRITY)
+                    kept_steps: list[dict] = []
+                else:
+                    kept_steps = steps[: boundary_index + 1]
+
+                # Finality check: the reorg branch point must be the
+                # finalized boundary itself or a current-branch point at
+                # a strictly greater height. Finalized history is
+                # irreversible.
+                if batch_anchor["height"] < finalized["height"] or (
+                    batch_anchor["height"] == finalized["height"]
+                    and batch_anchor["block_hash"] != finalized["block_hash"]
+                ):
+                    return _failed_advance(ERR_INTEGRITY)
+                replaced = len(steps) - len(kept_steps)
+
+                new_tip = result["tip"]
+                if not _header_tip_reorgs(checkpoint["tip"], new_tip):
+                    return _failed_advance(ERR_INTEGRITY)
+
+                new_steps = kept_steps + [step]
+                # Apply the reorg to the branch used for the credential
+                # walk: prune the dropped fork above the boundary, then
+                # record the new headers.
+                for height in [h for h in branch if h > batch_anchor["height"]]:
+                    del branch[height]
+                for document in documents:
+                    for header in document["headers"]:
+                        branch[header["height"]] = (
+                            header["block_hash"],
+                            header["status"],
+                        )
+                # The closing tip is authoritative for its height (an
+                # empty final page settles the tip's status without
+                # headers).
+                branch[new_tip["height"]] = (
+                    new_tip["tip_hash"],
+                    new_tip["status"],
+                )
+
+            # Walk the credential batch in order against the
+            # reorganized branch, exactly as apply_finalities walks the
+            # replayed one. Inside the batch finalized heights rise
+            # strictly and tip heights never fall; each item's tip must
+            # name the branch header at that height (same hash and
+            # status) and its finalized target must be the checkpoint
+            # anchor or a confirmed header no higher than that tip.
+            previous_target_height: int | None = None
+            previous_tip_height: int | None = None
+            last_target: dict | None = None
+            for target, cred_tip, _version, _signature in parsed:
+                tip_entry = branch.get(cred_tip["height"])
+                if tip_entry is None or tip_entry[0] != cred_tip["tip_hash"]:
+                    raise _Failure(ERR_INTEGRITY)
+                if tip_entry[1] != cred_tip["status"]:
+                    raise _Failure(ERR_INTEGRITY)
+                if (
+                    previous_tip_height is not None
+                    and cred_tip["height"] < previous_tip_height
+                ):
+                    raise _Failure(ERR_INTEGRITY)
+                previous_tip_height = cred_tip["height"]
+                if (
+                    previous_target_height is not None
+                    and target["height"] <= previous_target_height
+                ):
+                    raise _Failure(ERR_INTEGRITY)
+                previous_target_height = target["height"]
+                if target["height"] > cred_tip["height"]:
+                    raise _Failure(ERR_INTEGRITY)
+                entry = branch.get(target["height"])
+                if entry is None or entry[0] != target["block_hash"]:
+                    raise _Failure(ERR_INTEGRITY)
+                if target != checkpoint["anchor"] and entry[1] != STATUS_CONFIRMED:
+                    raise _Failure(ERR_INTEGRITY)
+                last_target = target
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+        assert last_target is not None  # finalities is shape-guaranteed non-empty
+
+        # The batch as a whole must not move the stored boundary
+        # backwards or sideways.
+        if last_target["height"] < finalized["height"] or (
+            last_target["height"] == finalized["height"]
+            and last_target["block_hash"] != finalized["block_hash"]
+        ):
+            return _failed_advance(ERR_INTEGRITY)
+
+        if same_step and last_target == finalized:
+            # Fully idempotent: the last locator step and the final
+            # boundary both equal the stored ones, so the file bytes
+            # stay exactly as they were, the generation holds and
+            # nothing was replaced.
+            return {
+                "ok": True,
+                "generation": checkpoint["generation"],
+                "tip": new_tip,
+                "finalized": {key: finalized[key] for key in HEADER_ANCHOR_KEYS},
+                "replaced": 0,
+                "applied": len(parsed),
+            }
+
+        next_generation = checkpoint["generation"] + 1
+        rewritten = {
+            "v": HEADER_CHECKPOINT_VERSION,
+            "generation": next_generation,
+            "anchor": checkpoint["anchor"],
+            "tip": new_tip,
+            "finalized": last_target,
+            "steps": new_steps,
+        }
+        rewritten["hash"] = _header_checkpoint_hash(
+            HEADER_CHECKPOINT_VERSION,
+            next_generation,
+            checkpoint["anchor"],
+            new_tip,
+            last_target,
+            new_steps,
+        )
+
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        try:
+            _atomic_write_header_checkpoint(path, rewritten)
+        except OSError:
+            # Compensate: put the original bytes back best-effort.
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_IO)
+        except (TypeError, ValueError):
+            # A trust/document/locator value JSON cannot serialize
+            # (verification only judges the fields it pins) is a
+            # caller-side defect.
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "tip": new_tip,
+            "finalized": {key: last_target[key] for key in HEADER_ANCHOR_KEYS},
+            "replaced": replaced,
             "applied": len(parsed),
         }
 
