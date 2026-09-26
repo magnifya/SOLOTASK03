@@ -341,6 +341,36 @@ io``), nothing is raised and a failed batch never changes the file bytes.
 :func:`finalize_headers`, :func:`apply_finality`, the HTTP endpoint and
 ``python -m ledger.cli`` are unchanged.
 
+:func:`advance_finalized_headers` atomically advances a header checkpoint
+and its finality boundary in one write. ``documents``, ``anchor``,
+``tip_hash`` and ``trust`` are exactly the :func:`advance_headers`
+arguments; ``finalities`` is a non-empty, ordered array of signed
+``GET /v1/chain/finality`` credentials, each keeping the exact
+:func:`apply_finality` key order, nested types and ``ledger-finality-v1``
+signature contract against the same ``trust.audit_signers``. Processing is
+staged: the whole finality batch's structure and raw types first
+(``input``); the checkpoint strictly loaded and replayed under the shared
+per-path lock (the first use of ``path`` builds the checkpoint exactly as
+:func:`advance_headers` does; a parse, key-order, digest or replay defect
+is ``state``, an unreadable file ``io``); every envelope verified in array
+order (an unknown key version or a bad signature is ``auth``); then the
+header batch is verified with :func:`verify_header_pages` and the
+credentials walk the replayed branch extended by the batch's new headers —
+each credential's ``tip`` must match the same-height header in hash and
+status, tip heights must not decrease, finalized heights must strictly
+increase, and each target must name the anchor or a confirmed header no
+higher than its own tip (``integrity``). The last item's target may not
+end below or beside the stored boundary. Only a fully valid call appends
+one ``linear`` step and writes the last target as the new boundary with
+the generation incremented exactly once; when the appended step would be
+identical to the last stored step and the last target equals the stored
+boundary the call is idempotent and the file bytes stay untouched.
+Success returns ``{"ok": True, "generation", "tip", "finalized",
+"applied"}`` in that key order with ``applied`` the number of credentials;
+failure returns only ``{"ok": False, "error": category}`` with category
+one of ``input/auth/integrity/state/io``, nothing is raised and a failed
+call never changes the file bytes.
+
 :func:`header_locators` derives a fork-location locator request from a
 checkpoint written by :func:`advance_headers` or :func:`reorg_headers`. The
 file is strictly
@@ -5178,6 +5208,330 @@ def apply_finalities(
         return {
             "ok": True,
             "generation": next_generation,
+            "finalized": {key: last_target[key] for key in HEADER_ANCHOR_KEYS},
+            "applied": len(parsed),
+        }
+
+
+# Fixed success key order returned by :func:`advance_finalized_headers`.
+ADVANCE_FINALIZED_HEADERS_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "tip",
+    "finalized",
+    "applied",
+)
+
+
+def advance_finalized_headers(
+    path: object,
+    documents: object,
+    finalities: object,
+    anchor: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Advance a header checkpoint and its finality boundary atomically.
+
+    ``documents``, ``anchor``, ``tip_hash`` and ``trust`` are exactly the
+    :func:`advance_headers` arguments: ``documents`` is an ordered,
+    non-empty batch of ``GET /v1/chain/headers`` pages verified with
+    :func:`verify_header_pages` against ``trust`` and the caller-pinned
+    ``tip_hash``; the first use of ``path`` requires a legal ``anchor``
+    (``{height, block_hash}``, key order ``height, block_hash``) and a
+    later call passes ``None`` (continue from the stored tip) or the
+    stored tip's ``{height, block_hash}``. ``finalities`` is a non-empty,
+    ordered array of signed ``GET /v1/chain/finality`` credentials, each
+    with the exact :func:`apply_finality` key order, nested types and
+    ``ledger-finality-v1`` signature contract against
+    ``trust.audit_signers``.
+
+    Verification is staged and all-or-nothing:
+
+    1. **input** — ``path``/``tip_hash`` and every credential's key order
+       and raw types (plus the trust signers) are checked first.
+    2. **state/io** — the checkpoint at ``path`` is strictly loaded and
+       fully replayed under the per-path lock shared with every other
+       same-path operation; a missing file starts a new checkpoint
+       exactly as :func:`advance_headers` does (a legal first ``anchor``
+       is then required), a parse, key-order, digest or replay defect is
+       ``state`` and an unreadable file ``io``.
+    3. **auth** — every credential envelope is verified in array order:
+       its ``key_version`` must resolve in ``trust.audit_signers`` and
+       its Ed25519 signature must verify under the
+       ``ledger-finality-v1`` domain.
+    4. **integrity** — the header batch is verified exactly as
+       :func:`advance_headers` verifies it (including the
+       tip-monotonicity rule), then the credentials walk the replayed
+       branch extended by the batch's new headers: each credential's
+       ``tip`` must match the same-height header in hash and status, tip
+       heights must not decrease, finalized heights must strictly
+       increase, and each target must name the checkpoint anchor or a
+       confirmed header no higher than its own tip. The last item's
+       target may not end below or beside the stored boundary.
+
+    Only when the whole call verifies is the checkpoint advanced once,
+    atomically, in the version-3 format (same serialization and hash
+    rules as :func:`advance_headers`): one ``linear`` step is appended
+    and the last credential's target is written as the new ``finalized``
+    boundary, with the generation incremented exactly one. When the
+    submitted step is identical to the last stored step (same
+    ``tip_hash``, ``trust`` and ``documents``) and the last credential's
+    target equals the stored boundary, the call is idempotent: it
+    returns the current generation and neither bumps the generation nor
+    touches the file bytes.
+
+    Success returns ``{"ok": True, "generation", "tip", "finalized",
+    "applied"}`` in that key order with ``finalized`` the last
+    credential's closed boundary and ``applied`` the number of
+    credentials. Failure returns only ``{"ok": False, "error":
+    category}`` with category one of ``input`` (bad arguments or
+    credential structure/types), ``auth`` (an unknown key version or a
+    failed signature), ``integrity`` (batch, tip, ordering, branch or
+    boundary defects), ``state`` (an existing checkpoint fails its
+    parse, key-order, digest or replay checks; it is never truncated or
+    rebuilt) and ``io`` (the checkpoint cannot be read or written; a
+    failed write restores the original bytes best-effort). Nothing is
+    raised and a failed call never changes the file bytes.
+    """
+    # Argument shape is validated before any file or verification work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Stage 1 (input): the whole finality batch's exact key order and
+        # raw types, and the trust signers, are settled before any file
+        # or signature work — structure precedes state and trust.
+        if not isinstance(finalities, list) or not finalities:
+            return _failed_advance(ERR_INPUT)
+        try:
+            parsed = [
+                _parse_finality_document(document) for document in finalities
+            ]
+            signers = _validate_header_trust(trust)
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+
+        # Stage 2 (state/io): the persisted checkpoint is strictly loaded
+        # and fully replayed before anything else is judged.
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_STATE)
+
+        if loaded is None:
+            # First use: the caller must pin a legal anchor. The anchor
+            # is also the initial finalized boundary and the seed of the
+            # tracked branch.
+            expected_anchor = _validate_header_anchor_argument(anchor)
+            if expected_anchor is None:
+                return _failed_advance(ERR_INPUT)
+            generation = 0
+            file_anchor = expected_anchor
+            stored_finalized = {
+                key: expected_anchor[key] for key in HEADER_ANCHOR_KEYS
+            }
+            steps: list[dict] = []
+            stored_tip: dict | None = None
+            branch = {
+                expected_anchor["height"]: (
+                    expected_anchor["block_hash"],
+                    STATUS_CONFIRMED,
+                )
+            }
+        else:
+            checkpoint, _step_tips, branch = loaded
+            generation = checkpoint["generation"]
+            file_anchor = checkpoint["anchor"]
+            stored_finalized = checkpoint["finalized"]
+            steps = list(checkpoint["steps"])
+            stored_tip = checkpoint["tip"]
+            if anchor is None:
+                # Continue the continuous chain from the stored closed tip.
+                expected_anchor = {
+                    "height": stored_tip["height"],
+                    "block_hash": stored_tip["tip_hash"],
+                }
+            else:
+                expected_anchor = _validate_header_anchor_argument(anchor)
+                if (
+                    expected_anchor is None
+                    or expected_anchor
+                    != {
+                        "height": stored_tip["height"],
+                        "block_hash": stored_tip["tip_hash"],
+                    }
+                ):
+                    return _failed_advance(ERR_INPUT)
+
+        step = {
+            "kind": "linear",
+            "tip_hash": tip_hash,
+            "trust": trust,
+            "documents": documents,
+            "locators": None,
+        }
+        same_step = bool(steps) and step == steps[-1]
+        last_target = parsed[-1][0]
+        if same_step and last_target == stored_finalized:
+            # Re-submitting the exact last batch with a finality batch
+            # ending on the stored boundary is idempotent: the stored
+            # step was verified when it was stored and re-verified by
+            # the load replay above, so the file bytes stay exactly as
+            # they were and the generation holds.
+            return {
+                "ok": True,
+                "generation": generation,
+                "tip": stored_tip,
+                "finalized": {
+                    key: stored_finalized[key] for key in HEADER_ANCHOR_KEYS
+                },
+                "applied": len(parsed),
+            }
+
+        try:
+            # Stage 3 (auth): every credential envelope is verified in
+            # array order. A later credential is never trusted because an
+            # earlier one was.
+            for document, (_target, _tip, key_version, signature) in zip(
+                finalities, parsed
+            ):
+                _authenticate_finality(
+                    document, key_version, signature, signers
+                )
+
+            # Stage 4 (integrity): the header batch is verified exactly
+            # as advance_headers verifies it; a step identical to the
+            # last stored one was already verified by the load replay.
+            if same_step:
+                new_tip = stored_tip
+            else:
+                result = verify_header_pages(
+                    documents, expected_anchor, tip_hash, trust
+                )
+                if not result.get("ok"):
+                    return {"ok": False, "error": result["error"]}
+                new_tip = result["tip"]
+                if stored_tip is not None and not _header_tip_advances(
+                    stored_tip, new_tip
+                ):
+                    return _failed_advance(ERR_INTEGRITY)
+                # Extend the replayed branch with the batch's headers so
+                # the credentials can name the freshly checkpointed
+                # chain. The closing tip is authoritative for its height.
+                for document in documents:
+                    for header in document["headers"]:
+                        branch[header["height"]] = (
+                            header["block_hash"],
+                            header["status"],
+                        )
+                branch[new_tip["height"]] = (
+                    new_tip["tip_hash"],
+                    new_tip["status"],
+                )
+
+            # The credentials walk the (extended) branch in array order,
+            # exactly as apply_finalities walks the replayed branch.
+            previous_target_height: int | None = None
+            previous_tip_height: int | None = None
+            for target, cred_tip, _version, _signature in parsed:
+                # The credential's tip must be the branch header at its
+                # own height — same hash and status.
+                tip_entry = branch.get(cred_tip["height"])
+                if tip_entry is None or tip_entry[0] != cred_tip["tip_hash"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                if tip_entry[1] != cred_tip["status"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                # Tip heights are non-decreasing across the batch.
+                if (
+                    previous_tip_height is not None
+                    and cred_tip["height"] < previous_tip_height
+                ):
+                    return _failed_advance(ERR_INTEGRITY)
+                previous_tip_height = cred_tip["height"]
+                # Finalized heights strictly increase from item to item.
+                if (
+                    previous_target_height is not None
+                    and target["height"] <= previous_target_height
+                ):
+                    return _failed_advance(ERR_INTEGRITY)
+                previous_target_height = target["height"]
+                # The target must not cross the tip the credential itself
+                # describes and must name the anchor or a confirmed
+                # header of the branch — never a pending, unknown or
+                # dropped-fork header.
+                if target["height"] > cred_tip["height"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                entry = branch.get(target["height"])
+                if entry is None or entry[0] != target["block_hash"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                if target != file_anchor and entry[1] != STATUS_CONFIRMED:
+                    return _failed_advance(ERR_INTEGRITY)
+
+            # The batch as a whole must not move the stored boundary
+            # backwards or sideways.
+            if last_target["height"] < stored_finalized["height"] or (
+                last_target["height"] == stored_finalized["height"]
+                and last_target["block_hash"] != stored_finalized["block_hash"]
+            ):
+                return _failed_advance(ERR_INTEGRITY)
+
+            next_generation = generation + 1
+            new_steps = steps if same_step else steps + [step]
+            rewritten = {
+                "v": HEADER_CHECKPOINT_VERSION,
+                "generation": next_generation,
+                "anchor": file_anchor,
+                "tip": new_tip,
+                "finalized": last_target,
+                "steps": new_steps,
+            }
+            rewritten["hash"] = _header_checkpoint_hash(
+                HEADER_CHECKPOINT_VERSION,
+                next_generation,
+                file_anchor,
+                new_tip,
+                last_target,
+                new_steps,
+            )
+
+            try:
+                original = _read_bytes_or_none(path)
+            except OSError:
+                return _failed_advance(ERR_IO)
+            try:
+                _atomic_write_header_checkpoint(path, rewritten)
+            except OSError:
+                # Compensate: put the original bytes back best-effort.
+                _restore_bytes(path, original)
+                return _failed_advance(ERR_IO)
+            except (TypeError, ValueError):
+                # A trust/document value JSON cannot serialize
+                # (verification only judges the fields it pins) is a
+                # caller-side defect.
+                return _failed_advance(ERR_INPUT)
+        except _Failure as failure:  # defensive: verifiers never raise these
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "tip": new_tip,
             "finalized": {key: last_target[key] for key in HEADER_ANCHOR_KEYS},
             "applied": len(parsed),
         }
