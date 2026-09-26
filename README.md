@@ -750,6 +750,43 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
 `StateRecoveryError`。查询与提交、打包、确认、回滚、采用、清理共用同一把锁，
 只反映已持久化的状态。
 
+## 最终化交易回执
+
+`GET /v1/transactions/{tx_id}/finalized-receipt` 返回一份**可离线验证**的最终化
+交易回执。`tx_id` 非法（非 64 位小写十六进制）或不存在返回 `404`；交易存在但
+未确认（仍在内存池或已打包进 pending 末块）返回 `409`。成功返回 `200`，顶层
+键序固定为 `receipt, proof, headers, finality`：
+
+- `receipt`：与 `GET /v1/transactions/{tx_id}` 相同的固定九字段回执
+  （`tx_id, from, to, amount, signature, status, height, block_hash,
+  index`），且 `status` 恒为 `confirmed`。
+- `proof`：与 `GET /v1/blocks/{height}/proof/{tx_id}` 相同的单笔 Merkle
+  包含证明（键序 `height, tx_id, index, merkle_root, block_hash,
+  siblings`，siblings 自叶向根、项键序 `direction, hash`）。
+- `headers`：从交易所在块到**最高 confirmed 块**的升序头链，每项沿用签名
+  头页的五字段（`height, prev_hash, merkle_root, block_hash, status`）且
+  全部为 `confirmed`；pending 末块永不出现。
+- `finality`：与 `GET /v1/chain/finality` 完全相同的签名最终化凭证（键序
+  `finalized, tip, auth`，`ledger-finality-v1` 域 Ed25519 签名），其
+  `finalized` 即末个头；`tip` 仍报告含 pending 末块的当前链描述符 S。
+
+链与当前签名者在**同一把锁**内取快照，回执、证明、头链与签名永不混入不同
+状态。其余入口（含 `GET /v1/transactions/{tx_id}` 与 CLI）不变。
+
+**离线校验**：`ledger.light_client.verify_finalized_receipt(document,
+expected_tx_id, trust) -> dict`，不读本地状态、不抛异常。`document` 为上述
+响应文档；`expected_tx_id` 为调用方钉住的 64 位小写 hex 交易 id；`trust`
+须携带 `audit_signers`（与 `verify_header_page` 相同）。校验按序进行：键序、
+类型与 hex（含 `expected_tx_id` 与 `trust` 形状）错为 `input`；`key_version`
+未知或 `ledger-finality-v1` 验签失败为 `auth`；交易 `tx_id` 重算或 Ed25519
+签名不符、`expected_tx_id` 绑定不符、status 非 confirmed、receipt/proof 的
+tx_id/height/block_hash/index 不一致、Merkle 路径（深度与 index 相容、逐跳
+方向与奇偶一致、重算根）不符、头链（高度连续、prev_hash 链接、重算块哈希、
+全部 confirmed、首头绑定回执块与证明根）断裂、`finalized` 不等于末头或 tip
+描述符不自洽，均为 `integrity`。成功键序固定为 `ok, tx_id, height,
+block_hash, finalized`（高度与哈希为交易所在块，`finalized` 为封闭的最终化
+边界）；失败仅返回 `{"ok": false, "error": "input"|"auth"|"integrity"}`。
+
 ## 批量 Merkle 证明
 
 在单笔 `GET /v1/blocks/{height}/proof/{tx_id}` 之外，提供一次取多笔的批量接口：

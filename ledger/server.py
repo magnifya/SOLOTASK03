@@ -315,9 +315,25 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.read_history_trust()
                 self._send_json(status, body, sort_keys=False)
             elif path.startswith("/v1/transactions/"):
+                remainder = path[len("/v1/transactions/") :]
+                if remainder.endswith("/finalized-receipt"):
+                    # GET /v1/transactions/{tx_id}/finalized-receipt — an
+                    # offline-verifiable finalized receipt; a malformed or
+                    # unknown tx_id returns 404, an unconfirmed transaction
+                    # 409. The success document has a contract-fixed key
+                    # order (receipt, proof, headers, finality), so it is
+                    # serialized in insertion order rather than
+                    # alphabetically.
+                    tx_id = unquote(remainder[: -len("/finalized-receipt")])
+                    if not tx_id:
+                        self._send_json(404, {"error": "transaction not found"})
+                        return
+                    status, body = service.get_finalized_receipt(tx_id)
+                    self._send_json(status, body, sort_keys=False)
+                    return
                 # GET /v1/transactions/{tx_id} — a transaction receipt; a
                 # malformed or unknown tx_id returns 404.
-                tx_id = unquote(path[len("/v1/transactions/") :])
+                tx_id = unquote(remainder)
                 if not tx_id:
                     self._send_json(404, {"error": "transaction not found"})
                     return

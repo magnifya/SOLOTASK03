@@ -267,6 +267,102 @@ class LedgerService:
             "index": index,
         }
 
+    def get_finalized_receipt(self, tx_id: object) -> tuple[int, dict]:
+        """GET /v1/transactions/{tx_id}/finalized-receipt — an offline-
+        verifiable finalized receipt for one confirmed transaction.
+
+        A ``tx_id`` that is not exactly 64 lowercase hex characters, or one
+        nothing holds, returns 404 (mirroring :meth:`get_transaction`, the
+        lookup covers the canonical chain and the mempool only). A
+        transaction that exists but is not confirmed — still in the mempool
+        or packed into the pending tip block — returns 409.
+
+        The success body has the fixed key order ``receipt, proof, headers,
+        finality``: ``receipt`` is the fixed nine-field receipt with
+        ``status`` ``confirmed``; ``proof`` is the single-transaction Merkle
+        inclusion proof exactly as ``GET /v1/blocks/{height}/proof/{tx_id}``
+        (key order ``height, tx_id, index, merkle_root, block_hash,
+        siblings``); ``headers`` runs from the transaction's block up to the
+        highest confirmed block in ascending height, each item in the signed
+        header page's five-field shape (``height, prev_hash, merkle_root,
+        block_hash, status``) and every one ``confirmed``; ``finality`` is
+        the exact ``GET /v1/chain/finality`` credential (key order
+        ``finalized, tip, auth``, the ``ledger-finality-v1`` signature) whose
+        ``finalized`` names the last header. The canonical chain and the
+        current audit signer are snapshotted together under one store lock,
+        so the receipt, the proof, the header chain and the signature can
+        never mix states.
+        """
+        if not crypto.is_hex64(tx_id):
+            return 404, {"error": "transaction not found"}
+        from . import light_client
+
+        with self.store.lock:
+            found: tuple[Block, int, Transaction] | None = None
+            for block in self.store.chain:
+                for index, tx in enumerate(block.transactions):
+                    if tx.tx_id == tx_id:
+                        found = (block, index, tx)
+                        break
+                if found is not None:
+                    break
+            if found is None:
+                # Still unpacked in the mempool: known but not confirmed.
+                if tx_id in self.store.pending:
+                    return 409, {"error": "transaction is not confirmed"}
+                return 404, {"error": "transaction not found"}
+            block, index, tx = found
+            if not self._is_receipt_tx_well_typed(tx):
+                return 404, {"error": "transaction not found"}
+            if block.status != STATUS_CONFIRMED:
+                return 409, {"error": "transaction is not confirmed"}
+
+            receipt = self._transaction_receipt(
+                tx, STATUS_CONFIRMED, block.height, block.block_hash, index
+            )
+            proof = {
+                "height": block.height,
+                "tx_id": tx_id,
+                "index": index,
+                "merkle_root": block.merkle_root,
+                "block_hash": block.block_hash,
+                "siblings": crypto.merkle_proof(
+                    [t.tx_id for t in block.transactions], index
+                ),
+            }
+            finalized_block = next(
+                b
+                for b in reversed(self.store.chain)
+                if b.status == STATUS_CONFIRMED
+            )
+            headers = [
+                self._header_entry(b)
+                for b in self.store.chain[block.height : finalized_block.height + 1]
+            ]
+            finalized = self._anchor_descriptor(finalized_block)
+            tip = self._fork_summary(self.store.chain)
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError("no audit signer available for finality")
+            auth = light_client.sign_finality(
+                signer["private_key"], signer["version"], finalized, tip
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "receipt": receipt,
+                "proof": proof,
+                "headers": headers,
+                "finality": {
+                    "finalized": finalized,
+                    "tip": tip,
+                    "auth": auth,
+                },
+            }
+
     # -- blocks -------------------------------------------------------------
 
     def mine_block(self) -> tuple[int, dict]:
