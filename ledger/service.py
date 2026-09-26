@@ -371,6 +371,151 @@ class LedgerService:
                 "finality": finality,
             }
 
+    def get_finalized_receipts(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/transactions/finalized-receipts — a batch of
+        offline-verifiable finalized receipts sharing one chain snapshot.
+
+        The body must be a JSON object containing exactly the ``tx_ids``
+        key: a non-empty list of distinct 64-lowercase-hex strings (the
+        same rules as ``POST /v1/blocks/{height}/proofs``). A malformed
+        body — parse failure, missing/extra keys, a wrong type, an empty
+        list, duplicates or a wrongly formatted id — is 400 and never
+        touches state. If every id is well formed but any of them is held
+        neither on the canonical chain nor in the mempool (candidate forks
+        are never matches), the answer is 404; otherwise, when nothing is
+        missing but at least one transaction is still in the mempool or
+        packed into the unconfirmed pending tip, the answer is 409.
+
+        On success the chain and the current audit signer are snapshotted
+        together under one store lock (exactly as for
+        :meth:`get_finalized_receipt`), so every item, the shared header
+        run and the finality credential can never mix chain states. The
+        body has the fixed key order ``items, headers, finality``:
+        ``items`` is ordered by ``tx_id`` ascending regardless of the
+        request order, and each item has the fixed key order
+        ``receipt, proof`` using the exact single-receipt contract;
+        ``headers`` is the continuous five-field confirmed header run from
+        the **lowest** transaction's block up to and including the highest
+        confirmed block (every item confirmed); ``finality`` is exactly the
+        ``GET /v1/chain/finality`` document, whose ``finalized`` names the
+        last header.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"tx_ids"}:
+            return 400, {"error": "request body must be a JSON object with only 'tx_ids'"}
+        tx_ids_raw = payload["tx_ids"]
+        if not isinstance(tx_ids_raw, list) or not tx_ids_raw:
+            return 400, {"error": "field 'tx_ids' must be a non-empty array"}
+        if any(not crypto.is_hex64(tx_id) for tx_id in tx_ids_raw):
+            return 400, {
+                "error": "every tx_id must be a string of 64 lowercase hex characters"
+            }
+        if len(set(tx_ids_raw)) != len(tx_ids_raw):
+            return 400, {"error": "tx_ids must be distinct"}
+
+        from . import light_client
+
+        with self.store.lock:
+            requested = sorted(tx_ids_raw)
+            requested_set = set(requested)
+            # One pass over the canonical chain (which includes the pending
+            # tip) locates every request id at its first inclusion point.
+            located: dict[str, tuple[Block, int, Transaction]] = {}
+            for block in self.store.chain:
+                for index, tx in enumerate(block.transactions):
+                    if tx.tx_id in requested_set and tx.tx_id not in located:
+                        located[tx.tx_id] = (block, index, tx)
+            # A 404 takes precedence over a 409: an id absent from both the
+            # chain and the mempool does not exist, even if another id of
+            # the same batch is merely unconfirmed.
+            unknown = [
+                tx_id
+                for tx_id in requested
+                if tx_id not in located
+                and tx_id not in self.store.pending
+            ]
+            if unknown:
+                return 404, {"error": "transaction not found"}
+            for tx_id, (_block, _index, tx) in located.items():
+                if not self._is_receipt_tx_well_typed(tx):
+                    return 404, {"error": "transaction not found"}
+            if any(
+                tx_id in self.store.pending
+                or located[tx_id][0].status != STATUS_CONFIRMED
+                for tx_id in requested
+            ):
+                # Packed-but-unconfirmed transactions can only sit in the
+                # pending chain tip; everything else here is in the mempool.
+                return 409, {"error": "transaction is not confirmed"}
+
+            items = []
+            lowest_height: int | None = None
+            for tx_id in requested:
+                block, index, tx = located[tx_id]
+                if lowest_height is None or block.height < lowest_height:
+                    lowest_height = block.height
+                items.append(
+                    {
+                        "receipt": self._transaction_receipt(
+                            tx,
+                            STATUS_CONFIRMED,
+                            block.height,
+                            block.block_hash,
+                            index,
+                        ),
+                        "proof": {
+                            "height": block.height,
+                            "tx_id": tx.tx_id,
+                            "index": index,
+                            "merkle_root": block.merkle_root,
+                            "block_hash": block.block_hash,
+                            "siblings": crypto.merkle_proof(
+                                [candidate.tx_id for candidate in block.transactions],
+                                index,
+                            ),
+                        },
+                    }
+                )
+
+            finalized_block = next(
+                candidate
+                for candidate in reversed(self.store.chain)
+                if candidate.status == STATUS_CONFIRMED
+            )
+            # The run spans the lowest transaction block through the highest
+            # confirmed block; every block in between is confirmed because
+            # the only pending block the chain ever carries is its tip.
+            assert lowest_height is not None
+            headers = [
+                self._header_entry(candidate)
+                for candidate in self.store.chain[
+                    lowest_height : finalized_block.height + 1
+                ]
+            ]
+            finalized = self._anchor_descriptor(finalized_block)
+            tip = self._fork_summary(self.store.chain)
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError(
+                    "no audit signer available for finalized receipts"
+                )
+            auth = light_client.sign_finality(
+                signer["private_key"], signer["version"], finalized, tip
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "items": items,
+                "headers": headers,
+                "finality": {
+                    "finalized": finalized,
+                    "tip": tip,
+                    "auth": auth,
+                },
+            }
+
     # -- blocks -------------------------------------------------------------
 
     def mine_block(self) -> tuple[int, dict]:

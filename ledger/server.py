@@ -164,6 +164,20 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.locate_finality_fork(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions/finalized-receipts":
+                # POST /v1/transactions/finalized-receipts — a batch of
+                # finalized receipts sharing one signed chain snapshot. The
+                # body is strictly {"tx_ids": [...]} (400), existence is
+                # 404 and any unconfirmed item 409. The success document has
+                # a contract-fixed key order (items, headers, finality), so
+                # it is serialized in insertion order rather than
+                # alphabetically.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.get_finalized_receipts(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:

@@ -353,7 +353,8 @@ confirmed), and a ``GET /v1/chain/finality`` credential whose
 ``finalized`` names the run's last header. The caller pins
 ``expected_tx_id`` (64 lowercase hex); ``trust`` must carry
 ``audit_signers`` exactly as for :func:`verify_header_page`. Stage 1
-(``input``) settles the exact key order, raw types, the hex shapes and the
+(``input``) settles the exact key order, raw types, the hex shapes (the
+receipt's transaction ``signature`` must be 128 lowercase hex) and the
 pin/trust; stage 2 (``auth``) resolves the finality envelope's
 ``key_version`` in ``trust.audit_signers`` and verifies its Ed25519
 signature over ``SHA256(UTF8("ledger-finality-v1") || canonical_json(
@@ -369,6 +370,24 @@ it, its hash covered by the signed credential). Success returns
 ``{"ok": True, "tx_id", "height", "block_hash", "finalized"}`` in that key
 order; failure returns only ``{"ok": False, "error": category}`` and
 nothing is raised.
+
+:func:`verify_finalized_receipts` verifies one
+``POST /v1/transactions/finalized-receipts`` batch document (exact key
+order ``items, headers, finality``): a non-empty, tx_id-ascending list of
+``{receipt, proof}`` items using the single-receipt contract, a continuous
+five-field confirmed header run from the lowest transaction's block
+through the highest confirmed block, and one shared
+``GET /v1/chain/finality`` credential. ``expected_tx_ids`` obeys the same
+batch rules as the request body (a non-empty list of distinct 64 lowercase
+hex ids). Each item reuses the single-receipt checks over its suffix of
+the shared run, and the batch is additionally checked for ascending order,
+a distinct set equal to ``expected_tx_ids`` and a coherent shared chain.
+Success returns ``{"ok": True, "tx_ids", "finalized"}`` with ``tx_ids``
+ascending and ``finalized`` the closed ``{height, block_hash}`` anchor;
+failure is only ``{"ok": False, "error": category}`` — shape/type/hex/trust
+defects are ``input``, an unknown version or a bad finality signature is
+``auth`` and every other tampering (ordering, set, per-item proof or
+signature, the shared chain or the finality binding) is ``integrity``.
 
 :func:`advance_finalized_headers` is the atomic combination of
 :func:`advance_headers` and :func:`apply_finalities`:
@@ -6933,6 +6952,11 @@ FINALIZED_RECEIPT_RESULT_KEYS = (
     "block_hash",
     "finalized",
 )
+# The batch document (POST /v1/transactions/finalized-receipts) and one of
+# its items, plus its fixed success key order.
+FINALIZED_RECEIPTS_KEYS = ("items", "headers", "finality")
+FINALIZED_RECEIPT_ITEM_KEYS = ("receipt", "proof")
+FINALIZED_RECEIPTS_RESULT_KEYS = ("ok", "tx_ids", "finalized")
 RECEIPT_KEYS = (
     "tx_id",
     "from",
@@ -6968,7 +6992,10 @@ def _parse_finalized_receipt_receipt(raw: object) -> dict:
         raise _Failure(ERR_INPUT)
     if not isinstance(recipient, str) or not recipient:
         raise _Failure(ERR_INPUT)
-    if not isinstance(signature, str) or not signature:
+    # The transaction signature is a 128-char lowercase Ed25519 hex string;
+    # a wrongly shaped signature is an input (hex) defect, while a
+    # well-shaped signature that fails verification is an integrity defect.
+    if not crypto.is_hex128(signature):
         raise _Failure(ERR_INPUT)
     amount = raw["amount"]
     if not _is_int(amount) or amount <= 0:
@@ -7102,18 +7129,11 @@ def verify_finalized_receipt(
             document["finality"], key_version, signature, signers
         )
 
-        # Stage 3 (integrity): receipt self-consistency first.
-        if receipt["status"] != STATUS_CONFIRMED:
-            raise _Failure(ERR_INTEGRITY)
-        message = crypto.canonical_message(
-            receipt["from"], receipt["to"], receipt["amount"]
-        )
-        if crypto.compute_tx_id(message) != receipt["tx_id"]:
-            raise _Failure(ERR_INTEGRITY)
-        if not crypto.verify_signature(
-            receipt["from"], message, receipt["signature"]
-        ):
-            raise _Failure(ERR_INTEGRITY)
+        # Stage 3 (integrity): the receipt, proof, header run and finality
+        # binding. Shared with the batch verifier, which runs this same core
+        # over each item's suffix of the shared header run.
+        _finalized_receipt_integrity(receipt, proof, headers, finalized, tip)
+
         # The caller pin is matched only after the receipt proves it is a
         # self-consistent transaction: a malformed pin is input above, a
         # tampered receipt already failed recomputation as integrity, and a
@@ -7121,96 +7141,6 @@ def verify_finalized_receipt(
         # (input) mismatch.
         if receipt["tx_id"] != expected_tx_id:
             raise _Failure(ERR_INPUT)
-
-        # The receipt and the single-transaction proof must name the same
-        # inclusion point.
-        if (
-            proof["tx_id"] != receipt["tx_id"]
-            or proof["height"] != receipt["height"]
-            or proof["index"] != receipt["index"]
-            or proof["block_hash"] != receipt["block_hash"]
-        ):
-            raise _Failure(ERR_INTEGRITY)
-
-        # The first header must be exactly the transaction's block, and the
-        # proof must bind to its Merkle root.
-        first = headers[0]
-        if (
-            first["height"] != receipt["height"]
-            or first["block_hash"] != receipt["block_hash"]
-            or first["merkle_root"] != proof["merkle_root"]
-        ):
-            raise _Failure(ERR_INTEGRITY)
-
-        # Recompute the confirmed header run: consecutive heights,
-        # prev_hash links, block hashes, no pending item anywhere.
-        previous_hash = None
-        previous_height = first["height"] - 1
-        for position, header in enumerate(headers):
-            if header["height"] != previous_height + 1:
-                raise _Failure(ERR_INTEGRITY)
-            if position > 0 and header["prev_hash"] != previous_hash:
-                raise _Failure(ERR_INTEGRITY)
-            if header["status"] != STATUS_CONFIRMED:
-                raise _Failure(ERR_INTEGRITY)
-            recomputed = compute_block_hash(
-                header["height"], header["prev_hash"], header["merkle_root"]
-            )
-            if recomputed != header["block_hash"]:
-                raise _Failure(ERR_INTEGRITY)
-            previous_hash = header["block_hash"]
-            previous_height = header["height"]
-
-        # Re-walk the Merkle sibling path with the ledger's pairing and
-        # odd-node-promotion rules; the index must agree with every turn.
-        siblings = proof["siblings"]
-        depth = len(siblings)
-        index = proof["index"]
-        if index >= (1 << depth):
-            raise _Failure(ERR_INTEGRITY)
-        current = proof["tx_id"]
-        position = index
-        for item in siblings:
-            sibling_hash = item["hash"]
-            if item["direction"] == "left":
-                # A genuine odd-node self-pair always points right; a left
-                # sibling equal to the path node addresses the phantom
-                # duplicate slot.
-                if position % 2 == 0 or sibling_hash == current:
-                    raise _Failure(ERR_INTEGRITY)
-                pair = sibling_hash + current
-            else:
-                if position % 2 == 1:
-                    raise _Failure(ERR_INTEGRITY)
-                pair = current + sibling_hash
-            current = crypto.sha256_hex(pair.encode("ascii"))
-            position //= 2
-        if current != proof["merkle_root"]:
-            raise _Failure(ERR_INTEGRITY)
-
-        # The signed finality credential closes the run: its finalized
-        # boundary must be exactly the last (highest) confirmed header.
-        last = headers[-1]
-        if finalized != {
-            "height": last["height"],
-            "block_hash": last["block_hash"],
-        }:
-            raise _Failure(ERR_INTEGRITY)
-        if tip["length"] != tip["height"] + 1:
-            raise _Failure(ERR_INTEGRITY)
-        if tip["status"] == STATUS_CONFIRMED:
-            # No pending tail: the descriptor S is the finalized block itself.
-            if (
-                tip["tip_hash"] != last["block_hash"]
-                or tip["height"] != last["height"]
-            ):
-                raise _Failure(ERR_INTEGRITY)
-        else:
-            # Only the single chain tip may be pending, exactly one block
-            # past the finalized boundary; its hash is attested by the
-            # signed credential and cannot be linked from this document.
-            if tip["height"] != last["height"] + 1:
-                raise _Failure(ERR_INTEGRITY)
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
@@ -7222,5 +7152,250 @@ def verify_finalized_receipt(
         "tx_id": receipt["tx_id"],
         "height": receipt["height"],
         "block_hash": receipt["block_hash"],
+        "finalized": {key: finalized[key] for key in HEADER_ANCHOR_KEYS},
+    }
+
+
+def _finalized_receipt_integrity(
+    receipt: dict,
+    proof: dict,
+    headers: list[dict],
+    finalized: dict,
+    tip: dict,
+) -> None:
+    """Stage 3 of the finalized-receipt contract, shared by one receipt and
+    each item of a batch.
+
+    ``headers`` is the confirmed run starting at the receipt's own block and
+    ending at the finality boundary (a batch item passes its suffix of the
+    shared run). Every defect here is an integrity failure.
+    """
+    # Receipt self-consistency first.
+    if receipt["status"] != STATUS_CONFIRMED:
+        raise _Failure(ERR_INTEGRITY)
+    message = crypto.canonical_message(
+        receipt["from"], receipt["to"], receipt["amount"]
+    )
+    if crypto.compute_tx_id(message) != receipt["tx_id"]:
+        raise _Failure(ERR_INTEGRITY)
+    if not crypto.verify_signature(
+        receipt["from"], message, receipt["signature"]
+    ):
+        raise _Failure(ERR_INTEGRITY)
+
+    # The receipt and the single-transaction proof must name the same
+    # inclusion point.
+    if (
+        proof["tx_id"] != receipt["tx_id"]
+        or proof["height"] != receipt["height"]
+        or proof["index"] != receipt["index"]
+        or proof["block_hash"] != receipt["block_hash"]
+    ):
+        raise _Failure(ERR_INTEGRITY)
+
+    # The first header must be exactly the transaction's block, and the
+    # proof must bind to its Merkle root.
+    first = headers[0]
+    if (
+        first["height"] != receipt["height"]
+        or first["block_hash"] != receipt["block_hash"]
+        or first["merkle_root"] != proof["merkle_root"]
+    ):
+        raise _Failure(ERR_INTEGRITY)
+
+    # Recompute the confirmed header run: consecutive heights,
+    # prev_hash links, block hashes, no pending item anywhere.
+    previous_hash = None
+    previous_height = first["height"] - 1
+    for position, header in enumerate(headers):
+        if header["height"] != previous_height + 1:
+            raise _Failure(ERR_INTEGRITY)
+        if position > 0 and header["prev_hash"] != previous_hash:
+            raise _Failure(ERR_INTEGRITY)
+        if header["status"] != STATUS_CONFIRMED:
+            raise _Failure(ERR_INTEGRITY)
+        recomputed = compute_block_hash(
+            header["height"], header["prev_hash"], header["merkle_root"]
+        )
+        if recomputed != header["block_hash"]:
+            raise _Failure(ERR_INTEGRITY)
+        previous_hash = header["block_hash"]
+        previous_height = header["height"]
+
+    # Re-walk the Merkle sibling path with the ledger's pairing and
+    # odd-node-promotion rules; the index must agree with every turn.
+    siblings = proof["siblings"]
+    depth = len(siblings)
+    index = proof["index"]
+    if index >= (1 << depth):
+        raise _Failure(ERR_INTEGRITY)
+    current = proof["tx_id"]
+    position = index
+    for item in siblings:
+        sibling_hash = item["hash"]
+        if item["direction"] == "left":
+            # A genuine odd-node self-pair always points right; a left
+            # sibling equal to the path node addresses the phantom
+            # duplicate slot.
+            if position % 2 == 0 or sibling_hash == current:
+                raise _Failure(ERR_INTEGRITY)
+            pair = sibling_hash + current
+        else:
+            if position % 2 == 1:
+                raise _Failure(ERR_INTEGRITY)
+            pair = current + sibling_hash
+        current = crypto.sha256_hex(pair.encode("ascii"))
+        position //= 2
+    if current != proof["merkle_root"]:
+        raise _Failure(ERR_INTEGRITY)
+
+    # The signed finality credential closes the run: its finalized
+    # boundary must be exactly the last (highest) confirmed header.
+    last = headers[-1]
+    if finalized != {
+        "height": last["height"],
+        "block_hash": last["block_hash"],
+    }:
+        raise _Failure(ERR_INTEGRITY)
+    if tip["length"] != tip["height"] + 1:
+        raise _Failure(ERR_INTEGRITY)
+    if tip["status"] == STATUS_CONFIRMED:
+        # No pending tail: the descriptor S is the finalized block itself.
+        if (
+            tip["tip_hash"] != last["block_hash"]
+            or tip["height"] != last["height"]
+        ):
+            raise _Failure(ERR_INTEGRITY)
+    else:
+        # Only the single chain tip may be pending, exactly one block
+        # past the finalized boundary; its hash is attested by the
+        # signed credential and cannot be linked from this document.
+        if tip["height"] != last["height"] + 1:
+            raise _Failure(ERR_INTEGRITY)
+
+
+def verify_finalized_receipts(
+    document: object, expected_tx_ids: object, trust: object
+) -> dict:
+    """Offline-verify one ``POST /v1/transactions/finalized-receipts`` batch.
+
+    ``document`` is the decoded response with the exact top-level key order
+    ``items, headers, finality``: ``items`` a non-empty list ordered by
+    ``tx_id`` ascending, each item in the exact key order
+    ``receipt, proof`` using the single-receipt contract (the fixed
+    nine-field confirmed receipt and the single-transaction Merkle proof);
+    ``headers`` the continuous five-field confirmed header run from the
+    **lowest** transaction's block through the highest confirmed block
+    (every item confirmed); and ``finality`` the shared
+    ``GET /v1/chain/finality`` credential whose ``finalized`` names the
+    run's last header. ``expected_tx_ids`` follows the same rules as the
+    request body: a non-empty list of distinct 64-lowercase-hex strings.
+    ``trust`` must carry ``audit_signers`` exactly as for
+    :func:`verify_finalized_receipt`.
+
+    The single-receipt verification is reused for every item against its
+    suffix of the shared header run; the batch is additionally checked for
+    ascending item order, a distinct set equal to ``expected_tx_ids`` and a
+    coherent shared chain (its first header must be the lowest
+    transaction's block and every item block must occur in the run).
+
+    Success returns ``{"ok": True, "tx_ids", "finalized"}`` in that key
+    order with ``tx_ids`` the ascending batch ids and ``finalized`` the
+    closed ``{height, block_hash}`` tail. Failure returns only
+    ``{"ok": False, "error": category}``: shape, type, hex or trust defects
+    are ``input``; an unknown key version or a failed finality signature is
+    ``auth``; every other tampering — ordering, set, per-item proof,
+    transaction signature, shared chain or binding defects — is
+    ``integrity``. Never raises for malformed input.
+    """
+    try:
+        # Stage 1 (input): exact key order and raw types of the document,
+        # the expected_tx_ids batch shape and the trust signer list.
+        if not isinstance(document, dict) or tuple(document.keys()) != tuple(
+            FINALIZED_RECEIPTS_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        raw_items = document["items"]
+        if not isinstance(raw_items, list) or not raw_items:
+            raise _Failure(ERR_INPUT)
+        parsed_items: list[tuple[dict, dict]] = []
+        for raw_item in raw_items:
+            if (
+                not isinstance(raw_item, dict)
+                or tuple(raw_item.keys()) != FINALIZED_RECEIPT_ITEM_KEYS
+            ):
+                raise _Failure(ERR_INPUT)
+            receipt = _parse_finalized_receipt_receipt(raw_item["receipt"])
+            proof = _parse_finalized_receipt_proof(raw_item["proof"])
+            parsed_items.append((receipt, proof))
+        headers = _parse_finalized_receipt_headers(document["headers"])
+        finalized, tip, key_version, signature = _parse_finality_document(
+            document["finality"]
+        )
+        if (
+            not isinstance(expected_tx_ids, list)
+            or not expected_tx_ids
+            or any(not crypto.is_hex64(tx_id) for tx_id in expected_tx_ids)
+            or len(set(expected_tx_ids)) != len(expected_tx_ids)
+        ):
+            raise _Failure(ERR_INPUT)
+        signers = _validate_header_trust(trust)
+
+        # Stage 2 (auth): the single ledger-finality-v1 envelope shared by
+        # every item is authenticated once.
+        _authenticate_finality(
+            document["finality"], key_version, signature, signers
+        )
+
+        # Stage 3 (integrity): batch ordering and set equality.
+        item_ids = [receipt["tx_id"] for receipt, _proof in parsed_items]
+        if item_ids != sorted(item_ids):
+            raise _Failure(ERR_INTEGRITY)
+        if len(set(item_ids)) != len(item_ids):
+            raise _Failure(ERR_INTEGRITY)
+        if set(item_ids) != set(expected_tx_ids):
+            raise _Failure(ERR_INTEGRITY)
+
+        # The shared run starts exactly at the lowest transaction's block.
+        lowest_height = min(receipt["height"] for receipt, _proof in parsed_items)
+        if headers[0]["height"] != lowest_height:
+            raise _Failure(ERR_INTEGRITY)
+        # Index the run by consecutive height for per-item suffix lookup.
+        run_by_height = {header["height"]: header for header in headers}
+        if len(run_by_height) != len(headers):
+            raise _Failure(ERR_INTEGRITY)
+
+        # Verify the lowest item over the whole shared run first: this
+        # recomputes every header hash and prev_hash link and proves the run
+        # is a consecutive confirmed chain, so later height-based suffix
+        # slices below are sound.
+        lowest_receipt, lowest_proof = min(
+            parsed_items, key=lambda item: item[0]["height"]
+        )
+        _finalized_receipt_integrity(
+            lowest_receipt, lowest_proof, headers, finalized, tip
+        )
+
+        # Every other item reuses the single-receipt integrity checks over
+        # its suffix of the now-verified shared header run.
+        for receipt, proof in parsed_items:
+            if receipt is lowest_receipt:
+                continue
+            header = run_by_height.get(receipt["height"])
+            if header is None or header["block_hash"] != receipt["block_hash"]:
+                raise _Failure(ERR_INTEGRITY)
+            suffix = headers[receipt["height"] - lowest_height :]
+            _finalized_receipt_integrity(
+                receipt, proof, suffix, finalized, tip
+            )
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "tx_ids": sorted(item_ids),
         "finalized": {key: finalized[key] for key in HEADER_ANCHOR_KEYS},
     }

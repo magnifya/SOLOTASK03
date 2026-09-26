@@ -796,6 +796,52 @@ canonical 消息重算交易 `tx_id` 并验证交易 Ed25519 签名，`receipt`/
 验签失败为 `auth`，交易签名、证明、头链或绑定错为 `integrity`。其余入口
 （普通回执、`/v1/chain/finality` 等）与 CLI 不变。
 
+### 批量最终化回执
+
+在单笔回执之外提供 `POST /v1/transactions/finalized-receipts`，一次取多笔
+已确认交易的自包含、可离线验证最终化回执，并让整批**共用同一条链快照与同一
+份最终化凭证**。
+
+- **请求**：请求体必须是 JSON 对象且**只含** `tx_ids` 一个键：非空数组，
+  元素两两互异，每个元素都是恰好 64 位**小写**十六进制字符串（规则同
+  `POST /v1/blocks/{height}/proofs`）。JSON 解析失败、不是对象、键缺失或有
+  额外键、`tx_ids` 类型错误、空数组、元素重复或格式不符（含大写、长度错、
+  非字符串）一律 `400`，且不触碰任何状态。
+- **状态码**：每个 id 均合法时，若任一 id 在 canonical 链与内存池中都不存在
+  （候选分叉永不暴露）返回 `404`；否则只要存在仍在内存池或已打包进未确认
+  pending 尾块的交易就返回 `409`（未知项优先于未确认项：两者同时出现仍为
+  `404`）。全部已确认返回 `200`。
+- **响应**：顶层键序固定为 `items, headers, finality`。
+  - `items`：按 `tx_id` **字典序升序**排列（与请求顺序无关）；每项键序固定为
+    `receipt, proof`，分别沿用单笔契约的固定九字段回执（`status` 必为
+    `confirmed`）与单笔六字段 Merkle 证明；
+  - `headers`：**从批内最低交易所在块起、至最高 confirmed 块止**的连续头
+    序列（按高度升序），每项为签名头页五字段
+    `{height, prev_hash, merkle_root, block_hash, status}` 且全部 confirmed；
+  - `finality`：沿用 `GET /v1/chain/finality` 契约（键序
+    `finalized, tip, auth`，`ledger-finality-v1` 签名），其 `finalized`
+    恰为 `headers` 的末项。
+
+链与当前审计签名者在**同一把锁**内取快照，各 item、共享头序列与最终化凭证
+不可能来自不同链状态；签名或构造失败不会返回部分文档。单笔
+`GET /v1/transactions/{tx_id}/finalized-receipt` 与其余入口不变。
+
+**离线校验**：`ledger.light_client.verify_finalized_receipts(document,
+expected_tx_ids, trust) -> dict`（纯库 API，不读本地状态、**不抛异常**）。
+`document` 即上述批量 200 响应；`expected_tx_ids` 与请求体同约束（非空、互异、
+均为 64 位小写 hex 字符串的数组）；`trust` 同单笔。校验复用单笔逻辑逐项验证
+（每项在共享头序列中属于自己的后缀上重放），并额外核对：item 按 tx_id 升序、
+批内互异、其集合恰等于 `expected_tx_ids`、且共享头链从最低交易块连续延伸至
+最终化边界。成功键序固定为 `ok, tx_ids, finalized`（`tx_ids` 升序，
+`finalized` 为末头的 `{height, block_hash}`）；失败仅返回
+`{"ok": false, "error"}`：形状、类型、hex 或 trust 错为 `input`，未知
+`key_version` 或最终化坏签名为 `auth`，其余篡改（批内排序、集合、逐项证明/
+交易签名、共享链或最终化绑定）为 `integrity`。
+
+同步收紧单笔 `verify_finalized_receipt`：`receipt.signature` 不是恰好 128 位
+小写 hex 时归为 `input`（hex 形状错）；仅形状合法但 Ed25519 验签失败才归
+`integrity`。其余入口不变。
+
 ## 批量 Merkle 证明
 
 在单笔 `GET /v1/blocks/{height}/proof/{tx_id}` 之外，提供一次取多笔的批量接口：
