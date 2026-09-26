@@ -169,6 +169,27 @@ header chain or a tip mismatch is ``integrity``. Success returns
 "verified_block_hashes"}``; failure returns only ``{"ok": False,
 "error": category}`` and nothing is raised.
 
+:func:`verify_header_locator_pages` verifies an ordered, non-empty batch of
+such signed locator pages as one continuous chain. The parameters and every
+page's key order, raw types and hex are checked first (``input``); then
+every page's envelope is verified under the ``ledger-headers-v1`` domain
+against ``trust.audit_signers`` (an unknown key version or a failed
+signature is ``auth``). The first page's anchor must be one of the
+``locators`` — its position (starting at 0) is returned as
+``matched_index`` — and every later page's anchor must equal the previous
+page's last header's ``{height, block_hash}``, so heights and prev_hash
+links continue across the page seams and a missing, duplicated or reordered
+page breaks the chain. Every page's ``tip`` descriptor must be
+field-for-field identical and name the caller-pinned ``tip_hash``; the last
+page must reach it. A non-final page's headers may never be empty — an
+empty first page is valid only as the batch's single page with its anchor
+being the tip — and a pending header may only be the very last header of
+the whole batch. All of those are ``integrity`` failures. Success returns
+``{"ok": True, "anchor", "tip", "matched_index", "pages",
+"verified_block_hashes"}`` with ``pages`` the page count and the hashes in
+chain order (the anchor itself is not included); failure returns only
+``{"ok": False, "error": category}`` and nothing is raised.
+
 :func:`advance_headers` durably checkpoints a verified header-page batch to
 ``path``. The file is one compact UTF-8 JSON document (non-ASCII written
 unescaped, one trailing newline) with the exact top-level key order
@@ -3144,14 +3165,13 @@ def _validate_header_trust(trust: object) -> dict:
     return signers
 
 
-def _verify_header_page(
-    document: object,
-    expected_anchor: object,
-    expected_tip_hash: object,
-    trust: object,
-) -> tuple[dict, dict, list[str]]:
-    """Strict core of :func:`verify_header_page`; may raise :class:`_Failure`."""
-    # 1. Exact key order and types — every defect here is an input error.
+def _parse_header_page(document: object) -> tuple[dict, list[dict], dict, int, str]:
+    """Stage 1 of the header-page contract: exact key order and raw types.
+
+    Every defect here is an input error. Returns the closed anchor, the
+    closed header items, the closed tip descriptor, the envelope's key
+    version and its signature.
+    """
     if not isinstance(document, dict):
         raise _Failure(ERR_INPUT)
     if tuple(document.keys()) != HEADER_PAGE_KEYS:
@@ -3196,17 +3216,19 @@ def _verify_header_page(
         raise _Failure(ERR_INPUT)
     if not isinstance(signature, str) or not crypto.is_hex128(signature):
         raise _Failure(ERR_INPUT)
+    return page_anchor, headers, tip, key_version, signature
 
-    # The caller-pinned anchor and tip hash are validated for shape too.
-    pinned_anchor = _validate_header_anchor(expected_anchor)
-    if not isinstance(expected_tip_hash, str) or not crypto.is_hex64(
-        expected_tip_hash
-    ):
-        raise _Failure(ERR_INPUT)
 
-    # 2. Trust signer lookup by key version, then the Ed25519 signature over
-    # the domain-prefixed canonical bytes of the page without its auth.
-    signers = _validate_header_trust(trust)
+def _authenticate_header_page(
+    document: dict, key_version: int, signature: str, signers: dict
+) -> None:
+    """Stage 2 of the header-page contract: signer lookup and signature.
+
+    The envelope's ``key_version`` selects the public key from
+    ``trust.audit_signers``; an unknown version or an Ed25519 signature that
+    does not verify over the domain-prefixed canonical bytes of the page
+    without its ``auth`` is an auth failure.
+    """
     public_key = signers.get(key_version)
     if public_key is None:
         raise _Failure(ERR_AUTH)
@@ -3215,16 +3237,21 @@ def _verify_header_page(
     if not crypto.verify_signature(public_key, digest, signature):
         raise _Failure(ERR_AUTH)
 
-    # 3. The delivered anchor must strictly equal the caller-pinned anchor.
-    if page_anchor != pinned_anchor:
-        raise _Failure(ERR_INTEGRITY)
 
-    # 4. Recompute every header hash and prev_hash link standalone from the
-    # anchor: heights run consecutively from anchor.height + 1, the first
-    # prev_hash is the anchor hash and later ones link internally. The
-    # merkle_root cannot be recomputed from a header-only page, but it is
-    # bound into the recomputed block hash. A pending header may only sit at
-    # the page tail.
+def _check_header_page_chain(
+    page_anchor: dict, headers: list[dict], tip: dict, expected_tip_hash: str
+) -> list[str]:
+    """Stage 3 of the header-page contract: recompute the chain and the tip.
+
+    Every header hash and prev_hash link is recomputed standalone from the
+    anchor: heights run consecutively from ``anchor.height + 1``, the first
+    prev_hash is the anchor hash and later ones link internally. The
+    merkle_root cannot be recomputed from a header-only page, but it is
+    bound into the recomputed block hash. A pending header may only sit at
+    the page tail. The tip descriptor must name the caller-pinned tip hash
+    and stay coherent with the page. Returns the verified header hashes in
+    ascending page order. Every defect is an integrity failure.
+    """
     previous_hash = page_anchor["block_hash"]
     for position, header in enumerate(headers):
         if header["height"] != page_anchor["height"] + 1 + position:
@@ -3240,7 +3267,7 @@ def _verify_header_page(
             raise _Failure(ERR_INTEGRITY)
         previous_hash = header["block_hash"]
 
-    # 5. The tip descriptor and the caller-pinned tip hash.
+    # The tip descriptor and the caller-pinned tip hash.
     if tip["tip_hash"] != expected_tip_hash:
         raise _Failure(ERR_INTEGRITY)
     # The canonical chain starts at height 0, so its descriptor length is
@@ -3270,8 +3297,40 @@ def _verify_header_page(
             or page_anchor["height"] != tip["height"]
         ):
             raise _Failure(ERR_INTEGRITY)
+    return [header["block_hash"] for header in headers]
 
-    verified_hashes = [header["block_hash"] for header in headers]
+
+def _verify_header_page(
+    document: object,
+    expected_anchor: object,
+    expected_tip_hash: object,
+    trust: object,
+) -> tuple[dict, dict, list[str]]:
+    """Strict core of :func:`verify_header_page`; may raise :class:`_Failure`."""
+    # 1. Exact key order and types — every defect here is an input error.
+    page_anchor, headers, tip, key_version, signature = _parse_header_page(document)
+
+    # The caller-pinned anchor and tip hash are validated for shape too.
+    pinned_anchor = _validate_header_anchor(expected_anchor)
+    if not isinstance(expected_tip_hash, str) or not crypto.is_hex64(
+        expected_tip_hash
+    ):
+        raise _Failure(ERR_INPUT)
+
+    # 2. Trust signer lookup by key version, then the Ed25519 signature over
+    # the domain-prefixed canonical bytes of the page without its auth.
+    signers = _validate_header_trust(trust)
+    _authenticate_header_page(document, key_version, signature, signers)
+
+    # 3. The delivered anchor must strictly equal the caller-pinned anchor.
+    if page_anchor != pinned_anchor:
+        raise _Failure(ERR_INTEGRITY)
+
+    # 4./5. Recompute the header chain from the anchor and check the tip
+    # descriptor against the caller-pinned tip hash.
+    verified_hashes = _check_header_page_chain(
+        page_anchor, headers, tip, expected_tip_hash
+    )
     return page_anchor, tip, verified_hashes
 
 
@@ -3486,6 +3545,141 @@ def verify_header_locator_page(
         "anchor": page_anchor,
         "tip": closed_tip,
         "matched_index": matched_index,
+        "verified_block_hashes": verified_hashes,
+    }
+
+
+# Fixed success key order returned by :func:`verify_header_locator_pages`.
+HEADER_LOCATOR_PAGES_RESULT_KEYS = (
+    "ok",
+    "anchor",
+    "tip",
+    "matched_index",
+    "pages",
+    "verified_block_hashes",
+)
+
+
+def verify_header_locator_pages(
+    documents: object,
+    locators: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Verify an ordered batch of signed locator pages as one chain.
+
+    ``documents`` must be a non-empty list of decoded
+    ``POST /v1/chain/headers/locate`` pages (each with the exact key order
+    ``anchor, headers, tip, auth``); ``locators`` is the original request
+    list (1-64 ``{height, block_hash}`` items, heights non-boolean
+    non-negative integers strictly descending, hashes 64 lowercase hex);
+    ``tip_hash`` is the caller-pinned chain tip every page's descriptor must
+    name; ``trust`` must carry ``audit_signers`` exactly as for
+    :func:`verify_header_page`.
+
+    Verification is staged across the whole batch: the parameters and every
+    page's key order, raw types and hex are checked first (``input``); then
+    every page's envelope is verified under the ``ledger-headers-v1`` domain
+    against ``trust.audit_signers`` (an unknown key version or a failed
+    signature is ``auth``); finally the batch is chained (``integrity``) —
+    the first page's anchor must be one of the ``locators`` (its position,
+    starting at 0, is returned as ``matched_index``), every later page's
+    anchor must equal the previous page's last header's
+    ``{height, block_hash}`` so heights and prev_hash links continue across
+    the seams and a missing, duplicated or reordered page breaks the chain,
+    every page's ``tip`` descriptor must be field-for-field identical, and
+    the last page must reach the pinned tip. A non-final page's headers may
+    never be empty — an empty first page is valid only as the batch's single
+    page with its anchor being the tip — and a pending header may only be
+    the very last header of the whole batch.
+
+    Returns ``{"ok": True, "anchor", "tip", "matched_index", "pages",
+    "verified_block_hashes"}`` on success — ``anchor`` the first page's
+    matched anchor, ``tip`` the shared chain descriptor, ``pages`` the page
+    count and ``verified_block_hashes`` every verified header hash in chain
+    order (the anchor itself is not a header and is not included) — or
+    ``{"ok": False, "error": category}`` on failure with category one of
+    ``input``, ``auth`` and ``integrity``. Never raises for malformed input.
+    """
+    try:
+        # Stage 1 (input): the parameters and every page's exact key order,
+        # raw types and hex are all settled before any signature work.
+        if not isinstance(documents, list) or not documents:
+            raise _Failure(ERR_INPUT)
+        closed_locators = _validate_header_locators(locators)
+        if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
+            raise _Failure(ERR_INPUT)
+        signers = _validate_header_trust(trust)
+        parsed = [_parse_header_page(document) for document in documents]
+
+        # Stage 2 (auth): every page's envelope must resolve a signer version
+        # and verify under the ledger-headers-v1 domain signature.
+        for document, (_, _, _, key_version, signature) in zip(documents, parsed):
+            _authenticate_header_page(document, key_version, signature, signers)
+
+        # Stage 3 (integrity): the first page anchors at one of the locators,
+        # every later page anchors at the previous page's last header, every
+        # page names the same caller-pinned tip and the batch reaches it.
+        pages = len(parsed)
+        matched_index: int | None = None
+        first_anchor: dict | None = None
+        shared_tip: dict | None = None
+        verified_hashes: list[str] = []
+        expected_anchor: dict | None = None
+        for position, (page_anchor, headers, tip, _, _) in enumerate(parsed):
+            if position == 0:
+                for index, locator in enumerate(closed_locators):
+                    if locator == page_anchor:
+                        matched_index = index
+                        break
+                if matched_index is None:
+                    # The batch anchors at a block the client never offered
+                    # as a known chain point.
+                    raise _Failure(ERR_INTEGRITY)
+                first_anchor = page_anchor
+            elif page_anchor != expected_anchor:
+                # A missing, duplicated or reordered page breaks the seam.
+                raise _Failure(ERR_INTEGRITY)
+            page_hashes = _check_header_page_chain(page_anchor, headers, tip, tip_hash)
+            if shared_tip is None:
+                shared_tip = tip
+            elif tip != shared_tip:
+                # Every page must carry the same chain descriptor, not
+                # merely the same tip hash.
+                raise _Failure(ERR_INTEGRITY)
+            last = position == pages - 1
+            if not page_hashes:
+                # An empty page (already pinned to the tip by the per-page
+                # rules) can only close the batch; a non-final empty page is
+                # a pagination defect and leaves no anchor to chain from.
+                if not last:
+                    raise _Failure(ERR_INTEGRITY)
+            else:
+                if last:
+                    # The final page must reach the pinned tip.
+                    if page_hashes[-1] != tip["tip_hash"]:
+                        raise _Failure(ERR_INTEGRITY)
+                elif headers[-1]["status"] != STATUS_CONFIRMED:
+                    # A pending header may only be the batch's very last
+                    # header: no page may follow it.
+                    raise _Failure(ERR_INTEGRITY)
+                expected_anchor = {
+                    "height": headers[-1]["height"],
+                    "block_hash": page_hashes[-1],
+                }
+            verified_hashes.extend(page_hashes)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "anchor": first_anchor,
+        "tip": shared_tip,
+        "matched_index": matched_index,
+        "pages": pages,
         "verified_block_hashes": verified_hashes,
     }
 
