@@ -314,6 +314,21 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `auth`（验签）、`integrity`（批次或 tip 冲突）、`state`（已存文件的
   解析、键序、类型、摘要或重放失配，文件不被截断或重建）、`io`
   （读写失败）。
+- **头检查点分叉定位请求生成**：
+  `ledger.light_client.header_locators(path: object, limit: object = 100)
+  -> dict`（纯库 API，只读、绝不写文件、不抛异常）。按 `advance_headers`
+  的既有加载方式严格重放 `path` 文件（JSON、键序、类型、自摘要、
+  generation 与 steps 数量、逐批重放全部核对）；令 B 为初始 `anchor` 与
+  每个 step 重放末端 tip 依**升序**组成、相邻同 `(height, block_hash)`
+  去重后的链点序列。从 B 末项起取至多 **10 个**连续倒序项，此后从当前索
+  引依次回退 2、4、8……；回退越过 0 则取 B[0] 结束；最多 **64 项**，第
+  64 项仍非 B[0] 时以 B[0] 替换。成功按键序 `ok, tip, request` 返回：
+  `tip` 沿用文件中的链描述符 S；`request` 键序恰为 `locators, limit`，
+  `locators` 每项键序恰为 `height, block_hash` 且高度**严格降序**，
+  `limit` 必须是非布尔整数 **1–500**（默认 100）。`path` 为空或非字符串
+  、`limit` 非法返回 `input`；文件缺失或不可读返回 `io`；JSON、键序、类
+  型、摘要、generation 与 steps 数量或逐批重放失配返回 `state`。失败仅
+  返回 `{"ok": false, "error"}`。
 
 ## 签名认证的增量区间协议
 
@@ -975,6 +990,18 @@ JSON**，成功/失败退出 0/1：
   失败打印 `{ok:false,error}`。给 `--trust` 时按持久签名者日志在下一
   授权边界前截断并给 `next`，`--key` 必须覆盖页内各 `verified_at`；
   未知/撤销覆盖 key 为 `auth`，坏日志为 `state`，日志缺失为 `io`。
+
+### CLI：`header-locators`
+
+离线子命令（不连接服务端、不写文件），调用
+`ledger.light_client.header_locators`：
+
+- `python -m ledger.cli header-locators FILE [--limit N]`：严格重放
+  `advance_headers` 检查点 `FILE` 并生成分叉定位请求。成功打印**单行**
+  request（键序 `locators, limit`，每个 locator 键序 `height, block_hash`
+  且严格降高），退出 **0**；失败单行打印 `{"ok": false, "error": ...}`
+  （`input`/`io`/`state`），退出 **1**。`--limit N` 缺省 100，N 必须为
+  非布尔整数 1–500，非法 N 为 `input`。
 
 ## 节点托管的检查点历史 HTTP 接口
 

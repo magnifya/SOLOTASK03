@@ -196,6 +196,24 @@ returns ``{"ok": True, "generation", "tip"}``; failure returns only
 ``{"ok": False, "error": category}`` with category one of
 ``input/auth/integrity/state/io`` and nothing is raised.
 
+:func:`header_locators` generates a fork-location request from a stored
+:func:`advance_headers` checkpoint without writing anything. The file is
+strictly replayed exactly as on load (JSON, key order, types, self hash,
+generation/step count and a full per-batch replay); a missing or unreadable
+file is ``io`` and any replay defect is ``state``. The ascending chain
+points B are the initial ``anchor`` followed by the replayed tip of each
+stored step, with adjacent equal ``(height, block_hash)`` pairs collapsed.
+The request leads with up to 10 consecutive points from B's tail running
+backwards, then falls back 2, 4, 8, ... positions from the current index;
+a step crossing index 0 takes B[0] and ends the walk. At most 64 locators
+are emitted and when the 64th is still not B[0] it is replaced by B[0].
+``path`` must be a non-empty string and ``limit`` a non-boolean integer in
+1..500 (default 100); anything else is ``input``. Success returns
+``{"ok": True, "tip", "request"}`` — ``tip`` the stored descriptor S,
+``request`` with the exact key order ``locators, limit`` and every locator a
+``{height, block_hash}`` document with strictly descending heights; failure
+returns only ``{"ok": False, "error": category}`` and nothing is raised.
+
 :func:`advance` durably checkpoints a verified batch to ``path``. The
 checkpoint file is one compact UTF-8 JSON document with the exact declared key
 order ``generation, anchor, tip, context, state_hash`` and a single trailing
@@ -3580,7 +3598,7 @@ def _validate_header_checkpoint_shape(data: object) -> dict:
     }
 
 
-def _replay_header_checkpoint(checkpoint: dict) -> None:
+def _replay_header_checkpoint(checkpoint: dict) -> list[dict]:
     """Re-verify one shape-validated header checkpoint document.
 
     The recorded ``hash`` pins the document before any replay: a tampered
@@ -3589,7 +3607,10 @@ def _replay_header_checkpoint(checkpoint: dict) -> None:
     :func:`verify_header_pages` against its own recorded pins — the first
     from the checkpoint anchor, every later one from the previous step's
     closed tip — with the same tip-monotonicity rule as a live advance, and
-    the final replayed tip must equal the stored one.
+    the final replayed tip must equal the stored one. Returns the replayed
+    per-step tip descriptors (one entry per step, in step order) so read-only
+    consumers such as :func:`header_locators` can build on the same replay
+    rather than repeating it.
     """
     recomputed = _header_checkpoint_hash(
         checkpoint["v"],
@@ -3607,23 +3628,25 @@ def _replay_header_checkpoint(checkpoint: dict) -> None:
         raise _CheckpointError(ERR_STATE)
 
     expected_anchor = checkpoint["anchor"]
-    tip: dict | None = None
+    replayed_tips: list[dict] = []
     for step in steps:
         result = verify_header_pages(
             step["documents"], expected_anchor, step["tip_hash"], step["trust"]
         )
         if not result.get("ok"):
             raise _CheckpointError(ERR_STATE)
-        if tip is not None and not _header_tip_advances(tip, result["tip"]):
+        if replayed_tips and not _header_tip_advances(replayed_tips[-1], result["tip"]):
             raise _CheckpointError(ERR_STATE)
         tip = result["tip"]
+        replayed_tips.append(tip)
         expected_anchor = {
             "height": tip["height"],
             "block_hash": tip["tip_hash"],
         }
-    assert tip is not None  # steps is shape-guaranteed non-empty
-    if tip != checkpoint["tip"]:
+    assert replayed_tips  # steps is shape-guaranteed non-empty
+    if replayed_tips[-1] != checkpoint["tip"]:
         raise _CheckpointError(ERR_STATE)
+    return replayed_tips
 
 
 def _load_header_checkpoint(path: str) -> dict | None:
@@ -3635,11 +3658,22 @@ def _load_header_checkpoint(path: str) -> dict | None:
     (unreadable JSON is ``state`` too, an unreadable file ``io``); the file
     is never truncated or rebuilt.
     """
+    checkpoint, _replayed_tips = _load_header_checkpoint_with_tips(path)
+    return checkpoint
+
+
+def _load_header_checkpoint_with_tips(
+    path: str,
+) -> tuple[dict | None, list[dict] | None]:
+    """Like :func:`_load_header_checkpoint` but also returns the replayed
+    per-step tip descriptors so a read-only caller builds on the same replay
+    instead of verifying every signature a second time.
+    """
     try:
         with open(path, "r", encoding="utf-8") as fh:
             text = fh.read()
     except FileNotFoundError:
-        return None
+        return None, None
     except OSError as exc:
         raise _CheckpointError(ERR_IO) from exc
 
@@ -3648,8 +3682,8 @@ def _load_header_checkpoint(path: str) -> dict | None:
     except (ValueError, UnicodeDecodeError) as exc:
         raise _CheckpointError(ERR_STATE) from exc
     checkpoint = _validate_header_checkpoint_shape(data)
-    _replay_header_checkpoint(checkpoint)
-    return checkpoint
+    replayed_tips = _replay_header_checkpoint(checkpoint)
+    return checkpoint, replayed_tips
 
 
 def _atomic_write_header_checkpoint(path: str, checkpoint: dict) -> None:
@@ -3825,3 +3859,124 @@ def _validate_header_anchor_argument(raw: object) -> dict | None:
     if not crypto.is_hex64(raw["block_hash"]):
         return None
     return {"height": height, "block_hash": raw["block_hash"]}
+
+
+# -- fork-location request generation from a header checkpoint ----------------
+
+# Fixed success key order returned by :func:`header_locators`.
+HEADER_LOCATORS_RESULT_KEYS = ("ok", "tip", "request")
+
+# The generated request's exact key order.
+HEADER_LOCATORS_REQUEST_KEYS = ("locators", "limit")
+
+# How many consecutive (step-by-step descending) chain points lead the list.
+HEADER_LOCATORS_LEADING = 10
+
+# Hard cap on the number of locators in one generated request.
+HEADER_LOCATORS_MAX = 64
+
+# The default request limit mirrors the locate endpoint's default.
+HEADER_LOCATORS_DEFAULT_LIMIT = 100
+
+
+def _header_locator_indices(last: int) -> list[int]:
+    """Indices into the ascending chain-point sequence B for one request.
+
+    ``last`` is the index of B's final item (``len(B) - 1``). The request
+    leads with at most 10 consecutive points from the tail backwards; after
+    that it falls back 2, 4, 8, ... positions per step. A step that would
+    cross index 0 lands on B[0] and ends the walk. At most 64 indices are
+    returned; when the 64th index is anything but 0 it is replaced by 0.
+    """
+    indices: list[int] = []
+    index = last
+    # Up to 10 consecutive tail points, never stepping past B's start.
+    for _ in range(HEADER_LOCATORS_LEADING):
+        indices.append(index)
+        if index == 0:
+            return indices
+        index -= 1
+    # Exponential fallback from the current position.
+    gap = 2
+    while len(indices) < HEADER_LOCATORS_MAX:
+        target = index - gap
+        if target <= 0:
+            indices.append(0)
+            break
+        indices.append(target)
+        index = target
+        gap *= 2
+    if indices[-1] != 0:
+        indices[-1] = 0
+    return indices
+
+
+def header_locators(path: object, limit: object = HEADER_LOCATORS_DEFAULT_LIMIT) -> dict:
+    """Build a fork-location request by replaying an advance_headers file.
+
+    The checkpoint at ``path`` is strictly loaded exactly as
+    :func:`advance_headers` loads it (key order, types, self hash,
+    generation/step count and a full per-batch replay). The chain points B
+    are the initial ``anchor`` plus the replayed tip of every stored step,
+    in ascending order with adjacent equal ``(height, block_hash)`` pairs
+    collapsed — a same-height confirmation records one point, not two. The
+    request leads with up to 10 consecutive points from B's tail backwards,
+    then falls back 2, 4, 8, ... positions; crossing index 0 takes B[0] and
+    stops; no more than 64 locators are emitted and the 64th is replaced by
+    B[0] when the walk has not reached it.
+
+    Success returns ``{"ok": True, "tip", "request"}`` in that key order:
+    ``tip`` is the stored chain descriptor S and ``request`` has the exact
+    key order ``locators, limit`` where each locator is a closed
+    ``{height, block_hash}`` document in strictly descending height order
+    and ``limit`` is the supplied non-boolean integer 1-500 (default 100).
+
+    Every failure is ``{"ok": False, "error": category}`` with category one
+    of ``input`` (a non-string/empty ``path`` or an illegal ``limit``),
+    ``io`` (the file is missing or unreadable) and ``state`` (the file is
+    present but fails its JSON, key-order, type, digest, generation/step
+    count or per-batch replay checks). The file is only ever read; nothing
+    is raised and nothing is written.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not _is_int(limit) or not (1 <= limit <= 500):
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            checkpoint, replayed_tips = _load_header_checkpoint_with_tips(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report rather
+            # than crash the caller.
+            return {"ok": False, "error": ERR_STATE}
+        if checkpoint is None:
+            # A missing checkpoint is treated like any unreadable file.
+            return {"ok": False, "error": ERR_IO}
+        assert replayed_tips is not None
+
+        # The loader already shape-validated and fully replayed the document;
+        # the per-step replayed descriptors are the verified chain points the
+        # request is built from, rather than the raw stored bytes.
+        points: list[dict] = [checkpoint["anchor"]]
+        for tip in replayed_tips:
+            point = {"height": tip["height"], "block_hash": tip["tip_hash"]}
+            if point != points[-1]:
+                # Ascending by construction: collapse an adjacent duplicate
+                # (the same-height pending -> confirmed point) and reject any
+                # non-ascending pair as state rather than emitting locators
+                # whose heights are not strictly descending.
+                if point["height"] < points[-1]["height"]:
+                    return {"ok": False, "error": ERR_STATE}
+                points.append(point)
+
+    indices = _header_locator_indices(len(points) - 1)
+    locators = [
+        {"height": points[index]["height"], "block_hash": points[index]["block_hash"]}
+        for index in indices
+    ]
+    request = {"locators": locators, "limit": limit}
+    return {"ok": True, "tip": checkpoint["tip"], "request": request}
