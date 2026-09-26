@@ -301,10 +301,13 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   与已存**末批**完全相同（`tip_hash`、`trust`、`documents` 逐字相同）的
   提交幂等，不增代、文件字节不动。文件为单个紧凑 UTF-8 JSON 文档（非
   ASCII 不转义、末尾恰好一个换行），顶层键序固定为
-  `v, generation, anchor, tip, steps, hash`：`v = 1`，`generation` 为非
-  布尔正整数、每次成功推进 +1，`anchor` 为首次钉住的锚点，`tip` 沿用链
-  描述符 S，`steps` 为非空数组且每项键序恰为
-  `tip_hash, trust, documents`（嵌套键序沿用既有契约），`hash` 为去掉
+  `v, generation, anchor, tip, steps, hash`：`v = 2`（v1 文件仍可读取，
+  其步骤按 `linear` 重放），`generation` 为非布尔正整数、每次成功推进
+  或重组 +1，`anchor` 为首次钉住的锚点，`tip` 沿用链描述符 S，`steps`
+  为非空数组且每项键序恰为
+  `kind, tip_hash, trust, documents, locators`（`kind` 为
+  `linear`/`locator`；`linear` 步 `locators` 为 `null`，`locator` 步
+  携带其请求定位列表；嵌套键序沿用既有契约），`hash` 为去掉
   `hash` 自身的 canonical_json（`sort_keys`、紧凑分隔符、
   `ensure_ascii=False`）字节的 SHA-256（64 位小写 hex）。加载时逐批重放
   并核对最终 tip；同一 `path` 共用一把锁串行、临时文件 fsync 后
@@ -314,6 +317,24 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `auth`（验签）、`integrity`（批次或 tip 冲突）、`state`（已存文件的
   解析、键序、类型、摘要或重放失配，文件不被截断或重建）、`io`
   （读写失败）。
+- **检查点重组**：`ledger.light_client.reorg_headers(path, documents,
+  locators, tip_hash, trust) -> dict` 把一批**已核验**的定位签名头页
+  （分叉重组）落盘到同一检查点文件（纯库 API，HTTP/CLI 不变）。批次按
+  `verify_header_locator_pages` 原样多页校验；`path` 处检查点必须已存在
+  （缺失为 `io`，无首次使用）。**边界**为 anchor 匹配的**最后**一个已存
+  step 的 tip；无 step 匹配时才取初始 anchor（anchor 落在别处为
+  `integrity`）。边界之后的步骤后缀被删除、追加一条 `locator` 步，
+  `replaced` 为删除的步数。新 tip 高度**不得低于**已存 tip；同高度异
+  hash（即重组本身）`pending`/`confirmed` 均可，同 hash 仅允许
+  `pending -> confirmed`，其余同高冲突为 `integrity`。与已存**末
+  locator 步**完全相同（`tip_hash`、`trust`、`documents`、`locators`
+  逐字相同）的提交幂等：`replaced = 0`、不写盘、不增代；其余成功
+  `generation + 1` 并原子换入 v2 文件。成功按键序
+  `ok, generation, tip, replaced` 返回；失败仅返回
+  `{"ok": false, "error"}` 且**不抛异常**，`error` 仅取 `input`
+  （参数或定位/批次结构）、`auth`（签名者版本或验签）、`integrity`
+  （边界、链、高度或同高冲突）、`state`（已存文件校验失败）、`io`
+  （文件缺失或读写失败）。
 
 ## 签名认证的增量区间协议
 

@@ -7,8 +7,9 @@ it through GET /v1/chain/headers and covers:
 * a first advance from a legal anchor and later advances with ``None`` or
   the stored tip's ``{height, block_hash}``;
 * file shape: exact top-level key order ``v, generation, anchor, tip, steps,
-  hash``, step key order ``tip_hash, trust, documents``, compact UTF-8 JSON
-  with non-ASCII unescaped and one trailing newline, and the self-excluding
+  hash``, step key order ``kind, tip_hash, trust, documents, locators`` with
+  ``kind: "linear"`` and ``locators: null``, compact UTF-8 JSON with
+  non-ASCII unescaped and one trailing newline, and the self-excluding
   canonical-json SHA-256 ``hash``;
 * generation starting at 1 and incremented only on a successful advance (a
   failed verification never bumps it), tip monotonicity (never lower; same
@@ -52,7 +53,8 @@ from ledger.service import LedgerService
 from ledger.store import LedgerStore
 
 CHECKPOINT_KEYS = ["v", "generation", "anchor", "tip", "steps", "hash"]
-STEP_KEYS = ["tip_hash", "trust", "documents"]
+STEP_KEYS = ["kind", "tip_hash", "trust", "documents", "locators"]
+V1_STEP_KEYS = ["tip_hash", "trust", "documents"]
 ANCHOR_KEYS = ["height", "block_hash"]
 TIP_KEYS = ["tip_hash", "height", "length", "status"]
 
@@ -203,7 +205,7 @@ class AdvanceHeadersSuccessTests(AdvanceHeadersFixture):
         self.assertNotIn(b": ", raw)
         data = json.loads(raw)
         self.assertEqual(list(data.keys()), CHECKPOINT_KEYS)
-        self.assertEqual(data["v"], 1)
+        self.assertEqual(data["v"], 2)
         self.assertEqual(data["generation"], 1)
         self.assertEqual(data["anchor"], self.anchor)
         self.assertEqual(list(data["anchor"].keys()), ANCHOR_KEYS)
@@ -212,9 +214,11 @@ class AdvanceHeadersSuccessTests(AdvanceHeadersFixture):
         self.assertEqual(len(data["steps"]), 1)
         step = data["steps"][0]
         self.assertEqual(list(step.keys()), STEP_KEYS)
+        self.assertEqual(step["kind"], "linear")
         self.assertEqual(step["tip_hash"], self.tip_hash)
         self.assertEqual(step["trust"], self.trust)
         self.assertEqual(step["documents"], documents)
+        self.assertIsNone(step["locators"])
 
     def test_hash_covers_every_field_but_itself(self) -> None:
         self.advance(self.paged(2), self.anchor)
@@ -342,6 +346,42 @@ class AdvanceHeadersSuccessTests(AdvanceHeadersFixture):
         result = self.advance([empty], None, tip_hash=self.tip_hash)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["generation"], 2)
+
+    def test_version_one_checkpoint_is_read_and_rewritten_as_v2(self) -> None:
+        self.advance(self.paged(2), self.anchor)
+        data = self.read_checkpoint()
+        # Downgrade the file to the legacy version-1 shape: v=1 and steps
+        # carrying only tip_hash, trust, documents.
+        legacy = {
+            "v": 1,
+            "generation": data["generation"],
+            "anchor": data["anchor"],
+            "tip": data["tip"],
+            "steps": [
+                {key: step[key] for key in V1_STEP_KEYS}
+                for step in data["steps"]
+            ],
+        }
+        self.rehash(legacy)
+        self.write_file(legacy)
+        # The legacy file loads and replays; the next advance appends a
+        # linear step and rewrites the file as version 2.
+        self.assertEqual(self.service.confirm_block("4")[0], 200)
+        empty = self.page(4, self.tip_hash)
+        result = self.advance([empty], None, tip_hash=self.tip_hash)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["generation"], 2)
+        rewritten = self.read_checkpoint()
+        self.assertEqual(rewritten["v"], 2)
+        self.assertEqual(len(rewritten["steps"]), 2)
+        self.assertEqual(
+            [list(step.keys()) for step in rewritten["steps"]],
+            [STEP_KEYS, STEP_KEYS],
+        )
+        self.assertEqual(
+            [step["kind"] for step in rewritten["steps"]], ["linear", "linear"]
+        )
+        self.assertIsNone(rewritten["steps"][0]["locators"])
 
 
 class AdvanceHeadersInputTests(AdvanceHeadersFixture):
@@ -507,7 +547,8 @@ class AdvanceHeadersStateTests(AdvanceHeadersFixture):
         data = self.read_checkpoint()
         step = data["steps"][0]
         data["steps"][0] = {
-            key: step[key] for key in ("trust", "tip_hash", "documents")
+            key: step[key]
+            for key in ("trust", "kind", "tip_hash", "documents", "locators")
         }
         self.rehash(data)
         self.write_file(data)
@@ -548,7 +589,7 @@ class AdvanceHeadersStateTests(AdvanceHeadersFixture):
     def test_bad_version_is_state(self) -> None:
         self.advance(self.paged(2), self.anchor)
         data = self.read_checkpoint()
-        data["v"] = 2
+        data["v"] = 3
         self.rehash(data)
         self.write_file(data)
         self.assert_error(self.advance(self.paged(1), self.anchor), ERR_STATE)
