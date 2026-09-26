@@ -181,6 +181,18 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.submit_fork_sync(payload)
                 self._send_json(status, body)
+            elif path == "/v1/chain/headers/locate":
+                # POST /v1/chain/headers/locate — a signed header page whose
+                # anchor is the first locator matching the canonical chain.
+                # The success document has the contract-fixed key order
+                # (anchor, headers, tip, auth), so it is serialized in
+                # insertion order rather than alphabetically.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.locate_chain_headers(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/audit/signer/rotate":
                 # POST /v1/audit/signer/rotate — rotate the Ed25519 key that
                 # authenticates audit export checkpoints.

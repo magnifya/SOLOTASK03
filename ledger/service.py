@@ -981,6 +981,123 @@ class LedgerService:
                 "auth": auth,
             }
 
+    # -- signed block-header pages located by a locator list ------------------
+
+    LOCATOR_MAX_COUNT = 64
+
+    def locate_chain_headers(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/chain/headers/locate — a signed header page from locators.
+
+        The body is a JSON object with the ordered keys ``locators, limit``
+        (``limit`` optional): ``locators`` is an array of 1-64 items, each
+        ``{height, block_hash}`` in that key order, with ``height`` a
+        non-boolean non-negative integer (strictly descending across the
+        list, hence unique) and ``block_hash`` 64 lowercase hex characters;
+        ``limit`` defaults to 100 and must be a non-boolean integer between
+        1 and 500. A parse failure or any key/value defect is a 400 before
+        any state is touched — the request has no side effects.
+
+        The first locator (in list order) naming the canonical block at its
+        height with its exact hash becomes the anchor; when no locator
+        matches the canonical chain the response is 409. The success body is
+        the same signed page as ``GET /v1/chain/headers`` with the fixed key
+        order ``anchor, headers, tip, auth``: the headers ascend strictly
+        after the anchor (at most ``limit`` items, empty when the anchor is
+        the tip) and the page is signed by the current audit signer. The
+        chain page, the tip descriptor and the signer are read as one
+        snapshot under the store lock, so a concurrent fork adoption or
+        signer rotation can never mix into one response.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        if tuple(payload.keys()) not in (("locators",), ("locators", "limit")):
+            return 400, {
+                "error": "body keys must be exactly locators[, limit] in order"
+            }
+        raw_locators = payload["locators"]
+        if not isinstance(raw_locators, list) or not 1 <= len(raw_locators) <= (
+            self.LOCATOR_MAX_COUNT
+        ):
+            return 400, {"error": "locators must be an array of 1 to 64 items"}
+        locators: list[dict] = []
+        previous_height: int | None = None
+        for item in raw_locators:
+            if not isinstance(item, dict) or tuple(item.keys()) != (
+                "height",
+                "block_hash",
+            ):
+                return 400, {
+                    "error": "locator items must have the ordered keys "
+                    "height, block_hash"
+                }
+            height = item["height"]
+            if (
+                isinstance(height, bool)
+                or not isinstance(height, int)
+                or height < 0
+            ):
+                return 400, {
+                    "error": "locator height must be a non-negative integer"
+                }
+            if previous_height is not None and height >= previous_height:
+                return 400, {
+                    "error": "locator heights must be strictly descending"
+                }
+            if not crypto.is_hex64(item["block_hash"]):
+                return 400, {
+                    "error": "locator block_hash must be 64 lowercase hex "
+                    "characters"
+                }
+            previous_height = height
+            locators.append({"height": height, "block_hash": item["block_hash"]})
+        limit = self.RANGE_DEFAULT_LIMIT
+        if "limit" in payload:
+            raw_limit = payload["limit"]
+            if (
+                isinstance(raw_limit, bool)
+                or not isinstance(raw_limit, int)
+                or not 1 <= raw_limit <= self.RANGE_MAX_LIMIT
+            ):
+                return 400, {
+                    "error": "limit must be an integer between 1 and 500"
+                }
+            limit = raw_limit
+
+        from . import light_client
+
+        with self.store.lock:
+            anchor_block = None
+            for locator in locators:
+                block = self.store.block_at(locator["height"])
+                if block is not None and block.block_hash == locator["block_hash"]:
+                    anchor_block = block
+                    break
+            if anchor_block is None:
+                return 409, {"error": "no locator matches the canonical chain"}
+            page = self.store.chain[
+                anchor_block.height + 1 : anchor_block.height + 1 + limit
+            ]
+            anchor = self._anchor_descriptor(anchor_block)
+            headers = [self._header_entry(block) for block in page]
+            tip = self._fork_summary(self.store.chain)
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError("no audit signer available for header page")
+            auth = light_client.sign_header_page(
+                signer["private_key"], signer["version"], anchor, headers, tip
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "anchor": anchor,
+                "headers": headers,
+                "tip": tip,
+                "auth": auth,
+            }
+
     # -- inter-node fork sync -------------------------------------------------
 
     SYNC_DEFAULT_LIMIT = 50

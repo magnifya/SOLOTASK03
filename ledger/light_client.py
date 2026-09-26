@@ -149,6 +149,22 @@ failure is ``{"ok": False, "error": category}`` with category one of
 key version or a failed signature) and ``integrity`` (anchor, tip, hash,
 link, pagination or pending-position defects). Nothing is raised.
 
+:func:`verify_header_locator_page` verifies one signed
+``POST /v1/chain/headers/locate`` page offline. The document has the same
+exact top-level key order ``anchor, headers, tip, auth`` as a
+``GET /v1/chain/headers`` page and is verified standalone from its own
+delivered anchor under the exact :func:`verify_header_page` rules; instead
+of a caller-pinned anchor, the caller supplies the request's locator list
+(1-64 ``{height, block_hash}`` items in that key order, heights strictly
+descending non-boolean non-negative integers, hashes 64 lowercase hex) and
+the page's anchor must equal one of the locators — the first match is
+reported as the 0-based ``matched_index``. Failures map to ``input``
+(parameter and locator list shape/key order/type defects), ``auth``
+(unknown key version or a failed signature) and ``integrity`` (the anchor
+matches no locator, or a header-chain/tip defect); nothing is raised.
+Success returns ``{"ok": True, "anchor", "tip", "matched_index",
+"verified_block_hashes"}``.
+
 :func:`advance_headers` durably checkpoints a verified header-page batch to
 ``path``. The file is one compact UTF-8 JSON document (non-ASCII written
 unescaped, one trailing newline) with the exact top-level key order
@@ -3068,6 +3084,107 @@ def verify_header_page(
     }
 
 
+# The maximum number of locators one locate request may carry.
+HEADER_LOCATOR_MAX_COUNT = 64
+
+# Fixed success key order returned by :func:`verify_header_locator_page`.
+HEADER_LOCATOR_RESULT_KEYS = (
+    "ok",
+    "anchor",
+    "tip",
+    "matched_index",
+    "verified_block_hashes",
+)
+
+
+def verify_header_locator_page(
+    document: object,
+    locators: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Offline-verify one signed ``POST /v1/chain/headers/locate`` page.
+
+    ``document`` is the decoded response with the exact top-level key order
+    ``anchor, headers, tip, auth`` (the same signed page shape as
+    ``GET /v1/chain/headers``); ``locators`` is the caller's locator list —
+    1-64 items, each ``{height, block_hash}`` in that key order, ``height``
+    a non-boolean non-negative integer strictly descending across the list
+    (hence unique) and ``block_hash`` 64 lowercase hex; ``tip_hash`` is the
+    caller-pinned chain tip; ``trust`` must carry an ``audit_signers`` list.
+
+    The page is verified standalone from its own delivered anchor under the
+    exact :func:`verify_header_page` rules (key order and types, signer
+    lookup by ``key_version``, the domain-prefixed Ed25519 signature, the
+    recomputed header hashes and prev_hash links, the tip descriptor), and
+    its anchor must then equal one of the locators — the first such locator
+    (0-based) is reported as ``matched_index``.
+
+    Returns ``{"ok": True, "anchor", "tip", "matched_index",
+    "verified_block_hashes"}`` on success or ``{"ok": False, "error":
+    category}`` on failure with category one of ``input`` (bad parameters,
+    locator list shape/key order/types), ``auth`` (unknown key version or a
+    signature that does not verify) and ``integrity`` (the anchor matches no
+    locator, or a header-chain/tip defect). Never raises for malformed
+    input.
+    """
+    try:
+        parsed_locators = _validate_header_locators(locators)
+        closed_anchor, closed_tip, verified_hashes = _verify_header_page(
+            document, None, tip_hash, trust
+        )
+        matched_index = next(
+            (
+                index
+                for index, locator in enumerate(parsed_locators)
+                if locator == closed_anchor
+            ),
+            None,
+        )
+        if matched_index is None:
+            raise _Failure(ERR_INTEGRITY)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "anchor": closed_anchor,
+        "tip": closed_tip,
+        "matched_index": matched_index,
+        "verified_block_hashes": verified_hashes,
+    }
+
+
+def _validate_header_locators(raw: object) -> list[dict]:
+    """Structural validation of a locate request's locator list.
+
+    The list must carry 1-64 items, each a ``{height, block_hash}`` document
+    in that exact key order with a non-boolean non-negative integer height
+    and a 64-lowercase-hex hash; heights must be strictly descending (which
+    also makes them unique). Returns the closed locator documents.
+    """
+    if not isinstance(raw, list) or not 1 <= len(raw) <= HEADER_LOCATOR_MAX_COUNT:
+        raise _Failure(ERR_INPUT)
+    locators: list[dict] = []
+    previous_height: int | None = None
+    for item in raw:
+        if not isinstance(item, dict) or tuple(item.keys()) != HEADER_ANCHOR_KEYS:
+            raise _Failure(ERR_INPUT)
+        height = item["height"]
+        if not _is_int(height) or height < 0:
+            raise _Failure(ERR_INPUT)
+        if previous_height is not None and height >= previous_height:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(item["block_hash"]):
+            raise _Failure(ERR_INPUT)
+        previous_height = height
+        locators.append({"height": height, "block_hash": item["block_hash"]})
+    return locators
+
+
 def _validate_header_anchor(raw: object) -> dict:
     """Structural validation of a closed ``{height, block_hash}`` anchor."""
     if not isinstance(raw, dict) or tuple(raw.keys()) != HEADER_ANCHOR_KEYS:
@@ -3113,7 +3230,13 @@ def _verify_header_page(
     expected_tip_hash: object,
     trust: object,
 ) -> tuple[dict, dict, list[str]]:
-    """Strict core of :func:`verify_header_page`; may raise :class:`_Failure`."""
+    """Strict core of :func:`verify_header_page`; may raise :class:`_Failure`.
+
+    ``expected_anchor`` is the caller-pinned ``{height, block_hash}`` the
+    page's anchor must strictly equal, or ``None`` to verify the page
+    standalone from its own delivered anchor (used by the locator variant,
+    which binds the anchor to the locator list afterwards).
+    """
     # 1. Exact key order and types — every defect here is an input error.
     if not isinstance(document, dict):
         raise _Failure(ERR_INPUT)
@@ -3160,8 +3283,14 @@ def _verify_header_page(
     if not isinstance(signature, str) or not crypto.is_hex128(signature):
         raise _Failure(ERR_INPUT)
 
-    # The caller-pinned anchor and tip hash are validated for shape too.
-    pinned_anchor = _validate_header_anchor(expected_anchor)
+    # The caller-pinned anchor and tip hash are validated for shape too. An
+    # unpinned (None) anchor verifies the page standalone from its own
+    # delivered anchor.
+    pinned_anchor = (
+        _validate_header_anchor(expected_anchor)
+        if expected_anchor is not None
+        else None
+    )
     if not isinstance(expected_tip_hash, str) or not crypto.is_hex64(
         expected_tip_hash
     ):
@@ -3179,7 +3308,7 @@ def _verify_header_page(
         raise _Failure(ERR_AUTH)
 
     # 3. The delivered anchor must strictly equal the caller-pinned anchor.
-    if page_anchor != pinned_anchor:
+    if pinned_anchor is not None and page_anchor != pinned_anchor:
         raise _Failure(ERR_INTEGRITY)
 
     # 4. Recompute every header hash and prev_hash link standalone from the
