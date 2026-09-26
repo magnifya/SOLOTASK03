@@ -1139,6 +1139,131 @@ class LedgerService:
                 "auth": auth,
             }
 
+    # -- paginated finality credentials ---------------------------------------
+
+    @staticmethod
+    def _block_descriptor(block: Block) -> dict:
+        """The descriptor S of the chain prefix ending at ``block``."""
+        return {
+            "tip_hash": block.block_hash,
+            "height": block.height,
+            # The length counts every block including the genesis block.
+            "length": block.height + 1,
+            "status": block.status,
+        }
+
+    def get_chain_finalities(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/chain/finalities — one signed page of finality credentials.
+
+        Query parameters follow exactly the rules of
+        ``GET /v1/chain/headers``: ``after_height`` and ``after_hash`` are
+        both required, ``limit`` defaults to 100 and must be a decimal
+        between 1 and 500; a repeated parameter is rejected by the HTTP
+        layer, an unknown parameter is 400, malformed values are 400, an
+        unknown anchor height is 404 and an anchor hash mismatch is 409. A
+        pending anchor is 409 too: a finality page only ever starts from a
+        confirmed anchor.
+
+        The success body has the fixed key order ``anchor, finalities,
+        next, head``: ``anchor`` is ``{height, block_hash}`` echoing the
+        request anchor; ``finalities`` are the signed finality credentials
+        of the confirmed blocks strictly after it in ascending height (at
+        most ``limit`` items, each with the exact GET /v1/chain/finality
+        key order ``finalized, tip, auth`` and the ``ledger-finality-v1``
+        signature, where ``finalized`` names that block and ``tip`` is the
+        descriptor S of the chain prefix ending at that block), so the
+        page can be fed straight to ``apply_finalities``; ``next`` is the
+        last item's ``finalized`` while the page has not reached the head
+        finality and ``null`` otherwise (an anchor that already is the
+        head yields an empty page and ``next: null``); ``head`` is the
+        current finality credential. The chain and the current audit
+        signer are snapshotted under one store lock and every credential
+        is signed before the response is assembled, so a signing or
+        construction failure can never return a partial page.
+        """
+        if any(key not in ("after_height", "after_hash", "limit") for key in params):
+            return 400, {"error": "unknown query parameter"}
+        after_height_raw = params.get("after_height")
+        after_hash = params.get("after_hash")
+        if after_height_raw is None:
+            return 400, {"error": "missing parameter: after_height"}
+        if after_hash is None:
+            return 400, {"error": "missing parameter: after_hash"}
+        after_height = _parse_decimal(after_height_raw)
+        if after_height is None:
+            return 400, {"error": "after_height must be a non-negative decimal"}
+        if not crypto.is_hex64(after_hash):
+            return 400, {"error": "after_hash must be 64 lowercase hex characters"}
+        limit = self.RANGE_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.RANGE_MAX_LIMIT:
+                return 400, {"error": "limit must be a decimal between 1 and 500"}
+            limit = parsed
+
+        from . import light_client
+
+        with self.store.lock:
+            anchor_block = self.store.block_at(after_height)
+            if anchor_block is None:
+                return 404, {"error": "anchor block not found"}
+            if after_hash != anchor_block.block_hash:
+                return 409, {
+                    "error": "after_hash does not match the block at after_height"
+                }
+            if anchor_block.status != STATUS_CONFIRMED:
+                return 409, {"error": "anchor block is pending"}
+            finalized_block = next(
+                block
+                for block in reversed(self.store.chain)
+                if block.status == STATUS_CONFIRMED
+            )
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError("no audit signer available for finality page")
+            # Confirmed blocks form a prefix of the chain, so the page is the
+            # consecutive run strictly after the anchor up to the limit and
+            # never past the head finality.
+            page_end = min(after_height + limit, finalized_block.height)
+            page = self.store.chain[after_height + 1 : page_end + 1]
+            finalities = []
+            for block in page:
+                finalized = self._anchor_descriptor(block)
+                tip = self._block_descriptor(block)
+                auth = light_client.sign_finality(
+                    signer["private_key"], signer["version"], finalized, tip
+                )
+                if auth is None:
+                    raise RuntimeError("current audit signer key is invalid")
+                finalities.append(
+                    {"finalized": finalized, "tip": tip, "auth": auth}
+                )
+            head_finalized = self._anchor_descriptor(finalized_block)
+            head_tip = self._fork_summary(self.store.chain)
+            head_auth = light_client.sign_finality(
+                signer["private_key"], signer["version"], head_finalized, head_tip
+            )
+            if head_auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            head = {
+                "finalized": head_finalized,
+                "tip": head_tip,
+                "auth": head_auth,
+            }
+            if finalities and page[-1].height < finalized_block.height:
+                next_anchor: dict | None = finalities[-1]["finalized"]
+            else:
+                next_anchor = None
+            return 200, {
+                "anchor": self._anchor_descriptor(anchor_block),
+                "finalities": finalities,
+                "next": next_anchor,
+                "head": head,
+            }
+
     # -- inter-node fork sync -------------------------------------------------
 
     SYNC_DEFAULT_LIMIT = 50
