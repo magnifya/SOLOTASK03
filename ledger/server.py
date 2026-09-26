@@ -368,6 +368,21 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.get_chain_headers(params)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/chain/finality":
+                # GET /v1/chain/finality — the finalized-block credential.
+                # It takes no parameters: any query string is rejected 400
+                # before the chain or signer are touched. The success
+                # document has a contract-fixed key order
+                # (finalized, tip, auth), so it is serialized in insertion
+                # order rather than alphabetically. This exact match must
+                # precede the generic /v1/chain branch below.
+                if query:
+                    self._send_json(
+                        400, {"error": "finality accepts no query parameters"}
+                    )
+                    return
+                status, body = service.get_chain_finality()
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/chain":
                 status, body = service.get_chain()
                 self._send_json(status, body)

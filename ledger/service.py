@@ -1094,6 +1094,52 @@ class LedgerService:
                 "auth": auth,
             }
 
+    # -- finality credential -------------------------------------------------
+
+    def get_chain_finality(self) -> tuple[int, dict]:
+        """GET /v1/chain/finality — the finalized-block finality credential.
+
+        Takes no parameters (the HTTP layer rejects any query string with
+        400). Under one store lock the chain and the current audit signer are
+        snapshotted together: ``finalized`` is the last *confirmed* chain
+        block as ``{height, block_hash}`` (the genesis block when nothing
+        above it is confirmed), ``tip`` is the current chain descriptor S and
+        ``auth`` is ``{key_version, signature}`` — an Ed25519 signature made
+        with the current audit signer over
+        ``SHA256(UTF8("ledger-finality-v1") || canonical_json({finalized,
+        tip}))``. The success body has the fixed key order
+        ``finalized, tip, auth``.
+        """
+        from . import light_client
+
+        with self.store.lock:
+            finalized_block = next(
+                block
+                for block in reversed(self.store.chain)
+                if block.status == STATUS_CONFIRMED
+            )
+            finalized = {
+                "height": finalized_block.height,
+                "block_hash": finalized_block.block_hash,
+            }
+            tip = self._fork_summary(self.store.chain)
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError("no audit signer available for finality")
+            auth = light_client.sign_finality_document(
+                signer["private_key"], signer["version"], finalized, tip
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "finalized": finalized,
+                "tip": tip,
+                "auth": auth,
+            }
+
     # -- inter-node fork sync -------------------------------------------------
 
     SYNC_DEFAULT_LIMIT = 50

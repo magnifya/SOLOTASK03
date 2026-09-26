@@ -360,6 +360,42 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   时须重验 finalized 的分支归属（落在已丢弃分叉或 pending 头为
   `state`）。
 
+## 最终化凭证
+
+节点对外发布当前最终化点的签名凭证，离线检查点可凭它推进不可逆边界。
+
+- **HTTP**：`GET /v1/chain/finality` **无参数**（任何查询参数，包括空值，
+  一律 `400`，且不读取链状态）。主链与当前审计签名者在**同一把锁**内取
+  快照，分页与签名不会混用并发状态。`200` 文档键序固定为
+  `finalized, tip, auth`：
+  - `finalized` 键序 `height, block_hash`，取链上**末个 confirmed 块**
+    （其上只有待定块或没有更高块时即该块；无任何已确认扩展时为创世块）；
+  - `tip` 沿用链描述符 S（`tip_hash, height, length, status`）；
+  - `auth` 键序 `key_version, signature`，版本对应
+    `GET /v1/trust` 的 `audit_signers` 中**当前版本**；签名为对
+    `UTF8("ledger-finality-v1") ‖ canonical_json(去掉 auth 的文档)` 的
+    SHA-256 32 字节摘要做出的 Ed25519 签名（128 位小写十六进制），
+    `canonical_json` 即 `json.dumps(..., sort_keys=True,
+    separators=(",",":"), ensure_ascii=False)` 的 UTF-8 字节。
+- **离线应用**：`ledger.light_client.apply_finality(path: object,
+  document: object, trust: object) -> dict`（纯库 API，其余 HTTP/CLI
+  不变）。先严格校验文档顶层与嵌套**键序/类型**（`finalized` 为
+  `{height, block_hash}`：非布尔非负整数与 64 位小写 hex；`tip` 为封闭
+  描述符 S；`auth.key_version` 为正整数、`auth.signature` 为 128 位小写
+  hex）——畸形为 `input`；再按 `key_version` 从 `trust.audit_signers`
+  取公钥并按上述 `ledger-finality-v1` 摘要验 Ed25519 签名——未知版本或
+  验签失败为 `auth`。随后在**同一把 per-path 锁**下严格加载并完整重放
+  本地头检查点（缺失为 `io`；解析、键序、类型、摘要、归属或重放失配为
+  `state`）：文档 `tip` 必须与本地重放 tip **逐字段相等**，`finalized`
+  必须是重放所得当前分支的 **anchor 或 confirmed 头**，且不得倒退
+  （更低高度或同高异 hash）——任一不符为 `integrity`，文件字节与
+  generation 均不变。同一目标幂等：不写文件、返回当前 generation；提高
+  边界时 `generation + 1` 并以 **v3 格式原子换入**（anchor/tip/steps
+  不变，仅 `finalized` 推进），与 `finalize_headers` 完全同构。成功键序
+  固定为 `ok, generation, finalized`；失败仅返回 `{"ok": false,
+  "error"}` 且**不抛异常**，`error` 仅取 `input`/`auth`/`integrity`/
+  `state`/`io`；任何失败都不改变文件字节。
+
 ## 签名认证的增量区间协议
 
 增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
@@ -1224,7 +1260,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 的 rotate/revoke（201 首创/200 更新，仅存 SHA-256 哈希，分权 Bearer 闸门
 read/update/export，401/403 无副作用）与 `history_credential_changed` 事件 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
-| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
+| `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust`；最终化凭证的离线应用 `apply_finality`（校验 `ledger-finality-v1` 域签名，tip 与本地重放一致、边界不倒退，幂等或 generation+1 v3 原子换入） |
 | `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
@@ -1361,6 +1397,12 @@ curl -s 'localhost:8080/v1/chain/range?after_height=2&after_hash=<block-hash>&li
 # || canonical_json(去auth)))，离线用 verify_header_page(document, anchor, tip_hash, trust) 校验）
 curl -s 'localhost:8080/v1/chain/headers?after_height=2&after_hash=<block-hash>&limit=100'
 # -> 200 {"anchor":{"height":2,"block_hash":"..."},"headers":[{"height":3,"prev_hash":"...","merkle_root":"...","block_hash":"...","status":"confirmed"}],"tip":{"tip_hash":"...","height":3,"length":4,"status":"confirmed"},"auth":{"key_version":1,"signature":"..."}}
+
+# 最终化凭证（无参数，否则 400；200 键序 finalized,tip,auth；finalized 取末个
+# confirmed 块，auth.signature = Ed25519(SHA256(UTF8("ledger-finality-v1")
+# || canonical_json(去auth)))，离线用 apply_finality(path, document, trust) 应用）
+curl -s localhost:8080/v1/chain/finality
+# -> 200 {"finalized":{"height":3,"block_hash":"..."},"tip":{"tip_hash":"...","height":4,"length":5,"status":"pending"},"auth":{"key_version":1,"signature":"..."}}
 
 # 增量区间：仅推送锚点之后的尾部区块（拼接 canonical 前缀做整链重验；
 # 状态优先级 400→403→410→锚点 409→重验/tip 400→重复 409；201 五字段，
