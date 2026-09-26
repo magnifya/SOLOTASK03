@@ -151,6 +151,19 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.locate_header_fork(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/chain/finalities/locate":
+                # POST /v1/chain/finalities/locate — fork location for the
+                # signed finality history by ordered block locators; the
+                # success document reuses the GET /v1/chain/finalities
+                # contract key order anchor, finalities, next, head (only
+                # anchor names the matched locator), so it is serialized in
+                # insertion order rather than alphabetically.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.locate_finality_fork(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
