@@ -7,9 +7,10 @@ it through GET /v1/chain/headers and covers:
 * a first advance from a legal anchor and later advances with ``None`` or
   the stored tip's ``{height, block_hash}``;
 * file shape: exact top-level key order ``v, generation, anchor, tip, steps,
-  hash``, step key order ``tip_hash, trust, documents``, compact UTF-8 JSON
-  with non-ASCII unescaped and one trailing newline, and the self-excluding
-  canonical-json SHA-256 ``hash``;
+  hash``, step key order ``kind, tip_hash, trust, documents, locators``
+  (an advance appends a ``linear`` step with null ``locators``), compact
+  UTF-8 JSON with non-ASCII unescaped and one trailing newline, and the
+  self-excluding canonical-json SHA-256 ``hash``;
 * generation starting at 1 and incremented only on a successful advance (a
   failed verification never bumps it), tip monotonicity (never lower; same
   height only pending -> confirmed with the same block hash) and the
@@ -52,7 +53,7 @@ from ledger.service import LedgerService
 from ledger.store import LedgerStore
 
 CHECKPOINT_KEYS = ["v", "generation", "anchor", "tip", "steps", "hash"]
-STEP_KEYS = ["tip_hash", "trust", "documents"]
+STEP_KEYS = ["kind", "tip_hash", "trust", "documents", "locators"]
 ANCHOR_KEYS = ["height", "block_hash"]
 TIP_KEYS = ["tip_hash", "height", "length", "status"]
 
@@ -203,7 +204,7 @@ class AdvanceHeadersSuccessTests(AdvanceHeadersFixture):
         self.assertNotIn(b": ", raw)
         data = json.loads(raw)
         self.assertEqual(list(data.keys()), CHECKPOINT_KEYS)
-        self.assertEqual(data["v"], 1)
+        self.assertEqual(data["v"], 2)
         self.assertEqual(data["generation"], 1)
         self.assertEqual(data["anchor"], self.anchor)
         self.assertEqual(list(data["anchor"].keys()), ANCHOR_KEYS)
@@ -212,9 +213,11 @@ class AdvanceHeadersSuccessTests(AdvanceHeadersFixture):
         self.assertEqual(len(data["steps"]), 1)
         step = data["steps"][0]
         self.assertEqual(list(step.keys()), STEP_KEYS)
+        self.assertEqual(step["kind"], "linear")
         self.assertEqual(step["tip_hash"], self.tip_hash)
         self.assertEqual(step["trust"], self.trust)
         self.assertEqual(step["documents"], documents)
+        self.assertIsNone(step["locators"])
 
     def test_hash_covers_every_field_but_itself(self) -> None:
         self.advance(self.paged(2), self.anchor)
@@ -548,10 +551,54 @@ class AdvanceHeadersStateTests(AdvanceHeadersFixture):
     def test_bad_version_is_state(self) -> None:
         self.advance(self.paged(2), self.anchor)
         data = self.read_checkpoint()
-        data["v"] = 2
+        data["v"] = 3
         self.rehash(data)
         self.write_file(data)
         self.assert_error(self.advance(self.paged(1), self.anchor), ERR_STATE)
+
+    def test_v1_step_shape_under_v2_is_state(self) -> None:
+        # A v2 document's steps must carry the five-key kind/locators shape.
+        self.advance(self.paged(2), self.anchor)
+        data = self.read_checkpoint()
+        step = data["steps"][0]
+        data["steps"][0] = {
+            key: step[key] for key in ("tip_hash", "trust", "documents")
+        }
+        self.rehash(data)
+        self.write_file(data)
+        self.assert_error(self.advance(self.paged(1), self.anchor), ERR_STATE)
+
+    def test_legacy_v1_checkpoint_is_read_and_upgraded(self) -> None:
+        # A version-1 checkpoint (three-key steps, all linear) still loads;
+        # the next successful advance rewrites the file as v2.
+        self.advance(self.paged(2), self.anchor)
+        data = self.read_checkpoint()
+        data["v"] = 1
+        data["steps"] = [
+            {
+                "tip_hash": step["tip_hash"],
+                "trust": step["trust"],
+                "documents": step["documents"],
+            }
+            for step in data["steps"]
+        ]
+        self.rehash(data)
+        self.write_file(data)
+
+        self.assertEqual(self.service.confirm_block("4")[0], 200)
+        empty = self.page(4, self.tip_hash)
+        result = self.advance([empty], None, tip_hash=self.tip_hash)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["generation"], 2)
+        upgraded = self.read_checkpoint()
+        self.assertEqual(upgraded["v"], 2)
+        self.assertEqual(
+            [list(step.keys()) for step in upgraded["steps"]],
+            [STEP_KEYS, STEP_KEYS],
+        )
+        self.assertEqual(
+            [step["kind"] for step in upgraded["steps"]], ["linear", "linear"]
+        )
 
     def test_empty_steps_is_state(self) -> None:
         self.advance(self.paged(2), self.anchor)

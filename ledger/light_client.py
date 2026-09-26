@@ -193,29 +193,60 @@ chain order (the anchor itself is not included); failure returns only
 :func:`advance_headers` durably checkpoints a verified header-page batch to
 ``path``. The file is one compact UTF-8 JSON document (non-ASCII written
 unescaped, one trailing newline) with the exact top-level key order
-``v, generation, anchor, tip, steps, hash``: ``v`` is 1, ``generation`` is a
-non-boolean positive integer incremented once per successful advance,
-``anchor`` is the first batch's pinned ``{height, block_hash}`` anchor (key
-order ``height, block_hash``), ``tip`` is the latest chain descriptor S,
-``steps`` is a non-empty array of ``{tip_hash, trust, documents}`` items (one
-per advance, nested key orders unchanged) and ``hash`` is the SHA-256 of the
-canonical (sorted, compact) JSON of the document with ``hash`` removed. The
-first use of ``path`` requires a legal ``anchor``; later advances accept
-``None`` (continue from the stored tip) or the stored tip's
-``{height, block_hash}``. Verification itself is :func:`verify_header_pages`
-unchanged against the caller-pinned ``tip_hash``. The new tip may never drop
-in height; at the same height only the same ``block_hash`` moving from
-``pending`` to ``confirmed`` is accepted — anything else is an ``integrity``
-failure. Re-submitting the exact last batch (same ``tip_hash``, ``trust`` and
-``documents``) is idempotent: it verifies but neither bumps the generation
-nor touches the file. Loading strictly replays every stored step (shape,
-hash, per-batch verification and tip monotonicity) and checks the stored
-tip; any mismatch is a ``state`` failure and the file is never truncated or
-rebuilt. Same-path advances share one lock and the new file is atomically
-replaced into place; a failed write restores the original bytes. Success
-returns ``{"ok": True, "generation", "tip"}``; failure returns only
-``{"ok": False, "error": category}`` with category one of
-``input/auth/integrity/state/io`` and nothing is raised.
+``v, generation, anchor, tip, steps, hash``: ``v`` is 2, ``generation`` is a
+non-boolean positive integer incremented once per successful advance or
+reorg, ``anchor`` is the first batch's pinned ``{height, block_hash}``
+anchor (key order ``height, block_hash``), ``tip`` is the latest chain
+descriptor S, ``steps`` is a non-empty array of ``{kind, tip_hash, trust,
+documents, locators}`` items (one per operation, nested key orders
+unchanged; an advance appends a ``linear`` step whose ``locators`` is null,
+a reorg a ``locator`` step) and ``hash`` is the SHA-256 of the canonical
+(sorted, compact) JSON of the document with ``hash`` removed. Version-1
+checkpoints (three-key ``{tip_hash, trust, documents}`` steps, all read as
+``linear``) are still loaded and replayed; the next successful write
+upgrades the file to v2. The first use of ``path`` requires a legal
+``anchor``; later advances accept ``None`` (continue from the stored tip) or
+the stored tip's ``{height, block_hash}``. Verification itself is
+:func:`verify_header_pages` unchanged against the caller-pinned
+``tip_hash``. The new tip may never drop in height; at the same height only
+the same ``block_hash`` moving from ``pending`` to ``confirmed`` is accepted
+— anything else is an ``integrity`` failure. Re-submitting the exact last
+batch (same ``tip_hash``, ``trust`` and ``documents``) is idempotent: it
+verifies but neither bumps the generation nor touches the file. Loading
+strictly replays every stored step (shape, hash, per-batch verification and
+tip monotonicity) and checks the stored tip; any mismatch is a ``state``
+failure and the file is never truncated or rebuilt. Same-path advances share
+one lock and the new file is atomically replaced into place; a failed write
+restores the original bytes. Success returns ``{"ok": True, "generation",
+"tip"}``; failure returns only ``{"ok": False, "error": category}`` with
+category one of ``input/auth/integrity/state/io`` and nothing is raised.
+
+:func:`reorg_headers` durably rewrites such a checkpoint around a verified
+locator batch. ``documents`` is verified with
+:func:`verify_header_locator_pages` against the caller's ``locators``,
+``tip_hash`` and ``trust``; the batch's matched anchor selects the reorg
+boundary — the last stored step whose closing tip is that anchor, or the
+checkpoint's initial anchor when no step matches (an anchor naming neither
+is an ``integrity`` failure). Every step after the boundary is dropped (the
+dropped count is returned as ``replaced``) and one ``{kind: "locator",
+tip_hash, trust, documents, locators}`` step is appended. The new tip may
+never drop below the stored tip's height; at the same height a different
+``block_hash`` is accepted in either status while the same ``block_hash``
+may only move from ``pending`` to ``confirmed`` — anything else is an
+``integrity`` failure. Re-submitting a last step fully identical to the new
+locator step is idempotent: it returns the current generation with
+``replaced`` 0 and neither bumps the generation nor touches the file; every
+other success increments the generation by one and atomically rewrites the
+file under the same per-path lock, hash and serialization rules as
+:func:`advance_headers`. Success returns ``{"ok": True, "generation",
+"tip", "replaced"}`` in that key order; failure returns only ``{"ok":
+False, "error": category}`` with category one of ``input`` (argument or
+batch structure), ``auth`` (signer lookup or signature), ``integrity``
+(boundary, chain, height or same-height conflicts), ``state`` (an existing
+checkpoint fails its key-order, type, hash or replay checks; it is never
+truncated or rebuilt) and ``io`` (the checkpoint is missing or cannot be
+read or written; a failed write restores the original bytes best-effort).
+Nothing is raised.
 
 :func:`header_locators` derives a fork-location locator request from a
 checkpoint written by :func:`advance_headers`. The file is strictly
@@ -3689,20 +3720,49 @@ def verify_header_locator_pages(
 # The exact top-level key order of one persisted advance_headers checkpoint.
 HEADER_CHECKPOINT_KEYS = ("v", "generation", "anchor", "tip", "steps", "hash")
 
-# The exact key order of one stored advance step.
-HEADER_STEP_KEYS = ("tip_hash", "trust", "documents")
+# The exact key order of one stored v2 step, and of a legacy v1 step (a v1
+# step carries no kind/locators and is read as a linear step).
+HEADER_STEP_KEYS = ("kind", "tip_hash", "trust", "documents", "locators")
+HEADER_STEP_KEYS_V1 = ("tip_hash", "trust", "documents")
 
-# The header checkpoint format version.
-HEADER_CHECKPOINT_VERSION = 1
+# The step kinds: a ``linear`` step continues the chain from the stored tip
+# (its ``locators`` is null); a ``locator`` step re-anchors the chain at a
+# matched locator after a reorg.
+HEADER_STEP_KIND_LINEAR = "linear"
+HEADER_STEP_KIND_LOCATOR = "locator"
+HEADER_STEP_KINDS = (HEADER_STEP_KIND_LINEAR, HEADER_STEP_KIND_LOCATOR)
+
+# The header checkpoint format version written today. Version-1 checkpoints
+# (three-key steps, all linear) are still loaded and replayed.
+HEADER_CHECKPOINT_VERSION = 2
+HEADER_CHECKPOINT_VERSION_V1 = 1
+HEADER_CHECKPOINT_VERSIONS = (HEADER_CHECKPOINT_VERSION_V1, HEADER_CHECKPOINT_VERSION)
 
 # Fixed success key order returned by :func:`advance_headers`.
 ADVANCE_HEADERS_RESULT_KEYS = ("ok", "generation", "tip")
+
+# Fixed success key order returned by :func:`reorg_headers`.
+REORG_HEADERS_RESULT_KEYS = ("ok", "generation", "tip", "replaced")
 
 
 def _header_checkpoint_hash(
     v: int, generation: int, anchor: dict, tip: dict, steps: list
 ) -> str:
-    """SHA-256 over the canonical JSON bytes of every field but ``hash``."""
+    """SHA-256 over the canonical JSON bytes of every field but ``hash``.
+
+    ``steps`` are the normalized five-key steps; a v1 document's hash body
+    carries their legacy three-key projection (no ``kind``/``locators``), so
+    a v1 file's recorded digest still recomputes exactly.
+    """
+    if v == HEADER_CHECKPOINT_VERSION_V1:
+        steps = [
+            {
+                "tip_hash": step["tip_hash"],
+                "trust": step["trust"],
+                "documents": step["documents"],
+            }
+            for step in steps
+        ]
     body = {
         "v": v,
         "generation": generation,
@@ -3728,8 +3788,27 @@ def _header_tip_advances(stored: dict, new: dict) -> bool:
     )
 
 
+def _header_tip_reorg_allowed(stored: dict, new: dict) -> bool:
+    """Whether ``new`` is a legal reorg successor of the stored tip.
+
+    The tip may never drop in height; at the same height a different
+    ``block_hash`` is accepted in either status (that is the reorg), while
+    the same ``block_hash`` may only move from ``pending`` to ``confirmed``.
+    """
+    if new["height"] != stored["height"]:
+        return new["height"] > stored["height"]
+    if new["tip_hash"] != stored["tip_hash"]:
+        return True
+    return stored["status"] == STATUS_PENDING and new["status"] == STATUS_CONFIRMED
+
+
 def _validate_header_checkpoint_shape(data: object) -> dict:
-    """Validate the exact key order and JSON types of one checkpoint document."""
+    """Validate the exact key order and JSON types of one checkpoint document.
+
+    Both checkpoint versions are accepted; every step is normalized to the
+    five-key v2 form (a v1 three-key step becomes a ``linear`` step with
+    ``locators`` null) so every later stage handles one step shape.
+    """
     if not isinstance(data, dict) or tuple(data.keys()) != HEADER_CHECKPOINT_KEYS:
         raise _CheckpointError(ERR_STATE)
     v = data["v"]
@@ -3739,7 +3818,7 @@ def _validate_header_checkpoint_shape(data: object) -> dict:
     steps = data["steps"]
     digest = data["hash"]
 
-    if not _is_int(v) or v != HEADER_CHECKPOINT_VERSION:
+    if not _is_int(v) or v not in HEADER_CHECKPOINT_VERSIONS:
         raise _CheckpointError(ERR_STATE)
     if not _is_int(generation) or generation < 1:
         raise _CheckpointError(ERR_STATE)
@@ -3763,8 +3842,23 @@ def _validate_header_checkpoint_shape(data: object) -> dict:
         raise _CheckpointError(ERR_STATE)
     validated_steps = []
     for raw in steps:
-        if not isinstance(raw, dict) or tuple(raw.keys()) != HEADER_STEP_KEYS:
-            raise _CheckpointError(ERR_STATE)
+        if v == HEADER_CHECKPOINT_VERSION_V1:
+            if not isinstance(raw, dict) or tuple(raw.keys()) != HEADER_STEP_KEYS_V1:
+                raise _CheckpointError(ERR_STATE)
+            kind = HEADER_STEP_KIND_LINEAR
+            locators = None
+        else:
+            if not isinstance(raw, dict) or tuple(raw.keys()) != HEADER_STEP_KEYS:
+                raise _CheckpointError(ERR_STATE)
+            kind = raw["kind"]
+            if kind not in HEADER_STEP_KINDS:
+                raise _CheckpointError(ERR_STATE)
+            locators = raw["locators"]
+            if kind == HEADER_STEP_KIND_LINEAR:
+                if locators is not None:
+                    raise _CheckpointError(ERR_STATE)
+            elif not isinstance(locators, list):
+                raise _CheckpointError(ERR_STATE)
         if not crypto.is_hex64(raw["tip_hash"]):
             raise _CheckpointError(ERR_STATE)
         if not isinstance(raw["trust"], dict):
@@ -3773,16 +3867,18 @@ def _validate_header_checkpoint_shape(data: object) -> dict:
             raise _CheckpointError(ERR_STATE)
         validated_steps.append(
             {
+                "kind": kind,
                 "tip_hash": raw["tip_hash"],
                 "trust": raw["trust"],
                 "documents": raw["documents"],
+                "locators": locators,
             }
         )
     if not crypto.is_hex64(digest):
         raise _CheckpointError(ERR_STATE)
 
     return {
-        "v": HEADER_CHECKPOINT_VERSION,
+        "v": v,
         "generation": generation,
         "anchor": {key: anchor[key] for key in HEADER_ANCHOR_KEYS},
         "tip": {key: tip[key] for key in HEADER_TIP_KEYS},
@@ -3796,11 +3892,13 @@ def _replay_header_checkpoint(checkpoint: dict) -> list[dict]:
 
     The recorded ``hash`` pins the document before any replay: a tampered
     version, generation, anchor, tip or step is state corruption, not
-    re-verified. Every stored step is then replayed through
-    :func:`verify_header_pages` against its own recorded pins — the first
-    from the checkpoint anchor, every later one from the previous step's
-    closed tip — with the same tip-monotonicity rule as a live advance, and
-    the final replayed tip must equal the stored one. Returns the verified
+    re-verified. Every stored step is then replayed against its own recorded
+    pins — a ``linear`` step through :func:`verify_header_pages` from the
+    previous chain point with the same tip-monotonicity rule as a live
+    advance, a ``locator`` step through :func:`verify_header_locator_pages`
+    with its matched anchor naming exactly the previous chain point (a
+    locator step is always appended right at its reorg boundary) — and the
+    final replayed tip must equal the stored one. Returns the verified
     per-step tip descriptors in step order.
     """
     recomputed = _header_checkpoint_hash(
@@ -3814,21 +3912,40 @@ def _replay_header_checkpoint(checkpoint: dict) -> list[dict]:
         raise _CheckpointError(ERR_STATE)
 
     steps = checkpoint["steps"]
-    # The generation counts exactly the recorded steps: one per advance.
-    if checkpoint["generation"] != len(steps):
+    if checkpoint["v"] == HEADER_CHECKPOINT_VERSION_V1:
+        # A v1 generation counts exactly the recorded steps: one per advance.
+        if checkpoint["generation"] != len(steps):
+            raise _CheckpointError(ERR_STATE)
+    elif checkpoint["generation"] < len(steps):
+        # A v2 generation increments once per successful operation while a
+        # reorg may also drop steps, so it never trails the step count.
         raise _CheckpointError(ERR_STATE)
 
     expected_anchor = checkpoint["anchor"]
     tip: dict | None = None
     step_tips: list[dict] = []
     for step in steps:
-        result = verify_header_pages(
-            step["documents"], expected_anchor, step["tip_hash"], step["trust"]
-        )
-        if not result.get("ok"):
-            raise _CheckpointError(ERR_STATE)
-        if tip is not None and not _header_tip_advances(tip, result["tip"]):
-            raise _CheckpointError(ERR_STATE)
+        if step["kind"] == HEADER_STEP_KIND_LOCATOR:
+            result = verify_header_locator_pages(
+                step["documents"],
+                step["locators"],
+                step["tip_hash"],
+                step["trust"],
+            )
+            if not result.get("ok"):
+                raise _CheckpointError(ERR_STATE)
+            if result["anchor"] != expected_anchor:
+                # A locator step re-anchors exactly at the previous chain
+                # point: anything else never was a legal reorg boundary.
+                raise _CheckpointError(ERR_STATE)
+        else:
+            result = verify_header_pages(
+                step["documents"], expected_anchor, step["tip_hash"], step["trust"]
+            )
+            if not result.get("ok"):
+                raise _CheckpointError(ERR_STATE)
+            if tip is not None and not _header_tip_advances(tip, result["tip"]):
+                raise _CheckpointError(ERR_STATE)
         tip = result["tip"]
         step_tips.append(tip)
         expected_anchor = {
@@ -3913,10 +4030,13 @@ def advance_headers(
     On success the checkpoint is written atomically (a uniquely named temp
     file in the same directory, fsynced and ``os.replace``d under the
     per-path lock shared with every other same-path operation) with key
-    order ``v, generation, anchor, tip, steps, hash``; generation starts at
-    1 and increments once per successful advance, so a failed verification
-    never bumps it. The return value is ``{"ok": True, "generation",
-    "tip"}`` in that key order.
+    order ``v, generation, anchor, tip, steps, hash`` — ``v`` is 2 and the
+    batch is appended as one ``{kind: "linear", tip_hash, trust, documents,
+    locators: null}`` step (version-1 checkpoints with three-key steps are
+    still read and replayed; the next successful write upgrades the file).
+    Generation starts at 1 and increments once per successful advance, so a
+    failed verification never bumps it. The return value is ``{"ok": True,
+    "generation", "tip"}`` in that key order.
 
     Every failure is ``{"ok": False, "error": category}`` with category one
     of ``input`` (bad arguments, a malformed first anchor or an illegal
@@ -3971,7 +4091,13 @@ def advance_headers(
                 ):
                     return _failed_advance(ERR_INPUT)
 
-        step = {"tip_hash": tip_hash, "trust": trust, "documents": documents}
+        step = {
+            "kind": HEADER_STEP_KIND_LINEAR,
+            "tip_hash": tip_hash,
+            "trust": trust,
+            "documents": documents,
+            "locators": None,
+        }
         if steps and step == steps[-1]:
             # Re-submitting the exact last batch (same tip_hash, trust and
             # documents) is idempotent: it was verified when it was stored
@@ -4054,6 +4180,168 @@ def _validate_header_anchor_argument(raw: object) -> dict | None:
     if not crypto.is_hex64(raw["block_hash"]):
         return None
     return {"height": height, "block_hash": raw["block_hash"]}
+
+
+def reorg_headers(
+    path: object,
+    documents: object,
+    locators: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Verify a signed locator-page batch and re-anchor the checkpoint.
+
+    ``documents`` is an ordered, non-empty batch of
+    ``POST /v1/chain/headers/locate`` pages verified with
+    :func:`verify_header_locator_pages` against the caller's ``locators``
+    and the pinned ``tip_hash`` under ``trust``. The checkpoint at ``path``
+    must already exist (a missing file is an ``io`` failure): the batch's
+    matched anchor selects the reorg boundary — the last stored step whose
+    closing tip is that anchor, or the checkpoint's initial anchor when no
+    step matches; an anchor naming neither is an ``integrity`` failure.
+    Every step after the boundary is dropped (the dropped count is returned
+    as ``replaced``) and one ``{kind: "locator", tip_hash, trust, documents,
+    locators}`` step is appended.
+
+    The new tip may never drop below the stored tip's height; at the same
+    height a different ``block_hash`` is accepted in either status, while
+    the same ``block_hash`` may only move from ``pending`` to ``confirmed``
+    — anything else is an ``integrity`` failure. Re-submitting a last step
+    fully identical to the new locator step is idempotent: it returns the
+    current generation with ``replaced`` 0 and neither bumps the generation
+    nor touches the file. Every other success increments the generation by
+    one and atomically rewrites the checkpoint (v2 key orders, same hash and
+    serialization rules as :func:`advance_headers`) under the shared
+    per-path lock; a failed write restores the original bytes best-effort
+    and any failure leaves the file's bytes and the generation untouched.
+
+    Success returns ``{"ok": True, "generation", "tip", "replaced"}`` in
+    that key order; failure returns only ``{"ok": False, "error":
+    category}`` with category one of ``input`` (bad arguments or batch
+    structure), ``auth`` (signer lookup or signature), ``integrity``
+    (boundary, chain, height or same-height conflicts), ``state`` (an
+    existing checkpoint fails its key-order, type, hash or replay checks)
+    and ``io`` (the checkpoint is missing or cannot be read or written).
+    Nothing is raised.
+    """
+    # Argument shape is validated before any file or verification work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        if loaded is None:
+            # A reorg rewrites an existing checkpoint; a path that has never
+            # been advanced has no anchor to re-anchor at.
+            return _failed_advance(ERR_IO)
+        previous, step_tips = loaded
+
+        generation = previous["generation"]
+        stored_tip = previous["tip"]
+        steps = list(previous["steps"])
+        step = {
+            "kind": HEADER_STEP_KIND_LOCATOR,
+            "tip_hash": tip_hash,
+            "trust": trust,
+            "documents": documents,
+            "locators": locators,
+        }
+        if step == steps[-1]:
+            # Re-submitting a last step fully identical to the new locator
+            # step is idempotent: it was verified when it was stored and
+            # re-verified by the load replay above, so the file bytes stay
+            # exactly as they were and the generation holds.
+            return {
+                "ok": True,
+                "generation": generation,
+                "tip": stored_tip,
+                "replaced": 0,
+            }
+
+        try:
+            result = verify_header_locator_pages(
+                documents, locators, tip_hash, trust
+            )
+            if not result.get("ok"):
+                return {"ok": False, "error": result["error"]}
+
+            anchor = result["anchor"]
+            new_tip = result["tip"]
+
+            # The reorg boundary is the last step whose closing tip is the
+            # matched anchor; only when no step matches does the initial
+            # anchor bound the reorg.
+            boundary: int | None = None
+            for index, step_tip in enumerate(step_tips):
+                if (
+                    step_tip["height"] == anchor["height"]
+                    and step_tip["tip_hash"] == anchor["block_hash"]
+                ):
+                    boundary = index
+            if boundary is None:
+                if anchor != previous["anchor"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                kept_steps: list[dict] = []
+            else:
+                kept_steps = steps[: boundary + 1]
+            replaced = len(steps) - len(kept_steps)
+
+            # The checkpoint tip never drops in height; at the same height a
+            # reorg may switch to a different block hash in either status,
+            # while the same hash may only move pending -> confirmed.
+            if not _header_tip_reorg_allowed(stored_tip, new_tip):
+                return _failed_advance(ERR_INTEGRITY)
+
+            next_generation = generation + 1
+            new_steps = kept_steps + [step]
+            checkpoint = {
+                "v": HEADER_CHECKPOINT_VERSION,
+                "generation": next_generation,
+                "anchor": previous["anchor"],
+                "tip": new_tip,
+                "steps": new_steps,
+            }
+            checkpoint["hash"] = _header_checkpoint_hash(
+                HEADER_CHECKPOINT_VERSION,
+                next_generation,
+                previous["anchor"],
+                new_tip,
+                new_steps,
+            )
+
+            try:
+                original = _read_bytes_or_none(path)
+            except OSError:
+                return _failed_advance(ERR_IO)
+            try:
+                _atomic_write_header_checkpoint(path, checkpoint)
+            except OSError:
+                # Compensate: put the original bytes back best-effort.
+                _restore_bytes(path, original)
+                return _failed_advance(ERR_IO)
+            except (TypeError, ValueError):
+                # A trust/document value JSON cannot serialize (verification
+                # only judges the fields it pins) is a caller-side defect.
+                return _failed_advance(ERR_INPUT)
+        except _Failure as failure:  # defensive: verifiers never raise these
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report rather
+            # than crash the caller.
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "tip": new_tip,
+            "replaced": replaced,
+        }
 
 
 # -- fork-location locator request --------------------------------------------
