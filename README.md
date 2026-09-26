@@ -301,40 +301,64 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   与已存**末批**完全相同（`tip_hash`、`trust`、`documents` 逐字相同）的
   提交幂等，不增代、文件字节不动。文件为单个紧凑 UTF-8 JSON 文档（非
   ASCII 不转义、末尾恰好一个换行），顶层键序固定为
-  `v, generation, anchor, tip, steps, hash`：`v = 2`（v1 文件仍可读取，
-  其步骤按 `linear` 重放），`generation` 为非布尔正整数、每次成功推进
-  或重组 +1，`anchor` 为首次钉住的锚点，`tip` 沿用链描述符 S，`steps`
+  `v, generation, anchor, tip, finalized, steps, hash`：`v = 3`
+  （v1/v2 文件仍可读取——其 `anchor` 即隐式 finalized 边界——下次成功
+  写入时迁移为 v3），`generation` 为非布尔正整数、每次成功推进、重组或
+  最终化 +1，`anchor` 为首次钉住的锚点，`tip` 沿用链描述符 S，
+  `finalized` 为不可逆最终化边界 `{height, block_hash}`（键序
+  `height, block_hash`；新检查点等于 `anchor`，由
+  `finalize_headers` 推进），`steps`
   为非空数组且每项键序恰为
   `kind, tip_hash, trust, documents, locators`（`kind` 为
   `linear`/`locator`；`linear` 步 `locators` 为 `null`，`locator` 步
   携带其请求定位列表；嵌套键序沿用既有契约），`hash` 为去掉
   `hash` 自身的 canonical_json（`sort_keys`、紧凑分隔符、
-  `ensure_ascii=False`）字节的 SHA-256（64 位小写 hex）。加载时逐批重放
-  并核对最终 tip；同一 `path` 共用一把锁串行、临时文件 fsync 后
-  `os.replace` 原子换入，任何失败原字节不变且不增代。成功按键序
-  `ok, generation, tip` 返回；失败仅返回 `{"ok": false, "error"}` 且
-  **不抛异常**，`error` 仅取 `input`（参数、首锚或 `tip_hash` 非法）、
-  `auth`（验签）、`integrity`（批次或 tip 冲突）、`state`（已存文件的
-  解析、键序、类型、摘要或重放失配，文件不被截断或重建）、`io`
-  （读写失败）。
+  `ensure_ascii=False`）字节的 SHA-256（64 位小写 hex），v3 在 v2
+  基础上仅新增 `finalized` 一个字段、序列化与摘要规则不变。加载时
+  逐批重放、重验 finalized 归属（必须为重放所得当前分支的 anchor 或
+  confirmed 头）并核对最终 tip；同一 `path` 共用一把锁串行、临时文件
+  fsync 后 `os.replace` 原子换入，任何失败原字节不变且不增代。成功按
+  键序 `ok, generation, tip` 返回；失败仅返回 `{"ok": false,
+  "error"}` 且**不抛异常**，`error` 仅取 `input`（参数、首锚或
+  `tip_hash` 非法）、`auth`（验签）、`integrity`（批次或 tip 冲突）、
+  `state`（已存文件的解析、键序、类型、摘要、归属或重放失配，文件不
+  被截断或重建）、`io`（读写失败）。
 - **检查点重组**：`ledger.light_client.reorg_headers(path, documents,
   locators, tip_hash, trust) -> dict` 把一批**已核验**的定位签名头页
   （分叉重组）落盘到同一检查点文件（纯库 API，HTTP/CLI 不变）。批次按
   `verify_header_locator_pages` 原样多页校验；`path` 处检查点必须已存在
   （缺失为 `io`，无首次使用）。**边界**为 anchor 匹配的**最后**一个已存
   step 的 tip；无 step 匹配时才取初始 anchor（anchor 落在别处为
-  `integrity`）。边界之后的步骤后缀被删除、追加一条 `locator` 步，
-  `replaced` 为删除的步数。新 tip 高度**不得低于**已存 tip；同高度异
-  hash（即重组本身）`pending`/`confirmed` 均可，同 hash 仅允许
+  `integrity`）。该边界还必须是 finalized 边界本身或其后的当前分支点：
+  最终化历史不可逆，anchor 早于 finalized（更低高度，或同高异 hash）的
+  批次为 `integrity`，文件字节与 generation 均不变。边界之后的步骤后缀
+  被删除、追加一条 `locator` 步，`replaced` 为删除的步数，finalized
+  边界保持不变。新 tip 高度**不得低于**已存 tip；同高度异 hash（即重组
+  本身）`pending`/`confirmed` 均可，同 hash 仅允许
   `pending -> confirmed`，其余同高冲突为 `integrity`。与已存**末
   locator 步**完全相同（`tip_hash`、`trust`、`documents`、`locators`
   逐字相同）的提交幂等：`replaced = 0`、不写盘、不增代；其余成功
-  `generation + 1` 并原子换入 v2 文件。成功按键序
+  `generation + 1` 并原子换入 v3 文件。成功按键序
   `ok, generation, tip, replaced` 返回；失败仅返回
   `{"ok": false, "error"}` 且**不抛异常**，`error` 仅取 `input`
   （参数或定位/批次结构）、`auth`（签名者版本或验签）、`integrity`
-  （边界、链、高度或同高冲突）、`state`（已存文件校验失败）、`io`
-  （文件缺失或读写失败）。
+  （最终化、边界、链、高度或同高冲突）、`state`（已存文件键序、类型、
+  摘要、归属或重放校验失败）、`io`（文件缺失或读写失败）。
+- **不可逆最终化边界**：`ledger.light_client.finalize_headers(path,
+  height, block_hash) -> dict`（纯库 API，参数无默认值）。`path` 为非空
+  串、`height` 为非布尔非负整数、`block_hash` 为 64 位小写 hex，参数非法
+  为 `input`。检查点在同一把 per-path 锁下被严格加载与完整重放（缺失为
+  `io`；解析、键序、类型、摘要、归属或重放失配为 `state`）。目标必须
+  是重放所得当前分支的 **anchor 或 confirmed 头**：未知高度（含高于
+  tip）、pending 头、低于当前 finalized 高度、同高异 hash 均为
+  `integrity`，不增代、文件字节不动。提高边界时 `generation + 1` 并以
+  v3 原子换入（anchor/tip/steps 不变，仅 `finalized` 推进）；同一目标
+  幂等，返回当前 generation 且字节不变。成功键序固定为
+  `ok, generation, finalized`，`finalized` 键序 `height, block_hash`；
+  失败仅返回 `{"ok": false, "error"}` 且**不抛异常**。v1/v2 文件读取时
+  以其 `anchor` 为 finalized，本函数成功写入即完成 v3 迁移；v3 文件恢复
+  时须重验 finalized 的分支归属（落在已丢弃分叉或 pending 头为
+  `state`）。
 
 ## 签名认证的增量区间协议
 
