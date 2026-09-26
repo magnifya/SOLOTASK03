@@ -796,6 +796,45 @@ canonical 消息重算交易 `tx_id` 并验证交易 Ed25519 签名，`receipt`/
 验签失败为 `auth`，交易签名、证明、头链或绑定错为 `integrity`。其余入口
 （普通回执、`/v1/chain/finality` 等）与 CLI 不变。
 
+#### 批量最终化回执
+
+`POST /v1/transactions/finalized-receipts` 一次给出多笔交易的可离线验证
+最终化回执。请求体必须是 JSON 对象且**只含** `tx_ids` 一个键：非空数组，
+元素两两互异，每个元素都是恰好 64 位**小写**十六进制字符串（与批量
+Merkle 证明同一形状约束）。JSON 解析失败、不是对象、键缺失或有额外键、
+`tx_ids` 类型错误、空数组、元素重复或格式不符一律 `400`，且不触碰任何
+状态；任一 id 在 canonical 链上不存在（内存池不算位置、候选分叉不暴露）为
+`404`；否则任一交易仍在内存池或已打包进未确认 pending 尾块为 `409`（未知
+项优先于未确认项判 `404`）。
+
+成功 `200` 体在**同一把存储锁**内连同当前审计签名者取整批快照（与单笔
+相同的原子性，现覆盖全部 item），顶层键序固定为 `items, headers,
+finality`：
+
+- `items`：按 tx_id **升序**排列；每个 item 沿用单笔契约的键序
+  `receipt, proof`，其中 `receipt` 为锚定其 canonical 已确认块的固定
+  九字段回执（`status=confirmed`），`proof` 为该笔的六字段单笔 Merkle
+  证明（叶向根 `{direction, hash}` 路径）；
+- `headers`：**从最低交易所在块起、至最高 confirmed 块止**的一段连续
+  五字段头序列（`{height, prev_hash, merkle_root, block_hash, status}`，
+  全部 confirmed；链尾 pending 时止于其上一 confirmed 块），为全部 item
+  共享的同一条链；
+- `finality`：沿用 `GET /v1/chain/finality` 契约（键序
+  `finalized, tip, auth`），其 `finalized` 恰为 `headers` 末项。
+
+**离线校验**：`ledger.light_client.verify_finalized_receipts(document,
+expected_tx_ids, trust) -> dict`（纯库 API，**不抛异常**）。
+`expected_tx_ids` 与请求字段同约束（非空、互异、均为 64 位小写 hex）。
+每个 item 复用单笔 `verify_finalized_receipt` 的全部三阶段校验，并针对其
+所在块起的共享链后缀复核；此外核对批内 **tx_id 升序且无重复**、item
+集合与 `expected_tx_ids` **集合严格相等**、以及**共享链**（头序列恰从
+最低 item 块开始、每个 item 块都是该序列中的一个头、所有 item 收束于同一
+签名 `finalized` 锚点）。成功键序固定为 `ok, tx_ids, finalized`（`tx_ids`
+升序、`finalized` 为共享末头的二字段 `{height, block_hash}`）；失败仅返回
+`{"ok": false, "error"}`：形状/类型/hex/trust 错（含集合与钉住集合不
+符）为 `input`，未知版本或最终化坏签名为 `auth`，其余篡改（批内排序、
+重复、交易签名、证明、头链或共享链绑定）为 `integrity`。其余入口不变。
+
 ## 批量 Merkle 证明
 
 在单笔 `GET /v1/blocks/{height}/proof/{tx_id}` 之外，提供一次取多笔的批量接口：
@@ -1468,6 +1507,14 @@ curl -s localhost:8080/v1/transactions/<tx-id-hex>/finalized-receipt
 #          "merkle_root":"...","block_hash":"...","siblings":[{"direction":"left|right","hash":"..."}]},
 #          "headers":[{"height","prev_hash","merkle_root","block_hash","status":"confirmed"},...],
 #          "finality":{"finalized":{"height","block_hash"},"tip":{...S...},"auth":{"key_version","signature"}}}
+# 批量最终化回执（体仅含 tx_ids：非空、互异、各 64 位小写 hex；非法 400、有不存在项 404、
+# 否则有未确认项 409；200 键序 items,headers,finality；items 按 tx_id 升序、每项 receipt,proof；
+# headers 从最低交易块到最高 confirmed 块连续五字段全 confirmed；离线用
+# verify_finalized_receipts(document, expected_tx_ids, trust) 校验）
+curl -s -X POST localhost:8080/v1/transactions/finalized-receipts \
+  -H 'Content-Type: application/json' \
+  -d '{"tx_ids":["<tx-id-hex-1>","<tx-id-hex-2>"]}'
+# -> 200 {"items":[{"receipt":{...},"proof":{...}},...],"headers":[...五字段 confirmed...],"finality":{...}}
 # 账户状态根与账户状态包含证明（最高块 pending 时均 404；账户不在已确认集 404）
 curl -s localhost:8080/v1/state/root
 # -> {"state_root":"...","height":N,"block_hash":"...","account_count":K}
@@ -1776,7 +1823,8 @@ python tests/light_client_apply_finality_test.py  # 签名最终化凭证 GET /v
 python tests/light_client_verify_finality_pages_test.py  # 最终化分页历史离线校验 verify_finality_pages（非空数组逐页 anchor,finalities,next,head 键序/类型/ledger-finality-v1 验签；首锚=入参后锚=前页 next、非末页非空且 next=末项 finalized、末页 next=null、高度连续、tip 以 confirmed 指向自身 finalized、head 跨页相同且 head.tip.tip_hash=入参、末项=head.finalized、空页仅单页锚点即 head；成功键序 ok,anchor,head,pages,verified_block_hashes 升序不含锚点；input/auth/integrity 分类、不抛异常）
 python tests/finality_locator_test.py   # 最终化分叉定位 POST /v1/chain/finalities/locate（体仅含顺序键 locators,limit；locators 1–64 项 height,block_hash 严格降序非布尔非负整数/64hex；limit 1–500 默认100、拒布尔；非法 400 无副作用；顺序取首个 canonical 同高同哈希 confirmed 命中否则 409；200 完全复用 GET /v1/chain/finalities 键序 anchor,finalities,next,head 仅 anchor 取命中项；verify_finality_locator_pages 成功 ok,anchor,head,matched_index,pages,verified_block_hashes 索引从0、locators 非法 input、首锚不在列表 integrity、不抛异常）与 HTTP
 python tests/light_client_apply_finality_locator_pages_test.py  # 定位最终化分页原子落盘 apply_finality_locator_pages（后四项沿用 verify_finality_locator_pages；仅接受已有检查点、缺文件 io；共锁依次结构 input→存量 state/io→认证 auth→完整性 integrity：命中锚与凭证逐高匹配 confirmed 分支、各页 head 相同且 head.tip 等于本地 tip 并钉住 tip_hash、分页/连续性/链描述符 S/末页到达 head.finalized；末目标不低于 finalized、同高不异 hash；全批通过才 v3 原子写 generation+1，目标相同幂等不改字节、空页锚高 confirmed 块推进一次；成功键序 ok,generation,finalized,matched_index,pages,applied、matched_index 0 基；失败仅 ok,error 不抛异常不改字节或代数）
-python tests/finalized_receipt_test.py  # 可离线验证最终化回执 GET /v1/transactions/{tx_id}/finalized-receipt（非法/不存在 404、内存池与 pending 尾块 409；200 固定键序 receipt,proof,headers,finality：九字段 receipt 且 status=confirmed、单笔 Merkle 证明六字段、头序列从交易块到最高 confirmed 块升序五字段全 confirmed、finality 沿用 /v1/chain/finality 且 finalized=末头；链与签名者同锁快照，pending 链尾止于上一 confirmed 块）与 verify_finalized_receipt（成功键序 ok,tx_id,height,block_hash,finalized；形状/类型/hex/expected_tx_id/trust 错 input、未知版本或 ledger-finality-v1 坏签名 auth、交易签名/重算 tx_id、receipt-proof-头绑定、Merkle 路径、头哈希与链接、末头/finality/tip 绑定 integrity；失败仅 ok,error、不抛异常）与 HTTP 线序
+python tests/finalized_receipt_test.py  # 可离线验证最终化回执 GET /v1/transactions/{tx_id}/finalized-receipt（非法/不存在 404、内存池与 pending 尾块 409；200 固定键序 receipt,proof,headers,finality：九字段 receipt 且 status=confirmed、单笔 Merkle 证明六字段、头序列从交易块到最高 confirmed 块升序五字段全 confirmed、finality 沿用 /v1/chain/finality 且 finalized=末头；链与签名者同锁快照，pending 链尾止于上一 confirmed 块）与 verify_finalized_receipt（成功键序 ok,tx_id,height,block_hash,finalized；receipt.signature 非 128 位小写 hex 归 input、形状合法但验签失败归 integrity；形状/类型/hex/expected_tx_id/trust 错 input、未知版本或 ledger-finality-v1 坏签名 auth、交易签名/重算 tx_id、receipt-proof-头绑定、Merkle 路径、头哈希与链接、末头/finality/tip 绑定 integrity；失败仅 ok,error、不抛异常）与 HTTP 线序
+python tests/finalized_receipts_batch_test.py  # 批量最终化回执 POST /v1/transactions/finalized-receipts（体仅 tx_ids：非空/互异/各 64 位小写 hex，形状错 400 不触状态；任一不存在 404 优先于未确认、否则任一内存池/pending 尾块 409；200 固定键序 items,headers,finality：items 按 tx_id 升序每项 receipt,proof 沿用单笔九字段回执与六字段证明、headers 从最低交易块到最高 confirmed 块连续五字段全 confirmed 且为全批共享、finality 沿用 /v1/chain/finality 且 finalized=末头；整批与签名者同一把锁快照，跨块/同块/pending 链尾均一致）与 verify_finalized_receipts（expected_tx_ids 同 tx_ids 约束；逐项复用单笔三阶段校验并核对批内升序无重复、集合严格相等、共享链（序列从最低 item 块起、每 item 块在序列中、同收束 finalized）；成功键序 ok,tx_ids,finalized（tx_ids 升序、finalized 二字段锚点）；形状/类型/hex/trust/集合不符 input、未知版本或最终化坏签名 auth、排序/重复/签名/证明/头链/共享链篡改 integrity；失败仅 ok,error、不抛异常）与 HTTP 线序
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
