@@ -127,6 +127,28 @@ when its anchor is the pinned tip. Success returns
 ``{"ok": True, "anchor", "tip", "verified_block_hashes"}``; nothing is
 raised for malformed input.
 
+:func:`verify_header_pages` verifies an ordered, non-empty batch of such
+signed header pages as one continuous chain. Every page is re-verified
+under the exact :func:`verify_header_page` contract (key order, types,
+signer history, domain signature, recomputed header hashes); the first
+page's anchor must strictly equal the caller-pinned ``anchor`` and every
+later page's anchor must equal the previous page's last header's
+``{height, block_hash}``, so heights and prev_hash links continue across
+the page seams and a missing, duplicated or reordered page breaks the
+chain. Every page's ``tip`` descriptor must be field-for-field identical
+and name the caller-pinned ``tip_hash``; the last page must reach that
+tip. A non-final page's headers may never be empty — an empty page is
+only ever valid as the batch's last page with its anchor being the tip —
+and a pending header may only be the very last header of the whole batch,
+so any page after a pending header is an ``integrity`` failure. Success
+returns ``{"ok": True, "anchor", "tip", "pages",
+"verified_block_hashes"}`` with ``pages`` the page count and the hashes
+in chain order (the anchor itself is not a header and is not included);
+failure is ``{"ok": False, "error": category}`` with category one of
+``input`` (array/parameter shape, key order, types), ``auth`` (unknown
+key version or a failed signature) and ``integrity`` (anchor, tip, hash,
+link, pagination or pending-position defects). Nothing is raised.
+
 :func:`advance` durably checkpoints a verified batch to ``path``. The
 checkpoint file is one compact UTF-8 JSON document with the exact declared key
 order ``generation, anchor, tip, context, state_hash`` and a single trailing
@@ -3187,3 +3209,111 @@ def _verify_header_page(
 
     verified_hashes = [header["block_hash"] for header in headers]
     return page_anchor, tip, verified_hashes
+
+
+# Fixed success key order returned by :func:`verify_header_pages`.
+HEADER_PAGES_RESULT_KEYS = (
+    "ok",
+    "anchor",
+    "tip",
+    "pages",
+    "verified_block_hashes",
+)
+
+
+def verify_header_pages(
+    documents: object,
+    anchor: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Verify an ordered batch of signed header pages as one chain.
+
+    ``documents`` must be a non-empty list of decoded
+    ``GET /v1/chain/headers`` pages, each re-verified under the exact
+    :func:`verify_header_page` contract (key order, types, signer history,
+    domain signature, recomputed header hashes). ``anchor`` is the
+    caller-pinned ``{height, block_hash}`` the first page's anchor must
+    strictly equal; every later page's anchor must equal the previous
+    page's last header's ``{height, block_hash}``, so heights and
+    prev_hash links continue across the page seams and a missing,
+    duplicated or reordered page breaks the chain. ``tip_hash`` is the
+    caller-pinned chain tip: every page's ``tip`` descriptor must be
+    field-for-field identical and name that hash, and the last page must
+    reach it. A non-final page's headers may never be empty — an empty
+    page is only valid as the batch's last page with its anchor being the
+    tip — and a pending header may only be the very last header of the
+    whole batch, so any page after a pending header fails.
+
+    Returns ``{"ok": True, "anchor", "tip", "pages",
+    "verified_block_hashes"}`` on success — ``anchor`` the pinned anchor
+    of the first page, ``tip`` the shared chain descriptor, ``pages`` the
+    page count and ``verified_block_hashes`` every verified header hash in
+    chain order (the anchor itself is not a header and is not included) —
+    or ``{"ok": False, "error": category}`` on failure with category one
+    of ``input`` (array/parameter shape, key order, types), ``auth``
+    (unknown key version or a failed signature) and ``integrity``
+    (anchor, tip, hash, link, pagination or pending-position defects).
+    Never raises for malformed input.
+    """
+    try:
+        if not isinstance(documents, list) or not documents:
+            raise _Failure(ERR_INPUT)
+        pages = len(documents)
+        expected_anchor = anchor
+        first_anchor: dict | None = None
+        shared_tip: dict | None = None
+        verified_hashes: list[str] = []
+        for position, document in enumerate(documents):
+            # _verify_header_page itself rejects a page whose anchor does
+            # not strictly equal ``expected_anchor`` — the first page's
+            # pinned anchor and every later page's previous last header —
+            # so a broken seam, a height jump or a fork surfaces as
+            # integrity here.
+            page_anchor, tip, page_hashes = _verify_header_page(
+                document, expected_anchor, tip_hash, trust
+            )
+            if first_anchor is None:
+                first_anchor = page_anchor
+            if shared_tip is None:
+                shared_tip = tip
+            elif tip != shared_tip:
+                # Every page must carry the same chain descriptor, not
+                # merely the same tip hash.
+                raise _Failure(ERR_INTEGRITY)
+            last = position == pages - 1
+            if not page_hashes:
+                # An empty page (already pinned to the tip by the per-page
+                # rules) can only close the batch; a non-final empty page
+                # is a pagination defect and leaves no anchor to chain
+                # from.
+                if not last:
+                    raise _Failure(ERR_INTEGRITY)
+            else:
+                last_header = document["headers"][-1]
+                if last:
+                    # The final page must reach the pinned tip.
+                    if page_hashes[-1] != tip["tip_hash"]:
+                        raise _Failure(ERR_INTEGRITY)
+                elif last_header["status"] != STATUS_CONFIRMED:
+                    # A pending header may only be the batch's very last
+                    # header: no page may follow it.
+                    raise _Failure(ERR_INTEGRITY)
+                expected_anchor = {
+                    "height": last_header["height"],
+                    "block_hash": page_hashes[-1],
+                }
+            verified_hashes.extend(page_hashes)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "anchor": first_anchor,
+        "tip": shared_tip,
+        "pages": pages,
+        "verified_block_hashes": verified_hashes,
+    }

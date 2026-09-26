@@ -254,6 +254,19 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `ok, anchor, tip, verified_block_hashes`，`verified_block_hashes` 为本页
   按升序验证通过的头哈希（锚点即链尾时为空数组）。签名者轮换后，旧页面仍
   可用其 `key_version` 对应的历史公钥继续验证。
+- **多页连续校验**：`ledger.light_client.verify_header_pages(documents,
+  anchor, tip_hash, trust) -> dict`。`documents` 为**非空有序数组**，每页
+  沿用 `verify_header_page` 的键序、类型、签名者历史、域签名与头哈希契约
+  逐页复验；各页 `tip` 必须逐字段相同且 `tip_hash` 等于入参。首页
+  `anchor` 必须等于钉住锚点，后页 `anchor` 必须等于前页末头的
+  `{height, block_hash}`，高度与 `prev_hash` 跨页连续——缺页、重页、乱序
+  均断链；非末页 `headers` 不得为空，pending 只许为全批末头（pending 之后
+  不允许再有后续页），末页必须到达钉住的 tip，空页仅当其锚点即 tip 时合
+  法。函数**不抛异常**：数组/参数形状、键序、类型错误为 `input`，未知签
+  名版本或验签失败为 `auth`，锚点、tip、哈希、链接、分页或 pending 位置
+  错误为 `integrity`。成功键序固定为
+  `ok, anchor, tip, pages, verified_block_hashes`，`pages` 为页数，哈希
+  按链序且不含锚点；失败仅返回 `{"ok": false, "error"}`。
 
 ## 签名认证的增量区间协议
 
@@ -1491,6 +1504,7 @@ python tests/export_index_test.py     # 分叉导出、导出格式候选重验�
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
 python tests/header_page_test.py      # 签名区块头分页 GET /v1/chain/headers（after_height/after_hash 必填、limit 1–500 默认 100、400/404/409；固定键序 anchor,headers,tip,auth 与头项 height,prev_hash,merkle_root,block_hash,status；anchor=tip 时空 headers；pending 仅链尾；domain=ledger-headers-v1 的 SHA-256+Ed25519 签名；verify_header_page input/auth/integrity、锚点/tip 钉住、重算哈希与链接、分页串联、轮换历史验签）与 HTTP
+python tests/header_pages_test.py     # 多页签名区块头离线连续校验 verify_header_pages（非空数组逐页复验、各页 tip 逐字段相同且等于钉住 tip_hash、首锚=入参后锚=前页末头、跨页高度/prev_hash 连续、缺页/重页/乱序/pending 后续页 integrity、pending 只许全批末头、末页必达 tip、空页仅锚点即 tip、成功键序 ok,anchor,tip,pages,verified_block_hashes 按链序不含锚点、input/auth/integrity 分类、跨轮换版本混排可验）
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
