@@ -393,6 +393,22 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `finalized` 键序 `height, block_hash`；失败仅返回
   `{"ok": false, "error"}`、**不抛异常**且**不改变文件字节**。
 
+- **可分页最终化历史**：`GET
+  /v1/chain/finalities?after_height=&after_hash=&limit=`。参数规则与
+  `GET /v1/chain/headers` 完全相同（`after_height`、`after_hash` 必填且
+  单值，`limit` 可选、默认 100、范围 1–500；未知、重复或格式错误参数
+  `400`，未知高度 `404`，哈希不符或锚点为 pending `409`，均无副作用）。
+  `200` 文档顶层键序固定为 `anchor, finalities, next, head`：`anchor`
+  键序 `height, block_hash` 且等于请求锚点；`finalities` 含锚点后至多
+  `limit` 个**连续 confirmed 块**的凭证（按高度升序），每项沿用
+  `GET /v1/chain/finality` 的键序 `finalized, tip, auth` 与
+  `ledger-finality-v1` 签名，其中 `finalized` 指该块、`tip` 为该块的链
+  描述符 S，可直接整批传给 `ledger.light_client.apply_finalities`；
+  `head` 为**同一把锁**内快照生成的当前最终化凭证。若尚未到 head，
+  `next` 为末项 `finalized`（可直接作为下一页的锚点），否则为 `null`；
+  锚点已是 head 时 `finalities` 为空且 `next` 为 `null`。链、当前签名者
+  与整个响应在同一把锁内取快照，签名或构造失败不会返回部分页面。
+
 ## 签名认证的增量区间协议
 
 增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
