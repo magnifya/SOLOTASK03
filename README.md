@@ -444,6 +444,36 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   `ok, anchor, head, matched_index, pages, verified_block_hashes`；
   失败仅 `{"ok": false, "error"}`。
 
+- **定位最终化分页原子落盘**：`ledger.light_client.
+  apply_finality_locator_pages(path, pages, locators, tip_hash, trust)
+  -> dict`。后四项沿用 `verify_finality_locator_pages` 契约（`pages`
+  非空、键序 `anchor, finalities, next, head`；`locators` 1–64 项、
+  项键序 `height, block_hash`、高度非布尔非负整数严格降序、哈希 64
+  位小写 hex；`tip_hash` 64 位小写 hex；`trust` 携带
+  `audit_signers`），但只作用于**已有**头检查点（文件缺失为 `io`，
+  从不凭定位批新开检查点），并在该 path 的同一把 per-path 锁内依次
+  分阶段、全有或无地处理：① 结构（参数/键序/类型/locators/信任，
+  失败 `input`）；② 存量（严格加载并完整重放：解析、键序、摘要或
+  重放错为 `state`，读写错为 `io`）；③ 认证（逐项、再逐页 `head`
+  验 `ledger-finality-v1` 签名，未知版本或坏签名为 `auth`）；
+  ④ 完整性——首页锚点必须出现在 `locators` 中（其 **0 基**位置即
+  `matched_index`），命中锚与每个凭证目标都须逐高匹配本地重放分支的
+  **confirmed** 块（pending/未知高度/分叉哈希不通过）；各页 `head`
+  逐字段相同、`head.tip.tip_hash` 等于入参且 `head.tip` 逐字段等于
+  本地 tip；分页链接、连续性、各凭证以 confirmed 的链描述符 S 指向
+  自身 `finalized`、末页 `next` 为 `null` 且到达 `head.finalized`
+  （仅单页可在锚点即 head 时凭证为空）；末目标不得低于已存
+  `finalized`，同高不得异 hash，否则 `integrity`。全批通过才把边界
+  一次性原子推进到 `head.finalized`：沿用 v3 格式、`generation + 1`
+  （anchor/tip/steps 不动）；末目标与已存边界相同（含从旧定位锚重放
+  至边界的历史）则**幂等**：文件字节逐字不变、代数不动；锚点高于
+  已存边界的空页仍推进一次边界。成功键序固定为
+  `ok, generation, finalized, matched_index, pages, applied`
+  （`matched_index` 0 基、`pages` 页数、`applied` 凭证数）；失败仅
+  `{"ok": false, "error"}`（`input/auth/integrity/state/io`）、
+  **不抛异常**、不改字节或代数，写失败尽力还原原字节。HTTP、CLI 及
+  其他轻客户端入口不变。
+
 ## 签名认证的增量区间协议
 
 增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
@@ -1692,6 +1722,7 @@ python tests/header_locator_test.py    # 签名区块头分叉定位 POST /v1/ch
 python tests/light_client_apply_finality_test.py  # 签名最终化凭证 GET /v1/chain/finality（无参数否则 400；锁内同快照取链与签名者；200 固定键序 finalized,tip,auth，finalized=最后 confirmed 块键序 height,block_hash、tip 沿用 S、auth 键序 key_version,signature；domain=ledger-finality-v1 的 SHA-256+Ed25519 签名、轮换历史可验）与 apply_finality（键序/非布尔整数/64hex/128hex input、未知版本或坏签名 auth、tip 须等于本地重放 tip、finalized 须为分支 anchor/confirmed 头且不倒退否则 integrity、存量解析/键序/摘要/重放 state、缺文件或读写失败 io；同目标幂等不写文件、提高边界 generation+1 沿用 v3 原子换入；失败仅 ok,error、不抛异常、字节不变）与 HTTP
 python tests/light_client_verify_finality_pages_test.py  # 最终化分页历史离线校验 verify_finality_pages（非空数组逐页 anchor,finalities,next,head 键序/类型/ledger-finality-v1 验签；首锚=入参后锚=前页 next、非末页非空且 next=末项 finalized、末页 next=null、高度连续、tip 以 confirmed 指向自身 finalized、head 跨页相同且 head.tip.tip_hash=入参、末项=head.finalized、空页仅单页锚点即 head；成功键序 ok,anchor,head,pages,verified_block_hashes 升序不含锚点；input/auth/integrity 分类、不抛异常）
 python tests/finality_locator_test.py   # 最终化分叉定位 POST /v1/chain/finalities/locate（体仅含顺序键 locators,limit；locators 1–64 项 height,block_hash 严格降序非布尔非负整数/64hex；limit 1–500 默认100、拒布尔；非法 400 无副作用；顺序取首个 canonical 同高同哈希 confirmed 命中否则 409；200 完全复用 GET /v1/chain/finalities 键序 anchor,finalities,next,head 仅 anchor 取命中项；verify_finality_locator_pages 成功 ok,anchor,head,matched_index,pages,verified_block_hashes 索引从0、locators 非法 input、首锚不在列表 integrity、不抛异常）与 HTTP
+python tests/light_client_apply_finality_locator_pages_test.py  # 定位最终化分页原子落盘 apply_finality_locator_pages（后四项沿用 verify_finality_locator_pages；仅接受已有检查点、缺文件 io；共锁依次结构 input→存量 state/io→认证 auth→完整性 integrity：命中锚与凭证逐高匹配 confirmed 分支、各页 head 相同且 head.tip 等于本地 tip 并钉住 tip_hash、分页/连续性/链描述符 S/末页到达 head.finalized；末目标不低于 finalized、同高不异 hash；全批通过才 v3 原子写 generation+1，目标相同幂等不改字节、空页锚高 confirmed 块推进一次；成功键序 ok,generation,finalized,matched_index,pages,applied、matched_index 0 基；失败仅 ok,error 不抛异常不改字节或代数）
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
