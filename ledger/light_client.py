@@ -5701,6 +5701,175 @@ def verify_finality_pages(
     }
 
 
+# Fixed success key order returned by :func:`verify_finality_locator_pages`.
+VERIFY_FINALITY_LOCATOR_PAGES_RESULT_KEYS = (
+    "ok",
+    "anchor",
+    "head",
+    "matched_index",
+    "pages",
+    "verified_block_hashes",
+)
+
+
+def verify_finality_locator_pages(
+    pages: object,
+    locators: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Offline-verify a paginated ``POST /v1/chain/finalities/locate`` history.
+
+    ``pages`` is a non-empty, ordered array of response pages in the exact
+    ``GET /v1/chain/finalities`` shape (key order ``anchor, finalities,
+    next, head``) precisely as for :func:`verify_finality_pages`.
+    ``locators`` is the original request list the client sent: 1-64 closed
+    ``{height, block_hash}`` items (item key order ``height, block_hash``),
+    heights non-boolean non-negative integers strictly descending and
+    unique, hashes 64 lowercase hex. ``tip_hash`` is the caller-pinned
+    chain tip (64 lowercase hex) the shared ``head.tip`` must name and
+    ``trust`` must carry ``audit_signers`` exactly as for
+    :func:`verify_finality_pages`.
+
+    Rather than one caller-pinned anchor, the first page's ``anchor`` must
+    appear in ``locators``: its index there (starting at 0) is returned as
+    ``matched_index``. Every other rule — the staged input checks, the
+    ``ledger-finality-v1`` Ed25519 authentication of every item and every
+    page's ``head``, and the pagination walk (identical heads, chained
+    anchors, consecutive finalized heights, per-item confirmed chain
+    descriptors, the final page reaching ``head.finalized``) — is the
+    :func:`verify_finality_pages` rule.
+
+    Success returns ``{"ok": True, "anchor", "head", "matched_index",
+    "pages", "verified_block_hashes"}`` in that key order with ``anchor``
+    the closed matched anchor, ``head`` the closed shared head credential,
+    ``pages`` the page count and ``verified_block_hashes`` every finalized
+    block hash in ascending chain order (the anchor itself is not
+    included). Failure returns only ``{"ok": False, "error": category}``
+    with category one of ``input`` (parameters, the locators list, key
+    order, types, encoding or trust shape), ``auth`` (an unknown key
+    version or a failed signature) and ``integrity`` (a first anchor absent
+    from the locator list, or anchor, continuity, pagination, tip or head
+    defects). Never raises for malformed input.
+    """
+    try:
+        # Stage 1 (input): argument shape, the locators list, the whole
+        # batch's exact key order and raw types, and the trust signers, are
+        # settled before any signature or pagination work.
+        if not isinstance(pages, list) or not pages:
+            raise _Failure(ERR_INPUT)
+        closed_locators = _validate_header_locators(locators)
+        if not crypto.is_hex64(tip_hash):
+            raise _Failure(ERR_INPUT)
+        parsed_pages = [_parse_finality_page(page) for page in pages]
+        signers = _validate_header_trust(trust)
+
+        # Stage 2 (auth): every item in page order, then every page's
+        # head credential. A later credential is never trusted because an
+        # earlier one was.
+        for page, (_anchor, items, _next, raw_head, head) in zip(
+            pages, parsed_pages
+        ):
+            for document, (_target, _tip, key_version, signature) in zip(
+                page["finalities"], items
+            ):
+                _authenticate_finality(document, key_version, signature, signers)
+            _authenticate_finality(raw_head, head[2], head[3], signers)
+
+        # Stage 3 (integrity): the first page anchors at one of the
+        # locators; the pagination walk is the verify_finality_pages walk
+        # from that matched anchor.
+        first_anchor = parsed_pages[0][0]
+        matched_index: int | None = None
+        for index, locator in enumerate(closed_locators):
+            if locator == first_anchor:
+                matched_index = index
+                break
+        if matched_index is None:
+            # The history anchors at a block the client never offered as a
+            # known chain point.
+            raise _Failure(ERR_INTEGRITY)
+        head_target, head_tip = parsed_pages[0][4][0], parsed_pages[0][4][1]
+        raw_head0 = parsed_pages[0][3]
+        closed_head = {
+            "finalized": head_target,
+            "tip": head_tip,
+            "auth": {
+                "key_version": parsed_pages[0][4][2],
+                "signature": parsed_pages[0][4][3],
+            },
+        }
+        # The shared head names the caller-pinned chain tip.
+        if head_tip["tip_hash"] != tip_hash:
+            raise _Failure(ERR_INTEGRITY)
+        expected_anchor: dict | None = first_anchor
+        verified_hashes: list[str] = []
+        last_target: dict | None = None
+        for index, (page_anchor, items, next_anchor, raw_head, _head) in enumerate(
+            parsed_pages
+        ):
+            # Every page carries the identical head credential.
+            if raw_head != raw_head0:
+                raise _Failure(ERR_INTEGRITY)
+            # The first page anchors at the matched locator; every later
+            # page anchors at its predecessor's next.
+            if page_anchor != expected_anchor:
+                raise _Failure(ERR_INTEGRITY)
+            last_page = index == len(parsed_pages) - 1
+            if last_page:
+                # The final page closes the history: no follow-up.
+                if next_anchor is not None:
+                    raise _Failure(ERR_INTEGRITY)
+            else:
+                # A non-final page delivers at least one credential and
+                # names its last finalized block as the follow-up anchor.
+                if not items or next_anchor is None:
+                    raise _Failure(ERR_INTEGRITY)
+                if next_anchor != items[-1][0]:
+                    raise _Failure(ERR_INTEGRITY)
+            if not items:
+                # Only a single page may be empty: its anchor already is
+                # the finalized head.
+                if len(parsed_pages) != 1 or page_anchor != head_target:
+                    raise _Failure(ERR_INTEGRITY)
+            previous_height = page_anchor["height"]
+            for target, cred_tip, _version, _signature in items:
+                # The credentials are the consecutive blocks strictly
+                # after the anchor.
+                if target["height"] != previous_height + 1:
+                    raise _Failure(ERR_INTEGRITY)
+                previous_height = target["height"]
+                # The credential's tip is the confirmed chain descriptor
+                # S of the finalized block itself.
+                expected_tip = {
+                    "tip_hash": target["block_hash"],
+                    "height": target["height"],
+                    "length": target["height"] + 1,
+                    "status": STATUS_CONFIRMED,
+                }
+                if cred_tip != expected_tip:
+                    raise _Failure(ERR_INTEGRITY)
+                last_target = target
+                verified_hashes.append(target["block_hash"])
+            if last_page and items and last_target != head_target:
+                raise _Failure(ERR_INTEGRITY)
+            expected_anchor = next_anchor
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "anchor": first_anchor,
+        "head": closed_head,
+        "matched_index": matched_index,
+        "pages": len(parsed_pages),
+        "verified_block_hashes": verified_hashes,
+    }
+
+
 # Fixed success key order returned by :func:`advance_finalized_headers`.
 ADVANCE_FINALIZED_HEADERS_RESULT_KEYS = (
     "ok",

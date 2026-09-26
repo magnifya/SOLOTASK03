@@ -1201,8 +1201,6 @@ class LedgerService:
                 return 400, {"error": "limit must be a decimal between 1 and 500"}
             limit = parsed
 
-        from . import light_client
-
         with self.store.lock:
             anchor_block = self.store.block_at(after_height)
             if anchor_block is None:
@@ -1213,55 +1211,164 @@ class LedgerService:
                 }
             if anchor_block.status != STATUS_CONFIRMED:
                 return 409, {"error": "anchor block is pending confirmation"}
-            signer = self.store.audit_signer
-            if signer is None:
-                # Every snapshot (including migrated legacy ones) carries a
-                # current audit signer after recovery; reaching here is a
-                # programming error rather than a client-visible condition.
-                raise RuntimeError("no audit signer available for finality")
+            return 200, self._finalities_page(anchor_block, limit)
 
-            def credential(finalized: dict, tip: dict) -> dict:
-                auth = light_client.sign_finality(
-                    signer["private_key"], signer["version"], finalized, tip
-                )
-                if auth is None:
-                    raise RuntimeError("current audit signer key is invalid")
-                return {"finalized": finalized, "tip": tip, "auth": auth}
+    def _finalities_page(self, anchor_block: Block, limit: int) -> dict:
+        """The signed finalities page strictly after ``anchor_block``.
 
-            # The consecutive confirmed blocks strictly after the anchor; a
-            # pending block (only ever the chain tip) ends the page.
-            page: list[Block] = []
-            for block in self.store.chain[
-                after_height + 1 : after_height + 1 + limit
-            ]:
-                if block.status != STATUS_CONFIRMED:
-                    break
-                page.append(block)
-            finalities = [
-                credential(
-                    self._anchor_descriptor(block), self._block_descriptor(block)
-                )
-                for block in page
-            ]
-            finalized_block = next(
-                block
-                for block in reversed(self.store.chain)
-                if block.status == STATUS_CONFIRMED
+        Must be called under the store lock with a confirmed canonical
+        anchor block. Returns the fixed-order ``anchor, finalities, next,
+        head`` body shared by ``GET /v1/chain/finalities`` and
+        ``POST /v1/chain/finalities/locate``: ``finalities`` carries at
+        most ``limit`` credentials for the consecutive confirmed blocks
+        strictly after the anchor, ``head`` is the current finality
+        credential and ``next`` the page's last ``finalized`` (or ``null``
+        when the page reaches the finalized head).
+        """
+        from . import light_client
+
+        signer = self.store.audit_signer
+        if signer is None:
+            # Every snapshot (including migrated legacy ones) carries a
+            # current audit signer after recovery; reaching here is a
+            # programming error rather than a client-visible condition.
+            raise RuntimeError("no audit signer available for finality")
+
+        def credential(finalized: dict, tip: dict) -> dict:
+            auth = light_client.sign_finality(
+                signer["private_key"], signer["version"], finalized, tip
             )
-            head = credential(
-                self._anchor_descriptor(finalized_block),
-                self._fork_summary(self.store.chain),
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return {"finalized": finalized, "tip": tip, "auth": auth}
+
+        # The consecutive confirmed blocks strictly after the anchor; a
+        # pending block (only ever the chain tip) ends the page.
+        after_height = anchor_block.height
+        page: list[Block] = []
+        for block in self.store.chain[
+            after_height + 1 : after_height + 1 + limit
+        ]:
+            if block.status != STATUS_CONFIRMED:
+                break
+            page.append(block)
+        finalities = [
+            credential(
+                self._anchor_descriptor(block), self._block_descriptor(block)
             )
-            if page and page[-1].height < finalized_block.height:
-                next_anchor: dict | None = self._anchor_descriptor(page[-1])
-            else:
-                next_anchor = None
-            return 200, {
-                "anchor": self._anchor_descriptor(anchor_block),
-                "finalities": finalities,
-                "next": next_anchor,
-                "head": head,
+            for block in page
+        ]
+        finalized_block = next(
+            block
+            for block in reversed(self.store.chain)
+            if block.status == STATUS_CONFIRMED
+        )
+        head = credential(
+            self._anchor_descriptor(finalized_block),
+            self._fork_summary(self.store.chain),
+        )
+        if page and page[-1].height < finalized_block.height:
+            next_anchor: dict | None = self._anchor_descriptor(page[-1])
+        else:
+            next_anchor = None
+        return {
+            "anchor": self._anchor_descriptor(anchor_block),
+            "finalities": finalities,
+            "next": next_anchor,
+            "head": head,
+        }
+
+    def locate_finality_fork(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/chain/finalities/locate — fork location by block locators.
+
+        The request body follows exactly the :meth:`locate_header_fork`
+        rules: a JSON object with the ordered keys ``locators`` and the
+        optional ``limit``; ``locators`` is an array of 1-64
+        ``{height, block_hash}`` items (item key order ``height,
+        block_hash``), each height a non-boolean non-negative integer,
+        strictly descending and unique across the array, and each hash 64
+        lowercase hexadecimal characters; ``limit`` is a non-boolean
+        integer between 1 and 500 and defaults to 100. Every parse or
+        key/value defect is a 400 answered before any state is read (no
+        side effects).
+
+        The locators are probed in their supplied order and the first item
+        naming a **confirmed** main-chain block at the same height with the
+        same hash anchors the response; when no locator names a confirmed
+        main-chain block the answer is 409. On success the body is the same
+        fixed-order signed finalities page as :meth:`get_chain_finalities`
+        — ``anchor, finalities, next, head`` — with the matched locator as
+        the anchor. The main chain, the current audit signer and the whole
+        response are snapshotted under one store lock.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        keys = tuple(payload.keys())
+        if keys not in (("locators",), ("locators", "limit")):
+            return 400, {
+                "error": "body must contain only ordered keys locators, limit"
             }
+        raw_locators = payload["locators"]
+        if not isinstance(raw_locators, list) or not (
+            1 <= len(raw_locators) <= 64
+        ):
+            return 400, {
+                "error": "field 'locators' must be an array of 1 to 64 items"
+            }
+        locators: list[dict] = []
+        previous_height: int | None = None
+        for item in raw_locators:
+            if not isinstance(item, dict) or tuple(item.keys()) != (
+                "height",
+                "block_hash",
+            ):
+                return 400, {
+                    "error": "every locator must be an object with ordered "
+                    "keys height, block_hash"
+                }
+            height = item["height"]
+            block_hash = item["block_hash"]
+            if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+                return 400, {
+                    "error": "locator height must be a non-negative integer"
+                }
+            if not crypto.is_hex64(block_hash):
+                return 400, {
+                    "error": "locator block_hash must be 64 lowercase hex characters"
+                }
+            if previous_height is not None and height >= previous_height:
+                return 400, {
+                    "error": "locator heights must be strictly descending and unique"
+                }
+            previous_height = height
+            locators.append({"height": height, "block_hash": block_hash})
+        limit = self.RANGE_DEFAULT_LIMIT
+        if "limit" in payload:
+            raw_limit = payload["limit"]
+            if (
+                isinstance(raw_limit, bool)
+                or not isinstance(raw_limit, int)
+                or not 1 <= raw_limit <= self.RANGE_MAX_LIMIT
+            ):
+                return 400, {"error": "limit must be an integer between 1 and 500"}
+            limit = raw_limit
+
+        with self.store.lock:
+            anchor_block = None
+            for locator in locators:
+                candidate = self.store.block_at(locator["height"])
+                if (
+                    candidate is not None
+                    and candidate.block_hash == locator["block_hash"]
+                    and candidate.status == STATUS_CONFIRMED
+                ):
+                    anchor_block = candidate
+                    break
+            if anchor_block is None:
+                return 409, {
+                    "error": "no locator matches a confirmed main-chain block"
+                }
+            return 200, self._finalities_page(anchor_block, limit)
 
     # -- inter-node fork sync -------------------------------------------------
 
