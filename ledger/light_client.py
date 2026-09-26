@@ -5820,6 +5820,303 @@ def verify_finality_locator_pages(
     }
 
 
+# Fixed success key order returned by :func:`apply_finality_locator_pages`.
+APPLY_FINALITY_LOCATOR_PAGES_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "finalized",
+    "matched_index",
+    "pages",
+    "applied",
+)
+
+
+def apply_finality_locator_pages(
+    path: object,
+    pages: object,
+    locators: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Apply a paginated ``POST /v1/chain/finalities/locate`` history atomically.
+
+    ``pages``/``locators``/``tip_hash``/``trust`` are exactly the
+    :func:`verify_finality_locator_pages` arguments: ``pages`` is a
+    non-empty, ordered array of response pages (each with the exact
+    top-level key order ``anchor, finalities, next, head``), ``locators``
+    the original request list (1-64 ``{height, block_hash}`` items, item
+    key order ``height, block_hash``, heights non-boolean non-negative
+    integers strictly descending, hashes 64 lowercase hex) the first
+    page's ``anchor`` must appear in, ``tip_hash`` the caller-pinned chain
+    tip (64 lowercase hex) and ``trust`` the ``audit_signers`` document.
+    The checkpoint at ``path`` must already exist.
+
+    Verification is staged and all-or-nothing:
+
+    1. **input** — ``path`` must be a non-empty string, ``pages`` a
+       non-empty list, ``locators`` a legal locator list and ``tip_hash``
+       64 lowercase hex; every page's key order and raw types (plus the
+       trust signers) are checked for the whole batch first.
+    2. **state/io** — the checkpoint at ``path`` is then strictly loaded
+       and fully replayed under the per-path lock shared with every other
+       same-path operation (a missing file is ``io``; a parse, key-order,
+       digest or replay defect is ``state``).
+    3. **auth** — every credential envelope, the pages' items in array
+       order and each page's ``head``, is verified: the ``key_version``
+       must resolve in ``trust.audit_signers`` and the Ed25519 signature
+       must verify under the ``ledger-finality-v1`` domain (an unknown
+       version or a failed signature is ``auth``).
+    4. **integrity** — the pagination and the branch are walked: every
+       page's ``head`` must be field-for-field identical and
+       ``head.tip.tip_hash`` must equal the pinned tip hash; the first
+       page's ``anchor`` must appear in ``locators`` (its 0-based position
+       is reported as ``matched_index``) and, like every credential
+       target, must name a **confirmed** block of the locally replayed
+       branch at its exact height and hash; every later page's ``anchor``
+       its predecessor's ``next``; a non-final page carries a non-empty
+       ``finalities`` and a ``next`` equal to its last item's
+       ``finalized``; the final page carries ``next: null`` and reaches
+       ``head.finalized`` — only a single page whose anchor already is the
+       head may be empty. The credentials are the consecutive confirmed
+       blocks of the locally replayed branch strictly after the anchor,
+       each ``tip`` the chain descriptor S of its block, and ``head.tip``
+       must equal the local tip descriptor. The closing boundary
+       (``head.finalized``) may not move the stored boundary backwards or
+       sideways: a lower height, or the same height with a different
+       hash, is ``integrity``.
+
+    Only when the whole batch verifies is the boundary advanced once,
+    atomically, to ``head.finalized``: the generation is incremented
+    exactly once and the file rewritten in the version-3 format. A batch
+    whose closing boundary equals the stored one is idempotent — the file
+    bytes stay exactly as they were and the generation holds. Success
+    returns ``{"ok": True, "generation", "finalized", "matched_index",
+    "pages", "applied"}`` in that key order with ``finalized`` the closed
+    boundary, ``matched_index`` the 0-based locator position of the first
+    page's anchor, ``pages`` the number of pages and ``applied`` the
+    number of credentials. Failure returns only ``{"ok": False, "error":
+    category}`` with category one of ``input`` (parameters, key order or
+    types), ``auth`` (an unknown version or a failed signature),
+    ``integrity`` (pagination, anchor, branch, tip or boundary defects),
+    ``state`` (a parse, digest or replay defect) and ``io`` (a missing
+    file or a read/write error; a failed write restores the original
+    bytes best-effort). Nothing is raised and a failed batch never
+    changes the file bytes or the generation.
+    """
+    # Argument shape is validated before any file work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Stage 1 (input): the locator list, the pinned tip, the whole
+        # batch's exact key order and raw types, and the trust signers,
+        # are settled before any file or signature work — structure
+        # precedes state and trust.
+        if not isinstance(pages, list) or not pages:
+            return _failed_advance(ERR_INPUT)
+        try:
+            closed_locators = _validate_header_locators(locators)
+            if not crypto.is_hex64(tip_hash):
+                raise _Failure(ERR_INPUT)
+            parsed_pages = [_parse_finality_page(page) for page in pages]
+            signers = _validate_header_trust(trust)
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+
+        # The persisted checkpoint is strictly loaded and fully replayed
+        # before any credential is judged: a corrupt or missing file is
+        # state/io regardless of the pages it arrives with.
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_STATE)
+        if loaded is None:
+            # Finality can only be applied to an existing checkpoint.
+            return _failed_advance(ERR_IO)
+        checkpoint, _step_tips, branch = loaded
+
+        # Stage 2 (auth): every item in page order, then every page's
+        # head credential. A later credential is never trusted because an
+        # earlier one was.
+        try:
+            for page, (_anchor, items, _next, raw_head, head) in zip(
+                pages, parsed_pages
+            ):
+                for document, (_target, _tip, key_version, signature) in zip(
+                    page["finalities"], items
+                ):
+                    _authenticate_finality(document, key_version, signature, signers)
+                _authenticate_finality(raw_head, head[2], head[3], signers)
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+
+        # Stage 3 (integrity): walk the pagination against the one
+        # replayed branch.
+        finalized = checkpoint["finalized"]
+        local_tip = checkpoint["tip"]
+        head_target, head_tip = parsed_pages[0][4][0], parsed_pages[0][4][1]
+        raw_head0 = parsed_pages[0][3]
+        try:
+            # The shared head names the caller-pinned chain tip.
+            if head_tip["tip_hash"] != tip_hash:
+                raise _Failure(ERR_INTEGRITY)
+            # The first page must anchor at one of the request locators;
+            # its 0-based position is reported as matched_index.
+            first_anchor = parsed_pages[0][0]
+            matched_index: int | None = None
+            for index, locator in enumerate(closed_locators):
+                if locator == first_anchor:
+                    matched_index = index
+                    break
+            if matched_index is None:
+                # The batch anchors at a block the client never offered
+                # as a known chain point.
+                raise _Failure(ERR_INTEGRITY)
+            # The matched anchor must name a confirmed block of the
+            # locally replayed branch at its exact height and hash.
+            anchor_entry = branch.get(first_anchor["height"])
+            if (
+                anchor_entry is None
+                or anchor_entry[0] != first_anchor["block_hash"]
+                or anchor_entry[1] != STATUS_CONFIRMED
+            ):
+                raise _Failure(ERR_INTEGRITY)
+            expected_anchor: dict | None = first_anchor
+            last_target: dict | None = None
+            applied = 0
+            for index, (anchor, items, next_anchor, raw_head, _head) in enumerate(
+                parsed_pages
+            ):
+                # Every page carries the identical head credential.
+                if raw_head != raw_head0:
+                    raise _Failure(ERR_INTEGRITY)
+                # The first page anchors at the matched locator; every
+                # later page anchors at its predecessor's next.
+                if anchor != expected_anchor:
+                    raise _Failure(ERR_INTEGRITY)
+                last_page = index == len(parsed_pages) - 1
+                if last_page:
+                    # The final page closes the history: no follow-up.
+                    if next_anchor is not None:
+                        raise _Failure(ERR_INTEGRITY)
+                else:
+                    # A non-final page delivers at least one credential
+                    # and names its last finalized block as the follow-up
+                    # anchor.
+                    if not items or next_anchor is None:
+                        raise _Failure(ERR_INTEGRITY)
+                    if next_anchor != items[-1][0]:
+                        raise _Failure(ERR_INTEGRITY)
+                if not items:
+                    # Only a single page may be empty: its anchor already
+                    # is the finalized head.
+                    if len(parsed_pages) != 1 or anchor != head_target:
+                        raise _Failure(ERR_INTEGRITY)
+                previous_height = anchor["height"]
+                for target, cred_tip, _version, _signature in items:
+                    # The credentials are the consecutive confirmed blocks
+                    # strictly after the anchor.
+                    if target["height"] != previous_height + 1:
+                        raise _Failure(ERR_INTEGRITY)
+                    previous_height = target["height"]
+                    entry = branch.get(target["height"])
+                    if entry is None or entry[0] != target["block_hash"]:
+                        raise _Failure(ERR_INTEGRITY)
+                    if entry[1] != STATUS_CONFIRMED:
+                        raise _Failure(ERR_INTEGRITY)
+                    # The credential's tip is the chain descriptor S of
+                    # the finalized block itself.
+                    expected_tip = {
+                        "tip_hash": target["block_hash"],
+                        "height": target["height"],
+                        "length": local_tip["length"]
+                        - (local_tip["height"] - target["height"]),
+                        "status": STATUS_CONFIRMED,
+                    }
+                    if cred_tip != expected_tip:
+                        raise _Failure(ERR_INTEGRITY)
+                    last_target = target
+                    applied += 1
+                if last_page and items and last_target != head_target:
+                    raise _Failure(ERR_INTEGRITY)
+                expected_anchor = next_anchor
+            # The shared head describes exactly the locally replayed tip.
+            if head_tip != local_tip:
+                raise _Failure(ERR_INTEGRITY)
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+
+        # The batch's closing boundary is the shared head's finalized
+        # target (the last credential's target when there are items). It
+        # may not move the stored boundary backwards or sideways; naming
+        # the stored boundary exactly replays history and is idempotent
+        # (the file bytes stay exactly as they were and the generation
+        # holds), a higher boundary advances once.
+        new_target = last_target if last_target is not None else head_target
+        if new_target["height"] < finalized["height"] or (
+            new_target["height"] == finalized["height"]
+            and new_target["block_hash"] != finalized["block_hash"]
+        ):
+            return _failed_advance(ERR_INTEGRITY)
+        if new_target == finalized:
+            return {
+                "ok": True,
+                "generation": checkpoint["generation"],
+                "finalized": {key: finalized[key] for key in HEADER_ANCHOR_KEYS},
+                "matched_index": matched_index,
+                "pages": len(parsed_pages),
+                "applied": applied,
+            }
+
+        next_generation = checkpoint["generation"] + 1
+        rewritten = {
+            "v": HEADER_CHECKPOINT_VERSION,
+            "generation": next_generation,
+            "anchor": checkpoint["anchor"],
+            "tip": checkpoint["tip"],
+            "finalized": new_target,
+            "steps": checkpoint["steps"],
+        }
+        rewritten["hash"] = _header_checkpoint_hash(
+            HEADER_CHECKPOINT_VERSION,
+            next_generation,
+            checkpoint["anchor"],
+            checkpoint["tip"],
+            new_target,
+            checkpoint["steps"],
+        )
+
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        try:
+            _atomic_write_header_checkpoint(path, rewritten)
+        except OSError:
+            # Compensate: put the original bytes back best-effort.
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_IO)
+        except (TypeError, ValueError):
+            # A stored value JSON cannot re-serialize is a file defect.
+            return _failed_advance(ERR_STATE)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "finalized": {key: new_target[key] for key in HEADER_ANCHOR_KEYS},
+            "matched_index": matched_index,
+            "pages": len(parsed_pages),
+            "applied": applied,
+        }
+
+
 # Fixed success key order returned by :func:`advance_finalized_headers`.
 ADVANCE_FINALIZED_HEADERS_RESULT_KEYS = (
     "ok",
