@@ -267,6 +267,29 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   错误为 `integrity`。成功键序固定为
   `ok, anchor, tip, pages, verified_block_hashes`，`pages` 为页数，哈希
   按链序且不含锚点；失败仅返回 `{"ok": false, "error"}`。
+- **持久化头检查点**：`ledger.light_client.advance_headers(path,
+  documents, anchor, tip_hash, trust) -> dict` 把每批**已核验**的签名头页
+  落盘为可继续的头检查点（纯库 API，其余入口不变）。首次使用 `path` 时
+  `anchor` 必须是键序 `height, block_hash` 的合法锚点；续写传 `None`
+  （从已存 tip 继续）或已存 tip 的 `{height, block_hash}`。`documents`
+  按 `verify_header_pages` 原样多页校验；新 tip **不得降高**，同高度仅允
+  许同一 `block_hash` 从 `pending` 变 `confirmed`，其余为 `integrity`；
+  与已存**末批**完全相同（`tip_hash`、`trust`、`documents` 逐字相同）的
+  提交幂等，不增代、文件字节不动。文件为单个紧凑 UTF-8 JSON 文档（非
+  ASCII 不转义、末尾恰好一个换行），顶层键序固定为
+  `v, generation, anchor, tip, steps, hash`：`v = 1`，`generation` 为非
+  布尔正整数、每次成功推进 +1，`anchor` 为首次钉住的锚点，`tip` 沿用链
+  描述符 S，`steps` 为非空数组且每项键序恰为
+  `tip_hash, trust, documents`（嵌套键序沿用既有契约），`hash` 为去掉
+  `hash` 自身的 canonical_json（`sort_keys`、紧凑分隔符、
+  `ensure_ascii=False`）字节的 SHA-256（64 位小写 hex）。加载时逐批重放
+  并核对最终 tip；同一 `path` 共用一把锁串行、临时文件 fsync 后
+  `os.replace` 原子换入，任何失败原字节不变且不增代。成功按键序
+  `ok, generation, tip` 返回；失败仅返回 `{"ok": false, "error"}` 且
+  **不抛异常**，`error` 仅取 `input`（参数、首锚或 `tip_hash` 非法）、
+  `auth`（验签）、`integrity`（批次或 tip 冲突）、`state`（已存文件的
+  解析、键序、类型、摘要或重放失配，文件不被截断或重建）、`io`
+  （读写失败）。
 
 ## 签名认证的增量区间协议
 

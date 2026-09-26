@@ -149,6 +149,33 @@ failure is ``{"ok": False, "error": category}`` with category one of
 key version or a failed signature) and ``integrity`` (anchor, tip, hash,
 link, pagination or pending-position defects). Nothing is raised.
 
+:func:`advance_headers` durably checkpoints a verified header-page batch to
+``path``. The file is one compact UTF-8 JSON document (non-ASCII written
+unescaped, one trailing newline) with the exact top-level key order
+``v, generation, anchor, tip, steps, hash``: ``v`` is 1, ``generation`` is a
+non-boolean positive integer incremented once per successful advance,
+``anchor`` is the first batch's pinned ``{height, block_hash}`` anchor (key
+order ``height, block_hash``), ``tip`` is the latest chain descriptor S,
+``steps`` is a non-empty array of ``{tip_hash, trust, documents}`` items (one
+per advance, nested key orders unchanged) and ``hash`` is the SHA-256 of the
+canonical (sorted, compact) JSON of the document with ``hash`` removed. The
+first use of ``path`` requires a legal ``anchor``; later advances accept
+``None`` (continue from the stored tip) or the stored tip's
+``{height, block_hash}``. Verification itself is :func:`verify_header_pages`
+unchanged against the caller-pinned ``tip_hash``. The new tip may never drop
+in height; at the same height only the same ``block_hash`` moving from
+``pending`` to ``confirmed`` is accepted — anything else is an ``integrity``
+failure. Re-submitting the exact last batch (same ``tip_hash``, ``trust`` and
+``documents``) is idempotent: it verifies but neither bumps the generation
+nor touches the file. Loading strictly replays every stored step (shape,
+hash, per-batch verification and tip monotonicity) and checks the stored
+tip; any mismatch is a ``state`` failure and the file is never truncated or
+rebuilt. Same-path advances share one lock and the new file is atomically
+replaced into place; a failed write restores the original bytes. Success
+returns ``{"ok": True, "generation", "tip"}``; failure returns only
+``{"ok": False, "error": category}`` with category one of
+``input/auth/integrity/state/io`` and nothing is raised.
+
 :func:`advance` durably checkpoints a verified batch to ``path``. The
 checkpoint file is one compact UTF-8 JSON document with the exact declared key
 order ``generation, anchor, tip, context, state_hash`` and a single trailing
@@ -3317,3 +3344,357 @@ def verify_header_pages(
         "pages": pages,
         "verified_block_hashes": verified_hashes,
     }
+
+
+# -- durable header-page checkpoint ---------------------------------------------
+
+# The exact top-level key order of one persisted advance_headers checkpoint.
+HEADER_CHECKPOINT_KEYS = ("v", "generation", "anchor", "tip", "steps", "hash")
+
+# The exact key order of one stored advance step.
+HEADER_STEP_KEYS = ("tip_hash", "trust", "documents")
+
+# The header checkpoint format version.
+HEADER_CHECKPOINT_VERSION = 1
+
+# Fixed success key order returned by :func:`advance_headers`.
+ADVANCE_HEADERS_RESULT_KEYS = ("ok", "generation", "tip")
+
+
+def _header_checkpoint_hash(
+    v: int, generation: int, anchor: dict, tip: dict, steps: list
+) -> str:
+    """SHA-256 over the canonical JSON bytes of every field but ``hash``."""
+    body = {
+        "v": v,
+        "generation": generation,
+        "anchor": anchor,
+        "tip": tip,
+        "steps": steps,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def _header_tip_advances(stored: dict, new: dict) -> bool:
+    """Whether ``new`` is a legal successor tip of ``stored``.
+
+    The tip may never drop in height; at the same height only the same
+    ``block_hash`` moving from ``pending`` to ``confirmed`` is accepted.
+    """
+    if new["height"] != stored["height"]:
+        return new["height"] > stored["height"]
+    return (
+        new["tip_hash"] == stored["tip_hash"]
+        and stored["status"] == STATUS_PENDING
+        and new["status"] == STATUS_CONFIRMED
+    )
+
+
+def _validate_header_checkpoint_shape(data: object) -> dict:
+    """Validate the exact key order and JSON types of one checkpoint document."""
+    if not isinstance(data, dict) or tuple(data.keys()) != HEADER_CHECKPOINT_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    v = data["v"]
+    generation = data["generation"]
+    anchor = data["anchor"]
+    tip = data["tip"]
+    steps = data["steps"]
+    digest = data["hash"]
+
+    if not _is_int(v) or v != HEADER_CHECKPOINT_VERSION:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(generation) or generation < 1:
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(anchor, dict) or tuple(anchor.keys()) != HEADER_ANCHOR_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(anchor["height"]) or anchor["height"] < 0:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(anchor["block_hash"]):
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(tip, dict) or tuple(tip.keys()) != HEADER_TIP_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(tip["tip_hash"]):
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(tip["height"]) or tip["height"] < 0:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(tip["length"]) or tip["length"] < 1:
+        raise _CheckpointError(ERR_STATE)
+    if tip["status"] not in (STATUS_PENDING, STATUS_CONFIRMED):
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(steps, list) or not steps:
+        raise _CheckpointError(ERR_STATE)
+    validated_steps = []
+    for raw in steps:
+        if not isinstance(raw, dict) or tuple(raw.keys()) != HEADER_STEP_KEYS:
+            raise _CheckpointError(ERR_STATE)
+        if not crypto.is_hex64(raw["tip_hash"]):
+            raise _CheckpointError(ERR_STATE)
+        if not isinstance(raw["trust"], dict):
+            raise _CheckpointError(ERR_STATE)
+        if not isinstance(raw["documents"], list) or not raw["documents"]:
+            raise _CheckpointError(ERR_STATE)
+        validated_steps.append(
+            {
+                "tip_hash": raw["tip_hash"],
+                "trust": raw["trust"],
+                "documents": raw["documents"],
+            }
+        )
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+
+    return {
+        "v": HEADER_CHECKPOINT_VERSION,
+        "generation": generation,
+        "anchor": {key: anchor[key] for key in HEADER_ANCHOR_KEYS},
+        "tip": {key: tip[key] for key in HEADER_TIP_KEYS},
+        "steps": validated_steps,
+        "hash": digest,
+    }
+
+
+def _replay_header_checkpoint(checkpoint: dict) -> None:
+    """Re-verify one shape-validated header checkpoint document.
+
+    The recorded ``hash`` pins the document before any replay: a tampered
+    version, generation, anchor, tip or step is state corruption, not
+    re-verified. Every stored step is then replayed through
+    :func:`verify_header_pages` against its own recorded pins — the first
+    from the checkpoint anchor, every later one from the previous step's
+    closed tip — with the same tip-monotonicity rule as a live advance, and
+    the final replayed tip must equal the stored one.
+    """
+    recomputed = _header_checkpoint_hash(
+        checkpoint["v"],
+        checkpoint["generation"],
+        checkpoint["anchor"],
+        checkpoint["tip"],
+        checkpoint["steps"],
+    )
+    if recomputed != checkpoint["hash"]:
+        raise _CheckpointError(ERR_STATE)
+
+    steps = checkpoint["steps"]
+    # The generation counts exactly the recorded steps: one per advance.
+    if checkpoint["generation"] != len(steps):
+        raise _CheckpointError(ERR_STATE)
+
+    expected_anchor = checkpoint["anchor"]
+    tip: dict | None = None
+    for step in steps:
+        result = verify_header_pages(
+            step["documents"], expected_anchor, step["tip_hash"], step["trust"]
+        )
+        if not result.get("ok"):
+            raise _CheckpointError(ERR_STATE)
+        if tip is not None and not _header_tip_advances(tip, result["tip"]):
+            raise _CheckpointError(ERR_STATE)
+        tip = result["tip"]
+        expected_anchor = {
+            "height": tip["height"],
+            "block_hash": tip["tip_hash"],
+        }
+    assert tip is not None  # steps is shape-guaranteed non-empty
+    if tip != checkpoint["tip"]:
+        raise _CheckpointError(ERR_STATE)
+
+
+def _load_header_checkpoint(path: str) -> dict | None:
+    """Strictly load and re-verify an existing advance_headers checkpoint.
+
+    Returns None when no file exists at ``path``. Otherwise validates the
+    exact key order and JSON types, recomputes ``hash`` over the other
+    fields, and replays every stored step. Any defect is a ``state`` failure
+    (unreadable JSON is ``state`` too, an unreadable file ``io``); the file
+    is never truncated or rebuilt.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+
+    try:
+        data = json.loads(text)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    checkpoint = _validate_header_checkpoint_shape(data)
+    _replay_header_checkpoint(checkpoint)
+    return checkpoint
+
+
+def _atomic_write_header_checkpoint(path: str, checkpoint: dict) -> None:
+    """Write the checkpoint in declared key order and atomically replace ``path``."""
+    ordered = {key: checkpoint[key] for key in HEADER_CHECKPOINT_KEYS}
+    _atomic_write_bytes(path, _serialize_document(ordered))
+
+
+def advance_headers(
+    path: object,
+    documents: object,
+    anchor: object,
+    tip_hash: object,
+    trust: object,
+) -> dict:
+    """Verify a signed header-page batch and durably checkpoint it at ``path``.
+
+    ``documents`` is an ordered, non-empty batch of ``GET /v1/chain/headers``
+    pages verified with :func:`verify_header_pages` against ``trust`` and the
+    caller-pinned ``tip_hash``. The first use of ``path`` requires a legal
+    ``anchor`` (``{height, block_hash}``, key order ``height, block_hash``);
+    a later advance passes ``None`` (continue from the stored tip) or the
+    stored tip's ``{height, block_hash}``.
+
+    The new tip may never drop in height; at the same height only the same
+    ``block_hash`` moving from ``pending`` to ``confirmed`` is accepted —
+    anything else is an ``integrity`` failure. Re-submitting the exact last
+    batch (same ``tip_hash``, ``trust`` and ``documents``) is idempotent: it
+    returns success with the current generation and neither bumps the
+    generation nor touches the file.
+
+    On success the checkpoint is written atomically (a uniquely named temp
+    file in the same directory, fsynced and ``os.replace``d under the
+    per-path lock shared with every other same-path operation) with key
+    order ``v, generation, anchor, tip, steps, hash``; generation starts at
+    1 and increments once per successful advance, so a failed verification
+    never bumps it. The return value is ``{"ok": True, "generation",
+    "tip"}`` in that key order.
+
+    Every failure is ``{"ok": False, "error": category}`` with category one
+    of ``input`` (bad arguments, a malformed first anchor or an illegal
+    ``tip_hash``), ``auth``/``integrity`` (batch verification and tip
+    conflicts), ``state`` (an existing checkpoint fails its key-order,
+    type, hash or replay checks; it is never truncated or rebuilt) and
+    ``io`` (the checkpoint cannot be read or written; a failed write
+    restores the original bytes best-effort). Nothing is raised.
+    """
+    # Argument shape is validated before any file or verification work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    if not isinstance(tip_hash, str) or not crypto.is_hex64(tip_hash):
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            previous = _load_header_checkpoint(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+
+        if previous is None:
+            # First use: the caller must pin a legal anchor.
+            expected_anchor = _validate_header_anchor_argument(anchor)
+            if expected_anchor is None:
+                return _failed_advance(ERR_INPUT)
+            generation = 0
+            file_anchor = expected_anchor
+            steps: list[dict] = []
+            stored_tip: dict | None = None
+        else:
+            generation = previous["generation"]
+            file_anchor = previous["anchor"]
+            steps = list(previous["steps"])
+            stored_tip = previous["tip"]
+            if anchor is None:
+                # Continue the continuous chain from the stored closed tip.
+                expected_anchor = {
+                    "height": stored_tip["height"],
+                    "block_hash": stored_tip["tip_hash"],
+                }
+            else:
+                expected_anchor = _validate_header_anchor_argument(anchor)
+                if (
+                    expected_anchor is None
+                    or expected_anchor
+                    != {
+                        "height": stored_tip["height"],
+                        "block_hash": stored_tip["tip_hash"],
+                    }
+                ):
+                    return _failed_advance(ERR_INPUT)
+
+        step = {"tip_hash": tip_hash, "trust": trust, "documents": documents}
+        if steps and step == steps[-1]:
+            # Re-submitting the exact last batch (same tip_hash, trust and
+            # documents) is idempotent: it was verified when it was stored
+            # and re-verified by the load replay above, so the file bytes
+            # stay exactly as they were and the generation holds.
+            return {
+                "ok": True,
+                "generation": generation,
+                "tip": stored_tip,
+            }
+
+        try:
+            result = verify_header_pages(documents, expected_anchor, tip_hash, trust)
+            if not result.get("ok"):
+                return {"ok": False, "error": result["error"]}
+
+            new_tip = result["tip"]
+            if stored_tip is not None and not _header_tip_advances(
+                stored_tip, new_tip
+            ):
+                return _failed_advance(ERR_INTEGRITY)
+
+            next_generation = generation + 1
+            steps = steps + [step]
+            checkpoint = {
+                "v": HEADER_CHECKPOINT_VERSION,
+                "generation": next_generation,
+                "anchor": file_anchor,
+                "tip": new_tip,
+                "steps": steps,
+            }
+            checkpoint["hash"] = _header_checkpoint_hash(
+                HEADER_CHECKPOINT_VERSION,
+                next_generation,
+                file_anchor,
+                new_tip,
+                steps,
+            )
+
+            try:
+                original = _read_bytes_or_none(path)
+            except OSError:
+                return _failed_advance(ERR_IO)
+            try:
+                _atomic_write_header_checkpoint(path, checkpoint)
+            except OSError:
+                # Compensate: put the original bytes back best-effort.
+                _restore_bytes(path, original)
+                return _failed_advance(ERR_IO)
+            except (TypeError, ValueError):
+                # A trust/document value JSON cannot serialize (verification
+                # only judges the fields it pins) is a caller-side defect.
+                return _failed_advance(ERR_INPUT)
+        except _Failure as failure:  # defensive: verifiers never raise these
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report rather
+            # than crash the caller.
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "tip": new_tip,
+        }
+
+
+def _validate_header_anchor_argument(raw: object) -> dict | None:
+    """Validate an advance_headers anchor as ``{height, block_hash}``.
+
+    Mirrors the header verifier's raw-value rules (exact key order
+    ``height, block_hash``, booleans rejected); returns a fresh closed
+    document or None on any shape/type defect.
+    """
+    if not isinstance(raw, dict) or tuple(raw.keys()) != HEADER_ANCHOR_KEYS:
+        return None
+    height = raw["height"]
+    if not _is_int(height) or height < 0:
+        return None
+    if not crypto.is_hex64(raw["block_hash"]):
+        return None
+    return {"height": height, "block_hash": raw["block_hash"]}
