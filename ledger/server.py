@@ -139,6 +139,18 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.export_history_page(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/chain/headers/locate":
+                # POST /v1/chain/headers/locate — fork location by ordered
+                # block locators; the success document has the contract key
+                # order anchor, headers, tip, auth (same signed header page
+                # shape as GET /v1/chain/headers), so it is serialized in
+                # insertion order rather than alphabetically.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.locate_header_fork(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
