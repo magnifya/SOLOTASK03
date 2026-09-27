@@ -345,6 +345,23 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 # {root, records, head} signer log.
                 status, body = service.read_history_trust()
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/light-client/sync-state":
+                # GET /v1/light-client/sync-state — read-only audit of the
+                # configured synced header/state pair and its journal. The
+                # endpoint takes no parameters: any query parameter
+                # (including a blank one) is rejected 400 with the ordered
+                # {"ok", "error"} input body; a bare trailing "?" carries
+                # none and is accepted. When the node was started without
+                # --sync-state the service answers 404 not_found; otherwise
+                # the audit result is passed through verbatim in its
+                # contract key order (200 ok=true, 500 io).
+                if parse_qs(query, keep_blank_values=True):
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.audit_sync_state()
+                self._send_json(status, body, sort_keys=False)
             elif path.startswith("/v1/transactions/") and path.endswith(
                 "/finalized-receipt"
             ):

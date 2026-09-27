@@ -1429,6 +1429,33 @@ JSON**，成功/失败退出 0/1：
   `reason`，绝不静默启动。尚无任何 `history_access` 事件的文件对
   （例如离线 CLI 预先创建）只做重验、不做绑定。
 
+## 同步状态只读审计（HTTP 与 CLI）
+
+`ledger.light_client.audit_sync_state(path)` 可以由节点通过 HTTP 只读
+托管：服务启动时加可选的 `--sync-state PATH`（`path` 为同步头检查点，
+`.state` 侧车与 `.txn` 事务日志同目录）。**缺省该选项时启动与既有完全
+一致**，路由返回 404；显式给出空值是配置错误，进程向 stderr 报错并以
+退出码 **2** 结束，不加载任何状态。
+
+- **路由**：`GET /v1/light-client/sync-state` **不带任何查询参数**——
+  任何参数（含空值）返回 **400** 与按序 `{"ok":false,"error":"input"}`；
+  裸的结尾 `?` 不携带参数、照常处理。未配置 `--sync-state` 时返回
+  **404** 与按序 `{"ok":false,"error":"not_found"}`。
+- **透传**：已配置时结果原样透传 `audit_sync_state`：成功 200 且顶层
+  与各子记录保持固定键序 `ok,status,header,state,transaction`（header
+  为 `status,generation,tip,finalized`，state 为
+  `status,generation,account,anchor`，transaction 为
+  `status,header_generation,state_generation`）；三个目标各自为
+  `missing`/`valid`/`invalid`（事务为 `absent`/`valid`/`invalid`），
+  总体 `empty`/`consistent`/`recoverable`/`split`/`corrupt`。文件打开/
+  读取或路径锁故障返回 **500** 与按序 `{"ok":false,"error":"io"}`。
+- **只读与确定性**：查询与 `advance_sync_state` 共用按路径锁，**绝不**
+  前滚遗留事务、清理缺陷日志或改写三个文件中的任何字节；并发查询与
+  推进、以及重启后的结果均确定。
+- **CLI**：`ledger sync-state-audit`（无位置参数）调用该路由并把响应
+  原序打印为单行 JSON；仅当 200 且 `ok=true` 时退出 0，其余（400/404/
+  500/无法连接）退出 1。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -1544,7 +1571,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 read/update/export，401/403 无副作用）与 `history_credential_changed` 事件 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / `sync-state-audit` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
 
@@ -1596,6 +1623,10 @@ python -m ledger --host 0.0.0.0 --port 8080 --state ledger_state.json
 令牌保护的 `/v1/history/trust` 与 `/v1/history/export` 托管接口（三者须
 全给且非空或全缺，部分给出退出码 2，详见「节点托管的检查点历史 HTTP
 接口」）。
+
+可选 `--sync-state PATH` 开启只读的
+`GET /v1/light-client/sync-state` 同步状态审计；显式空值退出码 2，
+缺省时路由 404 且启动行为不变（详见「同步状态只读审计」）。
 
 环境变量 `LEDGER_HOST` / `LEDGER_PORT` / `LEDGER_STATE` / `LEDGER_INITIAL_BALANCE`
 可提供同样的默认值。
@@ -1934,6 +1965,13 @@ cat docs.json | python -m ledger.cli receipt-proofs-audit - --expected-root <64h
 # -> 单行按契约键序 {"ok":...,"root":...,"total":N,"succeeded":M,
 #    "errors":{"input":I,"integrity":J},"entries":[...],"digest":"..."}；
 #    ok 为真退出 0，ok 为假或非 2xx 退出 1
+
+# 同步状态只读审计（GET /v1/light-client/sync-state；无位置参数；
+# 节点须以 --sync-state PATH 启动，否则 404 not_found）
+python -m ledger.cli sync-state-audit
+# -> 单行原序 {"ok":true,"status":"empty|consistent|recoverable|split|
+#    corrupt","header":{...},"state":{...},"transaction":{...}} 退出 0；
+#    带参 400/input、未配置 404/not_found、io 500、连不上退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -1982,3 +2020,4 @@ python tests/consistency_verify_test.py   # 离线快照整体一致性 verify_s
 python tests/history_http_test.py  # 节点托管 /v1/history/trust 与 /v1/history/export（--history/--history-trust/--history-token 全有/全缺否则退出2、Bearer 401 无副作用、读缺失 500/io、追加 201/幂等 200、导出 200 页离线 verify_history_trust 可验、400/403/409/500 与 {"ok":false,"error"}、history_access 事件键序 action,trust_head,history_head 与 null 头、共锁并发、快照写盘失败恢复信任日志原字节与内存事件、重启重验文件并绑定末条 history_access、篡改/坏事件 StateRecoveryError(path,reason)）
 python tests/history_credential_test.py  # 持久分权凭据 POST /v1/history/access（仅静态 TOKEN；首创 201 版本0/更新 200 版本+1/撤销保留 hash 与权限/幂等重复撤销；token_hash=SHA256(token UTF8) 不落明文、响应键序 version,token_hash,permissions,status；格式错 400/input、版本冲突 409/state；permissions 归一化 read/update/export；静态全权、活动凭据按 read/update/export 分权、无效 401/unauthorized、缺权 403/forbidden 且无副作用、凭据不能管理凭据；history_credential 快照区段与 history_credential_changed 事件原子落盘、写盘失败回滚、重启保留、篡改区段/事件 StateRecoveryError(path,reason)；特性关闭时 404）
 ```
+python tests/sync_state_audit_http_test.py  # 只读同步状态审计 GET /v1/light-client/sync-state 与 CLI sync-state-audit（--sync-state 空值退出2、缺省 404/not_found、带查询参数 400/input；透传 audit_sync_state 固定键序与五状态、io 500；查询不恢复/不清理/不改写三文件、遗留 .txn 保持 recoverable；共锁并发审计+推进无 corrupt、重启结果一致；CLI 无位置参数、单行原序 JSON、200 且 ok=true 退出 0 否则 1）

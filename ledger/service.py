@@ -103,8 +103,14 @@ class LedgerService:
         store: LedgerStore,
         initial_balance: int = DEFAULT_INITIAL_BALANCE,
         history_config: tuple[str, str, str] | None = None,
+        sync_state_path: str | None = None,
     ) -> None:
         self.store = store
+        # Optional read-only synced header/state pair exposed at
+        # GET /v1/light-client/sync-state. When set, it is the checkpoint
+        # path whose ``.state`` sidecar and ``.txn`` journal sit next to it;
+        # None leaves the route absent (404) and startup unchanged.
+        self.sync_state_path = sync_state_path
         # Optional token-gated checkpoint-history endpoints. When set, the
         # triple is ``(checkpoint_path, signer_log_path, bearer_token)`` and
         # the store already knows the two paths for startup re-verification.
@@ -4738,3 +4744,28 @@ class LedgerService:
                     # ran inside _append_history_access_and_save.
                     return 500, {"ok": False, "error": "io"}
                 return 200, result
+
+    # -- read-only light-client sync-state audit -----------------------------
+
+    def audit_sync_state(self) -> tuple[int, dict]:
+        """GET /v1/light-client/sync-state — read-only synced-pair audit.
+
+        Passthrough to ``light_client.audit_sync_state`` over the configured
+        checkpoint path: the route is absent (404 with the ordered
+        ``{"ok", "error"}`` body) unless the node started with
+        ``--sync-state``. The library result is returned verbatim in its
+        contract key order (200 when ``ok`` is true); an ``io`` failure
+        answers 500 and an ``input`` failure (only reachable defensively,
+        since startup pins a non-empty path) answers 400. The query shares
+        the advance path lock and never recovers, cleans or rewrites a file.
+        """
+        if not self.sync_state_path:
+            return 404, {"ok": False, "error": "not_found"}
+        from . import light_client
+
+        result = light_client.audit_sync_state(self.sync_state_path)
+        if result.get("ok") is True:
+            return 200, result
+        if result.get("error") == "input":
+            return 400, {"ok": False, "error": "input"}
+        return 500, {"ok": False, "error": "io"}

@@ -7,7 +7,7 @@ audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
 subcommands, the receipt-proofs-audit batch audit subcommand, plus the
-offline checkpoint-history history-trust,
+read-only sync-state-audit node query, the offline checkpoint-history history-trust,
 history-export and header-locators subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
@@ -973,6 +973,24 @@ def cmd_receipt_proofs_audit(args: argparse.Namespace) -> int:
     return 0 if 200 <= status < 300 and body.get("ok") is True else 1
 
 
+def cmd_sync_state_audit(args: argparse.Namespace) -> int:
+    """Read-only audit of the node-configured synced header/state pair.
+
+    GETs ``/v1/light-client/sync-state`` with no parameters and prints the
+    response as one JSON line in the server's contract key order (no key
+    sorting, so an input/not_found/io failure keeps the ordered
+    ``{"ok", "error"}`` shape). Exits 0 only on a 200 response with
+    ``ok`` true; 400 (the route takes no query parameters), 404 (the node
+    was started without --sync-state), 500 (io) and any connection failure
+    exit 1.
+    """
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/light-client/sync-state", None
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if status == 200 and body.get("ok") is True else 1
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -1364,6 +1382,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="expected receipt-index Merkle root (64 lowercase hex characters)",
     )
     p_receipt_proofs_audit.set_defaults(func=cmd_receipt_proofs_audit)
+
+    p_sync_state_audit = sub.add_parser(
+        "sync-state-audit",
+        help="read-only audit of the node-configured synced header/state "
+        "pair and its transaction journal",
+    )
+    p_sync_state_audit.set_defaults(func=cmd_sync_state_audit)
 
     # Source-trust management: `trust <action> ...`.
     p_trust = sub.add_parser("trust", help="manage trusted sources and export the trust document")
