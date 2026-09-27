@@ -8264,6 +8264,67 @@ def verify_receipt_proof(document: object, expected_root: object) -> dict:
     }
 
 
+def _receipt_proof_named_tx_id(document: object) -> str | None:
+    """The legal receipt ``tx_id`` a batch document names, if any.
+
+    Mirrors only the shape gates :func:`verify_receipt_proof` walks
+    before a receipt ``tx_id`` is accepted as 64 lowercase hex (the
+    exact document, item and receipt key orders), so a document that
+    fails its own verification can still spend its id slot without any
+    other field being trusted.
+    """
+    if not isinstance(document, dict) or tuple(
+        document.keys()
+    ) != RECEIPT_PROOF_RESULT_KEYS:
+        return None
+    raw_item = document["item"]
+    if not isinstance(raw_item, dict) or tuple(
+        raw_item.keys()
+    ) != FINALIZED_RECEIPT_ITEM_KEYS:
+        return None
+    receipt = raw_item["receipt"]
+    if not isinstance(receipt, dict) or tuple(receipt.keys()) != RECEIPT_KEYS:
+        return None
+    tx_id = receipt["tx_id"]
+    return tx_id if crypto.is_hex64(tx_id) else None
+
+
+def _verify_receipt_proofs_batch(
+    documents: list, expected_root: str
+) -> list[dict]:
+    """Verify every batch item independently, never short-circuiting.
+
+    Returns one verdict per input document in input order, each the
+    exact success or failure structure :func:`verify_receipt_proof`
+    produces for it. A receipt id slot is claimed as soon as an item
+    yields a legal ``tx_id`` under that single-item contract — for a
+    successful item its returned id, otherwise the legal id its receipt
+    still names — before any later item is examined. Hence a first item
+    that fails still occupies its id: every later item naming an already
+    claimed id is pinned to ``{"ok": False, "error": "integrity"}``
+    instead of its own verdict, whether or not that later item verifies
+    on its own. Assumes the batch shape was already accepted.
+    """
+    results: list[dict] = []
+    claimed_tx_ids: set[str] = set()
+    for document in documents:
+        result = verify_receipt_proof(document, expected_root)
+        if result["ok"]:
+            tx_id: str | None = result["tx_id"]
+        else:
+            tx_id = _receipt_proof_named_tx_id(document)
+        if tx_id is not None:
+            if tx_id in claimed_tx_ids:
+                # A receipt id cannot belong to one honest index tree
+                # twice; the first item that names the id keeps its own
+                # verdict and every later one is an integrity failure.
+                result = {"ok": False, "error": ERR_INTEGRITY}
+            else:
+                claimed_tx_ids.add(tx_id)
+        results.append(result)
+    return results
+
+
 def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
     """Offline-verify a batch of :func:`receipt_proof` success documents.
 
@@ -8282,30 +8343,20 @@ def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
     key order: ``root`` is ``expected_root`` and ``results`` carries one
     entry per input document, in input order, each exactly the success
     or failure structure :func:`verify_receipt_proof` returns for it.
-    Beyond the first occurrence of a receipt ``tx_id``, every further
-    document naming that id reports ``{"ok": False, "error":
-    "integrity"}`` instead of its own verdict; ``ok`` is true only when
-    every entry succeeded.
+
+    Each item's receipt id is claimed the moment a legal ``tx_id`` is
+    obtained under the single-item contract, before the remaining items
+    are examined; an id first carried by an item that nonetheless fails
+    is still spent. Every later document naming an already claimed id
+    reports ``{"ok": False, "error": "integrity"}`` instead of its own
+    verdict. ``ok`` is true only when every entry succeeded.
     """
     try:
         if not isinstance(documents, list) or not documents:
             return {"ok": False, "error": ERR_INPUT}
         if not crypto.is_hex64(expected_root):
             return {"ok": False, "error": ERR_INPUT}
-        results: list[dict] = []
-        seen_tx_ids: set[str] = set()
-        for document in documents:
-            result = verify_receipt_proof(document, expected_root)
-            if result["ok"]:
-                tx_id = result["tx_id"]
-                if tx_id in seen_tx_ids:
-                    # A duplicated receipt id cannot belong to one honest
-                    # index tree twice; only the first occurrence keeps
-                    # its own verdict.
-                    result = {"ok": False, "error": ERR_INTEGRITY}
-                else:
-                    seen_tx_ids.add(tx_id)
-            results.append(result)
+        results = _verify_receipt_proofs_batch(documents, expected_root)
     except Exception:
         # Defensive: structurally unforeseeable inputs must report rather
         # than crash the verifying process.
@@ -8315,3 +8366,72 @@ def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
         "root": expected_root,
         "results": results,
     }
+
+
+def receipt_proofs_audit(documents: object, expected_root: object) -> dict:
+    """Audit-summary companion to :func:`verify_receipt_proofs`.
+
+    Runs the same non-short-circuiting batch verification (including the
+    first-claim-wins receipt id rule) and returns a fixed summary with
+    key order ``{"ok", "root", "total", "succeeded", "errors",
+    "entries", "digest"}``. A batch-shape defect (``documents`` not a
+    non-empty list or ``expected_root`` not 64 lowercase hex) returns
+    only ``{"ok": False, "error": "input"}`` in that key order.
+
+    ``ok`` is true only when every item succeeded; ``root`` is
+    ``expected_root``; ``total`` is the number of input documents and
+    ``succeeded`` the number that succeeded. ``errors`` has the fixed
+    key order ``input, integrity`` and counts the failed verdicts of
+    each category as non-boolean non-negative integers whose sum is the
+    failure count. ``entries`` has one element per input document, in
+    input order and the same length: a successful entry is exactly
+    ``{"tx_id": ...}`` and a failed one exactly
+    ``{"error": category}``. ``digest`` binds the whole summary: it is
+    the SHA-256 lowercase hex of the UTF-8 JSON of this object without
+    its own ``digest`` key, produced with ``sort_keys=True,
+    separators=(",", ":"), ensure_ascii=False``. Nothing is read or
+    written, the arguments are never mutated and nothing is raised.
+    """
+    try:
+        if not isinstance(documents, list) or not documents:
+            return {"ok": False, "error": ERR_INPUT}
+        if not crypto.is_hex64(expected_root):
+            return {"ok": False, "error": ERR_INPUT}
+        results = _verify_receipt_proofs_batch(documents, expected_root)
+
+        entries: list[dict] = []
+        input_errors = 0
+        integrity_errors = 0
+        succeeded = 0
+        for result in results:
+            if result["ok"]:
+                succeeded += 1
+                entries.append({"tx_id": result["tx_id"]})
+            else:
+                if result["error"] == ERR_INPUT:
+                    input_errors += 1
+                else:
+                    integrity_errors += 1
+                entries.append({"error": result["error"]})
+        total = len(documents)
+        summary: dict = {
+            "ok": succeeded == total,
+            "root": expected_root,
+            "total": total,
+            "succeeded": succeeded,
+            "errors": {
+                "input": input_errors,
+                "integrity": integrity_errors,
+            },
+            "entries": entries,
+        }
+        # The digest covers exactly the summary object minus digest,
+        # serialized canonically (sorted, compact, unescaped UTF-8).
+        summary["digest"] = hashlib.sha256(
+            _canonical_json_bytes(summary)
+        ).hexdigest()
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the auditing process.
+        return {"ok": False, "error": ERR_INPUT}
+    return summary
