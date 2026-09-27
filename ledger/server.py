@@ -164,6 +164,23 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.locate_finality_fork(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions/receipt-proofs/audit":
+                # POST /v1/transactions/receipt-proofs/audit — offline audit
+                # summary for a batch of receipt_proof documents. The body is
+                # strictly {"documents", "expected_root"} in that order (400
+                # with the ordered {"ok", "error"} body otherwise, never
+                # touching state). The success document has the contract key
+                # order ok, root, total, succeeded, errors, entries, digest,
+                # so it is serialized in insertion order rather than
+                # alphabetically.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.audit_receipt_proofs(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions/finalized-receipts":
                 # POST /v1/transactions/finalized-receipts — a batch of
                 # finalized receipts sharing one signed chain snapshot. The

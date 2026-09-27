@@ -516,6 +516,41 @@ class LedgerService:
                 },
             }
 
+    def audit_receipt_proofs(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/transactions/receipt-proofs/audit — offline audit summary
+        for a batch of ``receipt_proof`` documents.
+
+        The body must be a JSON object containing exactly the keys
+        ``documents, expected_root`` in that order: ``documents`` a
+        non-empty array whose items are each audited under the
+        ``receipt_proof`` contract and ``expected_root`` the caller-pinned
+        64-lowercase-hex Merkle root. A malformed body — parse failure,
+        missing/extra/out-of-order keys, an empty array or an illegal root
+        — is 400 with the ordered body ``{"ok": false, "error": "input"}``
+        and never touches state.
+
+        A legal batch is answered 200 with the core
+        :func:`ledger.light_client.receipt_proofs_audit` result verbatim
+        (key order ``ok, root, total, succeeded, errors, entries,
+        digest``). The audit is a pure function of the request body: no
+        state is read or written, so concurrent requests and restarts
+        yield identical results.
+        """
+        if not isinstance(payload, dict) or tuple(payload.keys()) != (
+            "documents",
+            "expected_root",
+        ):
+            return 400, {"ok": False, "error": "input"}
+        documents = payload["documents"]
+        expected_root = payload["expected_root"]
+        if not isinstance(documents, list) or not documents:
+            return 400, {"ok": False, "error": "input"}
+        if not crypto.is_hex64(expected_root):
+            return 400, {"ok": False, "error": "input"}
+        from . import light_client
+
+        return 200, light_client.receipt_proofs_audit(documents, expected_root)
+
     # -- blocks -------------------------------------------------------------
 
     def mine_block(self) -> tuple[int, dict]:

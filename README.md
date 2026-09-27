@@ -902,6 +902,30 @@ JSON、v1 键序、摘要、`items` 排序或任一 item 的既有语义校验�
 索引不认识该 ID 为 `not_found`。读取与既有写入共用 `path` 锁，不写文件、不抛
 异常，同字节输入结果确定。
 
+## 回执证明批量审计（HTTP 与 CLI）
+
+离线核心函数 `ledger.light_client.receipt_proofs_audit(documents,
+expected_root)`（本身不变）同时暴露为 HTTP 接口与 CLI 子命令：
+
+- **请求**：`POST /v1/transactions/receipt-proofs/audit`，请求体必须是 JSON
+  对象且**按序只含** `documents, expected_root` 两个键：`documents` 为非空
+  数组，元素各自按 `receipt_proof` 成功文档契约逐项审计；`expected_root`
+  为恰好 64 位**小写**十六进制的钉住 Merkle 根。空体、非 UTF-8、JSON 解析
+  失败、键缺失/多余/乱序、空数组或根非法一律 `400`，响应体按序为
+  `{"ok": false, "error": "input"}`，且不改变任何状态。
+- **响应**：合法批次返回 `200`，体即核心函数结果，顶层键序固定为
+  `ok, root, total, succeeded, errors, entries, digest`。逐项处理不短路；
+  某文档一旦按单项契约取得合法 `tx_id` 即占位，后续同 ID 文档判
+  `integrity`。`errors` 键序固定 `input, integrity`；`entries` 与输入等长
+  同序，成功项仅 `{"tx_id": ...}`，失败项仅 `{"error": 类别}`；`digest`
+  为去掉自身后按键排序、紧凑分隔、不转义非 ASCII 的 UTF-8 JSON 的
+  SHA-256 小写 hex。审计是请求体的纯函数：不读写状态，并发请求与重启后
+  结果一致。
+- **CLI**：`receipt-proofs-audit FILE|- --expected-root ROOT`；`FILE` 或
+  标准输入（`-`）给出文档数组。读取失败、JSON 错误或参数（根）非法时
+  输出 `input` 体并退出 1，不请求服务；否则把响应按契约键序输出为单行
+  JSON，`ok` 为真退出 0，`ok` 为假或任何非 2xx 响应退出 1。
+
 ## 批量 Merkle 证明
 
 在单笔 `GET /v1/blocks/{height}/proof/{tx_id}` 之外，提供一次取多笔的批量接口：
@@ -1574,6 +1598,13 @@ curl -s localhost:8080/v1/transactions/<tx-id-hex>/finalized-receipt
 #          "merkle_root":"...","block_hash":"...","siblings":[{"direction":"left|right","hash":"..."}]},
 #          "headers":[{"height","prev_hash","merkle_root","block_hash","status":"confirmed"},...],
 #          "finality":{"finalized":{"height","block_hash"},"tip":{...S...},"auth":{"key_version","signature"}}}
+# 回执证明批量审计（请求体按序仅 documents,expected_root；畸形 400 且键序 ok,error；
+# 200 键序 ok,root,total,succeeded,errors,entries,digest）
+curl -s -X POST localhost:8080/v1/transactions/receipt-proofs/audit \
+  -H 'Content-Type: application/json' \
+  -d '{"documents":[<receipt_proof 文档>...],"expected_root":"<64hex>"}'
+# -> 200 {"ok":true,"root":"...","total":N,"succeeded":N,"errors":{"input":0,"integrity":0},
+#         "entries":[{"tx_id":"..."}...],"digest":"..."}
 # 账户状态根与账户状态包含证明（最高块 pending 时均 404；账户不在已确认集 404）
 curl -s localhost:8080/v1/state/root
 # -> {"state_root":"...","height":N,"block_hash":"...","account_count":K}
@@ -1856,6 +1887,14 @@ cat range-exports.json | python -m ledger.cli verify-range-batch --exports - --t
 # -> 成功单行 {"ok":true,"anchor":{...},"tip":{...},"pages":N,
 #    "verified_tx_ids":[...]} 退出 0；
 #    失败单行 {"ok":false,"error":"input"|"auth"|"expired"|"integrity"} 退出 1
+
+# 回执证明批量审计（POST /v1/transactions/receipt-proofs/audit；FILE 或 - 给出文档数组；
+# 读取/JSON/参数错不请求服务，直接输出 {"ok":false,"error":"input"} 退出 1）
+python -m ledger.cli receipt-proofs-audit docs.json --expected-root <64hex>
+cat docs.json | python -m ledger.cli receipt-proofs-audit - --expected-root <64hex>
+# -> 单行按契约键序 {"ok":...,"root":...,"total":N,"succeeded":M,
+#    "errors":{"input":I,"integrity":J},"entries":[...],"digest":"..."}；
+#    ok 为真退出 0，ok 为假或非 2xx 退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -1883,6 +1922,7 @@ python tests/light_client_verify_finality_pages_test.py  # 最终化分页历史
 python tests/finality_locator_test.py   # 最终化分叉定位 POST /v1/chain/finalities/locate（体仅含顺序键 locators,limit；locators 1–64 项 height,block_hash 严格降序非布尔非负整数/64hex；limit 1–500 默认100、拒布尔；非法 400 无副作用；顺序取首个 canonical 同高同哈希 confirmed 命中否则 409；200 完全复用 GET /v1/chain/finalities 键序 anchor,finalities,next,head 仅 anchor 取命中项；verify_finality_locator_pages 成功 ok,anchor,head,matched_index,pages,verified_block_hashes 索引从0、locators 非法 input、首锚不在列表 integrity、不抛异常）与 HTTP
 python tests/light_client_apply_finality_locator_pages_test.py  # 定位最终化分页原子落盘 apply_finality_locator_pages（后四项沿用 verify_finality_locator_pages；仅接受已有检查点、缺文件 io；共锁依次结构 input→存量 state/io→认证 auth→完整性 integrity：命中锚与凭证逐高匹配 confirmed 分支、各页 head 相同且 head.tip 等于本地 tip 并钉住 tip_hash、分页/连续性/链描述符 S/末页到达 head.finalized；末目标不低于 finalized、同高不异 hash；全批通过才 v3 原子写 generation+1，目标相同幂等不改字节、空页锚高 confirmed 块推进一次；成功键序 ok,generation,finalized,matched_index,pages,applied、matched_index 0 基；失败仅 ok,error 不抛异常不改字节或代数）
 python tests/finalized_receipt_test.py  # 可离线验证最终化回执 GET /v1/transactions/{tx_id}/finalized-receipt（非法/不存在 404、内存池与 pending 尾块 409；200 固定键序 receipt,proof,headers,finality：九字段 receipt 且 status=confirmed、单笔 Merkle 证明六字段、头序列从交易块到最高 confirmed 块升序五字段全 confirmed、finality 沿用 /v1/chain/finality 且 finalized=末头；链与签名者同锁快照，pending 链尾止于上一 confirmed 块）与 verify_finalized_receipt（成功键序 ok,tx_id,height,block_hash,finalized；形状/类型/hex/expected_tx_id/trust 错 input、未知版本或 ledger-finality-v1 坏签名 auth、交易签名/重算 tx_id、receipt-proof-头绑定、Merkle 路径、头哈希与链接、末头/finality/tip 绑定 integrity；失败仅 ok,error、不抛异常）与 HTTP 线序
+python tests/receipt_proofs_audit_http_test.py  # 回执证明批量审计 POST /v1/transactions/receipt-proofs/audit 与 CLI receipt-proofs-audit（体按序仅 documents,expected_root；空体/非UTF-8/JSON错/缺多乱序键/空数组/根非法 400 且键序 ok,error、不改状态；200 键序 ok,root,total,succeeded,errors,entries,digest，逐项不短路、tx_id 先占后同 ID 判 integrity、digest 可重算；并发与重启结果一致；CLI 文件/stdin、读取/JSON/参数错不请求服务输出 input 体退出 1、ok 真退出 0）
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
 python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode 查询（缺省/plain 普通、attested 签名、all 合并；非法/重复 mode 400；合并 (height,tip_hash,source,mode,request_id) 稳定排序分页；item 不新增 mode 字段；两模式同 tip 不互删；CLI --mode 原样转发）与 HTTP/CLI
