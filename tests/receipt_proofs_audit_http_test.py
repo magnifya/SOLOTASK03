@@ -359,6 +359,34 @@ class AuditCliTests(AuditHttpFixture):
             self.assertEqual(json.loads(line), INPUT_BODY, (target, stdin, root))
             self.assertEqual(list(json.loads(line)), ["ok", "error"])
 
+    def test_missing_required_arguments_are_input_without_request(self) -> None:
+        # A missing FILE positional or --expected-root must print the ordered
+        # input body and exit 1 instead of argparse's usage/exit-2 path, and
+        # must never contact the server (a dead base URL proves it).
+        dead = "http://127.0.0.1:1"
+        missing_cases = [
+            [],  # neither argument
+            [self.write_docs(self.docs)],  # FILE but no --expected-root
+            ["--expected-root", self.root],  # root but no FILE
+        ]
+        for extra in missing_cases:
+            argv = ["--base-url", dead, "receipt-proofs-audit", *extra]
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; from ledger.cli import main; sys.exit(main())",
+                    *argv,
+                ],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": REPO_ROOT},
+            )
+            self.assertEqual(proc.returncode, 1, (extra, proc.stderr))
+            line = proc.stdout.strip()
+            self.assertEqual(json.loads(line), INPUT_BODY, extra)
+            self.assertEqual(list(json.loads(line)), ["ok", "error"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

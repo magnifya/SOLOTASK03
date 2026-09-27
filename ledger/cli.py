@@ -933,10 +933,20 @@ def cmd_receipt_proofs_audit(args: argparse.Namespace) -> int:
     batch is POSTed to ``/v1/transactions/receipt-proofs/audit`` and the
     response is printed as one JSON line in the contract key order
     (``ok, root, total, succeeded, errors, entries, digest``). A read,
-    JSON or argument failure prints ``{"ok": false, "error": "input"}``
-    and exits 1 without contacting the server; otherwise the exit code
-    is 0 only when the response is 2xx with ``ok`` true.
+    JSON or argument failure — including a missing FILE or
+    ``--expected-root`` — prints ``{"ok": false, "error": "input"}`` and
+    exits 1 without contacting the server; otherwise the exit code is 0
+    only when the response is 2xx with ``ok`` true.
     """
+    documents_file = getattr(args, "documents_file", None)
+    expected_root = getattr(args, "expected_root", None)
+    if not documents_file or not expected_root:
+        # Missing required arguments are reported in the same envelope as
+        # every other input failure, with exit code 1 and before any
+        # network request, rather than argparse's usage/exit-2 path.
+        body = {"ok": False, "error": "input"}
+        print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+        return 1
     try:
         if args.documents_file == "-":
             documents = json.loads(sys.stdin.read())
@@ -1347,13 +1357,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_receipt_proofs_audit.add_argument(
         "documents_file",
+        nargs="?",
         metavar="FILE|-",
         help="JSON array of receipt_proof documents, or - to read it from "
         "standard input",
     )
     p_receipt_proofs_audit.add_argument(
         "--expected-root",
-        required=True,
         help="expected receipt-index Merkle root (64 lowercase hex characters)",
     )
     p_receipt_proofs_audit.set_defaults(func=cmd_receipt_proofs_audit)

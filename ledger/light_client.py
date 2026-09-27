@@ -3278,6 +3278,251 @@ def sign_finality(
         return None
     return {"key_version": key_version, "signature": signature}
 
+# -- signed account-state proof ----------------------------------------------
+
+STATE_PROOF_DOMAIN = "ledger-state-proof-v1"
+
+# The exact contract key order of GET /v1/accounts/{account}/attested-proof
+# and of its nested closed documents. The top level is state, proof, auth;
+# state reuses the state-root document and proof the state-proof document.
+STATE_ATTESTED_KEYS = ("state", "proof", "auth")
+STATE_ROOT_KEYS = ("state_root", "height", "block_hash", "account_count")
+STATE_PROOF_DOC_KEYS = (
+    "account",
+    "balance",
+    "confirmed_transactions",
+    "index",
+    "state_root",
+    "height",
+    "block_hash",
+    "siblings",
+)
+STATE_AUTH_KEYS = ("key_version", "signature")
+STATE_SIBLING_KEYS = ("direction", "hash")
+
+# Fixed success key order returned by :func:`verify_state_proof`.
+STATE_PROOF_RESULT_KEYS = (
+    "ok",
+    "account",
+    "height",
+    "block_hash",
+    "state_root",
+)
+
+
+def _state_proof_bytes(unsigned: dict) -> bytes:
+    """The signed bytes of an attested state proof without its ``auth`` envelope:
+    ``UTF8("ledger-state-proof-v1") || canonical_json({state, proof})``.
+    """
+    return STATE_PROOF_DOMAIN.encode("utf-8") + _canonical_json_bytes(unsigned)
+
+
+def sign_state_proof(
+    private_key_hex: str,
+    key_version: int,
+    state: dict,
+    proof: dict,
+) -> dict | None:
+    """Build the ``{key_version, signature}`` envelope of an attested state
+    proof.
+
+    The signature is an Ed25519 signature over
+    ``SHA256(UTF8("ledger-state-proof-v1") || canonical_json({state, proof}))``.
+    Returns None when the private key is malformed.
+    """
+    unsigned = {"state": state, "proof": proof}
+    digest = hashlib.sha256(_state_proof_bytes(unsigned)).digest()
+    signature = crypto.sign_message(private_key_hex, digest)
+    if signature is None:
+        return None
+    return {"key_version": key_version, "signature": signature}
+
+
+def verify_state_proof(
+    document: object,
+    account: object,
+    trust: object,
+) -> dict:
+    """Offline-verify one signed ``GET /v1/accounts/{account}/attested-proof``.
+
+    ``document`` is the decoded response with the exact top-level key order
+    ``state, proof, auth``: ``state`` is the state-root document (key order
+    ``state_root, height, block_hash, account_count``), ``proof`` is the
+    account-state inclusion proof (the exact eight-field
+    ``GET /v1/accounts/{account}/proof`` document, leaf-to-root
+    ``{direction, hash}`` siblings) and ``auth`` is
+    ``{key_version, signature}``. ``account`` is the caller-pinned 64-hex
+    account id the proof must name; ``trust`` must carry an
+    ``audit_signers`` list, with the envelope's ``key_version`` selecting
+    that version's public key.
+
+    Verification, in order: strict key order/types (non-boolean integers,
+    64-lowercase-hex hashes, 128-lowercase-hex signature) and the trust
+    document (``input``); signer lookup by ``key_version`` and the Ed25519
+    signature over
+    ``SHA256(UTF8("ledger-state-proof-v1") || canonical_json(document without
+    auth))`` (an unknown version/key or a signature that does not verify is
+    ``auth``); the account/root/height/block-hash binding between the caller
+    pin, ``state`` and ``proof``, the index range (non-negative and below
+    ``account_count``, depth-consistent) and the leaf-to-root Merkle path
+    (``integrity``). Never raises for malformed input.
+
+    Returns ``{"ok": True, "account", "height", "block_hash", "state_root"}``
+    on success or ``{"ok": False, "error": "input"|"auth"|"integrity"}``.
+    """
+    try:
+        result = _verify_state_proof(document, account, trust)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return result
+
+
+def _parse_attested_state(raw: object) -> dict:
+    """Strict parse of the nested state-root document; defects are input."""
+    if not isinstance(raw, dict) or tuple(raw.keys()) != STATE_ROOT_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["state_root"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["height"]) or raw["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["block_hash"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["account_count"]) or raw["account_count"] < 0:
+        raise _Failure(ERR_INPUT)
+    return {key: raw[key] for key in STATE_ROOT_KEYS}
+
+
+def _parse_attested_state_proof(raw: object) -> dict:
+    """Strict parse of the nested eight-field state-proof document."""
+    if not isinstance(raw, dict) or tuple(raw.keys()) != STATE_PROOF_DOC_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["account"]):
+        raise _Failure(ERR_INPUT)
+    if isinstance(raw["balance"], bool) or not isinstance(raw["balance"], int):
+        raise _Failure(ERR_INPUT)
+    if raw["balance"] < 0:
+        raise _Failure(ERR_INPUT)
+    transactions = raw["confirmed_transactions"]
+    if not isinstance(transactions, list):
+        raise _Failure(ERR_INPUT)
+    if any(not crypto.is_hex64(tx_id) for tx_id in transactions):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["index"]) or raw["index"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["state_root"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["height"]) or raw["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["block_hash"]):
+        raise _Failure(ERR_INPUT)
+    siblings = raw["siblings"]
+    if not isinstance(siblings, list) or len(siblings) > crypto.MAX_MERKLE_DEPTH:
+        raise _Failure(ERR_INPUT)
+    for item in siblings:
+        if not isinstance(item, dict) or tuple(item.keys()) != STATE_SIBLING_KEYS:
+            raise _Failure(ERR_INPUT)
+        if item["direction"] not in ("left", "right"):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(item["hash"]):
+            raise _Failure(ERR_INPUT)
+    return {key: raw[key] for key in STATE_PROOF_DOC_KEYS}
+
+
+def _verify_state_proof(
+    document: object,
+    expected_account: object,
+    trust: object,
+) -> dict:
+    """Strict core of :func:`verify_state_proof`; may raise :class:`_Failure`."""
+    # The caller-pinned account itself must be a 64-lowercase-hex id.
+    if not isinstance(expected_account, str) or not crypto.is_hex64(
+        expected_account
+    ):
+        raise _Failure(ERR_INPUT)
+
+    # 1. Exact key order and raw types — every defect here is an input error.
+    if not isinstance(document, dict) or tuple(document.keys()) != STATE_ATTESTED_KEYS:
+        raise _Failure(ERR_INPUT)
+    state = _parse_attested_state(document["state"])
+    proof = _parse_attested_state_proof(document["proof"])
+    raw_auth = document["auth"]
+    if not isinstance(raw_auth, dict) or tuple(raw_auth.keys()) != STATE_AUTH_KEYS:
+        raise _Failure(ERR_INPUT)
+    key_version = raw_auth["key_version"]
+    signature = raw_auth["signature"]
+    if not _is_int(key_version) or key_version < 1:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(signature, str) or not crypto.is_hex128(signature):
+        raise _Failure(ERR_INPUT)
+
+    # 2. Trust signer lookup by key version, then the Ed25519 signature over
+    # the domain-prefixed canonical bytes of the document without its auth.
+    signers = _validate_header_trust(trust)
+    public_key = signers.get(key_version)
+    if public_key is None:
+        raise _Failure(ERR_AUTH)
+    unsigned = {"state": document["state"], "proof": document["proof"]}
+    digest = hashlib.sha256(_state_proof_bytes(unsigned)).digest()
+    if not crypto.verify_signature(public_key, digest, signature):
+        raise _Failure(ERR_AUTH)
+
+    # 3. Integrity: the pinned account, the state/proof anchor binding, the
+    # index range and the leaf-to-root Merkle path.
+    if proof["account"] != expected_account:
+        raise _Failure(ERR_INTEGRITY)
+    if proof["state_root"] != state["state_root"]:
+        raise _Failure(ERR_INTEGRITY)
+    if proof["height"] != state["height"]:
+        raise _Failure(ERR_INTEGRITY)
+    if proof["block_hash"] != state["block_hash"]:
+        raise _Failure(ERR_INTEGRITY)
+    index = proof["index"]
+    if not 0 <= index < state["account_count"]:
+        raise _Failure(ERR_INTEGRITY)
+    siblings = proof["siblings"]
+    depth = len(siblings)
+    # A depth-D path addresses one of 2**D leaf slots; an index outside that
+    # range is illegal regardless of any supplied sibling hashes.
+    if index >= (1 << depth):
+        raise _Failure(ERR_INTEGRITY)
+
+    # The leaf is recomputed from the proof's own triple and walked up with
+    # the same pairing/index/phantom-self-pair rules as
+    # crypto.verify_account_proof.
+    current = crypto.account_state_leaf(
+        proof["account"], proof["balance"], proof["confirmed_transactions"]
+    )
+    position = index
+    for item in siblings:
+        sibling_hash = item["hash"]
+        direction = item["direction"]
+        # A left sibling equal to the current node addresses the phantom
+        # duplicate slot of an odd-level self-pair, never a real account.
+        if direction == "left":
+            if position % 2 == 0 or sibling_hash == current:
+                raise _Failure(ERR_INTEGRITY)
+            pair = sibling_hash + current
+        else:
+            if position % 2 == 1:
+                raise _Failure(ERR_INTEGRITY)
+            pair = current + sibling_hash
+        current = hashlib.sha256(pair.encode("ascii")).hexdigest()
+        position //= 2
+
+    if current != state["state_root"]:
+        raise _Failure(ERR_INTEGRITY)
+    return {
+        "ok": True,
+        "account": proof["account"],
+        "height": state["height"],
+        "block_hash": state["block_hash"],
+        "state_root": state["state_root"],
+    }
+
 # The exact contract key order of a signed header page and of its nested
 # closed documents.
 HEADER_PAGE_KEYS = ("anchor", "headers", "tip", "auth")

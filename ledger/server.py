@@ -575,7 +575,30 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 if not remainder:
                     self._send_json(404, {"error": "account not found"})
                     return
-                if remainder.endswith("/proof"):
+                if remainder.endswith("/attested-proof"):
+                    # GET /v1/accounts/{account}/attested-proof[?height=H] —
+                    # a signed account-state proof. The parameter rules are
+                    # identical to GET /v1/accounts/{account}/proof (a
+                    # malformed/repeated parameter is 400, a missing or
+                    # pending anchor/account is 404). The success document
+                    # has a contract-fixed key order (state, proof, auth),
+                    # so it is serialized in insertion order rather than
+                    # alphabetically.
+                    encoded_account = remainder[: -len("/attested-proof")]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    parsed = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) > 1 for values in parsed.values()):
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
+                        return
+                    params = {key: values[0] for key, values in parsed.items()}
+                    status, body = service.get_attested_account_proof(account, params)
+                    self._send_json(status, body, sort_keys=False)
+                elif remainder.endswith("/proof"):
                     # GET /v1/accounts/{account}/proof[?height=H]
                     encoded_account = remainder[: -len("/proof")]
                     account = unquote(encoded_account)

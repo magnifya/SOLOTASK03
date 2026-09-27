@@ -710,6 +710,44 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   两个子命令，`--height` 缺省时行为与输出完全不变；提供时逐字转发对应历史
   高度接口的单行 JSON 响应（含非 2xx 错误体）。
 
+### 签名状态证明
+
+`GET /v1/accounts/{account}/attested-proof` 在账户状态证明之外给出一份
+**自包含、可离线验证**的签名状态证明。可选查询参数 `height` 为**单值**，
+规则与 `GET /v1/accounts/{account}/proof` 完全相同：缺省锚定最高已确认块；
+非法、重复或未知查询参数返回 `400`；锚点未知/非 canonical/pending、或账户
+在该历史状态不存在返回 `404`。成功 `200` 文档顶层键序固定为
+`state, proof, auth`：
+
+- `state` 复用 `GET /v1/state/root` 的字段与键序
+  `state_root, height, block_hash, account_count`；
+- `proof` 复用 `GET /v1/accounts/{account}/proof` 的八字段与键序
+  （账户三元组、`index`、锚点与自叶向根的 `{direction, hash}` siblings）；
+- `auth` 键序 `key_version, signature`：由节点当前审计签名者
+  （`GET /v1/trust` 的 `audit_signers` 中当前版本）对
+  **SHA-256 摘要**做出的 Ed25519 签名，签名消息为
+  `UTF8("ledger-state-proof-v1") ‖ canonical_json({state, proof})`
+  （`canonical_json` 即 `json.dumps(..., sort_keys=True,
+  separators=(",",":"), ensure_ascii=False)` 的 UTF-8 字节，签名为 128
+  位小写十六进制）。
+
+链、状态与签名者在**同一把锁**内取快照，`state`/`proof`/`auth` 不可能来自
+不同链状态；签名或构造失败不会返回部分文档。
+
+**离线校验**：`ledger.light_client.verify_state_proof(document, account,
+trust) -> dict`（纯库 API，不读本地状态、**不抛异常**）。`document` 即
+上述 200 响应；`account` 为调用方钉住的 64 位小写 hex 账户 id；`trust`
+须携带 `audit_signers`。依次核对：顶层与嵌套文档的**键序与类型**、64/128
+位小写 hex 编码与 `trust.audit_signers` 形状（畸形为 `input`）；按
+`key_version` 取审计公钥并按 `ledger-state-proof-v1` 域验 Ed25519 签名
+（未知版本或坏签名为 `auth`）；`proof.account` 等于钉住账户，
+`state` 与 `proof` 的根/高度/块哈希严格一致，`index` 在
+`[0, account_count)` 内且与路径深度相容，并由账户三元组重算 leaf、按账本
+配对与奇数节点自配规则重走 Merkle 路径（绑定或证明错误为 `integrity`）。
+成功键序固定为 `ok, account, height, block_hash, state_root`；失败仅返回
+`{"ok": false, "error"}`，`error` 仅取 `input`/`auth`/`integrity`。签名者
+轮换后，旧证明仍可用其 `key_version` 对应的历史公钥继续验证。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
@@ -922,9 +960,10 @@ expected_root)`（本身不变）同时暴露为 HTTP 接口与 CLI 子命令：
   SHA-256 小写 hex。审计是请求体的纯函数：不读写状态，并发请求与重启后
   结果一致。
 - **CLI**：`receipt-proofs-audit FILE|- --expected-root ROOT`；`FILE` 或
-  标准输入（`-`）给出文档数组。读取失败、JSON 错误或参数（根）非法时
-  输出 `input` 体并退出 1，不请求服务；否则把响应按契约键序输出为单行
-  JSON，`ok` 为真退出 0，`ok` 为假或任何非 2xx 响应退出 1。
+  标准输入（`-`）给出文档数组。读取失败、JSON 错误、参数（根）非法或缺
+  必填参数（FILE/`--expected-root`）时输出 `input` 体并退出 1，不请求
+  服务；否则把响应按契约键序输出为单行 JSON，`ok` 为真退出 0，`ok`
+  为假或任何非 2xx 响应退出 1。
 
 ## 批量 Merkle 证明
 
@@ -1615,6 +1654,14 @@ curl -s localhost:8080/v1/accounts/<pubkey-hex>/proof
 #     "state_root":"...","height":N,"block_hash":"...","siblings":[{direction,hash}...]}
 # 历史锚点（非法/重复 height -> 400；锚点不可用或账户当时不存在 -> 404）
 curl -s "localhost:8080/v1/accounts/<pubkey-hex>/proof?height=H"
+# 签名状态证明（height 单值，规则同 state-proof：非法/重复/未知参数 400、缺失/pending 404；
+# 200 固定键序 state,proof,auth；auth.signature = Ed25519(SHA256(UTF8("ledger-state-proof-v1")
+# || canonical_json({state, proof})))；离线用 verify_state_proof(document, account, trust) 校验）
+curl -s "localhost:8080/v1/accounts/<pubkey-hex>/attested-proof"
+curl -s "localhost:8080/v1/accounts/<pubkey-hex>/attested-proof?height=H"
+# -> 200 {"state":{"state_root":"...","height":N,"block_hash":"...","account_count":K},
+#         "proof":{八字段 state-proof 文档},
+#         "auth":{"key_version":1,"signature":"..."}}
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
 # 批量 Merkle 证明（tx_ids 须非空、互异、各为 64 位小写 hex；畸形请求体 -> 400；
@@ -1908,6 +1955,7 @@ python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）�
 python tests/merkle_proof_bundle_test.py  # 批量 Merkle 证明（verify_merkle_proof_bundle 键序/类型/唯一性/index 映射/路径/根/区块哈希、严格 400、404/409、POST /v1/blocks/{height}/proofs、CLI proofs）
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
+python tests/attested_state_proof_test.py  # 签名状态证明 GET /v1/accounts/{account}/attested-proof（height 单值规则同 state-proof：非法/重复/未知参数 400、缺失/pending 404；200 固定键序 state,proof,auth，state 复用 state-root 四字段、proof 复用 state-proof 八字段；domain=ledger-state-proof-v1 的 SHA-256+Ed25519 签名、同锁快照；verify_state_proof 键序/类型/64·128 hex/audit_signers input、未知版本/坏签名 auth、账户/根/高度/块哈希绑定、index 范围与 Merkle 路径 integrity、成功键序 ok,account,height,block_hash,state_root、不抛异常、轮换历史公钥可验）与 HTTP
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
