@@ -9747,3 +9747,297 @@ def advance_sync_state(path: object, bundle: object) -> dict:
                 },
             },
         }
+
+
+# -- read-only synchronization-state audit ------------------------------------
+
+# Fixed success key order returned by :func:`audit_sync_state`.
+AUDIT_SYNC_STATE_KEYS = ("ok", "status", "header", "state", "transaction")
+AUDIT_SYNC_STATE_HEADER_KEYS = (
+    "status",
+    "generation",
+    "tip",
+    "finalized",
+)
+AUDIT_SYNC_STATE_STATE_KEYS = ("status", "generation", "account", "anchor")
+AUDIT_SYNC_STATE_TXN_KEYS = (
+    "status",
+    "header_generation",
+    "state_generation",
+)
+
+# Per-target classifications: the two stored files are ``missing`` when
+# absent, ``valid`` when they pass their full stored-state contract, and
+# ``invalid`` for every encoding/key-order/version/digest/replay defect;
+# the transaction journal is ``absent`` instead of ``missing``.
+AUDIT_TARGET_MISSING = "missing"
+AUDIT_TARGET_VALID = "valid"
+AUDIT_TARGET_INVALID = "invalid"
+AUDIT_TXN_ABSENT = "absent"
+AUDIT_TXN_VALID = "valid"
+AUDIT_TXN_INVALID = "invalid"
+
+# The overall pair classifications, in the audit's decision order.
+AUDIT_STATUS_EMPTY = "empty"
+AUDIT_STATUS_CONSISTENT = "consistent"
+AUDIT_STATUS_RECOVERABLE = "recoverable"
+AUDIT_STATUS_SPLIT = "split"
+AUDIT_STATUS_CORRUPT = "corrupt"
+
+
+def _audit_header_target(path: str) -> tuple[str, dict | None]:
+    """Audit the version-3 header checkpoint without mutating anything.
+
+    Returns ``(status, checkpoint)`` with status ``missing``/``valid``/
+    ``invalid``. Validity is exactly the :func:`advance_sync_state`
+    load contract: strict shape, key order, version, recorded digest and
+    full step replay (encoding/shape/replay defects are invalid; an
+    unreadable existing file propagates as the ``io``
+    :class:`_CheckpointError`).
+    """
+    try:
+        loaded = _load_header_checkpoint_document(path)
+    except _CheckpointError as failure:
+        if failure.category == ERR_IO:
+            raise
+        return AUDIT_TARGET_INVALID, None
+    if loaded is None:
+        return AUDIT_TARGET_MISSING, None
+    return AUDIT_TARGET_VALID, loaded[0]
+
+
+def _audit_state_target(path: str) -> tuple[str, dict | None]:
+    """Audit the version-1 state sidecar on its own, without mutating it.
+
+    Returns ``(status, stored)`` with status ``missing``/``valid``/
+    ``invalid``. The sidecar must pass the strict shape/key-order/version/
+    digest checks and its embedded proof must reverify with the recorded
+    anchor exactly projecting the proof result — the standing contract
+    :func:`advance_state_anchor` enforces when it loads a stored sidecar.
+    The anchor is not required to sit on the audited header's branch
+    here: the header binding is judged separately by the caller so a
+    sidecar anchored on another fork still reports as a valid target.
+    """
+    state_path = _state_anchor_path(path)
+    try:
+        stored = _load_state_anchor(state_path)
+    except _CheckpointError as failure:
+        if failure.category == ERR_IO:
+            raise
+        return AUDIT_TARGET_INVALID, None
+    if stored is None:
+        return AUDIT_TARGET_MISSING, None
+    try:
+        result = verify_state_proof(
+            stored["document"], stored["account"], stored["trust"]
+        )
+        if not result.get("ok"):
+            return AUDIT_TARGET_INVALID, None
+        if stored["anchor"] != {
+            "height": result["height"],
+            "block_hash": result["block_hash"],
+            "state_root": result["state_root"],
+        }:
+            return AUDIT_TARGET_INVALID, None
+    except Exception:
+        # Defensive: the verifier never raises, but an unforeseeable
+        # document must read as an invalid target, never escape the audit.
+        return AUDIT_TARGET_INVALID, None
+    return AUDIT_TARGET_VALID, stored
+
+
+def _audit_transaction(path: str) -> tuple[str, dict | None, dict | None]:
+    """Audit the sealed pair-commit journal without rolling it forward.
+
+    Returns ``(status, header, state)`` with status ``absent``/``valid``/
+    ``invalid``. A valid journal passes the exact
+    :func:`_validate_sync_txn` contract: the outer seal, each embedded
+    document's own encoding/key-order/version/digest checks, the embedded
+    header's full step replay, the embedded sidecar proof and the
+    embedded anchor-to-finalized binding. The journal is never
+    materialized and never unlinked.
+    """
+    try:
+        loaded = _load_sync_txn(path)
+    except _CheckpointError as failure:
+        if failure.category == ERR_IO:
+            raise
+        return AUDIT_TXN_INVALID, None, None
+    if loaded is None:
+        return AUDIT_TXN_ABSENT, None, None
+    header, state = loaded
+    return AUDIT_TXN_VALID, header, state
+
+
+def audit_sync_state(path: object) -> dict:
+    """Read-only audit of one synced header/state pair and its journal.
+
+    Inspects the version-3 header checkpoint at ``path``, the version-1
+    state sidecar at ``path + ".state"`` and the pair-commit transaction
+    journal at ``path + ".txn"`` under the shared per-path lock, purely
+    read-only: the journal is never rolled forward and no file is
+    recovered, rebuilt, truncated or unlinked, so a query never changes a
+    byte. Each target is judged under the exact stored-state contract of
+    :func:`advance_sync_state` — encoding, key order, version, recorded
+    digests and step/proof replay — and a valid transaction additionally
+    seals a valid embedded header and a valid embedded sidecar whose
+    anchor is bound to the embedded finalized boundary.
+
+    Success returns ``{"ok", "status", "header", "state",
+    "transaction"}`` in that key order. ``header`` is
+    ``{"status", "generation", "tip", "finalized"}`` and ``state`` is
+    ``{"status", "generation", "account", "anchor"}`` with each target
+    status one of ``missing`` (file absent), ``valid`` or ``invalid``;
+    every field but ``status`` is null unless the target is ``valid``,
+    when the values follow the stored-document contract (``tip`` in
+    ``tip_hash, height, length, status`` order, ``finalized`` in
+    ``height, block_hash`` order and ``anchor`` in
+    ``height, block_hash, state_root`` order). ``transaction`` is
+    ``{"status", "header_generation", "state_generation"}`` with status
+    one of ``absent`` (no journal), ``valid`` or ``invalid`` and both
+    generations null unless valid.
+
+    The overall ``status`` is, in order: ``empty`` when all three are
+    absent; ``consistent`` when no transaction is present, both stored
+    targets are valid, and the state anchor's height and block hash equal
+    the header's finalized boundary; ``recoverable`` when the transaction
+    is valid (a sealed commit waiting to be rolled forward); ``split``
+    when the transaction is absent and exactly one stored target is
+    missing or the two valid targets disagree at the finalized binding;
+    and ``corrupt`` when the transaction is invalid or, with no
+    transaction, a stored target is invalid.
+
+    Failure returns only ``{"ok": False, "error": category}`` in that key
+    order with category ``input`` (``path`` is not a non-empty string) or
+    ``io`` (an existing file cannot be read). Nothing is raised.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+
+    header_record: dict
+    state_record: dict
+    txn_record: dict
+    header_status = ""
+    state_status = ""
+    txn_status = ""
+    checkpoint: dict | None = None
+    stored: dict | None = None
+    txn_header: dict | None = None
+    txn_state: dict | None = None
+    try:
+        with _checkpoint_lock(path):
+            # Read each file independently: one invalid target must not
+            # hide the standing of the other two, and nothing is rolled
+            # forward or cleaned up.
+            try:
+                header_status, checkpoint = _audit_header_target(path)
+            except _CheckpointError:
+                return {"ok": False, "error": ERR_IO}
+            try:
+                state_status, stored = _audit_state_target(path)
+            except _CheckpointError:
+                return {"ok": False, "error": ERR_IO}
+            try:
+                txn_status, txn_header, txn_state = _audit_transaction(path)
+            except _CheckpointError:
+                return {"ok": False, "error": ERR_IO}
+
+            if header_status == AUDIT_TARGET_VALID:
+                assert checkpoint is not None
+                header_record = {
+                    "status": AUDIT_TARGET_VALID,
+                    "generation": checkpoint["generation"],
+                    "tip": {
+                        key: checkpoint["tip"][key] for key in HEADER_TIP_KEYS
+                    },
+                    "finalized": {
+                        key: checkpoint["finalized"][key]
+                        for key in HEADER_ANCHOR_KEYS
+                    },
+                }
+            else:
+                header_record = {
+                    "status": header_status,
+                    "generation": None,
+                    "tip": None,
+                    "finalized": None,
+                }
+
+            if state_status == AUDIT_TARGET_VALID:
+                assert stored is not None
+                state_record = {
+                    "status": AUDIT_TARGET_VALID,
+                    "generation": stored["generation"],
+                    "account": stored["account"],
+                    "anchor": {
+                        key: stored["anchor"][key]
+                        for key in STATE_ANCHOR_ANCHOR_KEYS
+                    },
+                }
+            else:
+                state_record = {
+                    "status": state_status,
+                    "generation": None,
+                    "account": None,
+                    "anchor": None,
+                }
+
+            if txn_status == AUDIT_TXN_VALID:
+                assert txn_header is not None and txn_state is not None
+                txn_record = {
+                    "status": AUDIT_TXN_VALID,
+                    "header_generation": txn_header["generation"],
+                    "state_generation": txn_state["generation"],
+                }
+            else:
+                txn_record = {
+                    "status": txn_status,
+                    "header_generation": None,
+                    "state_generation": None,
+                }
+    except OSError:
+        # Defensive: a lock or filesystem surprise must report rather
+        # than crash the auditing process; no bytes were changed.
+        return {"ok": False, "error": ERR_IO}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the caller.
+        return {"ok": False, "error": ERR_IO}
+
+    # Overall classification in the contract's fixed decision order.
+    if (
+        header_status == AUDIT_TARGET_MISSING
+        and state_status == AUDIT_TARGET_MISSING
+        and txn_status == AUDIT_TXN_ABSENT
+    ):
+        overall = AUDIT_STATUS_EMPTY
+    elif txn_status == AUDIT_TXN_VALID:
+        overall = AUDIT_STATUS_RECOVERABLE
+    elif txn_status == AUDIT_TXN_INVALID:
+        overall = AUDIT_STATUS_CORRUPT
+    elif header_status != AUDIT_TARGET_VALID or state_status != AUDIT_TARGET_VALID:
+        # No journal: one target missing (an unpaired half) is a split;
+        # an invalid stored file is corruption.
+        if AUDIT_TARGET_INVALID in (header_status, state_status):
+            overall = AUDIT_STATUS_CORRUPT
+        else:
+            overall = AUDIT_STATUS_SPLIT
+    else:
+        # Both stored targets valid and no journal: consistent exactly
+        # when the state anchor is bound to the header finalized boundary.
+        assert checkpoint is not None and stored is not None
+        finalized = checkpoint["finalized"]
+        anchor = stored["anchor"]
+        bound = (
+            anchor["height"] == finalized["height"]
+            and anchor["block_hash"] == finalized["block_hash"]
+        )
+        overall = AUDIT_STATUS_CONSISTENT if bound else AUDIT_STATUS_SPLIT
+
+    return {
+        "ok": True,
+        "status": overall,
+        "header": header_record,
+        "state": state_record,
+        "transaction": txn_record,
+    }
