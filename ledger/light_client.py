@@ -9747,3 +9747,262 @@ def advance_sync_state(path: object, bundle: object) -> dict:
                 },
             },
         }
+
+
+# Fixed success key order returned by :func:`audit_sync_state`.
+SYNC_STATE_AUDIT_KEYS = ("ok", "status", "header", "state", "transaction")
+SYNC_STATE_AUDIT_HEADER_KEYS = ("status", "generation", "tip", "finalized")
+SYNC_STATE_AUDIT_STATE_KEYS = ("status", "generation", "account", "anchor")
+SYNC_STATE_AUDIT_TXN_KEYS = ("status", "header_generation", "state_generation")
+
+# Per-component statuses reported by :func:`audit_sync_state`: the two
+# target files are ``missing``/``valid``/``invalid``; the transaction
+# journal is ``absent``/``valid``/``invalid``.
+AUDIT_TARGET_MISSING = "missing"
+AUDIT_TARGET_VALID = "valid"
+AUDIT_TARGET_INVALID = "invalid"
+AUDIT_TXN_ABSENT = "absent"
+
+# Top-level pair statuses reported by :func:`audit_sync_state`.
+AUDIT_STATUS_EMPTY = "empty"
+AUDIT_STATUS_CONSISTENT = "consistent"
+AUDIT_STATUS_RECOVERABLE = "recoverable"
+AUDIT_STATUS_SPLIT = "split"
+AUDIT_STATUS_CORRUPT = "corrupt"
+
+
+def _audit_state_anchor_proof(stored: dict) -> None:
+    """Re-verify a loaded sidecar's own proof and anchor projection.
+
+    This is the branch-independent half of
+    :func:`_reverify_stored_state_anchor`: the stored document must
+    re-verify exactly as a fresh state proof and the recorded anchor must
+    be its deterministic projection. The current-branch ownership check
+    is only meaningful against a valid header checkpoint, so the audit
+    runs it separately (via :func:`_reverify_stored_state_anchor`) when
+    one loaded. Every defect is existing-state corruption.
+    """
+    result = verify_state_proof(
+        stored["document"], stored["account"], stored["trust"]
+    )
+    if not result.get("ok"):
+        raise _CheckpointError(ERR_STATE)
+    anchor = stored["anchor"]
+    if anchor != {
+        "height": result["height"],
+        "block_hash": result["block_hash"],
+        "state_root": result["state_root"],
+    }:
+        raise _CheckpointError(ERR_STATE)
+
+
+def audit_sync_state(path: object) -> dict:
+    """Read-only audit of one synced header/state pair and its journal.
+
+    Inspects the version-3 header checkpoint at ``path``, the version-1
+    state sidecar at ``path + ".state"`` and the pair-commit transaction
+    journal at ``path + ".txn"`` under the per-path lock shared with
+    every other same-path operation. The audit is strictly observational:
+    no recovery, roll-forward or cleanup is ever performed and no byte of
+    any file is changed.
+
+    Each component is judged on its own under the exact contracts the
+    advances enforce — encoding (UTF-8/JSON), key order, version,
+    self-excluding digest and replay (the header checkpoint's full step
+    replay; the sidecar's stored-proof re-verification, plus
+    current-branch anchor ownership when a valid header checkpoint
+    loaded; the journal's seal and its embedded pair standing on their
+    own with the state anchor bound to the embedded finalized boundary):
+
+    - ``header``: ``missing`` (no file), ``valid`` or ``invalid``;
+    - ``state``: ``missing`` (no file), ``valid`` or ``invalid``;
+    - ``transaction``: ``absent`` (no file), ``valid`` or ``invalid``.
+
+    The top-level ``status`` is one of:
+
+    - ``empty`` — all three files are absent;
+    - ``consistent`` — no journal, both targets valid and the sidecar
+      anchor's height and block hash equal the checkpoint's ``finalized``
+      boundary;
+    - ``recoverable`` — a valid sealed journal is present (the committed
+      new pair it seals can be rolled forward by a later advance);
+    - ``split`` — no journal and exactly one target exists, or both
+      targets are valid but the anchor/finalized binding does not match;
+    - ``corrupt`` — the journal is invalid, or no journal is present and
+      a target is invalid.
+
+    Success returns ``{"ok": True, "status", "header", "state",
+    "transaction"}`` in that key order with
+    ``header = {"status", "generation", "tip", "finalized"}``,
+    ``state = {"status", "generation", "account", "anchor"}`` and
+    ``transaction = {"status", "header_generation", "state_generation"}``
+    (the journal's embedded generations). A component that is not
+    ``valid`` reports null for every remaining field; a valid component
+    reports the same shapes the advances return (``tip`` in
+    ``tip_hash, height, length, status`` order, ``finalized`` in
+    ``height, block_hash`` order, ``anchor`` in
+    ``height, block_hash, state_root`` order).
+
+    Failure returns only ``{"ok": False, "error": category}`` with
+    category one of ``input`` (``path`` is not a non-empty string) and
+    ``io`` (a file cannot be read). Nothing is raised.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # The header checkpoint: strictly loaded and fully replayed. An
+        # unreadable file fails the whole audit as io; every content
+        # defect (encoding, key order, version, digest, replay) marks the
+        # target invalid.
+        checkpoint: dict | None = None
+        branch: dict | None = None
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            if failure.category == ERR_IO:
+                return {"ok": False, "error": ERR_IO}
+            header_status = AUDIT_TARGET_INVALID
+        except Exception:
+            # Defensive: an unforeseeable load surprise must report
+            # rather than crash the caller.
+            header_status = AUDIT_TARGET_INVALID
+        else:
+            if loaded is None:
+                header_status = AUDIT_TARGET_MISSING
+            else:
+                checkpoint, _step_tips, branch = loaded
+                header_status = AUDIT_TARGET_VALID
+
+        # The state sidecar: strictly loaded; its stored proof is
+        # re-verified, and when a valid header checkpoint loaded its
+        # anchor is also checked for current-branch ownership.
+        stored: dict | None = None
+        try:
+            stored = _load_state_anchor(_state_anchor_path(path))
+            if stored is not None:
+                if branch is not None:
+                    _reverify_stored_state_anchor(stored, branch)
+                else:
+                    _audit_state_anchor_proof(stored)
+        except _CheckpointError as failure:
+            if failure.category == ERR_IO:
+                return {"ok": False, "error": ERR_IO}
+            state_status = AUDIT_TARGET_INVALID
+        except Exception:
+            # Defensive, as above.
+            state_status = AUDIT_TARGET_INVALID
+        else:
+            state_status = (
+                AUDIT_TARGET_VALID
+                if stored is not None
+                else AUDIT_TARGET_MISSING
+            )
+
+        # The pair-commit journal: strictly loaded. A valid journal seals
+        # a header/sidecar pair that stands on its own with the state
+        # anchor bound to the embedded finalized boundary; the journal is
+        # never rolled forward or unlinked here.
+        txn: tuple[dict, dict] | None = None
+        try:
+            txn = _load_sync_txn(path)
+        except _CheckpointError as failure:
+            if failure.category == ERR_IO:
+                return {"ok": False, "error": ERR_IO}
+            txn_status = AUDIT_TARGET_INVALID
+        except Exception:
+            # Defensive, as above.
+            txn_status = AUDIT_TARGET_INVALID
+        else:
+            txn_status = (
+                AUDIT_TARGET_VALID if txn is not None else AUDIT_TXN_ABSENT
+            )
+
+        if txn_status == AUDIT_TARGET_INVALID:
+            status = AUDIT_STATUS_CORRUPT
+        elif txn_status == AUDIT_TARGET_VALID:
+            status = AUDIT_STATUS_RECOVERABLE
+        elif (
+            header_status == AUDIT_TARGET_INVALID
+            or state_status == AUDIT_TARGET_INVALID
+        ):
+            status = AUDIT_STATUS_CORRUPT
+        elif (
+            header_status == AUDIT_TARGET_MISSING
+            and state_status == AUDIT_TARGET_MISSING
+        ):
+            status = AUDIT_STATUS_EMPTY
+        elif (
+            header_status == AUDIT_TARGET_VALID
+            and state_status == AUDIT_TARGET_VALID
+        ):
+            anchor = stored["anchor"]
+            finalized = checkpoint["finalized"]
+            if (
+                anchor["height"] == finalized["height"]
+                and anchor["block_hash"] == finalized["block_hash"]
+            ):
+                status = AUDIT_STATUS_CONSISTENT
+            else:
+                # Both targets valid but the anchor/finalized binding
+                # does not match.
+                status = AUDIT_STATUS_SPLIT
+        else:
+            # Exactly one target exists: the pair is split.
+            status = AUDIT_STATUS_SPLIT
+
+        if header_status == AUDIT_TARGET_VALID:
+            header_report = {
+                "status": header_status,
+                "generation": checkpoint["generation"],
+                "tip": {key: checkpoint["tip"][key] for key in HEADER_TIP_KEYS},
+                "finalized": {
+                    key: checkpoint["finalized"][key]
+                    for key in HEADER_ANCHOR_KEYS
+                },
+            }
+        else:
+            header_report = {
+                "status": header_status,
+                "generation": None,
+                "tip": None,
+                "finalized": None,
+            }
+        if state_status == AUDIT_TARGET_VALID:
+            state_report = {
+                "status": state_status,
+                "generation": stored["generation"],
+                "account": stored["account"],
+                "anchor": {
+                    key: stored["anchor"][key]
+                    for key in STATE_ANCHOR_ANCHOR_KEYS
+                },
+            }
+        else:
+            state_report = {
+                "status": state_status,
+                "generation": None,
+                "account": None,
+                "anchor": None,
+            }
+        if txn_status == AUDIT_TARGET_VALID:
+            txn_header, txn_state = txn
+            txn_report = {
+                "status": txn_status,
+                "header_generation": txn_header["generation"],
+                "state_generation": txn_state["generation"],
+            }
+        else:
+            txn_report = {
+                "status": txn_status,
+                "header_generation": None,
+                "state_generation": None,
+            }
+        return {
+            "ok": True,
+            "status": status,
+            "header": header_report,
+            "state": state_report,
+            "transaction": txn_report,
+        }
