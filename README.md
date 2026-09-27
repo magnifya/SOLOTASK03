@@ -868,13 +868,20 @@ expected_tx_ids, trust) -> dict` 把一批**已通过
   `key_version` 或最终化坏签名为 `auth`；批量校验失败、ID 内容冲突、边界
   倒退或同高异哈希为 `integrity`；存量索引解析、键序、结构或摘要损坏为
   `state`（绝不截断或重建）；文件读不出或写失败为 `io`（写失败尽力还原原
-  字节）。两函数均不抛异常，任何失败都不改变文件与代数。
+  字节）。两函数加载存量索引时，除既有格式、排序与 hash 检查外，还须逐项
+  重放单项语义：`receipt.status` 必为 `confirmed`，由 `from`、`to`、
+  `amount` 的 canonical 消息重算 `tx_id` 并验证交易 Ed25519 签名，
+  `receipt` 与 `proof` 的 `height`、`tx_id`、`index`、`block_hash` 完全
+  一致，并按既有 `index`、`direction` 与奇数自配规则把 `siblings` 重放到
+  `merkle_root`；任一项失配——即使记录的 hash 恰好正确——也只返回
+  `{"ok": false, "error": "state"}`，不抛异常、不改写文件、不推进
+  generation。两函数任何失败都不改变文件与代数。
 
 配套只读查询 `ledger.light_client.get_receipt(path, tx_id) -> dict`：`tx_id`
 须为恰好 64 位小写 hex。成功键序固定为 `ok, finalized, item`，`item` 即所存
-`{receipt, proof}`；ID 形状或 `path` 错为 `input`，存量索引损坏为 `state`，
-文件不存在或读写失败为 `io`，索引存在但不认识该 ID 返回
-`{"ok": false, "error": "not_found"}`。既有入口不变。
+`{receipt, proof}`；ID 形状或 `path` 错为 `input`，文件不存在或读不出为
+`io`，存量索引（含上述逐项语义重放）损坏为 `state`，索引存在但不认识该 ID
+返回 `{"ok": false, "error": "not_found"}`。既有入口不变。
 
 ## 批量 Merkle 证明
 

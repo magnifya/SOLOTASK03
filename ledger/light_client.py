@@ -7156,21 +7156,19 @@ def verify_finalized_receipt(
     }
 
 
-def _finalized_receipt_integrity(
-    receipt: dict,
-    proof: dict,
-    headers: list[dict],
-    finalized: dict,
-    tip: dict,
-) -> None:
-    """Stage 3 of the finalized-receipt contract, shared by one receipt and
-    each item of a batch.
+def _receipt_proof_semantics(receipt: dict, proof: dict) -> None:
+    """Recompute one receipt's transaction and its single-tx Merkle proof.
 
-    ``headers`` is the confirmed run starting at the receipt's own block and
-    ending at the finality boundary (a batch item passes its suffix of the
-    shared run). Every defect here is an integrity failure.
+    The shared per-item semantic contract used both while verifying a
+    fresh document and while strictly loading a persisted receipt index:
+    the receipt must be ``confirmed``; its ``tx_id`` is recomputed from
+    the canonical ``(from, to, amount)`` message and its Ed25519
+    transaction signature verified; receipt and proof must name the same
+    height/tx_id/index/block_hash inclusion point; and the sibling path
+    is replayed with the ledger's pairing and odd-node self-pairing
+    rules, with the index agreeing with every turn, up to the proof's
+    ``merkle_root``. Every defect is an integrity failure.
     """
-    # Receipt self-consistency first.
     if receipt["status"] != STATUS_CONFIRMED:
         raise _Failure(ERR_INTEGRITY)
     message = crypto.canonical_message(
@@ -7192,6 +7190,53 @@ def _finalized_receipt_integrity(
         or proof["block_hash"] != receipt["block_hash"]
     ):
         raise _Failure(ERR_INTEGRITY)
+
+    # Re-walk the Merkle sibling path with the ledger's pairing and
+    # odd-node-promotion rules; the index must agree with every turn.
+    siblings = proof["siblings"]
+    depth = len(siblings)
+    index = proof["index"]
+    if index >= (1 << depth):
+        raise _Failure(ERR_INTEGRITY)
+    current = proof["tx_id"]
+    position = index
+    for item in siblings:
+        sibling_hash = item["hash"]
+        if item["direction"] == "left":
+            # A genuine odd-node self-pair always points right; a left
+            # sibling equal to the path node addresses the phantom
+            # duplicate slot.
+            if position % 2 == 0 or sibling_hash == current:
+                raise _Failure(ERR_INTEGRITY)
+            pair = sibling_hash + current
+        else:
+            if position % 2 == 1:
+                raise _Failure(ERR_INTEGRITY)
+            pair = current + sibling_hash
+        current = crypto.sha256_hex(pair.encode("ascii"))
+        position //= 2
+    if current != proof["merkle_root"]:
+        raise _Failure(ERR_INTEGRITY)
+
+
+def _finalized_receipt_integrity(
+    receipt: dict,
+    proof: dict,
+    headers: list[dict],
+    finalized: dict,
+    tip: dict,
+) -> None:
+    """Stage 3 of the finalized-receipt contract, shared by one receipt and
+    each item of a batch.
+
+    ``headers`` is the confirmed run starting at the receipt's own block and
+    ending at the finality boundary (a batch item passes its suffix of the
+    shared run). Every defect here is an integrity failure.
+    """
+    # Receipt self-consistency, the receipt/proof inclusion-point binding
+    # and the Merkle sibling replay are the same per-item semantic check
+    # used when strictly loading a persisted receipt index.
+    _receipt_proof_semantics(receipt, proof)
 
     # The first header must be exactly the transaction's block, and the
     # proof must bind to its Merkle root.
@@ -7221,33 +7266,6 @@ def _finalized_receipt_integrity(
             raise _Failure(ERR_INTEGRITY)
         previous_hash = header["block_hash"]
         previous_height = header["height"]
-
-    # Re-walk the Merkle sibling path with the ledger's pairing and
-    # odd-node-promotion rules; the index must agree with every turn.
-    siblings = proof["siblings"]
-    depth = len(siblings)
-    index = proof["index"]
-    if index >= (1 << depth):
-        raise _Failure(ERR_INTEGRITY)
-    current = proof["tx_id"]
-    position = index
-    for item in siblings:
-        sibling_hash = item["hash"]
-        if item["direction"] == "left":
-            # A genuine odd-node self-pair always points right; a left
-            # sibling equal to the path node addresses the phantom
-            # duplicate slot.
-            if position % 2 == 0 or sibling_hash == current:
-                raise _Failure(ERR_INTEGRITY)
-            pair = sibling_hash + current
-        else:
-            if position % 2 == 1:
-                raise _Failure(ERR_INTEGRITY)
-            pair = current + sibling_hash
-        current = crypto.sha256_hex(pair.encode("ascii"))
-        position //= 2
-    if current != proof["merkle_root"]:
-        raise _Failure(ERR_INTEGRITY)
 
     # The signed finality credential closes the run: its finalized
     # boundary must be exactly the last (highest) confirmed header.
@@ -7431,9 +7449,15 @@ def _validate_receipt_index_shape(data: object) -> dict:
     ``v`` must be 1 and ``generation`` a positive plain integer; the
     finalized boundary uses the closed ``{height, block_hash}`` shape;
     items must be ascending by ``tx_id`` with no duplicates and each item
-    must satisfy the exact ``receipt, proof`` contract shapes. The
-    recorded ``hash`` is recomputed over the other fields last. Any defect
-    is existing-state corruption.
+    must satisfy the exact ``receipt, proof`` contract shapes. Beyond
+    shape, every item is semantically re-verified: the receipt must be
+    ``confirmed``, its ``tx_id`` is recomputed from the canonical
+    ``(from, to, amount)`` message and its Ed25519 signature verified,
+    receipt and proof must agree on height/tx_id/index/block_hash, and
+    the proof's siblings replay to its ``merkle_root`` under the index
+    and odd-node self-pairing rules. The recorded ``hash`` is recomputed
+    over the other fields last. Any defect — even one in a document
+    whose hash was correctly recomputed — is existing-state corruption.
     """
     if not isinstance(data, dict) or tuple(data.keys()) != RECEIPT_INDEX_KEYS:
         raise _CheckpointError(ERR_STATE)
@@ -7471,12 +7495,13 @@ def _validate_receipt_index_shape(data: object) -> dict:
         try:
             receipt = _parse_finalized_receipt_receipt(raw_item["receipt"])
             proof = _parse_finalized_receipt_proof(raw_item["proof"])
+            # Beyond shape: recompute the transaction, verify its
+            # Ed25519 signature, check the receipt/proof inclusion-point
+            # binding and replay the Merkle siblings to the root.
+            _receipt_proof_semantics(receipt, proof)
         except _Failure as failure:
             raise _CheckpointError(ERR_STATE) from failure
         tx_id = receipt["tx_id"]
-        # The two halves of one item name the same transaction.
-        if proof["tx_id"] != tx_id:
-            raise _CheckpointError(ERR_STATE)
         if tx_id in seen or (previous_id is not None and tx_id < previous_id):
             raise _CheckpointError(ERR_STATE)
         seen.add(tx_id)
@@ -7500,8 +7525,8 @@ def _load_receipt_index(path: str) -> dict | None:
     """Strictly load the receipt index at ``path`` (None when absent).
 
     An unreadable file is ``io``; bad UTF-8, malformed JSON and every
-    shape/key-order/digest defect is ``state``. The file is never
-    truncated or rebuilt.
+    shape/key-order/digest or stored-item semantic defect is ``state``.
+    The file is never truncated or rebuilt.
     """
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -7570,7 +7595,10 @@ def advance_receipts(
     finality signature), ``integrity`` (batch verification, id content
     conflict, boundary regression or same-height/other-hash), ``state``
     (an existing index fails its parse, key-order, shape or digest
-    checks) and ``io`` (the index cannot be read or written; a failed
+    checks, or one of its stored items fails the recomputed tx_id,
+    Ed25519 signature, confirmed-status, receipt/proof binding or Merkle
+    sibling replay — even when its recorded hash is otherwise correct)
+    and ``io`` (the index cannot be read or written; a failed
     write restores the original bytes best-effort). Nothing is raised
     and a failed call never changes the file bytes or the generation.
     """
@@ -7725,9 +7753,11 @@ def get_receipt(path: object, tx_id: object) -> dict:
     boundary and ``item`` the stored ``{receipt, proof}`` pair in its
     fixed contract key order. An existing index that does not know the
     id returns ``{"ok": False, "error": "not_found"}``; a bad path or
-    ``tx_id`` shape is ``input``, an index failing its strict checks is
-    ``state`` and a missing file or a read failure is ``io``. Nothing
-    is raised and the file is never modified.
+    ``tx_id`` shape is ``input``, an index failing its strict checks
+    (shape, digest or a stored item's recomputed tx_id, Ed25519
+    signature, confirmed-status, receipt/proof binding or Merkle
+    sibling replay) is ``state`` and a missing file or a read failure
+    is ``io``. Nothing is raised and the file is never modified.
     """
     if not isinstance(path, str) or not path:
         return {"ok": False, "error": ERR_INPUT}
