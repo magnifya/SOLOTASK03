@@ -7399,3 +7399,360 @@ def verify_finalized_receipts(
         "tx_ids": sorted(item_ids),
         "finalized": {key: finalized[key] for key in HEADER_ANCHOR_KEYS},
     }
+
+
+# -- persisted finalized-receipt index ----------------------------------------
+
+# Version 1 of the durable finalized-receipt index at a path.
+RECEIPT_INDEX_VERSION = 1
+RECEIPT_INDEX_KEYS = ("v", "generation", "finalized", "items", "hash")
+ADVANCE_RECEIPTS_RESULT_KEYS = ("ok", "generation", "finalized", "added")
+GET_RECEIPT_RESULT_KEYS = ("ok", "finalized", "item")
+ERR_NOT_FOUND = "not_found"
+
+
+def _receipt_index_hash(
+    generation: int, finalized: dict, items: list[dict]
+) -> str:
+    """SHA-256 over the canonical JSON bytes of every field but ``hash``."""
+    body = {
+        "v": RECEIPT_INDEX_VERSION,
+        "generation": generation,
+        "finalized": finalized,
+        "items": items,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def _validate_receipt_index_shape(data: object) -> dict:
+    """Strictly validate one version-1 receipt index document.
+
+    Exact top-level key order ``v, generation, finalized, items, hash``;
+    ``v`` must be 1 and ``generation`` a positive plain integer; the
+    finalized boundary uses the closed ``{height, block_hash}`` shape;
+    items must be ascending by ``tx_id`` with no duplicates and each item
+    must satisfy the exact ``receipt, proof`` contract shapes. The
+    recorded ``hash`` is recomputed over the other fields last. Any defect
+    is existing-state corruption.
+    """
+    if not isinstance(data, dict) or tuple(data.keys()) != RECEIPT_INDEX_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(data["v"]) or data["v"] != RECEIPT_INDEX_VERSION:
+        raise _CheckpointError(ERR_STATE)
+    generation = data["generation"]
+    if not _is_int(generation) or generation < 1:
+        raise _CheckpointError(ERR_STATE)
+    raw_finalized = data["finalized"]
+    if (
+        not isinstance(raw_finalized, dict)
+        or tuple(raw_finalized.keys()) != HEADER_ANCHOR_KEYS
+    ):
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(raw_finalized["height"]) or raw_finalized["height"] < 0:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(raw_finalized["block_hash"]):
+        raise _CheckpointError(ERR_STATE)
+    finalized = {
+        "height": raw_finalized["height"],
+        "block_hash": raw_finalized["block_hash"],
+    }
+    raw_items = data["items"]
+    if not isinstance(raw_items, list):
+        raise _CheckpointError(ERR_STATE)
+    items: list[dict] = []
+    seen: set[str] = set()
+    previous_id: str | None = None
+    for raw_item in raw_items:
+        if (
+            not isinstance(raw_item, dict)
+            or tuple(raw_item.keys()) != FINALIZED_RECEIPT_ITEM_KEYS
+        ):
+            raise _CheckpointError(ERR_STATE)
+        try:
+            receipt = _parse_finalized_receipt_receipt(raw_item["receipt"])
+            proof = _parse_finalized_receipt_proof(raw_item["proof"])
+        except _Failure as failure:
+            raise _CheckpointError(ERR_STATE) from failure
+        tx_id = receipt["tx_id"]
+        # The two halves of one item name the same transaction.
+        if proof["tx_id"] != tx_id:
+            raise _CheckpointError(ERR_STATE)
+        if tx_id in seen or (previous_id is not None and tx_id < previous_id):
+            raise _CheckpointError(ERR_STATE)
+        seen.add(tx_id)
+        previous_id = tx_id
+        items.append({"receipt": receipt, "proof": proof})
+    digest = data["hash"]
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+    if _receipt_index_hash(generation, finalized, items) != digest:
+        raise _CheckpointError(ERR_STATE)
+    return {
+        "v": RECEIPT_INDEX_VERSION,
+        "generation": generation,
+        "finalized": finalized,
+        "items": items,
+        "hash": digest,
+    }
+
+
+def _load_receipt_index(path: str) -> dict | None:
+    """Strictly load the receipt index at ``path`` (None when absent).
+
+    An unreadable file is ``io``; bad UTF-8, malformed JSON and every
+    shape/key-order/digest defect is ``state``. The file is never
+    truncated or rebuilt.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    return _validate_receipt_index_shape(data)
+
+
+def _atomic_write_receipt_index(path: str, index: dict) -> None:
+    """Write the index in declared key order and atomically replace ``path``."""
+    ordered = {key: index[key] for key in RECEIPT_INDEX_KEYS}
+    _atomic_write_bytes(path, _serialize_document(ordered))
+
+
+def advance_receipts(
+    path: object,
+    document: object,
+    expected_tx_ids: object,
+    trust: object,
+) -> dict:
+    """Verify a finalized-receipts batch and merge it into the index at ``path``.
+
+    ``document``/``expected_tx_ids``/``trust`` are exactly the
+    :func:`verify_finalized_receipts` arguments: the decoded
+    ``POST /v1/transactions/finalized-receipts`` response (key order
+    ``items, headers, finality``), the non-empty list of distinct
+    64-lowercase-hex ids it must name, and the trust document carrying
+    ``audit_signers``. The batch is fully verified first — nothing is
+    read or written before verification succeeds — and the verified
+    ``receipt, proof`` items are then merged **serially** into the
+    version-1 index under the shared per-path lock.
+
+    The index file carries the exact key order
+    ``v, generation, finalized, items, hash``: ``v`` is 1; ``finalized``
+    the closed ``{height, block_hash}`` boundary of the latest merged
+    batch; ``items`` all known receipts in ``tx_id`` ascending order,
+    each item in the fixed ``receipt, proof`` contract shape; and
+    ``hash`` the 64-char lowercase hex SHA-256 of the canonical JSON of
+    the other four fields. Serialization is compact UTF-8 JSON
+    (non-ASCII unescaped) with one trailing LF, atomically replaced.
+
+    The first successful change writes generation 1; every later change
+    increments it exactly once. Merge rules: an incoming id already
+    stored with the identical receipt/proof content is an idempotent
+    no-op for that id, while the same id with different content is a
+    conflict (``integrity``); the incoming finalized boundary may never
+    move backwards, and at the same height it must name the same block
+    hash (otherwise ``integrity``). A call that adds no receipt and
+    leaves the boundary unchanged writes nothing and holds the
+    generation. Success returns ``{"ok": True, "generation",
+    "finalized", "added"}`` in that key order, ``added`` the number of
+    previously unknown ids merged.
+
+    Failure returns only ``{"ok": False, "error": category}`` with
+    category one of ``input`` (argument or document structure; shared
+    with the batch verifier), ``auth`` (unknown key version or a failed
+    finality signature), ``integrity`` (batch verification, id content
+    conflict, boundary regression or same-height/other-hash), ``state``
+    (an existing index fails its parse, key-order, shape or digest
+    checks) and ``io`` (the index cannot be read or written; a failed
+    write restores the original bytes best-effort). Nothing is raised
+    and a failed call never changes the file bytes or the generation.
+    """
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Stage 1 (input/auth/integrity): verify the whole batch offline,
+        # reusing the shared batch contract, before any file is touched.
+        try:
+            result = verify_finalized_receipts(
+                document, expected_tx_ids, trust
+            )
+        except Exception:
+            # Defensive: the verifier never raises, but an unforeseeable
+            # input must report rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+        if not result.get("ok"):
+            return {"ok": False, "error": result["error"]}
+        if not isinstance(document, dict):
+            # Unreachable: the verifier pins the document shape; kept for
+            # a strict typed boundary.
+            return _failed_advance(ERR_INPUT)
+        incoming_finalized = {
+            key: result["finalized"][key] for key in HEADER_ANCHOR_KEYS
+        }
+
+        # The verified items, indexed by tx_id.
+        incoming_items: dict[str, dict] = {}
+        try:
+            for raw_item in document["items"]:
+                receipt = _parse_finalized_receipt_receipt(raw_item["receipt"])
+                proof = _parse_finalized_receipt_proof(raw_item["proof"])
+                incoming_items[receipt["tx_id"]] = {
+                    "receipt": receipt,
+                    "proof": proof,
+                }
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+
+        # Stage 2 (state/io): the existing index is strictly loaded; a
+        # missing file opens a new index at generation 0.
+        try:
+            stored = _load_receipt_index(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: an unreadable-by-surprise index must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_STATE)
+
+        if stored is None:
+            generation = 0
+            stored_finalized: dict | None = None
+            merged_items: dict[str, dict] = {}
+        else:
+            generation = stored["generation"]
+            stored_finalized = stored["finalized"]
+            merged_items = {
+                item["receipt"]["tx_id"]: item for item in stored["items"]
+            }
+
+        # Stage 3 (integrity): the boundary may never regress and at the
+        # same height must name exactly the stored block hash.
+        if stored_finalized is not None:
+            if incoming_finalized["height"] < stored_finalized["height"]:
+                return _failed_advance(ERR_INTEGRITY)
+            if (
+                incoming_finalized["height"] == stored_finalized["height"]
+                and incoming_finalized["block_hash"]
+                != stored_finalized["block_hash"]
+            ):
+                return _failed_advance(ERR_INTEGRITY)
+
+        # Serial merge: identical content for a known id is idempotent;
+        # any other content for the same id is a conflict.
+        added = 0
+        for tx_id in sorted(incoming_items):
+            incoming_item = incoming_items[tx_id]
+            stored_item = merged_items.get(tx_id)
+            if stored_item is not None:
+                if stored_item != incoming_item:
+                    return _failed_advance(ERR_INTEGRITY)
+                continue
+            merged_items[tx_id] = incoming_item
+            added += 1
+
+        boundary_unchanged = (
+            stored_finalized is not None
+            and stored_finalized == incoming_finalized
+        )
+        if added == 0 and boundary_unchanged:
+            # Idempotent: nothing merged and the boundary holds, so the
+            # file bytes stay exactly as they were and the generation
+            # holds.
+            return {
+                "ok": True,
+                "generation": generation,
+                "finalized": {
+                    key: stored_finalized[key] for key in HEADER_ANCHOR_KEYS
+                },
+                "added": 0,
+            }
+
+        next_generation = generation + 1
+        ordered_items = [merged_items[tx_id] for tx_id in sorted(merged_items)]
+        index = {
+            "v": RECEIPT_INDEX_VERSION,
+            "generation": next_generation,
+            "finalized": incoming_finalized,
+            "items": ordered_items,
+        }
+        index["hash"] = _receipt_index_hash(
+            next_generation, incoming_finalized, ordered_items
+        )
+
+        # Stage 4 (io): atomic replace; a failed write restores the
+        # original bytes best-effort.
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        try:
+            _atomic_write_receipt_index(path, index)
+        except OSError:
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_IO)
+        except (TypeError, ValueError):
+            # Defensive: a verified value JSON cannot serialize; do not
+            # leave a partial file behind.
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "finalized": {
+                key: incoming_finalized[key] for key in HEADER_ANCHOR_KEYS
+            },
+            "added": added,
+        }
+
+
+def get_receipt(path: object, tx_id: object) -> dict:
+    """Look up one previously merged finalized receipt in the index.
+
+    ``path`` is the receipt index maintained by :func:`advance_receipts`
+    and ``tx_id`` a caller-pinned 64-lowercase-hex transaction id.
+    Success returns ``{"ok": True, "finalized", "item"}`` in that key
+    order with ``finalized`` the index's closed ``{height, block_hash}``
+    boundary and ``item`` the stored ``{receipt, proof}`` pair in its
+    fixed contract key order. An existing index that does not know the
+    id returns ``{"ok": False, "error": "not_found"}``; a bad path or
+    ``tx_id`` shape is ``input``, an index failing its strict checks is
+    ``state`` and a missing file or a read failure is ``io``. Nothing
+    is raised and the file is never modified.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not crypto.is_hex64(tx_id):
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            stored = _load_receipt_index(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            # Defensive: an unreadable-by-surprise index must report
+            # rather than crash the caller.
+            return {"ok": False, "error": ERR_STATE}
+        if stored is None:
+            return {"ok": False, "error": ERR_IO}
+        for item in stored["items"]:
+            if item["receipt"]["tx_id"] == tx_id:
+                return {
+                    "ok": True,
+                    "finalized": {
+                        key: stored["finalized"][key] for key in HEADER_ANCHOR_KEYS
+                    },
+                    "item": item,
+                }
+        return {"ok": False, "error": ERR_NOT_FOUND}

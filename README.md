@@ -842,6 +842,40 @@ expected_tx_ids, trust) -> dict`（纯库 API，不读本地状态、**不抛异
 小写 hex 时归为 `input`（hex 形状错）；仅形状合法但 Ed25519 验签失败才归
 `integrity`。其余入口不变。
 
+### 持久化最终化回执索引
+
+在纯离线校验之外，`ledger.light_client.advance_receipts(path, document,
+expected_tx_ids, trust) -> dict` 把一批**已通过
+`verify_finalized_receipts` 校验**的最终化回执串行合并进 `path` 处的本地索引：
+先完整复用批量校验（先验后写，校验失败不触碰任何文件），再在该 `path` 的
+共享锁内串行合并。
+
+- **文件格式**：UTF-8 紧凑 JSON（非 ASCII 不转义）、末尾单个 LF、同目录临时
+  文件 fsync 后 `os.replace` 原子替换。顶层键序固定为
+  `v, generation, finalized, items, hash`：`v=1`；`finalized` 为最近一批的
+  封闭边界 `{height, block_hash}`（键序 `height, block_hash`）；`items` 为
+  全部已知回执，按 `tx_id` 升序，每项键序 `receipt, proof`，二者沿用既有
+  九字段回执与六字段单笔证明契约；`hash` 为去掉 `hash` 后文档 canonical JSON
+  的 SHA-256，64 位小写 hex。
+- **代数与合并**：首次发生变更写入 `generation=1`，此后每次变更恰好 +1。
+  同 ID 且 receipt/proof 内容完全一致为幂等（不计新增）；同 ID 内容冲突、
+  `finalized` 高度倒退或同高度而块哈希不同均为 `integrity`。既不新增回执也
+  不改变边界的调用**不写盘**，代数保持不变，文件字节原样保留。
+- **返回**：成功键序固定为 `ok, generation, finalized, added`，`added` 为
+  本次新并入的此前未知 ID 数（非负整数）；失败仅返回
+  `{"ok": false, "error"}`。
+- **错误分类**：参数/结构（含批量校验的 input）为 `input`；未知
+  `key_version` 或最终化坏签名为 `auth`；批量校验失败、ID 内容冲突、边界
+  倒退或同高异哈希为 `integrity`；存量索引解析、键序、结构或摘要损坏为
+  `state`（绝不截断或重建）；文件读不出或写失败为 `io`（写失败尽力还原原
+  字节）。两函数均不抛异常，任何失败都不改变文件与代数。
+
+配套只读查询 `ledger.light_client.get_receipt(path, tx_id) -> dict`：`tx_id`
+须为恰好 64 位小写 hex。成功键序固定为 `ok, finalized, item`，`item` 即所存
+`{receipt, proof}`；ID 形状或 `path` 错为 `input`，存量索引损坏为 `state`，
+文件不存在或读写失败为 `io`，索引存在但不认识该 ID 返回
+`{"ok": false, "error": "not_found"}`。既有入口不变。
+
 ## 批量 Merkle 证明
 
 在单笔 `GET /v1/blocks/{height}/proof/{tx_id}` 之外，提供一次取多笔的批量接口：
