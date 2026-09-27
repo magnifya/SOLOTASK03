@@ -888,6 +888,21 @@ expected_tx_ids, trust) -> dict` 把一批**已通过
 文件不存在或读写失败为 `io`，索引存在但不认识该 ID 返回
 `{"ok": false, "error": "not_found"}`。既有入口不变。
 
+只读 Merkle 查询 `ledger.light_client.receipt_proof(path, tx_id) -> dict`
+在同 `path` 的共享锁内加载同一 v1 索引（不写文件、不改变 v1 格式），以
+`items` 的 `tx_id` 升序为叶序：叶为 `SHA256(canonical_json(item))` 的 64 位
+小写 hex（`item` 即所存 `{receipt, proof}`），父节点为
+`SHA256(ASCII(left_hex+right_hex))`，奇数节点自配。成功键序固定为
+`ok, generation, finalized, root, item, index, siblings` 且 `ok=true`：
+`generation`、`finalized`、`item` 取自索引（`item` 键序 `receipt, proof`），
+`index` 为 0 基叶位，`siblings` 自叶向根、每项键序 `direction, hash`，
+`direction` 为 `left`/`right` 表示兄弟相对路径节点的位置，`hash` 为 64 位
+小写 hex；单叶树 `siblings` 为空、根即叶。失败仅返回 `{"ok": false,
+"error"}`：`path` 非空字符串或 `tx_id` 为 64 位小写 hex 的条件不满足为
+`input`；文件缺失或不可读为 `io`；编码、JSON、v1 键序、摘要、items 排序或
+任一 item 既有语义校验失败为 `state`；索引存在但不认识该 ID 为 `not_found`。
+不抛异常，同字节输入结果确定。
+
 ## 批量 Merkle 证明
 
 在单笔 `GET /v1/blocks/{height}/proof/{tx_id}` 之外，提供一次取多笔的批量接口：

@@ -7442,6 +7442,16 @@ ADVANCE_RECEIPT_BATCHES_RESULT_KEYS = (
     "batches",
 )
 GET_RECEIPT_RESULT_KEYS = ("ok", "finalized", "item")
+RECEIPT_PROOF_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "finalized",
+    "root",
+    "item",
+    "index",
+    "siblings",
+)
+RECEIPT_PROOF_SIBLING_KEYS = ("direction", "hash")
 ERR_NOT_FOUND = "not_found"
 
 
@@ -8022,3 +8032,105 @@ def get_receipt(path: object, tx_id: object) -> dict:
                     "item": item,
                 }
         return {"ok": False, "error": ERR_NOT_FOUND}
+
+
+def receipt_proof(path: object, tx_id: object) -> dict:
+    """Return a Merkle inclusion proof for one receipt in the v1 index.
+
+    The index at ``path`` (the same version-1 file maintained by
+    :func:`advance_receipts`) is strictly loaded under the shared
+    per-path lock and never written. Its ``items`` are already validated
+    as ascending by ``tx_id`` with no duplicates, and that ascending
+    order is the leaf order: each leaf is the 64-char lowercase hex of
+    ``SHA256(canonical_json(item))`` over the stored ``{receipt,
+    proof}`` pair. Inner nodes are
+    ``SHA256(ASCII(left_hex + right_hex))`` and a lone odd node is
+    paired with itself, mirroring :func:`crypto.merkle_proof`.
+
+    Success returns ``{"ok": True, "generation", "finalized", "root",
+    "item", "index", "siblings"}`` in that key order: ``generation`` and
+    ``finalized`` come straight from the index, ``item`` is the stored
+    ``{receipt, proof}`` pair in its fixed contract key order, ``index``
+    is its zero-based leaf position and ``siblings`` run from the leaf
+    toward the root, each item ``{"direction", "hash"}`` with
+    ``direction`` recording the sibling's position (``left`` or
+    ``right``) relative to the path node and ``hash`` a 64-char
+    lowercase hex digest; a one-leaf tree carries an empty sibling list
+    whose root is the leaf itself.
+
+    Failure returns only ``{"ok": False, "error": category}``: a
+    non-string-empty ``path`` or a ``tx_id`` that is not 64 lowercase
+    hex is ``input``; a missing or unreadable file is ``io``; bad
+    encoding, malformed JSON, a v1 key-order, shape, digest, items
+    ordering or any per-item semantic defect is ``state`` (the exact
+    :func:`_load_receipt_index` classification); and an existing index
+    that does not know the id is ``not_found``. Nothing is raised, the
+    file is never modified and equal on-disk bytes always yield an equal
+    result.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not crypto.is_hex64(tx_id):
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            stored = _load_receipt_index(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            # Defensive: an unreadable-by-surprise index must report
+            # rather than crash the caller.
+            return {"ok": False, "error": ERR_STATE}
+        if stored is None:
+            return {"ok": False, "error": ERR_IO}
+
+        index = -1
+        for position, item in enumerate(stored["items"]):
+            if item["receipt"]["tx_id"] == tx_id:
+                index = position
+                break
+        if index < 0:
+            return {"ok": False, "error": ERR_NOT_FOUND}
+
+        # Leaves follow the validated tx_id-ascending item order; each
+        # leaf hashes the canonical JSON of the whole stored pair.
+        level = [
+            hashlib.sha256(_canonical_json_bytes(item)).hexdigest()
+            for item in stored["items"]
+        ]
+        position = index
+        siblings: list[dict] = []
+        while len(level) > 1:
+            if len(level) % 2 == 1:
+                level.append(level[-1])
+            if position % 2 == 0:
+                # Path node is the left child; its sibling sits right.
+                siblings.append(
+                    {"direction": "right", "hash": level[position + 1]}
+                )
+            else:
+                # Path node is the right child; its sibling sits left.
+                siblings.append(
+                    {"direction": "left", "hash": level[position - 1]}
+                )
+            level = [
+                hashlib.sha256(
+                    (level[i] + level[i + 1]).encode("ascii")
+                ).hexdigest()
+                for i in range(0, len(level), 2)
+            ]
+            position //= 2
+
+        return {
+            "ok": True,
+            "generation": stored["generation"],
+            "finalized": {
+                key: stored["finalized"][key] for key in HEADER_ANCHOR_KEYS
+            },
+            "root": level[0],
+            "item": stored["items"][index],
+            "index": index,
+            "siblings": siblings,
+        }
