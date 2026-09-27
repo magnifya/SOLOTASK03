@@ -856,7 +856,17 @@ expected_tx_ids, trust) -> dict` 把一批**已通过
   封闭边界 `{height, block_hash}`（键序 `height, block_hash`）；`items` 为
   全部已知回执，按 `tx_id` 升序，每项键序 `receipt, proof`，二者沿用既有
   九字段回执与六字段单笔证明契约；`hash` 为去掉 `hash` 后文档 canonical JSON
-  的 SHA-256，64 位小写 hex。
+  的 SHA-256，64 位小写 hex。文件格式仍为 v1，不随本次收紧变更。
+- **加载时存量语义校验**：`advance_receipts` 与 `get_receipt` 加载索引时，除
+  既有的 JSON/键序/形状、`tx_id` 升序无重复与重算 `hash` 外，还**逐项**重放
+  语义：`receipt.status` 必须为 `confirmed`；由 `from`、`to`、`amount` 重算
+  canonical 消息与 `tx_id` 并验证 `from` 的 Ed25519 签名；`receipt` 与 `proof`
+  的 `height`、`tx_id`、`index`、`block_hash` 必须一致；再按既有 `index`、
+  `direction` 与奇数节点自配规则把 `siblings` 自叶向根重放至 `merkle_root`。
+  即使文件带有与内容相符的重算 `hash`，任一项失配即判存量损坏为 `state`：
+  只返回 `{"ok": false, "error": "state"}`，不抛异常、不改写文件、不推进
+  generation（索引不含头链，故头链/最终化绑定仍只在并入前的在线批量校验中
+  完成）。
 - **代数与合并**：首次发生变更写入 `generation=1`，此后每次变更恰好 +1。
   同 ID 且 receipt/proof 内容完全一致为幂等（不计新增）；同 ID 内容冲突、
   `finalized` 高度倒退或同高度而块哈希不同均为 `integrity`。既不新增回执也
@@ -866,9 +876,11 @@ expected_tx_ids, trust) -> dict` 把一批**已通过
   `{"ok": false, "error"}`。
 - **错误分类**：参数/结构（含批量校验的 input）为 `input`；未知
   `key_version` 或最终化坏签名为 `auth`；批量校验失败、ID 内容冲突、边界
-  倒退或同高异哈希为 `integrity`；存量索引解析、键序、结构或摘要损坏为
-  `state`（绝不截断或重建）；文件读不出或写失败为 `io`（写失败尽力还原原
-  字节）。两函数均不抛异常，任何失败都不改变文件与代数。
+  倒退或同高异哈希为 `integrity`；存量索引解析、键序、结构、摘要或逐项
+  语义重放（confirmed 状态、重算 tx_id、Ed25519 签名、receipt/proof 绑定、
+  siblings 重放）损坏为 `state`（绝不截断或重建）；文件读不出或写失败为
+  `io`（写失败尽力还原原字节）。两函数均不抛异常，任何失败都不改变文件与
+  代数。
 
 配套只读查询 `ledger.light_client.get_receipt(path, tx_id) -> dict`：`tx_id`
 须为恰好 64 位小写 hex。成功键序固定为 `ok, finalized, item`，`item` 即所存
