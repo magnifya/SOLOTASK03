@@ -2,7 +2,7 @@
 state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
-sync-history, sync-export, sync-range-export, chain-range,
+sync-history, sync-export, sync-range-export, chain-range, sync-plan,
 sync-state-audit,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
@@ -365,6 +365,37 @@ def cmd_chain_range(args: argparse.Namespace) -> int:
         url = f"{url}?{query}"
     status, body = _request("GET", url, None)
     return _emit(status, body)
+
+
+def cmd_sync_plan(args: argparse.Namespace) -> int:
+    """POST /v1/chain/sync-plan — the read-only synchronization precheck.
+
+    The request document (strictly the ordered ``locators, tip, finalized``
+    object) is read from ``FILE`` or standard input when ``-`` and forwarded
+    verbatim so its contract key order survives. The response is printed as
+    one JSON line preserving the server's contract key order (success
+    ``ok, ancestor, relation, pull, error``; a failure is the ordered
+    ``{"ok", "error"}`` envelope). A read or JSON failure locally prints the
+    same ``{"ok": false, "error": "input"}`` line and exits 1 without
+    contacting the server; every non-2xx response exits 1.
+    """
+    try:
+        if args.plan_file == "-":
+            payload = json.loads(sys.stdin.read())
+        else:
+            with open(args.plan_file, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        body = {"ok": False, "error": "input"}
+        print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+        return 1
+    # Transmit verbatim: the top-level key order locators, tip, finalized and
+    # every nested anchor/descriptor order is part of the contract.
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/chain/sync-plan", payload, sort_keys=False
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if 200 <= status < 300 else 1
 
 
 def cmd_sync_range(args: argparse.Namespace) -> int:
@@ -1205,6 +1236,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", help="page size (decimal, 1-500, default 100)"
     )
     p_chain_range.set_defaults(func=cmd_chain_range)
+
+    p_sync_plan = sub.add_parser(
+        "sync-plan",
+        help="read-only synchronization precheck (POST /v1/chain/sync-plan)",
+    )
+    p_sync_plan.add_argument(
+        "plan_file",
+        metavar="FILE|-",
+        help='request document {"locators","tip","finalized"}, or - to '
+        "read it from standard input",
+    )
+    p_sync_plan.set_defaults(func=cmd_sync_plan)
 
     p_sync_range = sub.add_parser(
         "sync-range",

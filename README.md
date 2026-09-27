@@ -474,6 +474,50 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   **不抛异常**、不改字节或代数，写失败尽力还原原字节。HTTP、CLI 及
   其他轻客户端入口不变。
 
+- **只读同步预检**：`POST /v1/chain/sync-plan`。该接口**只读**、不落任何
+  状态，供节点在拉取前判断与对端的分叉关系与拉取区间。请求体为 JSON
+  对象，**按序仅含 `locators, tip, finalized`**（多/缺/乱序键、JSON 解析
+  失败或任何值非法一律 `400`，体为键序固定的
+  `{"ok": false, "error": "input"}`，且在读取任何状态之前返回）：
+  - `locators` 沿用 `POST /v1/chain/headers/locate` 契约：1–64 项、项
+    键序恰为 `height, block_hash`、高度为非布尔非负整数且严格降序不
+    重复、哈希为 64 位小写 hex；且其**首项**必须与 `tip` 同高度同哈希；
+  - `tip` 沿用链描述符 S，恰含 `tip_hash, height, length, status` 四字段：
+    `tip_hash` 为 64 位小写 hex、`height` 为非布尔非负整数、`length`
+    为非布尔正整数且恒等于 `height + 1`（描述符自含创世块）、`status`
+    为 `pending`/`confirmed`；
+  - `finalized` 沿用最终化锚点（键序 `height, block_hash`，同样严格
+    类型），其高度不高于 `tip.height`；同高时哈希须等于 tip 哈希且
+    `tip.status` 必须为 `confirmed`。
+
+  全部链检查在**同一把锁**内完成：按数组顺序取**首个**与 canonical
+  同高度同哈希的项作为共同祖先；全部不匹配返回 `409` 与
+  `{"ok": false, "error": "no_common_ancestor"}`。找到祖先后，
+  `relation` 依次为：tip 哈希相同 `same`；祖先即本地 tip
+  `remote_ahead`；祖先即远端 tip `local_ahead`；其余 `fork`。最终化
+  冲突优先判定、命中即不拉取（`pull=null`、
+  `error="finality_conflict"`、`relation` 取上述机械关系）：
+  ① 对端 `finalized` 不得与已证共同前缀矛盾——不高于祖先时须为该高度
+  canonical 块的同哈希（哈希绑定整个前缀），高于祖先时仅当本地在该高度
+  已 finalize 了另一个 confirmed 块才冲突（本地未知或仅 pending 的高度
+  属对端更长的正常拉取情形）；② 真分叉且共同祖先低于本地 finalized
+  高度时，对端的 `finalized` 必须仍以同哈希覆盖本地 finalized 边界
+  （证明分叉点在边界之上、命中 locator 只是更浅），只认到边界之下则两
+  条链在最终化区间分叉；严格更短的对端属 `local_ahead` 而非分叉，仍按
+  下方 `remote_behind` 报告。无冲突时：对端更长、或同长且 `tip_hash`
+  字典序更小时，`pull` 为闭区间 `{from_height, to_height}`，从祖先后
+  一高度到远端 tip 高度；对端更短 `error="remote_behind"`，同长而
+  tip_hash 落败 `error="not_preferred"`（两者 `pull` 均为 `null`）。
+  `200` 文档键序固定为 `ok, ancestor, relation, pull, error`：`ok`
+  恒为 true，`ancestor` 沿用 `{height, block_hash}` 锚点形状命名共同
+  祖先，`pull` 为 `null` 或闭区间对象，`error` 为 `null` 或拒绝原因
+  （仅用于拒绝原因，不附带其他字段）。
+- **命令行**：`python -m ledger.cli sync-plan FILE|-`；`FILE` 或 `-`
+  （标准输入）提供上述请求文档并按原键序转发，响应打印为**单行** JSON
+  （保留 `ok, ancestor, relation, pull, error` 契约键序；本地读取或
+  JSON 失败打印 `{"ok": false, "error": "input"}` 且不连接服务端），
+  非 2xx 一律退出码 1。其余入口不变。
+
 ## 签名认证的增量区间协议
 
 增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
@@ -2028,6 +2072,7 @@ python tests/header_locator_test.py    # 签名区块头分叉定位 POST /v1/ch
 python tests/light_client_apply_finality_test.py  # 签名最终化凭证 GET /v1/chain/finality（无参数否则 400；锁内同快照取链与签名者；200 固定键序 finalized,tip,auth，finalized=最后 confirmed 块键序 height,block_hash、tip 沿用 S、auth 键序 key_version,signature；domain=ledger-finality-v1 的 SHA-256+Ed25519 签名、轮换历史可验）与 apply_finality（键序/非布尔整数/64hex/128hex input、未知版本或坏签名 auth、tip 须等于本地重放 tip、finalized 须为分支 anchor/confirmed 头且不倒退否则 integrity、存量解析/键序/摘要/重放 state、缺文件或读写失败 io；同目标幂等不写文件、提高边界 generation+1 沿用 v3 原子换入；失败仅 ok,error、不抛异常、字节不变）与 HTTP
 python tests/light_client_verify_finality_pages_test.py  # 最终化分页历史离线校验 verify_finality_pages（非空数组逐页 anchor,finalities,next,head 键序/类型/ledger-finality-v1 验签；首锚=入参后锚=前页 next、非末页非空且 next=末项 finalized、末页 next=null、高度连续、tip 以 confirmed 指向自身 finalized、head 跨页相同且 head.tip.tip_hash=入参、末项=head.finalized、空页仅单页锚点即 head；成功键序 ok,anchor,head,pages,verified_block_hashes 升序不含锚点；input/auth/integrity 分类、不抛异常）
 python tests/finality_locator_test.py   # 最终化分叉定位 POST /v1/chain/finalities/locate（体仅含顺序键 locators,limit；locators 1–64 项 height,block_hash 严格降序非布尔非负整数/64hex；limit 1–500 默认100、拒布尔；非法 400 无副作用；顺序取首个 canonical 同高同哈希 confirmed 命中否则 409；200 完全复用 GET /v1/chain/finalities 键序 anchor,finalities,next,head 仅 anchor 取命中项；verify_finality_locator_pages 成功 ok,anchor,head,matched_index,pages,verified_block_hashes 索引从0、locators 非法 input、首锚不在列表 integrity、不抛异常）与 HTTP
+python tests/sync_plan_test.py   # 只读同步预检 POST /v1/chain/sync-plan（体按序仅含 locators,tip,finalized；locators 沿用 headers/locate 契约且首项同高同哈希钉住 tip；tip 沿用 S（length=height+1）；finalized 沿用锚点、不高于 tip、同高须同 hash 且 tip confirmed；非法 400 有序 {ok:false,error:input} 不读状态；锁内顺序匹配 canonical、无共同祖先 409 no_common_ancestor；200 键序 ok,ancestor,relation,pull,error；relation 依次 same/remote_ahead/local_ahead/fork；更长或同长 tip_hash 更小拉取祖先后一高度至远端 tip 闭区间，更短 remote_behind、同长落败 not_preferred；祖先在本地 finalized 之下分叉或远端 finalized 与共同前缀矛盾优先 finality_conflict 不拉取；error 仅承载拒绝原因；只读不改状态）与 HTTP/CLI sync-plan FILE|-（单行、保留键序、非 2xx 退出1）
 python tests/light_client_apply_finality_locator_pages_test.py  # 定位最终化分页原子落盘 apply_finality_locator_pages（后四项沿用 verify_finality_locator_pages；仅接受已有检查点、缺文件 io；共锁依次结构 input→存量 state/io→认证 auth→完整性 integrity：命中锚与凭证逐高匹配 confirmed 分支、各页 head 相同且 head.tip 等于本地 tip 并钉住 tip_hash、分页/连续性/链描述符 S/末页到达 head.finalized；末目标不低于 finalized、同高不异 hash；全批通过才 v3 原子写 generation+1，目标相同幂等不改字节、空页锚高 confirmed 块推进一次；成功键序 ok,generation,finalized,matched_index,pages,applied、matched_index 0 基；失败仅 ok,error 不抛异常不改字节或代数）
 python tests/finalized_receipt_test.py  # 可离线验证最终化回执 GET /v1/transactions/{tx_id}/finalized-receipt（非法/不存在 404、内存池与 pending 尾块 409；200 固定键序 receipt,proof,headers,finality：九字段 receipt 且 status=confirmed、单笔 Merkle 证明六字段、头序列从交易块到最高 confirmed 块升序五字段全 confirmed、finality 沿用 /v1/chain/finality 且 finalized=末头；链与签名者同锁快照，pending 链尾止于上一 confirmed 块）与 verify_finalized_receipt（成功键序 ok,tx_id,height,block_hash,finalized；形状/类型/hex/expected_tx_id/trust 错 input、未知版本或 ledger-finality-v1 坏签名 auth、交易签名/重算 tx_id、receipt-proof-头绑定、Merkle 路径、头哈希与链接、末头/finality/tip 绑定 integrity；失败仅 ok,error、不抛异常）与 HTTP 线序
 python tests/receipt_proofs_audit_http_test.py  # 回执证明批量审计 POST /v1/transactions/receipt-proofs/audit 与 CLI receipt-proofs-audit（体按序仅 documents,expected_root；空体/非UTF-8/JSON错/缺多乱序键/空数组/根非法 400 且键序 ok,error、不改状态；200 键序 ok,root,total,succeeded,errors,entries,digest，逐项不短路、tx_id 先占后同 ID 判 integrity、digest 可重算；并发与重启结果一致；CLI 文件/stdin、读取/JSON/参数错不请求服务输出 input 体退出 1、ok 真退出 0）

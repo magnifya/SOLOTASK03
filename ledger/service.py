@@ -1748,6 +1748,254 @@ class LedgerService:
                 }
             return 200, self._finalities_page_locked(anchor_block, limit)
 
+    # -- read-only sync precheck ---------------------------------------------
+
+    def sync_plan(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/chain/sync-plan — read-only synchronization precheck.
+
+        The request body is a JSON object containing exactly the ordered keys
+        ``locators, tip, finalized`` (any parse, key-order, missing/extra-key
+        or value defect is ``400`` with the ordered body
+        ``{"ok": false, "error": "input"}`` answered before any state is
+        read):
+
+        * ``locators`` follows the exact ``POST /v1/chain/headers/locate``
+          contract — an array of 1-64 strictly descending
+          ``{height, block_hash}`` items (non-boolean non-negative integer
+          heights, 64-lowercase-hex hashes) — and its **first** item must name
+          the supplied ``tip`` (same height and hash);
+        * ``tip`` is the peer's chain descriptor S with exactly the keys
+          ``tip_hash, height, length, status`` (64-lowercase-hex hash,
+          non-boolean non-negative height, non-boolean positive length,
+          pending/confirmed status);
+        * ``finalized`` is the peer's finality anchor ``{height, block_hash}``
+          (same strict typing), no higher than ``tip.height``; at equal height
+          it must share the tip hash and the tip must itself be ``confirmed``.
+
+        All chain inspection happens under one store lock. The locators are
+        probed in their supplied order against the canonical chain and the
+        first same-height/same-hash block is the common ancestor; when none
+        matches, the answer is ``409`` with
+        ``{"ok": false, "error": "no_common_ancestor"}``.
+
+        A found ancestor first yields the mechanical relation: "same" (the
+        tips are identical), "remote_ahead" (the ancestor is the local tip),
+        "local_ahead" (the ancestor is the remote tip) or "fork" (neither).
+        Finality is then checked, with a contradiction answering ``200`` with
+        ``pull`` null and ``error`` "finality_conflict" (never planning a
+        pull): the peer's finalized anchor must agree with the shared prefix
+        (at or below the ancestor it has to name exactly the canonical block
+        the ancestor's hash commits to; above the ancestor it clashes only
+        when local already finalizes a different confirmed block at that
+        height), and in a true fork whose split point is below the local
+        finalized height the peer must still vouch for the shared
+        irreversible boundary — its finalized anchor naming the local
+        confirmed canonical block at that height — otherwise the chains
+        finalized different prefixes.
+
+        With no contradiction, ``error`` is null except that a shorter
+        remote reports "remote_behind" and an equal-length remote losing the
+        smaller-tip-hash tie-break reports "not_preferred" (both with
+        ``pull`` null). A longer remote, or an equal-length remote with the
+        smaller tip hash, plans the closed pull interval
+        ``{from_height, to_height}`` from ancestor height + 1 through the
+        remote tip height. The success body keeps the fixed key order
+        ``ok, ancestor, relation, pull, error``; the rejection reason lives
+        only in ``error`` (the endpoint itself never writes state).
+        """
+        bad_input = 400, {"ok": False, "error": "input"}
+        if not isinstance(payload, dict) or tuple(payload.keys()) != (
+            "locators",
+            "tip",
+            "finalized",
+        ):
+            return bad_input
+        raw_locators = payload["locators"]
+        remote_tip = payload["tip"]
+        remote_finalized = payload["finalized"]
+        if not isinstance(raw_locators, list) or not (
+            1 <= len(raw_locators) <= 64
+        ):
+            return bad_input
+        locators: list[dict] = []
+        previous_height: int | None = None
+        for item in raw_locators:
+            if not isinstance(item, dict) or tuple(item.keys()) != (
+                "height",
+                "block_hash",
+            ):
+                return bad_input
+            height = item["height"]
+            block_hash = item["block_hash"]
+            if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+                return bad_input
+            if not crypto.is_hex64(block_hash):
+                return bad_input
+            if previous_height is not None and height >= previous_height:
+                return bad_input
+            previous_height = height
+            locators.append({"height": height, "block_hash": block_hash})
+        if not isinstance(remote_tip, dict) or set(remote_tip) != {
+            "tip_hash",
+            "height",
+            "length",
+            "status",
+        }:
+            return bad_input
+        tip_hash = remote_tip["tip_hash"]
+        tip_height = remote_tip["height"]
+        tip_length = remote_tip["length"]
+        tip_status = remote_tip["status"]
+        if not crypto.is_hex64(tip_hash):
+            return bad_input
+        if isinstance(tip_height, bool) or not isinstance(tip_height, int) or tip_height < 0:
+            return bad_input
+        if (
+            isinstance(tip_length, bool)
+            or not isinstance(tip_length, int)
+            or tip_length < 1
+        ):
+            return bad_input
+        # A descriptor S always counts the genesis block, so its length is
+        # exactly the tip height plus one; a descriptor denying its own shape
+        # is rejected like any other malformed input.
+        if tip_length != tip_height + 1:
+            return bad_input
+        if tip_status not in (STATUS_PENDING, STATUS_CONFIRMED):
+            return bad_input
+        if not isinstance(remote_finalized, dict) or set(
+            remote_finalized
+        ) != {"height", "block_hash"}:
+            return bad_input
+        finalized_height = remote_finalized["height"]
+        finalized_hash = remote_finalized["block_hash"]
+        if (
+            isinstance(finalized_height, bool)
+            or not isinstance(finalized_height, int)
+            or finalized_height < 0
+        ):
+            return bad_input
+        if not crypto.is_hex64(finalized_hash):
+            return bad_input
+        # The first locator pins the supplied tip: same height and hash.
+        first = locators[0]
+        if first["height"] != tip_height or first["block_hash"] != tip_hash:
+            return bad_input
+        # Finalized never sits above the tip; at equal height the finalized
+        # anchor is the tip itself, which must then be confirmed.
+        if finalized_height > tip_height:
+            return bad_input
+        if finalized_height == tip_height and (
+            finalized_hash != tip_hash or tip_status != STATUS_CONFIRMED
+        ):
+            return bad_input
+
+        with self.store.lock:
+            ancestor_block = None
+            for locator in locators:
+                candidate = self.store.block_at(locator["height"])
+                if (
+                    candidate is not None
+                    and candidate.block_hash == locator["block_hash"]
+                ):
+                    ancestor_block = candidate
+                    break
+            if ancestor_block is None:
+                return 409, {"ok": False, "error": "no_common_ancestor"}
+
+            local_tip = self.store.chain[-1]
+            local_finalized_block = next(
+                block
+                for block in reversed(self.store.chain)
+                if block.status == STATUS_CONFIRMED
+            )
+            ancestor = self._anchor_descriptor(ancestor_block)
+            ancestor_height = ancestor_block.height
+
+            # The mechanical relation, fixed by the spec's priority: equal
+            # tips, then ancestor == local tip, ancestor == remote tip, else a
+            # fork.
+            if tip_hash == local_tip.block_hash:
+                relation = "same"
+            elif ancestor_height == local_tip.height:
+                relation = "remote_ahead"
+            elif ancestor_height == tip_height:
+                relation = "local_ahead"
+            else:
+                relation = "fork"
+
+            # Finality contradictions take precedence over the pull decision
+            # and never plan one. Two checks:
+            #
+            # 1. The peer's finalized anchor has to agree with the proven
+            #    common prefix. At or below the ancestor it must name exactly
+            #    the canonical block the ancestor's hash commits to (that
+            #    hash binds the whole prefix). Above the ancestor it clashes
+            #    only when local already finalizes a different confirmed
+            #    block at that height; a local pending block or an unknown
+            #    local height contradict nothing locally.
+            #
+            # 2. When the chains really fork below the local irreversible
+            #    boundary, the peer must still vouch for that boundary: its
+            #    finalized anchor reaching it (height >= local finalized
+            #    height) with the same confirmed canonical hash proves the
+            #    divergence is above the boundary (the matched locator was
+            #    merely shallow). Finalizing only below it means the peer's
+            #    prefix diverges in finalized territory. A strictly shorter
+            #    peer ("local_ahead") never reaches this fork-only check and
+            #    still reports remote_behind below.
+            local_at_finalized = self.store.block_at(finalized_height)
+            if finalized_height <= ancestor_height:
+                finality_conflict = (
+                    local_at_finalized is None
+                    or local_at_finalized.block_hash != finalized_hash
+                )
+            else:
+                finality_conflict = (
+                    local_at_finalized is not None
+                    and local_at_finalized.status == STATUS_CONFIRMED
+                    and local_at_finalized.block_hash != finalized_hash
+                )
+            if relation == "fork" and ancestor_height < local_finalized_block.height:
+                finality_conflict = finality_conflict or not (
+                    finalized_height >= local_finalized_block.height
+                    and local_at_finalized is not None
+                    and local_at_finalized.status == STATUS_CONFIRMED
+                    and local_at_finalized.block_hash == finalized_hash
+                )
+            if finality_conflict:
+                return 200, {
+                    "ok": True,
+                    "ancestor": ancestor,
+                    "relation": relation,
+                    "pull": None,
+                    "error": "finality_conflict",
+                }
+
+            pull: dict | None = None
+            error: str | None = None
+            if tip_length > len(self.store.chain) or (
+                tip_length == len(self.store.chain) and tip_hash < local_tip.block_hash
+            ):
+                # The peer wins the longest-chain / smallest-tip-hash rule:
+                # pull every block after the common ancestor through its tip.
+                pull = {
+                    "from_height": ancestor_height + 1,
+                    "to_height": tip_height,
+                }
+            elif tip_length < len(self.store.chain):
+                error = "remote_behind"
+            elif tip_hash != local_tip.block_hash:
+                # Equal length but the peer's tip hash loses the tie-break.
+                error = "not_preferred"
+            return 200, {
+                "ok": True,
+                "ancestor": ancestor,
+                "relation": relation,
+                "pull": pull,
+                "error": error,
+            }
+
     # -- inter-node fork sync -------------------------------------------------
 
     SYNC_DEFAULT_LIMIT = 50
