@@ -7009,8 +7009,16 @@ def _parse_finalized_receipt_receipt(raw: object) -> dict:
     return {key: raw[key] for key in RECEIPT_KEYS}
 
 
-def _parse_finalized_receipt_proof(raw: object) -> dict:
-    """Stage 1b: exact key order and raw types of the single-tx proof."""
+def _parse_finalized_receipt_proof(
+    raw: object, *, direction_integrity: bool = False
+) -> dict:
+    """Stage 1b: exact key order and raw types of the single-tx proof.
+
+    A sibling ``direction`` that is not a string is always an input
+    defect; a string outside ``left``/``right`` is an input defect by
+    default, or an integrity defect when ``direction_integrity`` is set
+    (:func:`verify_receipt_proof` classifies it that way).
+    """
     if not isinstance(raw, dict) or tuple(raw.keys()) != SINGLE_TX_PROOF_KEYS:
         raise _Failure(ERR_INPUT)
     if not _is_int(raw["height"]) or raw["height"] < 0:
@@ -7029,8 +7037,11 @@ def _parse_finalized_receipt_proof(raw: object) -> dict:
     for item in siblings:
         if not isinstance(item, dict) or tuple(item.keys()) != PROOF_SIBLING_KEYS:
             raise _Failure(ERR_INPUT)
-        if item["direction"] not in ("left", "right"):
+        direction = item["direction"]
+        if not isinstance(direction, str):
             raise _Failure(ERR_INPUT)
+        if direction not in ("left", "right"):
+            raise _Failure(ERR_INTEGRITY if direction_integrity else ERR_INPUT)
         if not crypto.is_hex64(item["hash"]):
             raise _Failure(ERR_INPUT)
     return {key: raw[key] for key in SINGLE_TX_PROOF_KEYS}
@@ -8184,7 +8195,9 @@ def verify_receipt_proof(document: object, expected_root: object) -> dict:
         ) != FINALIZED_RECEIPT_ITEM_KEYS:
             raise _Failure(ERR_INPUT)
         receipt = _parse_finalized_receipt_receipt(raw_item["receipt"])
-        proof = _parse_finalized_receipt_proof(raw_item["proof"])
+        proof = _parse_finalized_receipt_proof(
+            raw_item["proof"], direction_integrity=True
+        )
         item = {"receipt": receipt, "proof": proof}
         index = document["index"]
         if not _is_int(index) or index < 0:
@@ -8197,8 +8210,11 @@ def verify_receipt_proof(document: object, expected_root: object) -> dict:
                 sibling.keys()
             ) != PROOF_SIBLING_KEYS:
                 raise _Failure(ERR_INPUT)
-            if sibling["direction"] not in ("left", "right"):
+            direction = sibling["direction"]
+            if not isinstance(direction, str):
                 raise _Failure(ERR_INPUT)
+            if direction not in ("left", "right"):
+                raise _Failure(ERR_INTEGRITY)
             if not crypto.is_hex64(sibling["hash"]):
                 raise _Failure(ERR_INPUT)
 
@@ -8245,4 +8261,57 @@ def verify_receipt_proof(document: object, expected_root: object) -> dict:
         "root": root,
         "tx_id": receipt["tx_id"],
         "index": index,
+    }
+
+
+def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
+    """Offline-verify a batch of :func:`receipt_proof` success documents.
+
+    ``documents`` must be a non-empty list whose items are each a
+    ``document`` exactly as :func:`verify_receipt_proof` accepts and
+    ``expected_root`` the caller-pinned 64-lowercase-hex Merkle root
+    every document must recompute to. Verification is purely offline:
+    nothing is read or written, the arguments are never mutated and
+    nothing is raised.
+
+    A batch-shape defect (``documents`` not a non-empty list or
+    ``expected_root`` not 64 lowercase hex) returns only ``{"ok":
+    False, "error": "input"}`` in that key order. Otherwise every
+    document is verified independently — a failure never short-circuits
+    the batch — and the result is ``{"ok", "root", "results"}`` in that
+    key order: ``root`` is ``expected_root`` and ``results`` carries one
+    entry per input document, in input order, each exactly the success
+    or failure structure :func:`verify_receipt_proof` returns for it.
+    Beyond the first occurrence of a receipt ``tx_id``, every further
+    document naming that id reports ``{"ok": False, "error":
+    "integrity"}`` instead of its own verdict; ``ok`` is true only when
+    every entry succeeded.
+    """
+    try:
+        if not isinstance(documents, list) or not documents:
+            return {"ok": False, "error": ERR_INPUT}
+        if not crypto.is_hex64(expected_root):
+            return {"ok": False, "error": ERR_INPUT}
+        results: list[dict] = []
+        seen_tx_ids: set[str] = set()
+        for document in documents:
+            result = verify_receipt_proof(document, expected_root)
+            if result["ok"]:
+                tx_id = result["tx_id"]
+                if tx_id in seen_tx_ids:
+                    # A duplicated receipt id cannot belong to one honest
+                    # index tree twice; only the first occurrence keeps
+                    # its own verdict.
+                    result = {"ok": False, "error": ERR_INTEGRITY}
+                else:
+                    seen_tx_ids.add(tx_id)
+            results.append(result)
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": all(result["ok"] for result in results),
+        "root": expected_root,
+        "results": results,
     }
