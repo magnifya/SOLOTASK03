@@ -4590,14 +4590,19 @@ def _load_header_checkpoint(path: str) -> dict | None:
     return checkpoint
 
 
-def _atomic_write_header_checkpoint(path: str, checkpoint: dict) -> None:
-    """Write the checkpoint in declared key order and atomically replace ``path``."""
+def _header_checkpoint_payload(checkpoint: dict) -> bytes:
+    """Serialize one checkpoint in declared key order (steps in v2 order)."""
     ordered = {key: checkpoint[key] for key in HEADER_CHECKPOINT_KEYS}
     ordered["steps"] = [
         {key: step[key] for key in HEADER_STEP_V2_KEYS}
         for step in checkpoint["steps"]
     ]
-    _atomic_write_bytes(path, _serialize_document(ordered))
+    return _serialize_document(ordered)
+
+
+def _atomic_write_header_checkpoint(path: str, checkpoint: dict) -> None:
+    """Write the checkpoint in declared key order and atomically replace ``path``."""
+    _atomic_write_bytes(path, _header_checkpoint_payload(checkpoint))
 
 
 def advance_headers(
@@ -8894,6 +8899,12 @@ def advance_state_anchor(
         return _failed_advance(ERR_INPUT)
     try:
         _parse_state_anchor_arguments(document, account, trust)
+        # A value the sidecar cannot re-serialize is a caller-side input
+        # defect and is rejected before an idempotent replay could return
+        # success (the verifier only judges the fields it pins, so an
+        # extra un-JSON-able value would otherwise slip past it).
+        json.dumps(document, ensure_ascii=False)
+        json.dumps(trust, ensure_ascii=False)
     except _Failure as failure:
         return _failed_advance(failure.category)
     except Exception:
@@ -9010,4 +9021,703 @@ def advance_state_anchor(
             "ok": True,
             "generation": next_generation,
             "anchor": {key: new_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS},
+        }
+
+
+# Fixed bundle key order accepted by :func:`advance_sync_state`.
+SYNC_STATE_BUNDLE_KEYS = (
+    "documents",
+    "finalities",
+    "state_document",
+    "account",
+    "anchor",
+    "tip_hash",
+    "trust",
+)
+
+# Fixed success key orders returned by :func:`advance_sync_state`.
+SYNC_STATE_RESULT_KEYS = ("ok", "header", "state")
+SYNC_STATE_HEADER_KEYS = ("generation", "tip", "finalized", "applied")
+SYNC_STATE_STATE_KEYS = ("generation", "anchor")
+
+# The two-file commit is driven by one version-1 transaction journal kept
+# next to the pair: it seals both target documents (the version-3 header
+# checkpoint and the version-1 state sidecar) under one self-excluding
+# canonical-JSON SHA-256, so an interrupted commit is either rolled forward
+# to the complete new pair or reported as transaction (state) corruption.
+SYNC_STATE_TXN_VERSION = 1
+SYNC_STATE_TXN_KEYS = ("v", "header", "state", "hash")
+
+
+def _sync_txn_path(path: str) -> str:
+    """The transaction-journal path mirroring one synced pair."""
+    return path + ".txn"
+
+
+def _validate_sync_state_bundle(raw: object) -> dict:
+    """Stage-1 shape check of one :func:`advance_sync_state` bundle.
+
+    The bundle must be a dict with the exact key order
+    ``documents, finalities, state_document, account, anchor, tip_hash,
+    trust``: two non-empty lists (the signed header pages and finality
+    credentials), the first-use anchor ``{height, block_hash}`` (or null
+    to continue from the stored closed tip), a 64-lowercase-hex tip hash
+    and a 64-lowercase-hex pinned account. The deeper document contracts
+    are settled by the reused primitives — only the bundle's own envelope
+    is judged here, every defect as ``input``.
+    """
+    if not isinstance(raw, dict) or tuple(raw.keys()) != SYNC_STATE_BUNDLE_KEYS:
+        raise _Failure(ERR_INPUT)
+    documents = raw["documents"]
+    finalities = raw["finalities"]
+    account = raw["account"]
+    anchor = raw["anchor"]
+    tip_hash = raw["tip_hash"]
+    if not isinstance(documents, list) or not documents:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(finalities, list) or not finalities:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(account):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(tip_hash):
+        raise _Failure(ERR_INPUT)
+    # The anchor is exactly the advance_finalized_headers anchor: a legal
+    # closed ``{height, block_hash}`` for the first use, or null to
+    # continue from the stored closed tip. Any other shape is input.
+    if anchor is not None and _validate_header_anchor_argument(anchor) is None:
+        raise _Failure(ERR_INPUT)
+    return {key: raw[key] for key in SYNC_STATE_BUNDLE_KEYS}
+
+
+def _load_sync_state_pair(
+    path: str,
+) -> tuple[dict | None, list[dict], dict, dict | None]:
+    """Strictly load the v3 header checkpoint and the v1 state sidecar.
+
+    Returns ``(checkpoint, step_tips, branch, stored)`` with ``checkpoint``
+    and ``stored`` None when the respective file is absent. The pair is
+    replayed under the same rules as the standalone advances: the header
+    file is strictly loaded and fully replayed, and an existing sidecar is
+    strictly loaded, its stored proof re-verified and its old anchor
+    checked against the replayed current branch. Every defect is
+    existing-state corruption (``state``); a missing header with an
+    existing sidecar is the ``io`` the caller reports (a state anchor can
+    never outlive its header file).
+    """
+    loaded = _load_header_checkpoint_document(path)
+    if loaded is None:
+        # A state sidecar orphaned from its header file is a missing
+        # dependency (io): a state anchor can never outlive its header
+        # checkpoint, and first use must create the pair together.
+        if os.path.exists(_state_anchor_path(path)):
+            raise _CheckpointError(ERR_IO)
+        return None, [], {}, None
+    checkpoint, step_tips, branch = loaded
+    stored = _load_state_anchor(_state_anchor_path(path))
+    if stored is not None:
+        _reverify_stored_state_anchor(stored, branch)
+    return checkpoint, step_tips, branch, stored
+
+
+def _sync_txn_hash(header: dict, state: dict) -> str:
+    """SHA-256 over the canonical JSON of one transaction except ``hash``."""
+    body = {
+        "v": SYNC_STATE_TXN_VERSION,
+        "header": header,
+        "state": state,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def _validate_sync_txn(data: object) -> tuple[dict, dict]:
+    """Strictly validate one sealed pair-commit transaction journal.
+
+    Exact top-level key order ``v, header, state, hash`` with ``v`` equal
+    1; ``hash`` must be the 64-lowercase-hex SHA-256 of the canonical
+    JSON of the other three fields. The embedded header must be a
+    version-3 checkpoint that passes its full shape and step replay, the
+    embedded state document must pass the sidecar shape/digest checks,
+    its proof must reverify and its anchor must name the embedded
+    checkpoint's finalized boundary on the replayed branch. Every defect
+    is transaction (state) corruption.
+    """
+    if not isinstance(data, dict) or tuple(data.keys()) != SYNC_STATE_TXN_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(data["v"]) or data["v"] != SYNC_STATE_TXN_VERSION:
+        raise _CheckpointError(ERR_STATE)
+    raw_header = data["header"]
+    raw_state = data["state"]
+    digest = data["hash"]
+    if not isinstance(raw_header, dict) or not isinstance(raw_state, dict):
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+    # The seal pins the embedded bytes before they are judged, so a
+    # re-sealed tampered journal fails the strict replay below.
+    if _sync_txn_hash(raw_header, raw_state) != digest:
+        raise _CheckpointError(ERR_STATE)
+    # The embedded pair must stand on its own: the header is a version-3
+    # checkpoint passing its full shape and step replay, the sidecar
+    # passes its shape/digest checks with a reverifying proof, and the
+    # state anchor must name the embedded finalized boundary.
+    header = _validate_header_checkpoint_shape(raw_header)
+    if header["v"] != HEADER_CHECKPOINT_VERSION:
+        raise _CheckpointError(ERR_STATE)
+    _step_tips, branch = _replay_header_checkpoint(header)
+    state = _validate_state_anchor_shape(raw_state)
+    _reverify_stored_state_anchor(state, branch)
+    if state["anchor"]["height"] != header["finalized"]["height"] or (
+        state["anchor"]["block_hash"] != header["finalized"]["block_hash"]
+    ):
+        raise _CheckpointError(ERR_STATE)
+    return header, state
+
+
+def _load_sync_txn(path: str) -> tuple[dict, dict] | None:
+    """Strictly load the transaction journal (None when it is absent).
+
+    Bad UTF-8, malformed JSON and every shape/seal/replay defect is
+    transaction (state) corruption; an unreadable file is ``io``.
+    """
+    txn_path = _sync_txn_path(path)
+    try:
+        with open(txn_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    return _validate_sync_txn(data)
+
+
+def _materialize_sync_txn(
+    path: str, header_payload: bytes, state_payload: bytes
+) -> None:
+    """Roll one sealed transaction forward and drop its journal.
+
+    Each target is promoted only when its bytes differ from what is on
+    disk, so replaying an already-(partly)-materialized journal is
+    idempotent (and an unchanged half of the pair is never rewritten);
+    the journal is unlinked last (with a directory fsync). Read/write/
+    unlink failures propagate as OSError for the caller to classify
+    ``io`` — the sealed journal stays behind and the next call rolls
+    forward again.
+    """
+    state_path = _state_anchor_path(path)
+    if _read_bytes_or_none(path) != header_payload:
+        _atomic_write_bytes(path, header_payload)
+    if _read_bytes_or_none(state_path) != state_payload:
+        _atomic_write_bytes(state_path, state_payload)
+    os.unlink(_sync_txn_path(path))
+    _fsync_dir(os.path.dirname(os.path.abspath(path)) or ".")
+
+
+def _recover_sync_state(path: str) -> None:
+    """Roll a leftover pair-commit transaction forward, if one is present.
+
+    Called under the per-path lock before any stored state is judged. A
+    sealed journal makes the new pair the committed outcome: both files
+    are materialized from the journal and the journal is dropped, so the
+    only observable pairs are the complete old one (no journal) or the
+    complete new one (a journal). A defective journal is ``state``; a
+    read/write failure is ``io``.
+    """
+    loaded = _load_sync_txn(path)
+    if loaded is None:
+        return
+    header, state = loaded
+    header_payload = _header_checkpoint_payload(header)
+    state_payload = _serialize_document(state)
+    _materialize_sync_txn(path, header_payload, state_payload)
+
+
+def _sync_state_idempotent(
+    step: dict,
+    checkpoint: dict | None,
+    parsed: list,
+    new_anchor: dict,
+    account: str,
+    stored: dict | None,
+) -> bool:
+    """Whether this call is a full resubmission of the committed pair.
+
+    The header half is idempotent exactly when its appended linear step
+    and final boundary both equal the stored ones (the
+    :func:`advance_finalized_headers` rule); the state half when the
+    stored sidecar carries the same account and the same anchor (the
+    :func:`advance_state_anchor` rule). Both halves must replay.
+    """
+    if checkpoint is None or stored is None:
+        return False
+    steps = checkpoint["steps"]
+    if not (bool(steps) and step == steps[-1]):
+        return False
+    if parsed[-1][0] != checkpoint["finalized"]:
+        return False
+    return stored["account"] == account and stored["anchor"] == new_anchor
+
+
+def advance_sync_state(path: object, bundle: object) -> dict:
+    """Atomically advance one header checkpoint and its state anchor.
+
+    ``bundle`` is one dict in the exact key order
+    ``documents, finalities, state_document, account, anchor, tip_hash,
+    trust``. The first six fields are exactly the
+    :func:`advance_finalized_headers` arguments (``documents`` the
+    non-empty ordered ``GET /v1/chain/headers`` page batch, ``finalities``
+    the non-empty ordered signed finality credentials, ``anchor`` the
+    first-use anchor or the stored tip's closed ``{height, block_hash}``,
+    ``tip_hash`` the pinned chain tip, ``trust`` the audit-signer trust);
+    ``state_document``/``account``/``trust`` are exactly the
+    :func:`verify_state_proof` arguments (the decoded
+    ``GET /v1/accounts/{account}/attested-proof`` document in
+    ``state, proof, auth`` order and the caller-pinned 64-lowercase-hex
+    account).
+
+    Processing is staged and all-or-nothing under the shared per-path
+    lock, reusing the two existing contracts:
+
+    1. **input** — ``path`` and the bundle envelope (exact key order,
+       non-empty batches, hex account/tip hash, a legal anchor) are
+       settled first, together with every credential/trust shape;
+    2. **state/io** — the version-3 header checkpoint at ``path`` is
+       strictly replayed (a missing file opens a new checkpoint exactly
+       as :func:`advance_finalized_headers` does) and the version-1
+       sidecar at ``path + ".state"`` is strictly loaded, its proof
+       re-verified and its anchor checked on the replayed branch (any
+       defect is ``state``; a missing header next to a sidecar is ``io``);
+    3. **auth** — the finality envelopes, then the state-proof envelope,
+       are verified (an unknown key version or a bad signature is
+       ``auth``);
+    4. **integrity** — the header batch is verified and must legally
+       advance the stored tip, the credentials walk the freshly advanced
+       branch under the :func:`advance_finalized_headers` rules and may
+       not move the stored boundary backwards or sideways, and the state
+       proof's anchor (``state.height``/``state.block_hash``) must equal
+       exactly the **last credential's** ``finalized`` boundary; an
+       existing sidecar may not switch accounts or move its anchor
+       backwards/sideways.
+
+    Only a fully valid call commits. Both target documents are
+    serialized first (a value JSON cannot re-serialize is ``input``
+    before any file is touched) and the pair is then committed under one
+    sealed transaction journal at ``path + ".txn"``: the journal is
+    fsynced first (its canonical-JSON SHA-256 seals both documents, each
+    validated to stand on its own), the header is promoted next and the
+    sidecar last, and the journal is unlinked with a directory fsync. A
+    failure or a restart thus presents only the complete old pair (no
+    journal) or the complete new pair (a leftover journal is strictly
+    replayed and rolled forward); a malformed or tampered journal is
+    ``state`` (transaction corruption) and a read/write failure is
+    ``io``. The header bytes are byte-identical to what
+    :func:`advance_finalized_headers` writes; the sidecar bytes match
+    :func:`advance_state_anchor`.
+
+    A fully identical replay (same stored linear step, same final
+    boundary, same account and same state anchor) writes nothing and
+    holds both generations; any genuine content change increments each
+    affected file's generation exactly once. Success returns
+    ``{"ok": True, "header", "state"}`` in that key order with
+    ``header = {"generation", "tip", "finalized", "applied"}`` (the
+    :func:`advance_finalized_headers` result without ``ok``, ``applied``
+    the credential count) and ``state = {"generation", "anchor"}`` with
+    ``anchor`` in ``height, block_hash, state_root`` order. Failure
+    returns only ``{"ok": False, "error": category}`` with category one
+    of ``input`` (shape, key order, raw types or a non-JSON-serializable
+    value), ``auth`` (an unknown key or a bad signature), ``integrity``
+    (chain, proof, account binding, boundary or regression defects),
+    ``state`` (a corrupt stored checkpoint/sidecar/transaction) and
+    ``io`` (a missing dependency or a read/write failure). Nothing is
+    raised. The HTTP/CLI surface is unchanged and does not expose this
+    call.
+    """
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    # Stage 1a (input): the bundle envelope.
+    try:
+        bundle = _validate_sync_state_bundle(bundle)
+    except _Failure as failure:
+        return _failed_advance(failure.category)
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the caller.
+        return _failed_advance(ERR_INPUT)
+    documents = bundle["documents"]
+    finalities = bundle["finalities"]
+    state_document = bundle["state_document"]
+    account = bundle["account"]
+    anchor = bundle["anchor"]
+    tip_hash = bundle["tip_hash"]
+    trust = bundle["trust"]
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Recovery first: a leftover sealed transaction from an
+        # interrupted call is rolled forward so the pair about to be
+        # loaded is always a complete one (old pair or new pair). A
+        # defective journal is state (transaction corruption); a
+        # read/write failure is io.
+        try:
+            _recover_sync_state(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        except Exception:
+            # Defensive: an unforeseeable recovery surprise must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_STATE)
+
+        # Stage 1b (input): the exact credential shapes and the trust
+        # signers, plus the state-proof argument structure, before any
+        # file or signature work — mirroring the standalone advances.
+        try:
+            parsed = [
+                _parse_finality_document(document) for document in finalities
+            ]
+            signers = _validate_header_trust(trust)
+            _parse_state_anchor_arguments(state_document, account, trust)
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_INPUT)
+
+        # A value the persisted pair cannot re-serialize is a caller-side
+        # input defect and must be rejected even for an otherwise
+        # idempotent replay (the verifiers only judge the fields they
+        # pin, so an extra un-JSON-able value would slip past them).
+        try:
+            for document in documents:
+                json.dumps(document, ensure_ascii=False)
+            json.dumps(trust, ensure_ascii=False)
+            json.dumps(state_document, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return _failed_advance(ERR_INPUT)
+
+        # Stage 2 (state/io): strictly replay the existing header file and
+        # sidecar together before anything is judged.
+        try:
+            checkpoint, _step_tips, branch, stored = _load_sync_state_pair(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: an unreadable-by-surprise pair must report rather
+            # than crash the caller.
+            return _failed_advance(ERR_STATE)
+
+        if checkpoint is None:
+            # First use opens the checkpoint exactly as
+            # advance_finalized_headers does: the caller must pin a
+            # legal anchor, which is also the initial finalized boundary.
+            expected_anchor = _validate_header_anchor_argument(anchor)
+            if expected_anchor is None:
+                return _failed_advance(ERR_INPUT)
+            header_generation = 0
+            file_anchor = expected_anchor
+            finalized = {key: expected_anchor[key] for key in HEADER_ANCHOR_KEYS}
+            steps: list[dict] = []
+            stored_tip: dict | None = None
+            branch = {
+                expected_anchor["height"]: (
+                    expected_anchor["block_hash"],
+                    STATUS_CONFIRMED,
+                )
+            }
+        else:
+            header_generation = checkpoint["generation"]
+            file_anchor = checkpoint["anchor"]
+            finalized = checkpoint["finalized"]
+            steps = checkpoint["steps"]
+            stored_tip = checkpoint["tip"]
+            if anchor is None:
+                # Continue the continuous chain from the stored closed tip.
+                expected_anchor = {
+                    "height": stored_tip["height"],
+                    "block_hash": stored_tip["tip_hash"],
+                }
+            else:
+                expected_anchor = _validate_header_anchor_argument(anchor)
+                if (
+                    expected_anchor is None
+                    or expected_anchor
+                    != {
+                        "height": stored_tip["height"],
+                        "block_hash": stored_tip["tip_hash"],
+                    }
+                ):
+                    return _failed_advance(ERR_INPUT)
+
+        step = {
+            "kind": "linear",
+            "tip_hash": tip_hash,
+            "trust": trust,
+            "documents": documents,
+            "locators": None,
+        }
+        # An exact resubmission of the stored last step was verified when
+        # it was stored and re-verified by the load replay above.
+        same_step = bool(steps) and step == steps[-1]
+
+        # Stage 3a (auth): every finality envelope, in array order.
+        try:
+            for document, (_target, _tip, key_version, signature) in zip(
+                finalities, parsed
+            ):
+                _authenticate_finality(
+                    document, key_version, signature, signers
+                )
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+
+        # The header batch is verified exactly as advance_finalized_headers
+        # verifies it, and the new tip may never drop in height.
+        if same_step:
+            new_tip = stored_tip
+        else:
+            try:
+                result = verify_header_pages(
+                    documents, expected_anchor, tip_hash, trust
+                )
+            except Exception:
+                # Defensive: the verifier never raises, but an
+                # unforeseeable input must report rather than crash.
+                return _failed_advance(ERR_INPUT)
+            if not result.get("ok"):
+                return {"ok": False, "error": result["error"]}
+            new_tip = result["tip"]
+            if stored_tip is not None and not _header_tip_advances(
+                stored_tip, new_tip
+            ):
+                return _failed_advance(ERR_INTEGRITY)
+            for document in documents:
+                for header in document["headers"]:
+                    branch[header["height"]] = (
+                        header["block_hash"],
+                        header["status"],
+                    )
+            branch[new_tip["height"]] = (
+                new_tip["tip_hash"],
+                new_tip["status"],
+            )
+
+        # Stage 4a (integrity): walk the credentials against the advanced
+        # branch under the advance_finalized_headers per-item rules.
+        previous_target_height: int | None = None
+        previous_tip_height: int | None = None
+        last_target: dict | None = None
+        try:
+            for target, cred_tip, _version, _signature in parsed:
+                tip_entry = branch.get(cred_tip["height"])
+                if tip_entry is None or tip_entry[0] != cred_tip["tip_hash"]:
+                    raise _Failure(ERR_INTEGRITY)
+                if tip_entry[1] != cred_tip["status"]:
+                    raise _Failure(ERR_INTEGRITY)
+                if (
+                    previous_tip_height is not None
+                    and cred_tip["height"] < previous_tip_height
+                ):
+                    raise _Failure(ERR_INTEGRITY)
+                previous_tip_height = cred_tip["height"]
+                if (
+                    previous_target_height is not None
+                    and target["height"] <= previous_target_height
+                ):
+                    raise _Failure(ERR_INTEGRITY)
+                previous_target_height = target["height"]
+                if target["height"] > cred_tip["height"]:
+                    raise _Failure(ERR_INTEGRITY)
+                entry = branch.get(target["height"])
+                if entry is None or entry[0] != target["block_hash"]:
+                    raise _Failure(ERR_INTEGRITY)
+                if target != file_anchor and entry[1] != STATUS_CONFIRMED:
+                    raise _Failure(ERR_INTEGRITY)
+                last_target = target
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        assert last_target is not None  # finalities is shape-guaranteed non-empty
+
+        if last_target["height"] < finalized["height"] or (
+            last_target["height"] == finalized["height"]
+            and last_target["block_hash"] != finalized["block_hash"]
+        ):
+            return _failed_advance(ERR_INTEGRITY)
+
+        # Stage 3b (auth) + the proof's own binding/Merkle checks
+        # (integrity): the full state-proof contract, exactly as
+        # advance_state_anchor runs it once persisted state is settled.
+        proof_result = verify_state_proof(state_document, account, trust)
+        if not proof_result.get("ok"):
+            return {"ok": False, "error": proof_result["error"]}
+        state = state_document["state"]
+        new_anchor = {
+            "height": state["height"],
+            "block_hash": state["block_hash"],
+            "state_root": state["state_root"],
+        }
+
+        # Stage 4b (integrity): the proof anchor must equal exactly the
+        # last credential's finalized boundary.
+        if (
+            new_anchor["height"] != last_target["height"]
+            or new_anchor["block_hash"] != last_target["block_hash"]
+        ):
+            return _failed_advance(ERR_INTEGRITY)
+
+        if stored is not None:
+            # The sidecar binds one account and its anchor may only
+            # advance: the advance_state_anchor rules.
+            if account != stored["account"]:
+                return _failed_advance(ERR_INTEGRITY)
+            old_anchor = stored["anchor"]
+            if new_anchor["height"] < old_anchor["height"]:
+                return _failed_advance(ERR_INTEGRITY)
+            if (
+                new_anchor["height"] == old_anchor["height"]
+                and new_anchor != old_anchor
+            ):
+                return _failed_advance(ERR_INTEGRITY)
+
+        header_idempotent = same_step and last_target == finalized
+        state_idempotent = stored is not None and stored["anchor"] == new_anchor
+        if _sync_state_idempotent(
+            step, checkpoint, parsed, new_anchor, account, stored
+        ):
+            # Full resubmission of the committed pair: neither file is
+            # rewritten and both generations hold.
+            return {
+                "ok": True,
+                "header": {
+                    "generation": header_generation,
+                    "tip": stored_tip,
+                    "finalized": {
+                        key: finalized[key] for key in HEADER_ANCHOR_KEYS
+                    },
+                    "applied": len(parsed),
+                },
+                "state": {
+                    "generation": stored["generation"],
+                    "anchor": {
+                        key: stored["anchor"][key]
+                        for key in STATE_ANCHOR_ANCHOR_KEYS
+                    },
+                },
+            }
+
+        next_header_generation = (
+            header_generation if header_idempotent else header_generation + 1
+        )
+        next_steps = steps if same_step else steps + [step]
+        new_checkpoint = {
+            "v": HEADER_CHECKPOINT_VERSION,
+            "generation": next_header_generation,
+            "anchor": file_anchor,
+            "tip": new_tip,
+            "finalized": last_target,
+            "steps": next_steps,
+        }
+        new_checkpoint["hash"] = _header_checkpoint_hash(
+            HEADER_CHECKPOINT_VERSION,
+            next_header_generation,
+            file_anchor,
+            new_tip,
+            last_target,
+            next_steps,
+        )
+
+        if stored is None:
+            next_state_generation = 1
+        elif state_idempotent:
+            next_state_generation = stored["generation"]
+        else:
+            next_state_generation = stored["generation"] + 1
+        if state_idempotent:
+            # The advance_state_anchor rule: an equal anchor never
+            # rewrites the sidecar, even for an equivalent freshly
+            # re-signed proof — commit and seal the stored bytes so the
+            # materialization skips them and the generation holds.
+            state_commit: dict = stored
+        else:
+            state_commit = {
+                "v": STATE_ANCHOR_VERSION,
+                "generation": next_state_generation,
+                "account": account,
+                "anchor": new_anchor,
+                "document": state_document,
+                "trust": trust,
+            }
+            state_commit["hash"] = _state_anchor_hash(
+                next_state_generation, account, new_anchor, state_document, trust
+            )
+
+        # Serialize both target documents before touching the disk: a
+        # value JSON cannot re-serialize is a caller-side input defect,
+        # never a partial pair.
+        try:
+            header_payload = _header_checkpoint_payload(new_checkpoint)
+            state_payload = _serialize_document(state_commit)
+        except (TypeError, ValueError):
+            return _failed_advance(ERR_INPUT)
+
+        # Transactional pair commit under one sealed journal:
+        #
+        #   1. fsync the journal at path + ".txn" (it seals both target
+        #      documents, validated to stand on their own, so it is the
+        #      sole recovery source);
+        #   2. promote the header checkpoint, then the sidecar;
+        #   3. unlink the journal.
+        #
+        # A crash leaves either no journal (the complete old pair is
+        # intact) or the journal (the next call rolls the complete new
+        # pair forward); strict replay on recovery accepts no other
+        # outcome. A write failure before the journal lands changes
+        # nothing; one afterwards rolls forward on the next call and is
+        # reported io here.
+        # The journal embeds the exact ordered documents the pair is
+        # materialized from; its seal covers their canonical JSON, so the
+        # strict recovery replay detects any tampered or re-sealed file.
+        journal = {
+            "v": SYNC_STATE_TXN_VERSION,
+            "header": new_checkpoint,
+            "state": state_commit,
+        }
+        journal["hash"] = _sync_txn_hash(new_checkpoint, state_commit)
+        try:
+            journal_payload = _serialize_document(journal)
+        except (TypeError, ValueError):
+            # Unreachable: both embedded documents serialized above; kept
+            # defensive so no value can escape the input contract.
+            return _failed_advance(ERR_INPUT)
+        txn_path = _sync_txn_path(path)
+        try:
+            _atomic_write_bytes(txn_path, journal_payload)
+            _materialize_sync_txn(path, header_payload, state_payload)
+        except OSError:
+            # The pair is never reported half-written: the sealed journal
+            # is the committed new pair and the next call rolls it
+            # forward; a journal that never landed leaves the old pair
+            # untouched. Either way, report the write failure.
+            return _failed_advance(ERR_IO)
+
+        return {
+            "ok": True,
+            "header": {
+                "generation": next_header_generation,
+                "tip": new_tip,
+                "finalized": {
+                    key: last_target[key] for key in HEADER_ANCHOR_KEYS
+                },
+                "applied": len(parsed),
+            },
+            "state": {
+                "generation": next_state_generation,
+                "anchor": {
+                    key: new_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS
+                },
+            },
         }
