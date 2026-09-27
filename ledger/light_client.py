@@ -9321,8 +9321,12 @@ def advance_sync_state(path: object, bundle: object) -> dict:
 
     A fully identical replay (same stored linear step, same final
     boundary, same account and same state anchor) writes nothing and
-    holds both generations; any genuine content change increments each
-    affected file's generation exactly once. Success returns
+    holds both generations; a resubmitted first commit is likewise
+    recognized after a racing caller already moved the stored tip past
+    the first-use anchor it pinned, so concurrent identical first
+    bundles all succeed with both generations at 1 and a single pair
+    write. Any genuine content change increments each affected file's
+    generation exactly once. Success returns
     ``{"ok": True, "header", "state"}`` in that key order with
     ``header = {"generation", "tip", "finalized", "applied"}`` (the
     :func:`advance_finalized_headers` result without ``ok``, ``applied``
@@ -9411,6 +9415,14 @@ def advance_sync_state(path: object, bundle: object) -> dict:
             # than crash the caller.
             return _failed_advance(ERR_STATE)
 
+        step = {
+            "kind": "linear",
+            "tip_hash": tip_hash,
+            "trust": trust,
+            "documents": documents,
+            "locators": None,
+        }
+
         if checkpoint is None:
             # First use opens the checkpoint exactly as
             # advance_finalized_headers does: the caller must pin a
@@ -9443,23 +9455,25 @@ def advance_sync_state(path: object, bundle: object) -> dict:
                 }
             else:
                 expected_anchor = _validate_header_anchor_argument(anchor)
-                if (
-                    expected_anchor is None
-                    or expected_anchor
-                    != {
-                        "height": stored_tip["height"],
-                        "block_hash": stored_tip["tip_hash"],
-                    }
-                ):
+                if expected_anchor is None:
                     return _failed_advance(ERR_INPUT)
+                if expected_anchor != {
+                    "height": stored_tip["height"],
+                    "block_hash": stored_tip["tip_hash"],
+                }:
+                    # Not the continuation anchor: the only other legal
+                    # pin is the checkpoint's own first-use anchor, and
+                    # only when the bundle's header step is the stored
+                    # last step — a racing first commit already moved
+                    # the stored tip past the anchor it was committed
+                    # from, so the resubmission is recognized as the
+                    # committed request below and holds both
+                    # generations. Anything else is a foreign anchor.
+                    if expected_anchor != file_anchor or not (
+                        bool(steps) and step == steps[-1]
+                    ):
+                        return _failed_advance(ERR_INPUT)
 
-        step = {
-            "kind": "linear",
-            "tip_hash": tip_hash,
-            "trust": trust,
-            "documents": documents,
-            "locators": None,
-        }
         # An exact resubmission of the stored last step was verified when
         # it was stored and re-verified by the load replay above.
         same_step = bool(steps) and step == steps[-1]
