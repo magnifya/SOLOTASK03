@@ -7434,6 +7434,13 @@ def verify_finalized_receipts(
 RECEIPT_INDEX_VERSION = 1
 RECEIPT_INDEX_KEYS = ("v", "generation", "finalized", "items", "hash")
 ADVANCE_RECEIPTS_RESULT_KEYS = ("ok", "generation", "finalized", "added")
+ADVANCE_RECEIPT_BATCHES_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "finalized",
+    "added",
+    "batches",
+)
 GET_RECEIPT_RESULT_KEYS = ("ok", "finalized", "item")
 ERR_NOT_FOUND = "not_found"
 
@@ -7758,6 +7765,221 @@ def advance_receipts(
                 key: incoming_finalized[key] for key in HEADER_ANCHOR_KEYS
             },
             "added": added,
+        }
+
+
+def advance_receipt_batches(
+    path: object,
+    documents: object,
+    expected_tx_ids: object,
+    trust: object,
+) -> dict:
+    """Verify an ordered run of finalized-receipts batches and merge once.
+
+    ``documents`` is a non-empty list of decoded
+    ``POST /v1/transactions/finalized-receipts`` responses and
+    ``expected_tx_ids`` an equal-length list whose every element is the
+    non-empty, duplicate-free list of distinct 64-lowercase-hex ids the
+    matching document must name; ``trust`` carries ``audit_signers``
+    exactly as for :func:`advance_receipts`. Under the shared per-path
+    lock the arguments are validated first, every batch is verified with
+    :func:`verify_finalized_receipts` before anything is read or written,
+    the version-1 index at ``path`` is then strictly loaded (a missing
+    file opens at generation 0) and the batches are merged **in order**.
+
+    The finalized boundary may never move backwards across the stored
+    boundary and the batch sequence, and at the same height every batch
+    must name the same block hash (otherwise ``integrity``). An incoming
+    id already merged — by the index or by an earlier batch of the same
+    call — with identical receipt/proof content is an idempotent no-op,
+    while the same id with different content is a conflict
+    (``integrity``). The merge is a change only when at least one
+    previously unknown id is added or the boundary advances: then the
+    generation increments exactly once and the index is written
+    atomically a single time with the exact key order
+    ``v, generation, finalized, items, hash`` — ``finalized`` the last
+    batch's closed ``{height, block_hash}`` boundary, ``items`` every
+    known receipt in ``tx_id`` ascending order and ``hash`` the SHA-256
+    of the canonical JSON of the other four fields. A call that changes
+    nothing leaves the file bytes and the generation untouched.
+
+    Success returns ``{"ok": True, "generation", "finalized", "added",
+    "batches"}`` in that key order with ``added`` the number of
+    previously unknown unique ids merged by this call (an id repeated
+    across batches counts once) and ``batches`` the number of documents.
+    Failure returns only ``{"ok": False, "error": category}`` with the
+    :func:`advance_receipts` categories: argument, array-shape or
+    array-length defects are ``input``; per-batch verification keeps the
+    shared ``input``/``auth``/``integrity`` classification; batch
+    ordering, boundary regressions and same-height/other-hash or
+    cross-batch id-content conflicts are ``integrity``; a corrupt
+    existing index is ``state`` and a read/write failure is ``io``.
+    Nothing is raised and a failed call never changes the file bytes or
+    the generation.
+    """
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Stage 1 (input): the documents/expected_tx_ids array contract.
+        if not isinstance(documents, list) or not documents:
+            return _failed_advance(ERR_INPUT)
+        if not isinstance(expected_tx_ids, list) or len(
+            expected_tx_ids
+        ) != len(documents):
+            return _failed_advance(ERR_INPUT)
+        for tx_ids in expected_tx_ids:
+            if (
+                not isinstance(tx_ids, list)
+                or not tx_ids
+                or any(not crypto.is_hex64(tx_id) for tx_id in tx_ids)
+                or len(set(tx_ids)) != len(tx_ids)
+            ):
+                return _failed_advance(ERR_INPUT)
+
+        # Stage 2 (input/auth/integrity): verify every batch offline,
+        # reusing the shared batch contract, before any file is touched.
+        verified: list[tuple[dict, dict[str, dict]]] = []
+        for document, tx_ids in zip(documents, expected_tx_ids):
+            try:
+                result = verify_finalized_receipts(document, tx_ids, trust)
+            except Exception:
+                # Defensive: the verifier never raises, but an
+                # unforeseeable input must report rather than crash the
+                # caller.
+                return _failed_advance(ERR_INPUT)
+            if not result.get("ok"):
+                return {"ok": False, "error": result["error"]}
+            if not isinstance(document, dict):
+                # Unreachable: the verifier pins the document shape; kept
+                # for a strict typed boundary.
+                return _failed_advance(ERR_INPUT)
+            finalized = {
+                key: result["finalized"][key] for key in HEADER_ANCHOR_KEYS
+            }
+            items: dict[str, dict] = {}
+            try:
+                for raw_item in document["items"]:
+                    receipt = _parse_finalized_receipt_receipt(
+                        raw_item["receipt"]
+                    )
+                    proof = _parse_finalized_receipt_proof(raw_item["proof"])
+                    items[receipt["tx_id"]] = {
+                        "receipt": receipt,
+                        "proof": proof,
+                    }
+            except _Failure as failure:
+                return _failed_advance(failure.category)
+            verified.append((finalized, items))
+
+        # Stage 3 (state/io): the existing index is strictly loaded; a
+        # missing file opens a new index at generation 0.
+        try:
+            stored = _load_receipt_index(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: an unreadable-by-surprise index must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_STATE)
+
+        if stored is None:
+            generation = 0
+            current_finalized: dict | None = None
+            merged_items: dict[str, dict] = {}
+        else:
+            generation = stored["generation"]
+            current_finalized = stored["finalized"]
+            merged_items = {
+                item["receipt"]["tx_id"]: item for item in stored["items"]
+            }
+
+        # Stage 4 (integrity): merge the batches in order. The boundary
+        # may never regress across the stored boundary and the batch
+        # sequence and at the same height must name exactly one block
+        # hash; identical content for a known id is idempotent, any
+        # other content for the same id — stored or cross-batch — is a
+        # conflict.
+        added = 0
+        for finalized, items in verified:
+            if current_finalized is not None:
+                if finalized["height"] < current_finalized["height"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                if (
+                    finalized["height"] == current_finalized["height"]
+                    and finalized["block_hash"]
+                    != current_finalized["block_hash"]
+                ):
+                    return _failed_advance(ERR_INTEGRITY)
+            for tx_id in sorted(items):
+                incoming_item = items[tx_id]
+                stored_item = merged_items.get(tx_id)
+                if stored_item is not None:
+                    if stored_item != incoming_item:
+                        return _failed_advance(ERR_INTEGRITY)
+                    continue
+                merged_items[tx_id] = incoming_item
+                added += 1
+            current_finalized = finalized
+
+        incoming_finalized = verified[-1][0]
+        boundary_unchanged = (
+            stored is not None
+            and stored["finalized"] == incoming_finalized
+        )
+        if added == 0 and boundary_unchanged:
+            # Idempotent: nothing merged and the boundary holds, so the
+            # file bytes stay exactly as they were and the generation
+            # holds.
+            return {
+                "ok": True,
+                "generation": generation,
+                "finalized": {
+                    key: incoming_finalized[key]
+                    for key in HEADER_ANCHOR_KEYS
+                },
+                "added": 0,
+                "batches": len(documents),
+            }
+
+        next_generation = generation + 1
+        ordered_items = [merged_items[tx_id] for tx_id in sorted(merged_items)]
+        index = {
+            "v": RECEIPT_INDEX_VERSION,
+            "generation": next_generation,
+            "finalized": incoming_finalized,
+            "items": ordered_items,
+        }
+        index["hash"] = _receipt_index_hash(
+            next_generation, incoming_finalized, ordered_items
+        )
+
+        # Stage 5 (io): atomic replace; a failed write restores the
+        # original bytes best-effort.
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        try:
+            _atomic_write_receipt_index(path, index)
+        except OSError:
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_IO)
+        except (TypeError, ValueError):
+            # Defensive: a verified value JSON cannot serialize; do not
+            # leave a partial file behind.
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "finalized": {
+                key: incoming_finalized[key] for key in HEADER_ANCHOR_KEYS
+            },
+            "added": added,
+            "batches": len(documents),
         }
 
 
