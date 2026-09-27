@@ -6,7 +6,8 @@ sync-history, sync-export, sync-range-export, chain-range,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
-subcommands, plus the offline checkpoint-history history-trust,
+subcommands, plus the receipt-proofs-audit batch audit subcommand and the
+offline checkpoint-history history-trust,
 history-export and header-locators subcommands.
 
 The CLI talks to a running ledger server over HTTP and prints each response as
@@ -38,11 +39,13 @@ DEFAULT_BASE_URL = os.environ.get("LEDGER_BASE_URL", "http://127.0.0.1:8080")
 # -- HTTP helpers ------------------------------------------------------------
 
 
-def _request(method: str, url: str, payload: dict | None) -> tuple[int, dict]:
+def _request(
+    method: str, url: str, payload: dict | None, sort_keys: bool = True
+) -> tuple[int, dict]:
     data = None
     headers = {"Accept": "application/json"}
     if payload is not None:
-        data = json.dumps(payload, sort_keys=True).encode("utf-8")
+        data = json.dumps(payload, sort_keys=sort_keys).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -801,6 +804,46 @@ def cmd_header_locators(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_receipt_proofs_audit(args: argparse.Namespace) -> int:
+    """Audit a batch of offline receipt-proof documents via the server.
+
+    ``FILE`` (or ``-`` for standard input) supplies the JSON array of
+    ``receipt_proof`` success documents; ``--expected-root`` pins the
+    64-lowercase-hex Merkle root every document must recompute to. An
+    unreadable file, non-JSON input or an illegal ``--expected-root``
+    prints ``{"ok": false, "error": "input"}`` and exits 1 without
+    contacting the server. Otherwise the batch is POSTed to
+    ``/v1/transactions/receipt-proofs/audit`` and the response is printed
+    as one JSON line in its contract key order; exit 0 only when the
+    response is 2xx with ``ok`` true, 1 otherwise.
+    """
+    try:
+        if args.documents_file == "-":
+            documents = json.loads(sys.stdin.read())
+        else:
+            with open(args.documents_file, "r", encoding="utf-8") as fh:
+                documents = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON input is an input error.
+        print(json.dumps({"ok": False, "error": "input"}, ensure_ascii=False))
+        return 1
+    if not crypto.is_hex64(args.expected_root):
+        print(json.dumps({"ok": False, "error": "input"}, ensure_ascii=False))
+        return 1
+    payload = {"documents": documents, "expected_root": args.expected_root}
+    # Insertion order (documents, expected_root) is the contract key order
+    # and each document must reach the server with its own key order intact,
+    # so the payload is serialized as-is rather than key-sorted.
+    status, body = _request(
+        "POST",
+        f"{args.base_url}/v1/transactions/receipt-proofs/audit",
+        payload,
+        sort_keys=False,
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if 200 <= status < 300 and body.get("ok") is True else 1
+
+
 def cmd_audit_signer_rotate(args: argparse.Namespace) -> int:
     status, body = _request(
         "POST",
@@ -1370,6 +1413,24 @@ def build_parser() -> argparse.ArgumentParser:
         "when given, checkpoint_auth signatures are additionally verified",
     )
     p_audit_verify.set_defaults(func=cmd_audit_verify)
+
+    p_receipt_proofs_audit = sub.add_parser(
+        "receipt-proofs-audit",
+        help="audit a batch of offline receipt-proof documents against a "
+        "pinned Merkle root via the server",
+    )
+    p_receipt_proofs_audit.add_argument(
+        "documents_file",
+        metavar="FILE|-",
+        help="JSON array of receipt_proof documents, or - to read it from "
+        "standard input",
+    )
+    p_receipt_proofs_audit.add_argument(
+        "--expected-root",
+        required=True,
+        help="expected Merkle root (64 lowercase hex characters)",
+    )
+    p_receipt_proofs_audit.set_defaults(func=cmd_receipt_proofs_audit)
 
     p_consistency = sub.add_parser(
         "consistency",

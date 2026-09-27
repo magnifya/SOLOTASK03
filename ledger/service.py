@@ -516,6 +516,39 @@ class LedgerService:
                 },
             }
 
+    def audit_receipt_proofs(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/transactions/receipt-proofs/audit — audit a batch of
+        offline receipt-proof documents against a caller-pinned root.
+
+        The body must be a JSON object containing exactly the keys
+        ``documents`` and ``expected_root`` in that order: ``documents`` a
+        non-empty array whose items are each audited under the single-item
+        ``receipt_proof`` contract and ``expected_root`` a 64-lowercase-hex
+        Merkle root. Any defect — a missing/extra/out-of-order key, an
+        empty array or a malformed root — is 400 with the
+        ``{"ok": false, "error": "input"}`` body and never touches state.
+
+        A legal batch is answered 200 with the unchanged core
+        :func:`ledger.light_client.receipt_proofs_audit` summary (key order
+        ``ok, root, total, succeeded, errors, entries, digest``). The audit
+        is purely offline: nothing is read or written, so concurrent
+        requests and restarts cannot change the outcome.
+        """
+        from . import light_client
+
+        if not isinstance(payload, dict) or tuple(payload) != (
+            "documents",
+            "expected_root",
+        ):
+            return 400, {"ok": False, "error": "input"}
+        documents = payload["documents"]
+        expected_root = payload["expected_root"]
+        if not isinstance(documents, list) or not documents:
+            return 400, {"ok": False, "error": "input"}
+        if not crypto.is_hex64(expected_root):
+            return 400, {"ok": False, "error": "input"}
+        return 200, light_client.receipt_proofs_audit(documents, expected_root)
+
     # -- blocks -------------------------------------------------------------
 
     def mine_block(self) -> tuple[int, dict]:
