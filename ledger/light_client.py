@@ -341,6 +341,45 @@ io``), nothing is raised and a failed batch never changes the file bytes.
 :func:`finalize_headers`, :func:`apply_finality`, the HTTP endpoint and
 ``python -m ledger.cli`` are unchanged.
 
+:func:`advance_state_anchor` persists an attested account-state proof as a
+state anchor beside a v3 header checkpoint.
+``advance_state_anchor(path, document, account, trust)`` takes no default
+arguments and never raises: ``path`` names the header checkpoint written by
+:func:`advance_headers`/`:func:`reorg_headers`/`:func:`finalize_headers`,
+and ``document``/``account``/``trust`` are exactly the
+:func:`verify_state_proof` arguments (the ``state, proof, auth`` response,
+the caller-pinned 64-lowercase-hex account and a trust document carrying
+``audit_signers``). Under the per-path lock shared with every other
+same-path operation, the header checkpoint and the ``path + ".state"``
+sidecar are both loaded first (a missing header is ``io``; a parse,
+key-order, digest, replay or ownership defect of either stored file is
+``state``); an existing sidecar is fully re-verified on load — its stored
+proof is re-run through :func:`verify_state_proof` and its old anchor must
+bind to that proof and name the current replayed branch's anchor or one of
+its confirmed headers. Only then is the incoming proof verified
+(``input``/``auth``/``integrity`` from :func:`verify_state_proof`); its
+``state`` ``height``/``block_hash`` must equal the header checkpoint's
+current ``finalized`` boundary (a mismatch is ``integrity``). The sidecar
+is version 1 with the exact key order
+``v, generation, account, anchor, document, trust, hash``: ``v`` is 1,
+``generation`` a positive non-boolean integer, ``anchor`` the closed
+``{height, block_hash, state_root}`` derived from the verified document,
+``document``/``trust`` saved verbatim and ``hash`` the 64-char lowercase
+SHA-256 of the self-excluding canonical (sorted, compact, unescaped
+non-ASCII) JSON bytes; it is serialized in declared key order as compact
+UTF-8 with one trailing LF and atomically replaced. Generations start at 1;
+the same account with the identical anchor is idempotent (no write,
+generation held); switching accounts is ``integrity``; a lower anchor
+height is a regression and the same height with another block hash/state
+root a conflict (both ``integrity``); a higher finalized boundary
+increments the generation by one. Success returns
+``{"ok": True, "generation", "anchor"}`` in that key order; failure
+returns only ``{"ok": False, "error": category}`` (``input`` arguments/
+structure/encoding, ``auth`` unknown key/bad signature, ``integrity``
+finalized binding/account switch/regression/same-height-other-value,
+``state`` damaged stored header or sidecar, ``io`` missing header or
+read/write error) and a failed call never changes either file.
+
 :func:`verify_finalized_receipt` verifies one offline-verifiable
 ``GET /v1/transactions/{tx_id}/finalized-receipt`` document. The document has
 the exact top-level key order ``receipt, proof, headers, finality``: the
@@ -5296,6 +5335,353 @@ def apply_finality(path: object, document: object, trust: object) -> dict:
             "ok": True,
             "generation": next_generation,
             "finalized": {key: target[key] for key in HEADER_ANCHOR_KEYS},
+        }
+
+
+# -- persisted account-state anchor (path + ".state" sidecar) -----------------
+
+# The state-anchor sidecar is a version-1 companion document to the v3
+# header checkpoint at ``path`` (stored at ``path + ".state"``). It pins
+# the one attested account-state proof last advanced for the checkpoint's
+# finalized boundary.
+STATE_ANCHOR_VERSION = 1
+STATE_ANCHOR_KEYS = (
+    "v",
+    "generation",
+    "account",
+    "anchor",
+    "document",
+    "trust",
+    "hash",
+)
+# The stored anchor binds the proof's confirmed block (height, block_hash)
+# to the state root it establishes, in that exact key order.
+STATE_ANCHOR_ANCHOR_KEYS = ("height", "block_hash", "state_root")
+
+# Fixed success key order returned by :func:`advance_state_anchor`.
+ADVANCE_STATE_ANCHOR_RESULT_KEYS = ("ok", "generation", "anchor")
+
+
+def _state_anchor_hash(
+    generation: int,
+    account: str,
+    anchor: dict,
+    document: object,
+    trust: object,
+) -> str:
+    """SHA-256 over the canonical JSON bytes of every sidecar field but ``hash``."""
+    body = {
+        "v": STATE_ANCHOR_VERSION,
+        "generation": generation,
+        "account": account,
+        "anchor": anchor,
+        "document": document,
+        "trust": trust,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def _validate_state_anchor_shape(data: object) -> dict:
+    """Strictly validate one version-1 state-anchor sidecar document.
+
+    Exact top-level key order ``v, generation, account, anchor, document,
+    trust, hash``: ``v`` must be 1, ``generation`` a positive plain
+    (non-boolean) integer, ``account`` a 64-lowercase-hex account, the
+    ``anchor`` the closed ``{height, block_hash, state_root}`` document
+    (non-negative plain integer height, 64-lowercase-hex hashes) and
+    ``hash`` a 64-lowercase-hex digest recomputed over the other fields.
+    The ``document``/``trust`` values are stored verbatim and re-verified
+    by the caller with :func:`verify_state_proof`. Any defect is existing
+    state corruption.
+    """
+    if not isinstance(data, dict) or tuple(data.keys()) != STATE_ANCHOR_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(data["v"]) or data["v"] != STATE_ANCHOR_VERSION:
+        raise _CheckpointError(ERR_STATE)
+    generation = data["generation"]
+    if not _is_int(generation) or generation < 1:
+        raise _CheckpointError(ERR_STATE)
+    account = data["account"]
+    if not crypto.is_hex64(account):
+        raise _CheckpointError(ERR_STATE)
+    raw_anchor = data["anchor"]
+    if (
+        not isinstance(raw_anchor, dict)
+        or tuple(raw_anchor.keys()) != STATE_ANCHOR_ANCHOR_KEYS
+    ):
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(raw_anchor["height"]) or raw_anchor["height"] < 0:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(raw_anchor["block_hash"]):
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(raw_anchor["state_root"]):
+        raise _CheckpointError(ERR_STATE)
+    anchor = {key: raw_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS}
+    document = data["document"]
+    trust = data["trust"]
+    digest = data["hash"]
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+    if _state_anchor_hash(generation, account, anchor, document, trust) != digest:
+        raise _CheckpointError(ERR_STATE)
+    return {
+        "v": STATE_ANCHOR_VERSION,
+        "generation": generation,
+        "account": account,
+        "anchor": anchor,
+        "document": document,
+        "trust": trust,
+        "hash": digest,
+    }
+
+
+def _load_state_anchor(
+    path: str, branch: dict, header_anchor: dict
+) -> dict | None:
+    """Strictly load and re-verify the ``path + ".state"`` sidecar.
+
+    Returns None when the sidecar does not exist (first use). Otherwise it
+    validates the exact key order, JSON types and recorded digest, re-runs
+    :func:`verify_state_proof` over the stored ``document``/``trust``/
+    ``account``, binds the stored anchor to that re-verified document, and
+    proves the anchor's branch ownership against the freshly replayed
+    header ``branch``: it must name the checkpoint's own initial anchor or
+    a confirmed header on the current branch (an unknown height, a
+    dropped-fork hash or a pending header is corruption). A re-sealed file
+    whose digest matches tampered content still fails. A read error is
+    ``io``; bad UTF-8, JSON and every shape/digest/re-verification/ownership
+    defect is ``state``. The file is never truncated or rebuilt.
+    """
+    state_path = path + ".state"
+    try:
+        with open(state_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+
+    record = _validate_state_anchor_shape(data)
+
+    # Re-verify the stored attested state proof exactly as when it was
+    # written; any failure (input/auth/integrity) is existing-state damage.
+    result = verify_state_proof(
+        record["document"], record["account"], record["trust"]
+    )
+    if not result.get("ok"):
+        raise _CheckpointError(ERR_STATE)
+    state_section = record["document"]["state"]
+    anchor = record["anchor"]
+    # The stored anchor must bind field-for-field to its own re-verified
+    # document's state section.
+    if (
+        anchor["height"] != state_section["height"]
+        or anchor["block_hash"] != state_section["block_hash"]
+        or anchor["state_root"] != state_section["state_root"]
+    ):
+        raise _CheckpointError(ERR_STATE)
+
+    # Old-anchor branch ownership: name the checkpoint's initial anchor or
+    # a confirmed header of the current replayed branch.
+    entry = branch.get(anchor["height"])
+    if entry is None or entry[0] != anchor["block_hash"]:
+        raise _CheckpointError(ERR_STATE)
+    is_header_anchor = (
+        anchor["height"] == header_anchor["height"]
+        and anchor["block_hash"] == header_anchor["block_hash"]
+    )
+    if not is_header_anchor and entry[1] != STATUS_CONFIRMED:
+        raise _CheckpointError(ERR_STATE)
+    return record
+
+
+def advance_state_anchor(
+    path: object,
+    document: object,
+    account: object,
+    trust: object,
+) -> dict:
+    """Advance the persisted account-state anchor of a header checkpoint.
+
+    ``advance_state_anchor(path, document, account, trust)`` takes no
+    default arguments and never raises. ``path`` names the v3 header
+    checkpoint maintained by :func:`advance_headers`/
+    :func:`reorg_headers`/:func:`finalize_headers` and must be a non-empty
+    string; ``document``, ``account`` and ``trust`` are exactly the
+    :func:`verify_state_proof` arguments — the decoded
+    ``GET /v1/accounts/{account}/attested-proof`` response (key order
+    ``state, proof, auth``), the caller-pinned 64-lowercase-hex account and
+    the trust document carrying ``audit_signers``.
+
+    Under the per-path lock shared with every other same-path header
+    operation, the header checkpoint and the ``path + ".state"`` sidecar are
+    both loaded first (a missing header is ``io``; a parse, key-order,
+    digest, replay or ownership defect of either stored file is ``state``).
+    The existing sidecar is fully re-verified on load: its stored proof is
+    re-run through :func:`verify_state_proof` and its old anchor must bind
+    to that proof and name the current replayed branch's anchor or one of
+    its confirmed headers. Only then is the incoming proof verified
+    (``input``/``auth``/``integrity`` from :func:`verify_state_proof`); its
+    ``state`` ``height``/``block_hash`` must equal the header checkpoint's
+    current ``finalized`` boundary (a mismatch is ``integrity``).
+
+    The sidecar is version 1 with the exact key order
+    ``v, generation, account, anchor, document, trust, hash``: ``v`` is 1;
+    ``generation`` a positive non-boolean integer; ``anchor`` the closed
+    ``{height, block_hash, state_root}`` derived from the verified
+    document; ``document``/``trust`` are saved verbatim; and ``hash`` the
+    64-char lowercase-hex SHA-256 of the canonical (sorted, compact,
+    unescaped-non-ASCII) JSON bytes of the object without its own ``hash``.
+    It is serialized in declared key order as compact UTF-8 JSON
+    (non-ASCII unescaped) with one trailing LF and atomically replaced.
+
+    The first advance writes generation 1. With an existing sidecar the
+    account is fixed — switching accounts is ``integrity``; the same
+    account with the identical anchor is idempotent (no write, generation
+    held); a lower anchor height is a regression and the same height with a
+    different ``block_hash``/``state_root`` a conflict (both
+    ``integrity``); a higher finalized boundary increments the generation
+    by one. Success returns ``{"ok": True, "generation", "anchor"}`` in
+    that key order. Failure returns only
+    ``{"ok": False, "error": category}`` with category one of ``input``
+    (arguments/structure/encoding), ``auth`` (unknown key version or a bad
+    signature), ``integrity`` (finalized binding, account switch,
+    regression or same-height/other-value), ``state`` (a damaged stored
+    header checkpoint or sidecar) and ``io`` (a missing header file or a
+    read/write error; a failed write restores the original bytes
+    best-effort). A failed call never changes either file.
+    """
+    # Argument shape is validated before any lock or file work.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    if not crypto.is_hex64(account):
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Load the v3 header checkpoint and its replayed branch/finalized
+        # boundary under the same per-path lock as the header operations.
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: structurally unforeseeable inputs must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_STATE)
+        if loaded is None:
+            # A state anchor can only be advanced on an existing header
+            # checkpoint.
+            return _failed_advance(ERR_IO)
+        checkpoint, _step_tips, branch = loaded
+        finalized = checkpoint["finalized"]
+
+        # Load and fully re-verify an existing sidecar (None on first use)
+        # before the incoming proof is judged: stored damage is state
+        # regardless of the credential it arrives with.
+        try:
+            stored = _load_state_anchor(path, branch, checkpoint["anchor"])
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_STATE)
+
+        # Verify the incoming attested state proof (input/auth/integrity).
+        try:
+            result = verify_state_proof(document, account, trust)
+        except Exception:
+            # Defensive: the verifier never raises, but an unforeseeable
+            # input must report rather than crash the caller.
+            return _failed_advance(ERR_INPUT)
+        if not result.get("ok"):
+            return {"ok": False, "error": result["error"]}
+
+        state_section = document["state"]
+        new_anchor = {
+            "height": state_section["height"],
+            "block_hash": state_section["block_hash"],
+            "state_root": state_section["state_root"],
+        }
+
+        # The new proof must pin the checkpoint's current finalized
+        # boundary; a state proof at any other point is not anchored.
+        if (
+            new_anchor["height"] != finalized["height"]
+            or new_anchor["block_hash"] != finalized["block_hash"]
+        ):
+            return _failed_advance(ERR_INTEGRITY)
+
+        if stored is not None:
+            # One sidecar pins one account; a later account cannot take it
+            # over.
+            if stored["account"] != account:
+                return _failed_advance(ERR_INTEGRITY)
+            old_anchor = stored["anchor"]
+            if new_anchor == old_anchor:
+                # Same account and same anchor: idempotent. The proof was
+                # just re-verified, so the sidecar bytes stay exactly as
+                # they were and the generation holds.
+                return {
+                    "ok": True,
+                    "generation": stored["generation"],
+                    "anchor": {
+                        key: new_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS
+                    },
+                }
+            # The anchor may only advance with the finalized boundary: a
+            # lower height is a regression, the same height with another
+            # block hash or state root a conflict.
+            if new_anchor["height"] < old_anchor["height"]:
+                return _failed_advance(ERR_INTEGRITY)
+            if new_anchor["height"] == old_anchor["height"]:
+                return _failed_advance(ERR_INTEGRITY)
+            next_generation = stored["generation"] + 1
+        else:
+            # First advance: generations start at 1.
+            next_generation = 1
+
+        sidecar = {
+            "v": STATE_ANCHOR_VERSION,
+            "generation": next_generation,
+            "account": account,
+            "anchor": new_anchor,
+            "document": document,
+            "trust": trust,
+        }
+        sidecar["hash"] = _state_anchor_hash(
+            next_generation, account, new_anchor, document, trust
+        )
+
+        state_path = path + ".state"
+        ordered = {key: sidecar[key] for key in STATE_ANCHOR_KEYS}
+        try:
+            original = _read_bytes_or_none(state_path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        try:
+            _atomic_write_bytes(state_path, _serialize_document(ordered))
+        except OSError:
+            # Compensate: put the original bytes back best-effort.
+            _restore_bytes(state_path, original)
+            return _failed_advance(ERR_IO)
+        except (TypeError, ValueError):
+            # A verified value JSON cannot serialize is a caller defect;
+            # do not leave a partial file behind.
+            _restore_bytes(state_path, original)
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "anchor": {
+                key: new_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS
+            },
         }
 
 
