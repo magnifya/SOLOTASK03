@@ -932,11 +932,18 @@ def cmd_receipt_proofs_audit(args: argparse.Namespace) -> int:
     64-lowercase-hex Merkle root every document must recompute to. The
     batch is POSTed to ``/v1/transactions/receipt-proofs/audit`` and the
     response is printed as one JSON line in the contract key order
-    (``ok, root, total, succeeded, errors, entries, digest``). A read,
-    JSON or argument failure prints ``{"ok": false, "error": "input"}``
-    and exits 1 without contacting the server; otherwise the exit code
-    is 0 only when the response is 2xx with ``ok`` true.
+    (``ok, root, total, succeeded, errors, entries, digest``). A missing
+    required argument, read, JSON or argument failure prints
+    ``{"ok": false, "error": "input"}`` and exits 1 without contacting the
+    server; otherwise the exit code is 0 only when the response is 2xx
+    with ``ok`` true.
     """
+    if not args.documents_file or not args.expected_root:
+        # A missing FILE or --expected-root is an input error; answer before
+        # reading any file or contacting the server.
+        body = {"ok": False, "error": "input"}
+        print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+        return 1
     try:
         if args.documents_file == "-":
             documents = json.loads(sys.stdin.read())
@@ -1348,12 +1355,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_receipt_proofs_audit.add_argument(
         "documents_file",
         metavar="FILE|-",
+        nargs="?",
         help="JSON array of receipt_proof documents, or - to read it from "
         "standard input",
     )
     p_receipt_proofs_audit.add_argument(
         "--expected-root",
-        required=True,
         help="expected receipt-index Merkle root (64 lowercase hex characters)",
     )
     p_receipt_proofs_audit.set_defaults(func=cmd_receipt_proofs_audit)

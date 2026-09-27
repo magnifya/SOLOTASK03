@@ -892,6 +892,98 @@ class LedgerService:
                 "siblings": siblings,
             }
 
+    def get_attested_account_proof(
+        self, account: str, params: dict | None = None
+    ) -> tuple[int, dict]:
+        """GET /v1/accounts/{account}/attested-proof — a signed state proof.
+
+        The query-parameter rules are identical to
+        :meth:`get_account_proof`: ``height`` is the only accepted (optional,
+        single) parameter and must be a strict non-negative decimal; a
+        malformed, repeated or unknown parameter is 400. An unknown,
+        non-canonical or pending anchor, a pending default tip and an account
+        absent from the (historical) confirmed set are all 404.
+
+        On success the chain, the state tree and the current audit signer are
+        snapshotted together under one store lock and the body has the fixed
+        key order ``state, proof, auth``: ``state`` reuses the state-root
+        document (``state_root, height, block_hash, account_count``),
+        ``proof`` reuses the account-state proof document
+        (``account, balance, confirmed_transactions, index, state_root,
+        height, block_hash, siblings``) and ``auth`` is
+        ``{key_version, signature}`` — an Ed25519 signature made with the
+        current audit signer over
+        ``SHA256(UTF8("ledger-state-proof-v1") || canonical_json({state,
+        proof}))``.
+        """
+        height_raw: object = None
+        if params is not None:
+            if any(key != "height" for key in params):
+                return 400, {"error": "unknown query parameter"}
+            height_raw = params.get("height")
+        anchor_height: int | None = None
+        if height_raw is not None:
+            anchor_height = _parse_decimal(height_raw)
+            if anchor_height is None:
+                return 400, {"error": "height must be a non-negative decimal"}
+        from . import light_client
+
+        with self.store.lock:
+            if anchor_height is None:
+                anchor = self.store.tip()
+            else:
+                anchor = self.store.block_at(anchor_height)
+                if anchor is None:
+                    return 404, {"error": "anchor block not found"}
+            if anchor.status != STATUS_CONFIRMED:
+                return 404, {"error": "chain tip is pending confirmation"}
+            prefix = (
+                self.store.chain
+                if anchor_height is None
+                else self.store.chain[: anchor.height + 1]
+            )
+            rows, leaves, root = self._state_tree(prefix)
+            index = next(
+                (i for i, (name, _b, _t) in enumerate(rows) if name == account),
+                None,
+            )
+            if index is None:
+                return 404, {"error": "account not found"}
+            account_name, balance, transactions = rows[index]
+            siblings = crypto.merkle_proof(leaves, index)
+            state = {
+                "state_root": root,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "account_count": len(rows),
+            }
+            proof = {
+                "account": account_name,
+                "balance": balance,
+                "confirmed_transactions": transactions,
+                "index": index,
+                "state_root": root,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "siblings": siblings,
+            }
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError("no audit signer available for state proof")
+            auth = light_client.sign_state_proof(
+                signer["private_key"], signer["version"], state, proof
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "state": state,
+                "proof": proof,
+                "auth": auth,
+            }
+
     def confirmed_balance(self, account: str) -> int:
         """Balance from confirmed blocks only."""
         entry = self.store.accounts.get(account)

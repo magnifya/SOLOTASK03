@@ -706,9 +706,38 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `ledger.store.StateRecoveryError(path, reason)`，绝不静默改写或新建链。
   同代孪生快照若 `state_root` 不同也属于冲突。该特性之前的旧快照（无
   state_root 字段）仍可加载。
+- **签名状态证明**：`GET /v1/accounts/{account}/attested-proof` 在普通
+  账户证明之外给出一份带审计签名的状态证明。`height` 为**可选单值**查询
+  参数，格式与锚点规则完全同 state-proof：`height` 是唯一允许的参数，
+  非法、重复或未知参数返回 `400`；锚点未知/非 canonical/pending、最高块
+  pending 或账户在该（历史）已确认状态不存在均返回 `404`。成功 `200`
+  顶层键序固定为 `state, proof, auth`：`state` 复用 state-root 的字段与
+  键序（`state_root, height, block_hash, account_count`），`proof` 复用
+  state-proof 的字段与键序（`account, balance, confirmed_transactions,
+  index, state_root, height, block_hash, siblings`），`auth` 键序为
+  `key_version, signature`。链、状态树与当前审计签名者在**同一把锁**内取
+  快照；签名为对
+  `SHA256(UTF8("ledger-state-proof-v1") ‖ canonical_json(去掉 auth 的文档))`
+  做出的 Ed25519 签名（`canonical_json` 即 `json.dumps(..., sort_keys=True,
+  separators=(",",":"), ensure_ascii=False)` 的 UTF-8 字节；签名 128 位小写
+  十六进制），轮换后旧证明仍可按其 `key_version` 的历史公钥验证。
+- **签名状态证明离线校验**：`ledger.light_client.verify_state_proof(document,
+  account, trust) -> dict`（纯库 API，不读本地状态、**不抛异常**）。
+  `document` 即上述 200 响应，`account` 为调用方钉住的 64 位小写 hex
+  账户，`trust` 须携带 `audit_signers`。依次核对：顶层与嵌套**键序/类型**
+  严格一致、64/128 位小写 hex、`trust.audit_signers`（畸形为 `input`）；
+  按 `key_version` 取审计公钥并按 `ledger-state-proof-v1` 域验 Ed25519
+  签名（未知版本或坏签名为 `auth`）；proof 必须命名钉住账户，其
+  `state_root`/`height`/`block_hash` 必须与 state 文档一致，`index` 必须
+  落在 `account_count` 范围内，并从账户三元组重算叶子、沿 siblings 重算
+  状态根（任一绑定或证明错误为 `integrity`）。成功键序固定为
+  `ok, account, height, block_hash, state_root`；失败仅返回
+  `{"ok": false, "error"}`，`error` 仅取 `input`/`auth`/`integrity`。
 - **CLI**：`state-root [--height H]` 与 `state-proof <account> [--height H]`
   两个子命令，`--height` 缺省时行为与输出完全不变；提供时逐字转发对应历史
-  高度接口的单行 JSON 响应（含非 2xx 错误体）。
+  高度接口的单行 JSON 响应（含非 2xx 错误体）。`receipt-proofs-audit`
+  缺少必填参数（FILE 或 `--expected-root`）时输出
+  `{"ok":false,"error":"input"}`、退出码 1 且不请求服务。
 
 ## 交易索引
 
@@ -1615,6 +1644,16 @@ curl -s localhost:8080/v1/accounts/<pubkey-hex>/proof
 #     "state_root":"...","height":N,"block_hash":"...","siblings":[{direction,hash}...]}
 # 历史锚点（非法/重复 height -> 400；锚点不可用或账户当时不存在 -> 404）
 curl -s "localhost:8080/v1/accounts/<pubkey-hex>/proof?height=H"
+# 签名状态证明（height 可选单值、规则同 state-proof；非法 400；缺失/pending 404；
+# 200 键序 state,proof,auth，auth.signature =
+# Ed25519(SHA256(UTF8("ledger-state-proof-v1") || canonical_json(去auth)))，
+# 离线用 verify_state_proof(document, account, trust) 校验）
+curl -s "localhost:8080/v1/accounts/<pubkey-hex>/attested-proof"
+curl -s "localhost:8080/v1/accounts/<pubkey-hex>/attested-proof?height=H"
+# -> 200 {"state":{"state_root":"...","height":N,"block_hash":"...","account_count":K},
+#         "proof":{"account":"...","balance":...,"confirmed_transactions":[...],"index":I,
+#                  "state_root":"...","height":N,"block_hash":"...","siblings":[...]},
+#         "auth":{"key_version":1,"signature":"..."}}
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
 # 批量 Merkle 证明（tx_ids 须非空、互异、各为 64 位小写 hex；畸形请求体 -> 400；
@@ -1908,6 +1947,7 @@ python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）�
 python tests/merkle_proof_bundle_test.py  # 批量 Merkle 证明（verify_merkle_proof_bundle 键序/类型/唯一性/index 映射/路径/根/区块哈希、严格 400、404/409、POST /v1/blocks/{height}/proofs、CLI proofs）
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
+python tests/attested_state_proof_test.py  # 签名状态证明 GET /v1/accounts/{account}/attested-proof（height 可选单值规则同 state-proof；非法/重复/未知参数 400；未知/pending 锚点与缺失账户 404；200 固定键序 state,proof,auth，state/proof 复用 state-root/state-proof 字段键序，auth 键序 key_version,signature；ledger-state-proof-v1 域 SHA256+Ed25519、链状态签名者同锁；verify_state_proof input/auth/integrity 分类、账户/锚点/index 范围/Merkle 路径、轮换历史验签、不抛异常）与 HTTP 线序
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
