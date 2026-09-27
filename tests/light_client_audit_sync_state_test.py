@@ -229,6 +229,32 @@ class AuditSyncStateCorruptTests(SyncStateFixture):
         self.assertEqual(result["state"]["status"], "valid")
         self.assertEqual(result["transaction"]["status"], "absent")
 
+    def test_non_utf8_header_is_invalid_not_io(self) -> None:
+        # Bad UTF-8 decodes during the text-mode read; it must classify as an
+        # invalid stored target (corrupt), never as an io read failure.
+        self.assertTrue(
+            advance_sync_state(self.path, self.first_bundle())["ok"]
+        )
+        with open(self.path, "wb") as fh:
+            fh.write(b"\xff\xfe not utf-8")
+        result = audit_sync_state(self.path)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "corrupt")
+        self.assertEqual(result["header"]["status"], "invalid")
+        self.assertIsNone(result["header"]["generation"])
+        self.assertEqual(result["state"]["status"], "valid")
+
+    def test_non_utf8_journal_is_invalid_not_io(self) -> None:
+        self.assertTrue(
+            advance_sync_state(self.path, self.first_bundle())["ok"]
+        )
+        with open(self.txn_path(), "wb") as fh:
+            fh.write(b"\xff\xfe not utf-8")
+        result = audit_sync_state(self.path)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "corrupt")
+        self.assertEqual(result["transaction"]["status"], "invalid")
+
     def test_corrupt_sidecar_is_corrupt(self) -> None:
         self.assertTrue(
             advance_sync_state(self.path, self.first_bundle())["ok"]
@@ -240,6 +266,18 @@ class AuditSyncStateCorruptTests(SyncStateFixture):
         self.assertEqual(result["state"]["status"], "invalid")
         self.assertIsNone(result["state"]["generation"])
         self.assertIsNone(result["state"]["anchor"])
+        self.assertEqual(result["header"]["status"], "valid")
+
+    def test_non_utf8_sidecar_is_invalid_not_io(self) -> None:
+        self.assertTrue(
+            advance_sync_state(self.path, self.first_bundle())["ok"]
+        )
+        with open(self.state_path(), "wb") as fh:
+            fh.write(b"\xff\xfe not utf-8")
+        result = audit_sync_state(self.path)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "corrupt")
+        self.assertEqual(result["state"]["status"], "invalid")
         self.assertEqual(result["header"]["status"], "valid")
 
     def test_corrupt_journal_is_corrupt(self) -> None:

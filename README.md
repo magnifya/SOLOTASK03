@@ -1429,6 +1429,51 @@ JSON**，成功/失败退出 0/1：
   `reason`，绝不静默启动。尚无任何 `history_access` 事件的文件对
   （例如离线 CLI 预先创建）只做重验、不做绑定。
 
+## 只读同步状态审计（HTTP 与 CLI）
+
+`ledger.light_client.audit_sync_state(path)` 对一个轻客户端同步对做**只读**
+审计：版本 3 的头检查点 `path`、版本 1 的状态侧车 `path + ".state"` 与成对
+提交事务日志 `path + ".txn"`。三者在与 `advance_sync_state` 共用的按路径
+锁下读取，**绝不恢复、清理或改写**任何文件（遗留日志不会被前滚、不会被
+删除），因此并发查询与重启的结果完全确定。成功返回固定键序
+`ok,status,header,state,transaction`：
+
+- `header` 键序 `status,generation,tip,finalized`，`state` 键序
+  `status,generation,account,anchor`：目标状态为 `missing`（文件不存在）、
+  `valid` 或 `invalid`（非 UTF-8、JSON 不可解析、违反既有键序/版本/记录
+  摘要/步骤或证明重放契约）；仅 `valid` 时其余字段有值（`tip` 键序
+  `tip_hash,height,length,status`，`finalized` 键序 `height,block_hash`，
+  `anchor` 键序 `height,block_hash,state_root`），否则全为 `null`。
+- `transaction` 键序 `status,header_generation,state_generation`：日志状态
+  为 `absent`、`valid` 或 `invalid`（外封皮、嵌入文档或重放契约任一失配），
+  仅 `valid` 时两代号有值。
+- 顶层 `status` 按固定判定顺序为 `empty`（三者皆无）、`consistent`（无日志、
+  两个目标均 valid 且状态锚绑定头的 finalized 边界）、`recoverable`（日志
+  valid，等待前滚）、`split`（无日志且恰有一个目标缺失，或两个 valid 目标
+  在 finalized 绑定上不一致）、`corrupt`（日志 invalid，或无日志时某存储
+  目标 invalid）。
+- 失败仅返回按序 `{"ok":false,"error":"input"|"io"}`：`path` 不是非空串为
+  `input`；仅打开、读取或路径锁故障为 `io`。任何情况下不抛异常。
+
+节点可用可选的 `--sync-state PATH` 把该审计通过 HTTP 托管：
+
+- 该选项**可缺省**：不给时启动行为与以前完全一致，路由返回 404；给出但
+  **空值**是配置错误，进程向 stderr 报错并以退出码 **2** 结束，不加载任何
+  状态。
+- `GET /v1/light-client/sync-state` **不接受任何查询参数**（裸的尾随 `?`
+  等价于无参数）：携带任何参数一律 **400**，返回按序
+  `{"ok":false,"error":"input"}`。
+- 未配置 `--sync-state` 时一律 **404**，返回按序
+  `{"ok":false,"error":"not_found"}`。
+- 已配置时**透传**库函数结果且保持键序：`ok=true` 返回 **200**（含
+  `status=corrupt` 等只读发现——查询本身成功）；`io` 失败体返回 **500**
+  `{"ok":false,"error":"io"}`。
+
+CLI 新增 `sync-state-audit` 子命令（**无位置参数**，审计路径由服务端的
+`--sync-state` 固定）：`python -m ledger.cli sync-state-audit` 以 GET 调用
+该路由，**原序打印单行 JSON**；200 且 `ok=true` 退出 **0**，其余（400/404/
+500/不可达）退出 **1**。`advance_sync_state` 及其余 HTTP、CLI 行为不变。
+
 ## 审计导出的离线校验
 
 不连接服务端也能核验只增审计流是否被篡改或截断：用
@@ -1596,6 +1641,11 @@ python -m ledger --host 0.0.0.0 --port 8080 --state ledger_state.json
 令牌保护的 `/v1/history/trust` 与 `/v1/history/export` 托管接口（三者须
 全给且非空或全缺，部分给出退出码 2，详见「节点托管的检查点历史 HTTP
 接口」）。
+
+可选 `--sync-state PATH` 开启只读的
+`GET /v1/light-client/sync-state` 同步状态审计（透传
+`audit_sync_state`，详见「只读同步状态审计（HTTP 与 CLI）」）；缺省不
+改变启动，给出空值退出码 2。
 
 环境变量 `LEDGER_HOST` / `LEDGER_PORT` / `LEDGER_STATE` / `LEDGER_INITIAL_BALANCE`
 可提供同样的默认值。
@@ -1823,6 +1873,17 @@ curl -s -X POST localhost:8080/v1/history/access \
   -d '{"action":"revoke","token":null,"permissions":null,"expected_version":2}'
 # 格式错 400/input；版本冲突 409/state；此后活动凭据可用其明文 token 按
 # read/update/export 分权访问上面三个历史路由（无效 401，缺权 403）。
+
+# 只读同步状态审计（服务须以 --sync-state PATH 启动；路由不接受查询参数，
+# 携带任何参数 400/input；未配置 404/not_found；已配置透传 audit_sync_state，
+# ok=true 200（含 status=corrupt），io 500；200 键序 ok,status,header,state,transaction）
+curl -s localhost:8080/v1/light-client/sync-state
+# -> 200 {"ok":true,"status":"consistent",
+#         "header":{"status":"valid","generation":1,"tip":{...S...},"finalized":{"height":3,"block_hash":"..."}},
+#         "state":{"status":"valid","generation":1,"account":"...","anchor":{"height":3,"block_hash":"...","state_root":"..."}},
+#         "transaction":{"status":"absent","header_generation":null,"state_generation":null}}
+curl -s 'localhost:8080/v1/light-client/sync-state?x=1'
+# -> 400 {"ok":false,"error":"input"}
 ```
 
 ## 命令行
@@ -1934,6 +1995,13 @@ cat docs.json | python -m ledger.cli receipt-proofs-audit - --expected-root <64h
 # -> 单行按契约键序 {"ok":...,"root":...,"total":N,"succeeded":M,
 #    "errors":{"input":I,"integrity":J},"entries":[...],"digest":"..."}；
 #    ok 为真退出 0，ok 为假或非 2xx 退出 1
+
+# 只读同步状态审计（无位置参数；GET 服务端 --sync-state 固定的路径；
+# 原序单行打印透传文档；200 且 ok=true 退出 0，400/404/500/不可达退出 1）
+python -m ledger.cli sync-state-audit
+# -> 单行 {"ok":true,"status":"empty|consistent|recoverable|split|corrupt",
+#    "header":{...},"state":{...},"transaction":{...}}；服务未配置时
+#    {"ok":false,"error":"not_found"} 退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。

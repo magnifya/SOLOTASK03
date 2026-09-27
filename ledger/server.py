@@ -446,6 +446,24 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.get_chain_finality()
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/light-client/sync-state":
+                # GET /v1/light-client/sync-state — the read-only synced
+                # header/state pair audit, enabled with --sync-state. The
+                # endpoint takes no parameters: any query parameter
+                # (including a blank one) is rejected 400 with the ordered
+                # {"ok", "error"} input body; a bare trailing "?" carries
+                # none and is accepted. A node started without --sync-state
+                # answers 404 (ordered {"ok", "error"} not_found); the
+                # pass-through audit document has a contract-fixed key order
+                # (ok, status, header, state, transaction), so it is
+                # serialized in insertion order rather than alphabetically.
+                if parse_qs(query, keep_blank_values=True):
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.get_light_client_sync_state()
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/chain/finalities":
                 # GET /v1/chain/finalities?after_height=&after_hash=&limit= —
                 # one signed page of finality credentials strictly after an

@@ -3,6 +3,7 @@ state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
+sync-state-audit,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
@@ -621,6 +622,24 @@ def cmd_audit(args: argparse.Namespace) -> int:
         url = f"{url}?{query}"
     status, body = _request("GET", url, None)
     return _emit(status, body)
+
+
+def cmd_sync_state_audit(args: argparse.Namespace) -> int:
+    """GET /v1/light-client/sync-state — the read-only synced-pair audit.
+
+    Takes no positional arguments: the audited path is the one the server
+    was started with via --sync-state. The response is printed verbatim as
+    one single-line JSON document preserving its contract key order
+    (``ok, status, header, state, transaction``; the ordered
+    ``{"ok", "error"}`` failure body otherwise). Exit code is 0 only for a
+    200 response with ``ok`` true; every other status (including an
+    unreachable server) exits 1.
+    """
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/light-client/sync-state", None
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if status == 200 and body.get("ok") is True else 1
 
 
 def cmd_audit_export(args: argparse.Namespace) -> int:
@@ -1423,6 +1442,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit", help="page size (decimal, 1-200, default 50)"
     )
     p_audit_export.set_defaults(func=cmd_audit_export)
+
+    p_sync_state_audit = sub.add_parser(
+        "sync-state-audit",
+        help="read-only audit of the server's synced header/state pair "
+        "(GET /v1/light-client/sync-state)",
+    )
+    # The audited path is pinned server-side by --sync-state; this command
+    # deliberately takes no positional arguments or query parameters.
+    p_sync_state_audit.set_defaults(func=cmd_sync_state_audit)
 
     p_audit_verify = sub.add_parser(
         "audit-verify",

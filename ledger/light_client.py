@@ -4564,12 +4564,17 @@ def _load_header_checkpoint_document(path: str) -> tuple[dict, list[dict], dict]
             text = fh.read()
     except FileNotFoundError:
         return None
+    except UnicodeDecodeError as exc:
+        # In text mode the bytes decode during read() rather than in
+        # json.loads below; bad UTF-8 is an encoding defect of stored state,
+        # exactly as in the state-sidecar and transaction-journal loaders.
+        raise _CheckpointError(ERR_STATE) from exc
     except OSError as exc:
         raise _CheckpointError(ERR_IO) from exc
 
     try:
         data = json.loads(text)
-    except (ValueError, UnicodeDecodeError) as exc:
+    except ValueError as exc:
         raise _CheckpointError(ERR_STATE) from exc
     checkpoint = _validate_header_checkpoint_shape(data)
     step_tips, branch = _replay_header_checkpoint(checkpoint)

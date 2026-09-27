@@ -103,8 +103,14 @@ class LedgerService:
         store: LedgerStore,
         initial_balance: int = DEFAULT_INITIAL_BALANCE,
         history_config: tuple[str, str, str] | None = None,
+        sync_state_path: str | None = None,
     ) -> None:
         self.store = store
+        # Optional read-only light-client sync-state audit. When set, the
+        # value is the header-checkpoint path whose header/.state/.txn trio
+        # GET /v1/light-client/sync-state audits purely read-only.
+        self.sync_state_path = sync_state_path
+        self.sync_state_enabled = sync_state_path is not None
         # Optional token-gated checkpoint-history endpoints. When set, the
         # triple is ``(checkpoint_path, signer_log_path, bearer_token)`` and
         # the store already knows the two paths for startup re-verification.
@@ -4738,3 +4744,33 @@ class LedgerService:
                     # ran inside _append_history_access_and_save.
                     return 500, {"ok": False, "error": "io"}
                 return 200, result
+
+    # -- read-only light-client sync-state audit ----------------------------
+
+    def get_light_client_sync_state(self) -> tuple[int, dict]:
+        """GET /v1/light-client/sync-state — read-only synced-pair audit.
+
+        Answers 404 with the ordered body ``{"ok": false, "error":
+        "not_found"}`` when the node was started without ``--sync-state``.
+        Otherwise the result of ``light_client.audit_sync_state`` for the
+        configured path is passed through verbatim: an ``ok`` document
+        (fixed key order ``ok, status, header, state, transaction``) is 200,
+        and the only reachable failure for a startup-validated non-empty
+        path is ``io``, answered 500 with the ordered
+        ``{"ok": false, "error": "io"}`` body. The audit never recovers,
+        cleans or rewrites the header/``.state``/``.txn`` files, so
+        concurrent queries and restarts return identical results.
+        """
+        if not self.sync_state_enabled:
+            return 404, {"ok": False, "error": "not_found"}
+        from . import light_client
+
+        result = light_client.audit_sync_state(self.sync_state_path)
+        if result.get("ok") is True:
+            return 200, result
+        if result.get("error") == "input":
+            # Defensive: startup rejects an empty --sync-state with exit 2,
+            # so a directly constructed service carrying one reports input
+            # rather than a server error.
+            return 400, {"ok": False, "error": "input"}
+        return 500, {"ok": False, "error": "io"}

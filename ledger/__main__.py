@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="bearer token required by /v1/history/* (requires --history "
         "and --history-trust)",
     )
+    parser.add_argument(
+        "--sync-state",
+        default=None,
+        help="header checkpoint path audited read-only at "
+        "GET /v1/light-client/sync-state (its .state and .txn sidecars are "
+        "inspected too); an empty value is a startup error",
+    )
     return parser
 
 
@@ -64,6 +71,16 @@ def main(argv: list[str] | None = None) -> int:
         history_config = (args.history, args.history_trust, args.history_token)
     else:
         history_config = None
+    # --sync-state is optional but, when given, must be a non-empty path: an
+    # empty value is a configuration error reported with exit code 2 before
+    # any state loads; omitting the option leaves startup unchanged.
+    if args.sync_state is not None and not args.sync_state:
+        print(
+            "ledger: --sync-state must be given a non-empty path (or be "
+            "omitted entirely)",
+            file=sys.stderr,
+        )
+        return 2
     try:
         store = LedgerStore(
             args.state,
@@ -79,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         store,
         initial_balance=args.initial_balance,
         history_config=history_config,
+        sync_state_path=args.sync_state,
     )
     print(f"ledger listening on http://{args.host}:{args.port} (state: {args.state})")
     try:
