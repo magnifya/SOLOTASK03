@@ -7442,6 +7442,15 @@ ADVANCE_RECEIPT_BATCHES_RESULT_KEYS = (
     "batches",
 )
 GET_RECEIPT_RESULT_KEYS = ("ok", "finalized", "item")
+RECEIPT_PROOF_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "finalized",
+    "root",
+    "item",
+    "index",
+    "siblings",
+)
 ERR_NOT_FOUND = "not_found"
 
 
@@ -8020,5 +8029,80 @@ def get_receipt(path: object, tx_id: object) -> dict:
                         key: stored["finalized"][key] for key in HEADER_ANCHOR_KEYS
                     },
                     "item": item,
+                }
+        return {"ok": False, "error": ERR_NOT_FOUND}
+
+
+def _receipt_index_leaves(items: list[dict]) -> list[str]:
+    """Leaf hashes of the receipt-index Merkle tree, in index order.
+
+    Each leaf is the SHA-256 (64 lowercase hex) of the canonical JSON of
+    the stored ``{receipt, proof}`` item; the index keeps items ascending
+    by ``tx_id``, which fixes the leaf order.
+    """
+    return [
+        hashlib.sha256(_canonical_json_bytes(item)).hexdigest()
+        for item in items
+    ]
+
+
+def receipt_proof(path: object, tx_id: object) -> dict:
+    """Merkle inclusion proof for one receipt in the durable index.
+
+    ``path`` is the receipt index maintained by :func:`advance_receipts`
+    and ``tx_id`` a caller-pinned 64-lowercase-hex transaction id. The
+    tree is computed over the index's items in their stored ascending
+    ``tx_id`` order: each leaf is ``SHA256(canonical_json(item))`` as 64
+    lowercase hex, each parent ``SHA256(ascii(left_hex + right_hex))``
+    and a lone odd node is paired with itself — the ledger's usual
+    pairing rules. The index file itself (v1) is not changed.
+
+    Success returns ``{"ok": True, "generation", "finalized", "root",
+    "item", "index", "siblings"}`` in that key order with ``generation``
+    and ``finalized`` taken from the index, ``root`` the recomputed
+    Merkle root, ``item`` the stored ``{receipt, proof}`` pair in its
+    fixed contract key order, ``index`` the item's 0-based leaf position
+    and ``siblings`` the path from leaf to root, each item
+    ``{"direction", "hash"}`` with ``direction`` the sibling's side
+    (``left``/``right``) and ``hash`` 64 lowercase hex. An existing index
+    that does not know the id returns ``{"ok": False, "error":
+    "not_found"}``; a bad path or ``tx_id`` shape is ``input``, an index
+    failing its strict load checks (encoding, JSON, v1 key order, item
+    ordering, digest or any item's stored semantics) is ``state`` and a
+    missing file or a read failure is ``io``. The read shares the path
+    lock with the writers, nothing is raised and the file is never
+    modified; identical file bytes yield identical results.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not crypto.is_hex64(tx_id):
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            stored = _load_receipt_index(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            # Defensive: an unreadable-by-surprise index must report
+            # rather than crash the caller.
+            return {"ok": False, "error": ERR_STATE}
+        if stored is None:
+            return {"ok": False, "error": ERR_IO}
+        items = stored["items"]
+        for position, item in enumerate(items):
+            if item["receipt"]["tx_id"] == tx_id:
+                leaves = _receipt_index_leaves(items)
+                return {
+                    "ok": True,
+                    "generation": stored["generation"],
+                    "finalized": {
+                        key: stored["finalized"][key] for key in HEADER_ANCHOR_KEYS
+                    },
+                    "root": crypto.merkle_root(leaves),
+                    "item": item,
+                    "index": position,
+                    "siblings": crypto.merkle_proof(leaves, position),
                 }
         return {"ok": False, "error": ERR_NOT_FOUND}
