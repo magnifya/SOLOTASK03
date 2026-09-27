@@ -9322,7 +9322,14 @@ def advance_sync_state(path: object, bundle: object) -> dict:
     A fully identical replay (same stored linear step, same final
     boundary, same account and same state anchor) writes nothing and
     holds both generations; any genuine content change increments each
-    affected file's generation exactly once. Success returns
+    affected file's generation exactly once. A replay of the committed
+    first bundle may still pin the checkpoint's own first-use anchor
+    rather than the stored tip — this is what makes concurrent identical
+    first commits idempotent: the loser of the lock race re-reads the
+    committed pair under the lock and reports the same success without
+    rewriting either file or bumping either generation. A first-use
+    anchor carried by anything but the committed request is a foreign
+    continuation anchor (``input``). Success returns
     ``{"ok": True, "header", "state"}`` in that key order with
     ``header = {"generation", "tip", "finalized", "applied"}`` (the
     :func:`advance_finalized_headers` result without ``ok``, ``applied``
@@ -9411,6 +9418,12 @@ def advance_sync_state(path: object, bundle: object) -> dict:
             # than crash the caller.
             return _failed_advance(ERR_STATE)
 
+        # A non-null anchor that names the checkpoint's own first-use
+        # anchor rather than the stored tip is only legal as an exact
+        # resubmission of the committed pair (a concurrent first commit
+        # replayed after losing the lock race); anything else pinned to
+        # it is a foreign continuation anchor.
+        resubmission_anchor = False
         if checkpoint is None:
             # First use opens the checkpoint exactly as
             # advance_finalized_headers does: the caller must pin a
@@ -9443,15 +9456,18 @@ def advance_sync_state(path: object, bundle: object) -> dict:
                 }
             else:
                 expected_anchor = _validate_header_anchor_argument(anchor)
-                if (
-                    expected_anchor is None
-                    or expected_anchor
-                    != {
-                        "height": stored_tip["height"],
-                        "block_hash": stored_tip["tip_hash"],
-                    }
-                ):
+                if expected_anchor is None:
                     return _failed_advance(ERR_INPUT)
+                if expected_anchor != {
+                    "height": stored_tip["height"],
+                    "block_hash": stored_tip["tip_hash"],
+                }:
+                    if expected_anchor != file_anchor:
+                        return _failed_advance(ERR_INPUT)
+                    # The caller still pins the first-use anchor: only
+                    # the already-committed request itself may carry it
+                    # (settled on the idempotency path below).
+                    resubmission_anchor = True
 
         step = {
             "kind": "linear",
@@ -9463,6 +9479,11 @@ def advance_sync_state(path: object, bundle: object) -> dict:
         # An exact resubmission of the stored last step was verified when
         # it was stored and re-verified by the load replay above.
         same_step = bool(steps) and step == steps[-1]
+        if resubmission_anchor and not same_step:
+            # A first-use anchor stops naming the committed request as
+            # soon as the checkpoint holds any other last step: the
+            # batch pinned to it is a foreign continuation anchor.
+            return _failed_advance(ERR_INPUT)
 
         # Stage 3a (auth): every finality envelope, in array order.
         try:
@@ -9608,6 +9629,11 @@ def advance_sync_state(path: object, bundle: object) -> dict:
                     },
                 },
             }
+        if resubmission_anchor:
+            # The first-use anchor only ever names the committed pair:
+            # any other request pinned to it is a foreign continuation
+            # anchor.
+            return _failed_advance(ERR_INPUT)
 
         next_header_generation = (
             header_generation if header_idempotent else header_generation + 1
