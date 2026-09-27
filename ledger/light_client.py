@@ -7451,6 +7451,14 @@ RECEIPT_PROOF_RESULT_KEYS = (
     "index",
     "siblings",
 )
+RECEIPT_PROOF_VERIFY_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "finalized",
+    "root",
+    "tx_id",
+    "index",
+)
 ERR_NOT_FOUND = "not_found"
 
 
@@ -8106,3 +8114,135 @@ def receipt_proof(path: object, tx_id: object) -> dict:
                     "siblings": crypto.merkle_proof(leaves, position),
                 }
         return {"ok": False, "error": ERR_NOT_FOUND}
+
+
+def verify_receipt_proof(document: object, expected_root: object) -> dict:
+    """Offline-verify one :func:`receipt_proof` success document.
+
+    ``document`` is the decoded ``{"ok": True, "generation", "finalized",
+    "root", "item", "index", "siblings"}`` document exactly as
+    :func:`receipt_proof` issues it (strictly that key order, no missing
+    or extra keys, ``ok`` true); ``expected_root`` is the caller-pinned
+    64-lowercase-hex Merkle root the receipt-index tree must recompute
+    to. Verification is purely offline: nothing is read or written, the
+    arguments are never mutated and nothing is raised.
+
+    Stage 1 (``input``) settles the exact key order and raw types:
+    ``generation`` a positive plain integer, ``finalized`` the closed
+    ``{height, block_hash}`` anchor, ``root``/``expected_root`` and every
+    hash 64 lowercase hex, ``item`` the exact ``{receipt, proof}``
+    contract shapes, ``index`` a non-negative plain integer and
+    ``siblings`` a ``{direction, hash}`` list within the depth limit.
+
+    Stage 2 (``integrity``) replays the item's own semantics (confirmed
+    receipt, recomputed ``tx_id``, Ed25519 signature, receipt/proof
+    binding and the proof's sibling path to its ``merkle_root``) and then
+    re-walks the receipt-index Merkle path: the leaf is
+    ``SHA256(canonical_json(item))``, each level pairs
+    ``SHA256(ascii(left_hex + right_hex))`` with the index bit fixing the
+    sibling side (even positions only accept a right sibling — which may
+    be the current digest itself for an odd-node self-pair — and odd
+    positions only a left one, never the phantom self-pair), and the
+    recomputed root must equal both the document's ``root`` and
+    ``expected_root``.
+
+    Success returns ``{"ok": True, "generation", "finalized", "root",
+    "tx_id", "index"}`` in that key order with ``tx_id`` the receipt's
+    transaction id; failure returns only ``{"ok": False, "error":
+    category}`` with category ``input`` (key, type or hex defects) or
+    ``integrity`` (item semantics, direction, path or root mismatches).
+    """
+    try:
+        # Stage 1 (input): exact key order and raw types of the document
+        # and the caller-pinned root.
+        if not isinstance(document, dict) or tuple(document.keys()) != tuple(
+            RECEIPT_PROOF_RESULT_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        if document["ok"] is not True:
+            raise _Failure(ERR_INPUT)
+        generation = document["generation"]
+        if not _is_int(generation) or generation < 1:
+            raise _Failure(ERR_INPUT)
+        finalized_raw = document["finalized"]
+        if not isinstance(finalized_raw, dict) or tuple(
+            finalized_raw.keys()
+        ) != HEADER_ANCHOR_KEYS:
+            raise _Failure(ERR_INPUT)
+        if not _is_int(finalized_raw["height"]) or finalized_raw["height"] < 0:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(finalized_raw["block_hash"]):
+            raise _Failure(ERR_INPUT)
+        root = document["root"]
+        if not crypto.is_hex64(root):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(expected_root):
+            raise _Failure(ERR_INPUT)
+        raw_item = document["item"]
+        if not isinstance(raw_item, dict) or tuple(
+            raw_item.keys()
+        ) != FINALIZED_RECEIPT_ITEM_KEYS:
+            raise _Failure(ERR_INPUT)
+        receipt = _parse_finalized_receipt_receipt(raw_item["receipt"])
+        proof = _parse_finalized_receipt_proof(raw_item["proof"])
+        item = {"receipt": receipt, "proof": proof}
+        index = document["index"]
+        if not _is_int(index) or index < 0:
+            raise _Failure(ERR_INPUT)
+        siblings = document["siblings"]
+        if not isinstance(siblings, list) or len(siblings) > crypto.MAX_MERKLE_DEPTH:
+            raise _Failure(ERR_INPUT)
+        for sibling in siblings:
+            if not isinstance(sibling, dict) or tuple(
+                sibling.keys()
+            ) != PROOF_SIBLING_KEYS:
+                raise _Failure(ERR_INPUT)
+            if sibling["direction"] not in ("left", "right"):
+                raise _Failure(ERR_INPUT)
+            if not crypto.is_hex64(sibling["hash"]):
+                raise _Failure(ERR_INPUT)
+
+        # Stage 2 (integrity): the item's own semantics, exactly as the
+        # durable index revalidates every stored item on load.
+        _receipt_item_self_consistent(receipt, proof)
+        _replay_proof_siblings(proof)
+
+        # Re-walk the receipt-index Merkle path from the item's leaf up
+        # to the declared root with the ledger pairing and odd-node
+        # self-pairing rules; the index bit fixes every turn.
+        depth = len(siblings)
+        if index >= (1 << depth):
+            raise _Failure(ERR_INTEGRITY)
+        current = crypto.sha256_hex(_canonical_json_bytes(item))
+        position = index
+        for sibling in siblings:
+            sibling_hash = sibling["hash"]
+            if sibling["direction"] == "left":
+                # A genuine odd-node self-pair always points right; a
+                # left sibling equal to the path node addresses the
+                # phantom duplicate slot.
+                if position % 2 == 0 or sibling_hash == current:
+                    raise _Failure(ERR_INTEGRITY)
+                pair = sibling_hash + current
+            else:
+                if position % 2 == 1:
+                    raise _Failure(ERR_INTEGRITY)
+                pair = current + sibling_hash
+            current = crypto.sha256_hex(pair.encode("ascii"))
+            position //= 2
+        if current != root or current != expected_root:
+            raise _Failure(ERR_INTEGRITY)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "generation": generation,
+        "finalized": {key: finalized_raw[key] for key in HEADER_ANCHOR_KEYS},
+        "root": root,
+        "tx_id": receipt["tx_id"],
+        "index": index,
+    }
