@@ -8882,12 +8882,14 @@ def advance_state_anchor(
 
     Success returns ``{"ok": True, "generation", "anchor"}`` in that key
     order; failure returns only ``{"ok": False, "error": category}`` with
-    category one of ``input`` (parameters, structure or encoding), ``auth``
-    (unknown key version or a bad signature), ``integrity`` (finalized
-    binding, account change, regression or a same-height value mismatch),
-    ``state`` (a corrupt stored header checkpoint or sidecar) and ``io``
-    (the header file is missing, or a read/write fails). Nothing is raised
-    and a failure never changes a file.
+    category one of ``input`` (parameters, structure, encoding, or a
+    document/trust value JSON cannot serialize — rejected before the
+    idempotent success, so even a same-anchor retry never reports ok for an
+    unpersistable value), ``auth`` (unknown key version or a bad signature),
+    ``integrity`` (finalized binding, account change, regression or a
+    same-height value mismatch), ``state`` (a corrupt stored header
+    checkpoint or sidecar) and ``io`` (the header file is missing, or a
+    read/write fails). Nothing is raised and a failure never changes a file.
     """
     # Argument/structure shape is checked before any file work.
     if not isinstance(path, str) or not path:
@@ -8948,8 +8950,10 @@ def advance_state_anchor(
         ):
             return _failed_advance(ERR_INTEGRITY)
 
+        write_sidecar: bool
         if stored is None:
             next_generation = 1
+            write_sidecar = True
         else:
             # A state anchor is bound to one account; switching accounts on
             # the same sidecar is an integrity failure, not a replacement.
@@ -8957,25 +8961,50 @@ def advance_state_anchor(
                 return _failed_advance(ERR_INTEGRITY)
             old_anchor = stored["anchor"]
             if new_anchor == old_anchor:
-                # Same account and same anchor: idempotent. The proof was
-                # re-verified above, so the file bytes stay exactly as they
-                # were and the generation holds even for an equivalent
-                # freshly-signed document.
-                return {
-                    "ok": True,
-                    "generation": stored["generation"],
-                    "anchor": {
-                        key: old_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS
-                    },
+                # Same account and same anchor: idempotent pending the
+                # serializability probe below. The proof was re-verified
+                # above, so a persistable value leaves the file bytes exactly
+                # as they were and holds the generation even for an
+                # equivalent freshly-signed document.
+                next_generation = stored["generation"]
+                write_sidecar = False
+            else:
+                # The boundary may only advance: a lower height regresses, and
+                # the same height with a different block hash/state root is a
+                # conflicting value. A higher finalized height advances.
+                if new_anchor["height"] < old_anchor["height"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                if new_anchor["height"] == old_anchor["height"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                next_generation = stored["generation"] + 1
+                write_sidecar = True
+
+        # Probe serializability only after every integrity decision, so an
+        # account/regression/binding defect still reports integrity; an
+        # unpersistable-but-otherwise-idempotent value is rejected as input
+        # before the no-op success.
+        try:
+            _serialize_document(
+                {
+                    "v": STATE_ANCHOR_VERSION,
+                    "generation": next_generation,
+                    "account": account,
+                    "anchor": new_anchor,
+                    "document": document,
+                    "trust": trust,
                 }
-            # The boundary may only advance: a lower height regresses, and
-            # the same height with a different block hash/state root is a
-            # conflicting value. A higher finalized height advances.
-            if new_anchor["height"] < old_anchor["height"]:
-                return _failed_advance(ERR_INTEGRITY)
-            if new_anchor["height"] == old_anchor["height"]:
-                return _failed_advance(ERR_INTEGRITY)
-            next_generation = stored["generation"] + 1
+            )
+        except (TypeError, ValueError):
+            return _failed_advance(ERR_INPUT)
+
+        if not write_sidecar:
+            return {
+                "ok": True,
+                "generation": next_generation,
+                "anchor": {
+                    key: new_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS
+                },
+            }
 
         ordered = {
             "v": STATE_ANCHOR_VERSION,
@@ -9010,4 +9039,305 @@ def advance_state_anchor(
             "ok": True,
             "generation": next_generation,
             "anchor": {key: new_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS},
+        }
+
+
+# Fixed success key orders returned by :func:`advance_sync_state`.
+SYNC_STATE_RESULT_KEYS = ("ok", "header", "state")
+SYNC_STATE_HEADER_KEYS = ("generation", "tip", "finalized", "applied")
+SYNC_STATE_STATE_KEYS = ("generation", "anchor")
+
+
+def _parse_sync_state_bundle(bundle: object) -> tuple:
+    """Stage-1 (input) shape check for the exact seven-member ordered bundle.
+
+    The bundle must be a (non-string) sequence of exactly seven items in the
+    fixed order ``documents, finalities, state_document, account, anchor,
+    tip_hash, trust``; every defect (a missing or extra item, a wrong outer
+    shape, an unreadable element) is an ``input`` failure reported before
+    either composed operation is invoked.
+    """
+    if (
+        isinstance(bundle, (str, bytes))
+        or not isinstance(bundle, (list, tuple))
+        or len(bundle) != 7
+    ):
+        raise _Failure(ERR_INPUT)
+    documents, finalities, state_document, account, anchor, tip_hash, trust = bundle
+    return documents, finalities, state_document, account, anchor, tip_hash, trust
+
+
+def advance_sync_state(path: object, bundle: object) -> dict:
+    """Atomically advance a header checkpoint and its pinned state anchor.
+
+    ``bundle`` is exactly seven items in the fixed order
+    ``documents, finalities, state_document, account, anchor, tip_hash,
+    trust``: ``documents``/``finalities``/``anchor``/``tip_hash``/``trust``
+    are the :func:`advance_finalized_headers` arguments (the non-empty
+    signed header-page batch, the non-empty ordered finality credentials,
+    the first-use ``{height, block_hash}`` anchor or ``None`` on
+    continuation, the pinned tip hash and the trust document), while
+    ``state_document``/``account``/``trust`` are the
+    :func:`verify_state_proof` arguments (the attested
+    ``state, proof, auth`` account-state proof and the caller-pinned
+    64-lowercase-hex account it must name).
+
+    The header sync reuses :func:`advance_finalized_headers` exactly and the
+    state proof reuses :func:`verify_state_proof` exactly; the proof anchor
+    (``state.height``/``state.block_hash``) must equal the **last**
+    finality credential's ``finalized`` boundary. Everything happens under
+    the per-path lock shared with every other same-path operation, replaying
+    the version-3 header checkpoint at ``path`` and the version-1 sidecar at
+    ``path + ".state"`` together.
+
+    The whole call is all-or-nothing and verify-before-write: every input,
+    persisted-state and verification check settles before either file is
+    touched, so a *reported* failure leaves the complete previous pair (or no
+    pair) on disk and a success presents the complete new pair. Both files'
+    original bytes are snapshotted first and restored best-effort if a write
+    fails, mirroring :func:`advance` (hard-crash atomicity across the two
+    files is not promised). The write order is header-then-sidecar, so a
+    process interrupted between the two leaves the advanced header with the
+    older sidecar — still a replayable, consistent state from which the exact
+    same bundle (``anchor=None`` on continuation) converges to the complete
+    new pair on the next strict call. The composed header advance is
+    internally idempotent (an exact resubmission does not rewrite the header
+    or bump its generation), and the state sidecar is written only when its
+    account anchor content changes: a full retry whose header step, boundary
+    and state anchor are all unchanged writes neither file. A genuine content
+    change (a different header boundary or a moved state anchor) bumps each
+    file's generation exactly once; the state generation rules mirror
+    :func:`advance_state_anchor` (the account may not switch and the anchor
+    may only advance along the new branch).
+
+    Success returns ``{"ok": True, "header", "state"}`` in that key order:
+    ``header`` carries ``generation, tip, finalized, applied`` (the
+    :func:`advance_finalized_headers` result minus ``ok``) and ``state``
+    carries ``generation, anchor`` with ``anchor`` in the closed
+    ``height, block_hash, state_root`` order. Failure returns only
+    ``{"ok": False, "error": category}`` with category one of ``input``
+    (the bundle shape/key order, item types, or a value JSON cannot
+    serialize), ``auth`` (an unknown key version or a bad signature on any
+    document), ``integrity`` (the header chain, the finality/state bindings,
+    the account or an anchor regression), ``state`` (a corrupt stored
+    header checkpoint or sidecar; a transaction that cannot be replayed) and
+    ``io`` (a missing dependency or a read/write error; a failed write
+    restores the original bytes best-effort). Nothing is raised; the HTTP
+    and CLI surfaces are unchanged.
+    """
+    # Stage 1 (input): path and the exact ordered bundle shape are settled
+    # before either composed operation or any file is touched.
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+    try:
+        (
+            documents,
+            finalities,
+            state_document,
+            account,
+            anchor,
+            tip_hash,
+            trust,
+        ) = _parse_sync_state_bundle(bundle)
+    except _Failure as failure:
+        return _failed_advance(failure.category)
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the caller.
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    state_path = _state_anchor_path(path)
+    with lock:
+        # Stage 2 (state/io): strictly load and replay BOTH persisted files
+        # before anything is verified or written. A missing sidecar with no
+        # header is a clean first sync (both created below); a missing header
+        # with a sidecar present is a split pair — the state anchor can never
+        # outlive its header file, so the missing dependency is ``io`` and the
+        # orphan sidecar is left untouched rather than rebuilt over.
+        try:
+            loaded = _load_header_checkpoint_document(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            # Defensive: an unreadable-by-surprise checkpoint must report
+            # rather than crash the caller.
+            return _failed_advance(ERR_STATE)
+        try:
+            stored = _load_state_anchor(state_path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_STATE)
+        if loaded is None:
+            if stored is not None:
+                return _failed_advance(ERR_IO)
+        else:
+            _prior_checkpoint, _prior_steps, branch_before = loaded
+            try:
+                if stored is not None:
+                    _reverify_stored_state_anchor(stored, branch_before)
+            except _CheckpointError as failure:
+                return _failed_advance(failure.category)
+            except Exception:
+                return _failed_advance(ERR_STATE)
+
+        # Stage 3 (auth/integrity): the state proof is fully verified first,
+        # reusing verify_state_proof verbatim, before the header sync runs.
+        proof = verify_state_proof(state_document, account, trust)
+        if not proof.get("ok"):
+            return {"ok": False, "error": proof["error"]}
+        new_anchor = {
+            "height": proof["height"],
+            "block_hash": proof["block_hash"],
+            "state_root": proof["state_root"],
+        }
+
+        # A document/trust value JSON cannot re-serialize is an input defect
+        # and is rejected up front — before the idempotent decision, before
+        # the binding/regression checks and before either file is touched —
+        # exactly as advance_state_anchor promises. The generation placeholder
+        # is irrelevant to serializability.
+        try:
+            _serialize_document(
+                {
+                    "v": STATE_ANCHOR_VERSION,
+                    "generation": 1,
+                    "account": account,
+                    "anchor": new_anchor,
+                    "document": state_document,
+                    "trust": trust,
+                }
+            )
+        except (TypeError, ValueError):
+            return _failed_advance(ERR_INPUT)
+
+        # The proof anchor must pin exactly the LAST finality credential's
+        # finalized boundary. The credential shape is part of the composed
+        # contract; reading the target here must never raise.
+        try:
+            last_finalized, _tip, _version, _signature = _parse_finality_document(
+                finalities[-1]
+            )
+        except _Failure as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_INPUT)
+        if (
+            new_anchor["height"] != last_finalized["height"]
+            or new_anchor["block_hash"] != last_finalized["block_hash"]
+        ):
+            return _failed_advance(ERR_INTEGRITY)
+
+        # Stage 4 (integrity): the sidecar account/anchor transition, decidable
+        # now because the proof is bound to the batch's closing boundary. It
+        # mirrors advance_state_anchor exactly: one bound account, an anchor
+        # that may only advance, and an identical anchor that holds generation.
+        if stored is None:
+            next_generation = 1
+            write_sidecar = True
+        else:
+            if account != stored["account"]:
+                return _failed_advance(ERR_INTEGRITY)
+            old_anchor = stored["anchor"]
+            if new_anchor == old_anchor:
+                next_generation = stored["generation"]
+                write_sidecar = False
+            else:
+                if new_anchor["height"] < old_anchor["height"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                if new_anchor["height"] == old_anchor["height"]:
+                    return _failed_advance(ERR_INTEGRITY)
+                next_generation = stored["generation"] + 1
+                write_sidecar = True
+
+        # Pre-seal the prospective sidecar bytes. Serialization already
+        # succeeded above, so this cannot raise; the bytes are ready before
+        # the first file write so a failure below costs nothing on disk.
+        payload: bytes | None = None
+        if write_sidecar:
+            ordered = {
+                "v": STATE_ANCHOR_VERSION,
+                "generation": next_generation,
+                "account": account,
+                "anchor": new_anchor,
+                "document": state_document,
+                "trust": trust,
+            }
+            ordered["hash"] = _state_anchor_hash(
+                next_generation, account, new_anchor, state_document, trust
+            )
+            payload = _serialize_document(ordered)
+
+        # Snapshot the raw bytes of both files for cross-file compensation:
+        # from here on only physical writes remain, and a failed sync must
+        # leave the complete previous pair (or no pair at all) behind.
+        try:
+            header_original = _read_bytes_or_none(path)
+            state_original = _read_bytes_or_none(state_path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+
+        # Stage 5 (auth/integrity/state/io): the composed header advance under
+        # this same lock (an RLock, so it re-enters safely). It is fully
+        # verify-before-write and internally idempotent: on failure it never
+        # changes the header bytes and the sidecar is still untouched; on a
+        # first use it creates the version-3 checkpoint from ``anchor``.
+        header_result = advance_finalized_headers(
+            path, documents, finalities, anchor, tip_hash, trust
+        )
+        if not header_result.get("ok"):
+            return {"ok": False, "error": header_result["error"]}
+
+        # Stage 6 (state): replay the freshly written version-3 transaction and
+        # the stored sidecar against the advanced branch together. The advance
+        # is linear, so an old anchor stays on the branch; any miss here is a
+        # corrupted transaction, rolled back to the complete previous pair.
+        try:
+            advanced = _load_header_checkpoint_document(path)
+            if advanced is None:
+                raise _CheckpointError(ERR_STATE)
+            _new_checkpoint, _new_steps, branch_after = advanced
+            if stored is not None:
+                _reverify_stored_state_anchor(stored, branch_after)
+        except _CheckpointError as failure:
+            # Compensate: put both files' original bytes back best-effort.
+            _restore_bytes(state_path, state_original)
+            _restore_bytes(path, header_original)
+            return _failed_advance(failure.category)
+        except Exception:
+            _restore_bytes(state_path, state_original)
+            _restore_bytes(path, header_original)
+            return _failed_advance(ERR_STATE)
+
+        # Stage 7 (io): append the sidecar only when its anchor changed. A
+        # physical write failure compensates BOTH files best-effort, restoring
+        # the complete previous pair.
+        if write_sidecar:
+            try:
+                _atomic_write_bytes(state_path, payload)
+            except OSError:
+                _restore_bytes(state_path, state_original)
+                _restore_bytes(path, header_original)
+                return _failed_advance(ERR_IO)
+            state_generation = next_generation
+        else:
+            state_generation = stored["generation"]  # type: ignore[assignment]
+
+        return {
+            "ok": True,
+            "header": {
+                "generation": header_result["generation"],
+                "tip": header_result["tip"],
+                "finalized": {
+                    key: header_result["finalized"][key] for key in HEADER_ANCHOR_KEYS
+                },
+                "applied": header_result["applied"],
+            },
+            "state": {
+                "generation": state_generation,
+                "anchor": {
+                    key: new_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS
+                },
+            },
         }
