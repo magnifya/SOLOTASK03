@@ -8264,6 +8264,57 @@ def verify_receipt_proof(document: object, expected_root: object) -> dict:
     }
 
 
+def _claimed_receipt_tx_id(document: object) -> str | None:
+    """Best-effort receipt ``tx_id`` a proof document names.
+
+    Only consulted for cross-item dedup when a document's own
+    verification fails: a structurally reachable 64-lowercase-hex
+    ``item.receipt.tx_id`` is the receipt id the document claims. Any
+    other shape names no id.
+    """
+    if not isinstance(document, dict):
+        return None
+    item = document.get("item")
+    if not isinstance(item, dict):
+        return None
+    receipt = item.get("receipt")
+    if not isinstance(receipt, dict):
+        return None
+    tx_id = receipt.get("tx_id")
+    if not crypto.is_hex64(tx_id):
+        return None
+    return tx_id
+
+
+def _verify_receipt_proof_batch(documents: list, expected_root: str) -> list[dict]:
+    """Per-document verdicts of a batch with cross-item ``tx_id`` dedup.
+
+    Every document is verified independently — a failure never
+    short-circuits the batch. Each document naming a receipt ``tx_id``
+    occupies that id: a successful document names the id its
+    single-item success contract returned and is registered
+    immediately; a failed document still occupies the id it claims.
+    The first document naming an id keeps its own verdict; every
+    further document naming the same id reports ``{"ok": False,
+    "error": "integrity"}`` instead of its own verdict.
+    """
+    results: list[dict] = []
+    seen_tx_ids: set[str] = set()
+    for document in documents:
+        result = verify_receipt_proof(document, expected_root)
+        tx_id = result["tx_id"] if result["ok"] else _claimed_receipt_tx_id(document)
+        if tx_id is not None:
+            if tx_id in seen_tx_ids:
+                # A duplicated receipt id cannot belong to one honest
+                # index tree twice; only the first occurrence keeps
+                # its own verdict.
+                result = {"ok": False, "error": ERR_INTEGRITY}
+            else:
+                seen_tx_ids.add(tx_id)
+        results.append(result)
+    return results
+
+
 def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
     """Offline-verify a batch of :func:`receipt_proof` success documents.
 
@@ -8282,8 +8333,10 @@ def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
     key order: ``root`` is ``expected_root`` and ``results`` carries one
     entry per input document, in input order, each exactly the success
     or failure structure :func:`verify_receipt_proof` returns for it.
-    Beyond the first occurrence of a receipt ``tx_id``, every further
-    document naming that id reports ``{"ok": False, "error":
+    Every document naming a receipt ``tx_id`` occupies that id — a
+    successful one the id its success contract returned, a failed one
+    the id it still claims — and beyond the first occurrence every
+    further document naming that id reports ``{"ok": False, "error":
     "integrity"}`` instead of its own verdict; ``ok`` is true only when
     every entry succeeded.
     """
@@ -8292,20 +8345,7 @@ def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
             return {"ok": False, "error": ERR_INPUT}
         if not crypto.is_hex64(expected_root):
             return {"ok": False, "error": ERR_INPUT}
-        results: list[dict] = []
-        seen_tx_ids: set[str] = set()
-        for document in documents:
-            result = verify_receipt_proof(document, expected_root)
-            if result["ok"]:
-                tx_id = result["tx_id"]
-                if tx_id in seen_tx_ids:
-                    # A duplicated receipt id cannot belong to one honest
-                    # index tree twice; only the first occurrence keeps
-                    # its own verdict.
-                    result = {"ok": False, "error": ERR_INTEGRITY}
-                else:
-                    seen_tx_ids.add(tx_id)
-            results.append(result)
+        results = _verify_receipt_proof_batch(documents, expected_root)
     except Exception:
         # Defensive: structurally unforeseeable inputs must report rather
         # than crash the verifying process.
@@ -8315,3 +8355,69 @@ def verify_receipt_proofs(documents: object, expected_root: object) -> dict:
         "root": expected_root,
         "results": results,
     }
+
+
+def receipt_proofs_audit(documents: object, expected_root: object) -> dict:
+    """Summarize a :func:`verify_receipt_proofs` batch as a digested audit.
+
+    ``documents`` and ``expected_root`` follow the same batch-shape
+    rules as :func:`verify_receipt_proofs` and every document is
+    verified with exactly that function's per-item semantics (including
+    the cross-item ``tx_id`` dedup). The audit is purely offline:
+    nothing is read or written, the arguments are never mutated and
+    nothing is raised.
+
+    A batch-shape defect (``documents`` not a non-empty list or
+    ``expected_root`` not 64 lowercase hex) returns only ``{"ok":
+    False, "error": "input"}`` in that key order. Otherwise the result
+    is ``{"ok", "root", "total", "succeeded", "errors", "entries",
+    "digest"}`` in that key order: ``ok`` is true only when every
+    document succeeded; ``root`` is ``expected_root``; ``total`` the
+    number of input documents; ``succeeded`` the number that verified;
+    ``errors`` exactly ``{"input", "integrity"}`` in that key order
+    with plain non-negative integer counts summing to the number of
+    failed documents; and ``entries`` one entry per input document, in
+    input order — ``{"tx_id"}`` only for a success, ``{"error"}`` only
+    for a failure. ``digest`` is the SHA-256 of the UTF-8 JSON of this
+    object without ``digest`` (``sort_keys=True``,
+    ``separators=(",", ":")``, ``ensure_ascii=False``) as 64 lowercase
+    hex.
+    """
+    try:
+        if not isinstance(documents, list) or not documents:
+            return {"ok": False, "error": ERR_INPUT}
+        if not crypto.is_hex64(expected_root):
+            return {"ok": False, "error": ERR_INPUT}
+        results = _verify_receipt_proof_batch(documents, expected_root)
+        entries: list[dict] = []
+        succeeded = 0
+        input_errors = 0
+        integrity_errors = 0
+        for result in results:
+            if result["ok"]:
+                succeeded += 1
+                entries.append({"tx_id": result["tx_id"]})
+            else:
+                if result["error"] == ERR_INPUT:
+                    input_errors += 1
+                else:
+                    integrity_errors += 1
+                entries.append({"error": result["error"]})
+        summary: dict = {
+            "ok": succeeded == len(results),
+            "root": expected_root,
+            "total": len(results),
+            "succeeded": succeeded,
+            "errors": {"input": input_errors, "integrity": integrity_errors},
+            "entries": entries,
+        }
+        summary["digest"] = crypto.sha256_hex(
+            json.dumps(
+                summary, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        )
+        return summary
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
