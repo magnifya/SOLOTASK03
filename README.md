@@ -474,6 +474,45 @@ GET /v1/blocks/{height}/status 返回 height 与 status，未知高度返回 404
   **不抛异常**、不改字节或代数，写失败尽力还原原字节。HTTP、CLI 及
   其他轻客户端入口不变。
 
+## 只读同步预检
+
+`POST /v1/chain/sync-plan` 在**不拉取、不改任何状态**的前提下，仅凭请求方提供的
+定位列表与链描述符预判双方链的相对关系（纯只读，余入口不变）。请求体为 JSON 对象，
+**按序仅含 `locators`、`tip`、`finalized` 三个键**（顺序不符、多/缺键均 `400`）：
+
+- `locators` 完全沿用 `POST /v1/chain/headers/locate` 契约：**1–64 项**数组，
+  每项键序恰为 `height, block_hash`，`height` 为非布尔非负整数、在数组中**严格
+  降序且不重复**，`block_hash` 为 64 位小写 hex；此外**首项必须命中文中的
+  `tip`**（同高度且同哈希）。
+- `tip` 沿用链描述符 S（键序 `tip_hash, height, length, status`）：64 位小写
+  hex、非布尔非负 `height`、正整数 `length` 且恰为 `height + 1`、`status` 取
+  `pending`/`confirmed`。
+- `finalized` 沿用锚点形状（键序 `height, block_hash`）：非布尔非负高度、64 位
+  小写 hex，**不得高于 `tip`**；与 `tip` 同高时必须同哈希且 `tip` 为
+  `confirmed`。
+
+JSON 解析失败或任何键/值非法一律返回 `400` 及**有序**
+`{"ok": false, "error": "input"}`，且在读状态前作答（无副作用）。
+
+节点在**同一把锁**内按数组顺序把 `locators` 与 canonical 链逐项匹配（tip 完全
+相同时直接判 `same`），取**首个**同高同哈希项为共同祖先；全部不匹配返回 `409`
+及 `{"ok": false, "error": "no_common_ancestor"}`。`200` 键序固定
+`ok, ancestor, relation, pull, error`：
+
+- `ancestor` 沿用锚点 `{height, block_hash}`（同 tip 时即 tip，否则为命中项）；
+- `relation` 按序判定：两端 tip 完全相同为 `same`；祖先等于**本地** tip 为
+  `remote_ahead`；祖先等于**远端** tip 为 `local_ahead`；其余为 `fork`；
+- `pull` 为 `null` 或闭区间 `{from_height, to_height}`：远端链**更长**，或
+  **同长且 `tip_hash` 更小**（与候选分叉采用同一最长链/最小哈希规则）时，拉取
+  **祖先的下一高度至远端 tip**（闭区间）；远端更短不拉取并报 `remote_behind`，
+  同长落败报 `not_preferred`；
+- 祖先**低于本地 finalized 边界**，或远端 `finalized` 与共同 canonical 前缀矛盾
+  （其高度不高于祖先、但该高度本地 canonical 哈希不同）时，**优先**报
+  `finality_conflict` 且**不拉取**（即使拓扑上本应 remote_behind/not_preferred）；
+  远端 finalized 高于祖先（处于分叉段、本地无该高度）不构成矛盾；
+- `error` 仅承载拒绝原因（`remote_behind`/`not_preferred`/
+  `finality_conflict`），接受拉取或同链时为 `null`。
+
 ## 签名认证的增量区间协议
 
 增量区间还可以带来源签名推送：`POST /v1/forks/sync/range/attested`。请求体为
@@ -1762,6 +1801,15 @@ curl -s 'localhost:8080/v1/chain/headers?after_height=2&after_hash=<block-hash>&
 curl -s localhost:8080/v1/chain/finality
 # -> 200 {"finalized":{"height":2,"block_hash":"..."},"tip":{"tip_hash":"...","height":3,"length":4,"status":"pending"},"auth":{"key_version":1,"signature":"..."}}
 
+# 只读同步预检（体按序仅 locators,tip,finalized；首项 locator 须命中 tip；
+# 畸形 400 {"ok":false,"error":"input"}；无共同祖先 409 no_common_ancestor；
+# 200 键序 ok,ancestor,relation,pull,error；只读不改任何状态）
+curl -s -X POST localhost:8080/v1/chain/sync-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"locators":[{"height":4,"block_hash":"<remote-tip>"},{"height":2,"block_hash":"<canonical>"}],"tip":{"tip_hash":"<remote-tip>","height":4,"length":5,"status":"confirmed"},"finalized":{"height":2,"block_hash":"<canonical>"}}'
+# -> 200 {"ok":true,"ancestor":{"height":2,"block_hash":"<canonical>"},"relation":"fork|remote_ahead|local_ahead|same",
+#         "pull":null|{"from_height":3,"to_height":4},"error":null|"remote_behind"|"not_preferred"|"finality_conflict"}
+
 # 增量区间：仅推送锚点之后的尾部区块（拼接 canonical 前缀做整链重验；
 # 状态优先级 400→403→410→锚点 409→重验/tip 400→重复 409；201 五字段，
 # 同 source+request_id 同内容重试 200 首次结果、异内容 409）
@@ -2002,6 +2050,15 @@ python -m ledger.cli sync-state-audit
 # -> 单行 {"ok":true,"status":"empty|consistent|recoverable|split|corrupt",
 #    "header":{...},"state":{...},"transaction":{...}}；服务未配置时
 #    {"ok":false,"error":"not_found"} 退出 1
+
+# 只读同步预检（POST /v1/chain/sync-plan；FILE 或 - 给出按序
+# locators,tip,finalized 的请求文档并原样上送；读取/JSON 错不请求服务，
+# 直接输出 {"ok":false,"error":"input"} 退出 1；原序单行打印响应）
+python -m ledger.cli sync-plan plan.json
+cat plan.json | python -m ledger.cli sync-plan -
+# -> 单行 {"ok":true,"ancestor":{...},"relation":"same|remote_ahead|local_ahead|fork",
+#    "pull":null|{"from_height":N,"to_height":M},"error":null|"..."}；
+#    2xx 退出 0，400/409/不可达退出 1
 ```
 
 非 2xx 响应同样打印单行 JSON 并以退出码 1 结束。
@@ -2037,6 +2094,7 @@ python tests/sync_mode_query_test.py   # syncs 与 sync-history 的可选 mode �
 python tests/sync_export_test.py       # 同步记录导出 GET /v1/forks/sync/export（source/request_id/mode 三参数必填单值，缺失/重复/未知 400；固定键序与类型；plain 五字段 candidate+attestation null、attested 签名候选+冻结公钥/版本/签名并按 domain/冻结公钥/指纹重验；range 记录 409；未知/过期/清理后 404；fork 或 canonical 前缀重建不增副本；签名/摘要失配丢缓存留审计；清理落盘失败恢复并抛 OSError；重启一致）与 HTTP/CLI sync-export
 python tests/sync_range_export_test.py  # 区间记录导出 GET /v1/forks/sync/range/export（三参数必填单值 400；未知/过期/清理后 404；整链记录 409；固定键序 source,request_id,mode,expires_at,anchor,blocks,tip,attestation；tip 由 anchor+blocks 重算；attested 冻结公钥/版本/签名按 ledger-sync-range-v1 重验；链/Merkle/指纹/签名失配丢缓存留审计 404；清理落盘失败恢复抛 OSError；采用后 canonical 前缀重建；重启一致）与 HTTP/CLI sync-range-export
 python tests/sync_authorization_test.py  # sync 来源授权闸门（403/410/400 优先级、新请求授权）、跨越轮换/撤销/过期的幂等回放、重启重新授权丢弃失效记录并为停机期间到期/失权记录补写去重且连续的 sync_expired（已采用 tip 不动 canonical）、保存失败完整恢复（链/候选/元数据/generation/事件）、HTTP/CLI
+python tests/sync_plan_test.py         # 只读同步预检 POST /v1/chain/sync-plan（体按序仅 locators,tip,finalized；locators 沿用 headers/locate 1–64 项严格降序且首项命中 tip；tip 沿用 S 且 length=height+1；finalized 沿用锚点不高于 tip、同高须同 hash 且 tip confirmed；非法 400 {"ok":false,"error":"input"} 无副作用；锁内顺序匹配 canonical，无共同祖先 409 no_common_ancestor；200 键序 ok,ancestor,relation,pull,error；same/remote_ahead/local_ahead/fork；更长或同长 tip_hash 更小拉祖先后一高度至远端 tip 闭区间，更短 remote_behind、同长落败 not_preferred；祖先低于本地 finalized 或远端 finalized 与共同前缀矛盾优先 finality_conflict 且不拉取；HTTP 线序与 CLI sync-plan FILE|- 单行、非 2xx 退出 1）
 python tests/light_client_test.py     # 离线轻客户端验证（input/auth/expired/integrity/proof、Ed25519 验签、重算链、proof 唯一性、pending 禁令、CLI）
 python tests/range_export_verify_test.py  # 区间导出离线核验 verify_range_export（固定顶层键序、expected_anchor 严格相等、尾部重算与 pending 末块、tip 摘要、plain allowlist+attestation null、attested 钉住公钥+ledger-sync-range-v1 签名、input/auth/expired/integrity 分类、CLI verify-range 文件/stdin/退出码）
 python tests/range_export_batch_verify_test.py  # 多页增量区间离线连续核验 verify_range_exports（非空数组、逐页复验、首锚=expected_anchor 后锚=前页 tip{height,block_hash}、断锚/跳高/重叠 integrity、tx_id 跨页唯一、pending 只许末页、成功键序 ok,anchor,tip,pages,verified_tx_ids 升序、input/auth/expired/integrity 分类、CLI verify-range-batch 文件/stdin/退出码）

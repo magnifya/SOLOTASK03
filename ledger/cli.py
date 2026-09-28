@@ -3,7 +3,7 @@ state-root,
 state-proof, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
-sync-state-audit,
+sync-state-audit, sync-plan,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
@@ -943,6 +943,42 @@ def cmd_verify_range_batch(args: argparse.Namespace) -> int:
     return 0 if body.get("ok") is True else 1
 
 
+def cmd_sync_plan(args: argparse.Namespace) -> int:
+    """Read-only sync precheck: POST one sync-plan request document.
+
+    ``FILE`` (or standard input when ``-``) supplies the JSON request body
+    with the ordered keys ``locators``, ``tip`` and ``finalized``; it is
+    POSTed verbatim to ``/v1/chain/sync-plan`` and the response is printed
+    as one JSON line in the contract key order
+    (``ok, ancestor, relation, pull, error``). An unreadable or non-JSON
+    file prints ``{"ok": false, "error": "input"}`` and exits 1 without
+    contacting the server; otherwise the exit code follows the response
+    (0 only on 2xx).
+    """
+    try:
+        if args.plan_file == "-":
+            payload = json.loads(sys.stdin.read())
+        else:
+            with open(args.plan_file, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON input is reported in the same envelope as
+        # the server's 400.
+        body = {"ok": False, "error": "input"}
+        print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+        return 1
+    # The document is transmitted verbatim: the strict top-level key order
+    # and every nested contract order must survive the round trip.
+    status, body = _request(
+        "POST",
+        f"{args.base_url}/v1/chain/sync-plan",
+        payload,
+        sort_keys=False,
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if 200 <= status < 300 else 1
+
+
 def cmd_receipt_proofs_audit(args: argparse.Namespace) -> int:
     """Audit a batch of offline receipt-proof documents via the server.
 
@@ -1365,6 +1401,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="expected anchor block hash of the first page (64 lowercase hex)",
     )
     p_verify_range_batch.set_defaults(func=cmd_verify_range_batch)
+
+    p_sync_plan = sub.add_parser(
+        "sync-plan",
+        help="read-only sync precheck (POST /v1/chain/sync-plan)",
+    )
+    p_sync_plan.add_argument(
+        "plan_file",
+        metavar="FILE|-",
+        help="sync-plan request JSON document (ordered locators, tip, "
+        "finalized), or - to read it from standard input",
+    )
+    p_sync_plan.set_defaults(func=cmd_sync_plan)
 
     p_receipt_proofs_audit = sub.add_parser(
         "receipt-proofs-audit",

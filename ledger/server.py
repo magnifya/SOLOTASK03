@@ -164,6 +164,23 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.locate_finality_fork(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/chain/sync-plan":
+                # POST /v1/chain/sync-plan — read-only sync precheck. The
+                # body is strictly the ordered {"locators", "tip",
+                # "finalized"} document (400 with the ordered {"ok",
+                # "error"} input body otherwise, never touching state); no
+                # shared ancestor is 409. The success document has the
+                # contract key order ok, ancestor, relation, pull, error,
+                # so it is serialized in insertion order rather than
+                # alphabetically.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.build_sync_plan(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions/receipt-proofs/audit":
                 # POST /v1/transactions/receipt-proofs/audit — offline audit
                 # summary for a batch of receipt_proof documents. The body is
