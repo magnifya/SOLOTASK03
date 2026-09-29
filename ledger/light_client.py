@@ -10208,3 +10208,440 @@ def audit_sync_state(path: object) -> dict:
         "state": state_record,
         "transaction": txn_record,
     }
+
+
+# -- durable batch state-anchor archive ---------------------------------------
+#
+# A local, restartable archive of batch attested account-state proofs. Each
+# successful record_state_anchors call first verifies one POST
+# /v1/accounts/attested-proofs document with the shared batch rules
+# (verify_state_proofs) and then merges one atomic record — the shared state
+# root, block height/hash and every account proof, plus the trust material
+# pinned at record time — into a version-1 file. Historical heights arrive in
+# any order, the same anchor with the same account set and equivalent proofs
+# is idempotent, and conflicting anchors/proofs are rejected before a byte is
+# changed.
+
+STATE_ANCHORS_VERSION = 1
+STATE_ANCHORS_KEYS = ("v", "generation", "records", "hash")
+STATE_ANCHORS_RECORD_KEYS = (
+    "height",
+    "block_hash",
+    "state_root",
+    "accounts",
+    "document",
+    "trust",
+)
+STATE_ANCHORS_ENTRY_KEYS = (
+    "height",
+    "block_hash",
+    "state_root",
+    "account",
+    "proof",
+)
+RECORD_STATE_ANCHORS_RESULT_KEYS = ("ok", "generation", "added")
+READ_STATE_ANCHORS_RESULT_KEYS = ("ok", "generation", "results")
+
+
+def _state_anchors_hash(generation: int, records: list) -> str:
+    """SHA-256 over the canonical JSON bytes of every field but ``hash``."""
+    body = {
+        "v": STATE_ANCHORS_VERSION,
+        "generation": generation,
+        "records": records,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def _state_anchor_record_key(record: dict) -> tuple[int, tuple[str, ...]]:
+    """The archive ordering/identity key: height then the account set."""
+    return record["height"], tuple(record["accounts"])
+
+
+def _state_anchor_unsigned_equivalent(left: dict, right: dict) -> bool:
+    """True when two batch documents carry the same signed content.
+
+    Only the ``state``/``proofs`` envelope is compared: equivalent proof
+    content for the same anchor is idempotent regardless of how the frozen
+    trust material or the envelope bytes present themselves.
+    """
+    return _canonical_json_bytes(
+        {"state": left["state"], "proofs": left["proofs"]}
+    ) == _canonical_json_bytes(
+        {"state": right["state"], "proofs": right["proofs"]}
+    )
+
+
+def _validate_state_anchors_shape(data: object) -> dict:
+    """Strictly validate one version-1 batch state-anchor archive.
+
+    Exact top-level key order ``v, generation, records, hash``; ``v`` must be
+    1 and ``generation`` a positive plain integer. Records must be ascending
+    by ``(height, accounts)`` with no two records sharing the same height and
+    account set; within a record accounts ascend and are distinct 64-hex
+    strings, the closed anchor fields agree with the embedded state document
+    and each record replays through :func:`verify_state_proofs` against its
+    own frozen trust. Every record at the same height must pin the same block
+    hash and state root. The recorded ``hash`` is recomputed last, so a
+    re-sealed tampered file is still corruption. Any defect is existing-state
+    corruption.
+    """
+    if not isinstance(data, dict) or tuple(data.keys()) != STATE_ANCHORS_KEYS:
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(data["v"]) or data["v"] != STATE_ANCHORS_VERSION:
+        raise _CheckpointError(ERR_STATE)
+    generation = data["generation"]
+    if not _is_int(generation) or generation < 1:
+        raise _CheckpointError(ERR_STATE)
+    raw_records = data["records"]
+    if not isinstance(raw_records, list):
+        raise _CheckpointError(ERR_STATE)
+    records: list[dict] = []
+    previous_key: tuple[int, tuple[str, ...]] | None = None
+    height_anchors: dict[int, tuple[str, str]] = {}
+    for raw_record in raw_records:
+        if (
+            not isinstance(raw_record, dict)
+            or tuple(raw_record.keys()) != STATE_ANCHORS_RECORD_KEYS
+        ):
+            raise _CheckpointError(ERR_STATE)
+        height = raw_record["height"]
+        if not _is_int(height) or height < 0:
+            raise _CheckpointError(ERR_STATE)
+        if not crypto.is_hex64(raw_record["block_hash"]):
+            raise _CheckpointError(ERR_STATE)
+        if not crypto.is_hex64(raw_record["state_root"]):
+            raise _CheckpointError(ERR_STATE)
+        raw_accounts = raw_record["accounts"]
+        if (
+            not isinstance(raw_accounts, list)
+            or not raw_accounts
+            or any(not crypto.is_hex64(account) for account in raw_accounts)
+            or len(set(raw_accounts)) != len(raw_accounts)
+            or list(raw_accounts) != sorted(raw_accounts)
+        ):
+            raise _CheckpointError(ERR_STATE)
+        document = raw_record["document"]
+        trust = raw_record["trust"]
+        # The anchor summary must agree with the verbatim state document.
+        if not isinstance(document, dict):
+            raise _CheckpointError(ERR_STATE)
+        state = document.get("state")
+        if (
+            not isinstance(state, dict)
+            or state.get("height") != height
+            or state.get("block_hash") != raw_record["block_hash"]
+            or state.get("state_root") != raw_record["state_root"]
+        ):
+            raise _CheckpointError(ERR_STATE)
+        key = (height, tuple(raw_accounts))
+        if previous_key is not None and key <= previous_key:
+            raise _CheckpointError(ERR_STATE)
+        previous_key = key
+        anchor_pair = (raw_record["block_hash"], raw_record["state_root"])
+        prior_anchor = height_anchors.get(height)
+        if prior_anchor is not None and prior_anchor != anchor_pair:
+            raise _CheckpointError(ERR_STATE)
+        height_anchors[height] = anchor_pair
+        # Full semantic replay against the frozen trust: a re-sealed file
+        # with a fresh hash over tampered proofs or signatures still fails.
+        replayed = verify_state_proofs(document, list(raw_accounts), trust)
+        if replayed.get("ok") is not True:
+            raise _CheckpointError(ERR_STATE)
+        records.append(
+            {
+                "height": height,
+                "block_hash": raw_record["block_hash"],
+                "state_root": raw_record["state_root"],
+                "accounts": list(raw_accounts),
+                "document": document,
+                "trust": trust,
+            }
+        )
+    digest = data["hash"]
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+    if _state_anchors_hash(generation, records) != digest:
+        raise _CheckpointError(ERR_STATE)
+    return {
+        "v": STATE_ANCHORS_VERSION,
+        "generation": generation,
+        "records": records,
+        "hash": digest,
+    }
+
+
+def _load_state_anchors(path: str) -> dict | None:
+    """Strictly load the batch state-anchor archive at ``path``.
+
+    Returns None when the archive is absent. An unreadable file is ``io``;
+    bad UTF-8, malformed JSON and every shape/key-order/ordering/digest or
+    replay defect is ``state``. The file is never truncated or rebuilt.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    return _validate_state_anchors_shape(data)
+
+
+def record_state_anchors(
+    path: object,
+    document: object,
+    accounts: object,
+    trust: object,
+) -> dict:
+    """Verify a batch state-proof document and atomically archive it.
+
+    ``document``/``accounts``/``trust`` are exactly the
+    :func:`verify_state_proofs` arguments: the decoded
+    ``POST /v1/accounts/attested-proofs`` response (key order
+    ``state, proofs, auth``), the caller-pinned non-empty list of distinct
+    64-lowercase-hex accounts and the trust document carrying
+    ``audit_signers``. The batch is fully verified first — nothing is read
+    or written before verification succeeds — and one record (the shared
+    state root, height, block hash, every account proof and the frozen
+    trust) is then merged serially into the version-1 archive under the
+    shared per-path lock.
+
+    The archive carries the exact key order
+    ``v, generation, records, hash``: records ascend by
+    ``(height, accounts)``; ``hash`` is the SHA-256 of the canonical JSON
+    of the other fields. Heights are discrete and may arrive in any order.
+    The same anchor with the same account set and equivalent proofs is
+    idempotent and writes nothing (the generation and the frozen trust are
+    kept). The same height with a different block hash or state root, or the
+    same account set with different balances, confirmed transactions or
+    proof paths, is an ``integrity`` conflict. Proofs signed by a historical
+    signer version keep verifying because each record keeps the trust it was
+    recorded with.
+
+    Success returns ``{"ok": True, "generation", "added"}`` with ``added``
+    0 for an idempotent replay and 1 for a new record; the first record
+    starts at generation 1. Failure returns only
+    ``{"ok": False, "error": category}`` with category ``input``
+    (arguments, document structure, encodings or non-stable values),
+    ``auth`` (unknown signer version or a failed Ed25519 signature),
+    ``integrity`` (account/proof mismatch, Merkle or anchor failure, or a
+    duplicate-content conflict), ``state`` (the existing archive fails its
+    parse, shape, digest or replay checks) and ``io`` (read/write failure;
+    a failed write restores the original bytes). Nothing is raised and a
+    failed call never changes the file bytes or the generation.
+    """
+    if not isinstance(path, str) or not path:
+        return _failed_advance(ERR_INPUT)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        # Stage 1 (input/auth/integrity): the shared batch rules verify the
+        # whole document before any file is touched.
+        try:
+            result = verify_state_proofs(document, accounts, trust)
+        except Exception:
+            return _failed_advance(ERR_INPUT)
+        if result.get("ok") is not True:
+            category = result.get("error")
+            if category not in (ERR_INPUT, ERR_AUTH, ERR_INTEGRITY):
+                category = ERR_INPUT
+            return _failed_advance(category)
+        if not isinstance(document, dict) or not isinstance(accounts, list):
+            return _failed_advance(ERR_INPUT)
+
+        ordered_accounts = sorted(accounts)
+        height = result["height"]
+        incoming_record = {
+            "height": height,
+            "block_hash": result["block_hash"],
+            "state_root": result["state_root"],
+            "accounts": ordered_accounts,
+            "document": document,
+            "trust": trust,
+        }
+        incoming_key = _state_anchor_record_key(incoming_record)
+
+        # Stage 2 (state/io): the existing archive is strictly loaded and
+        # fully replayed; a missing file opens a new archive at generation 0.
+        try:
+            stored = _load_state_anchors(path)
+        except _CheckpointError as failure:
+            return _failed_advance(failure.category)
+        except Exception:
+            return _failed_advance(ERR_STATE)
+
+        if stored is None:
+            generation = 0
+            records: list[dict] = []
+        else:
+            generation = stored["generation"]
+            records = list(stored["records"])
+
+        # Stage 3 (integrity): same-height anchors must agree globally; the
+        # record for the same (height, account set) must be equivalent.
+        same_key_index: int | None = None
+        for index, record in enumerate(records):
+            if record["height"] == height and (
+                record["block_hash"] != incoming_record["block_hash"]
+                or record["state_root"] != incoming_record["state_root"]
+            ):
+                return _failed_advance(ERR_INTEGRITY)
+            if _state_anchor_record_key(record) == incoming_key:
+                same_key_index = index
+        if same_key_index is not None:
+            existing = records[same_key_index]
+            if not _state_anchor_unsigned_equivalent(
+                existing["document"], incoming_record["document"]
+            ):
+                return _failed_advance(ERR_INTEGRITY)
+            # Idempotent: keep the original bytes, generation and trust.
+            return {
+                "ok": True,
+                "generation": generation,
+                "added": 0,
+            }
+
+        records.append(incoming_record)
+        records.sort(key=_state_anchor_record_key)
+        next_generation = generation + 1
+        archive = {
+            "v": STATE_ANCHORS_VERSION,
+            "generation": next_generation,
+            "records": records,
+        }
+
+        # The digest is computed before touching the file so a value that
+        # cannot be stably serialized reports input and changes nothing.
+        try:
+            archive["hash"] = _state_anchors_hash(next_generation, records)
+            payload = _serialize_document(
+                {key: archive[key] for key in STATE_ANCHORS_KEYS}
+            )
+        except (TypeError, ValueError):
+            return _failed_advance(ERR_INPUT)
+
+        # Stage 4 (io): temp file, fsync and atomic replace; a failed write
+        # restores the original bytes best-effort.
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return _failed_advance(ERR_IO)
+        try:
+            _atomic_write_bytes(path, payload)
+        except OSError:
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_IO)
+        except (TypeError, ValueError):
+            _restore_bytes(path, original)
+            return _failed_advance(ERR_INPUT)
+
+        return {
+            "ok": True,
+            "generation": next_generation,
+            "added": 1,
+        }
+
+
+def read_state_anchors(
+    path: object,
+    heights: object = None,
+    accounts: object = None,
+) -> dict:
+    """Read archived batch state anchors, optionally filtered by height/account.
+
+    ``path`` is the archive maintained by :func:`record_state_anchors`.
+    ``heights`` and ``accounts`` are optional filters: each must be a list
+    when supplied, of non-boolean non-negative integers and of distinct or
+    repeated 64-lowercase-hex accounts respectively (a malformed filter is
+    ``input``). Every stored record matching the height filter contributes
+    one entry per account it holds that passes the account filter; entries
+    are stably sorted by ``(height, account)`` and each has the fixed key
+    order ``height, block_hash, state_root, account, proof`` with ``proof``
+    the stored single account-state-proof document.
+
+    A missing archive, unknown heights and account/height combinations with
+    no hit all return an empty ``results`` list (generation 0 when the
+    archive does not exist); only a genuinely corrupt archive reports
+    ``state`` and only an unreadable file reports ``io``. The archive is
+    read strictly and never rewritten, cleaned up or truncated. Nothing is
+    raised.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    height_filter: set[int] | None
+    account_filter: set[str] | None
+    try:
+        if heights is None:
+            height_filter = None
+        else:
+            if not isinstance(heights, list) or any(
+                not _is_int(height) or height < 0 for height in heights
+            ):
+                return {"ok": False, "error": ERR_INPUT}
+            height_filter = set(heights)
+        if accounts is None:
+            account_filter = None
+        else:
+            if not isinstance(accounts, list) or any(
+                not crypto.is_hex64(account) for account in accounts
+            ):
+                return {"ok": False, "error": ERR_INPUT}
+            account_filter = set(accounts)
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            stored = _load_state_anchors(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            return {"ok": False, "error": ERR_STATE}
+        if stored is None:
+            return {"ok": True, "generation": 0, "results": []}
+
+        entries: list[dict] = []
+        seen: set[tuple[int, str]] = set()
+        for record in stored["records"]:
+            if (
+                height_filter is not None
+                and record["height"] not in height_filter
+            ):
+                continue
+            proofs_by_account = {
+                proof["account"]: proof
+                for proof in record["document"]["proofs"]
+            }
+            for account in record["accounts"]:
+                if (
+                    account_filter is not None
+                    and account not in account_filter
+                ):
+                    continue
+                identity = (record["height"], account)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                entries.append(
+                    {
+                        "height": record["height"],
+                        "block_hash": record["block_hash"],
+                        "state_root": record["state_root"],
+                        "account": account,
+                        "proof": proofs_by_account[account],
+                    }
+                )
+        entries.sort(key=lambda entry: (entry["height"], entry["account"]))
+        return {
+            "ok": True,
+            "generation": stored["generation"],
+            "results": entries,
+        }
