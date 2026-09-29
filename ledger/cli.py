@@ -1,6 +1,6 @@
 """Command line interface: send, tx, mine, block, account, proof, proofs,
 state-root,
-state-proof, confirm, rollback, status, candidates, chain, adopt, export,
+state-proof, state-proofs, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
 sync-state-audit, sync-plan,
@@ -181,6 +181,36 @@ def cmd_state_proof(args: argparse.Namespace) -> int:
         url = f"{url}?height={urllib.parse.quote(args.height, safe='')}"
     status, body = _request("GET", url, None)
     return _emit(status, body)
+
+
+def cmd_state_proofs(args: argparse.Namespace) -> int:
+    # Batch signed state proofs. Missing arguments, duplicates and malformed
+    # account/height values are rejected locally with the ordered {"ok",
+    # "error"} input body and exit code 1 without contacting the server; the
+    # success document has a contract-fixed key order, so it is printed in
+    # insertion order rather than alphabetically.
+    accounts = args.accounts
+    if (
+        not accounts
+        or any(not crypto.is_hex64(account) for account in accounts)
+        or len(set(accounts)) != len(accounts)
+    ):
+        return _emit(400, {"ok": False, "error": "input"}, sort_keys=False)
+    if args.height is not None:
+        if args.height != "0" and (
+            not args.height.isdigit() or args.height[0] == "0"
+        ):
+            return _emit(400, {"ok": False, "error": "input"}, sort_keys=False)
+        payload: dict = {"accounts": list(accounts), "height": args.height}
+    else:
+        payload = {"accounts": list(accounts)}
+    status, body = _request(
+        "POST",
+        f"{args.base_url}/v1/accounts/attested-proofs",
+        payload,
+        sort_keys=False,
+    )
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_proof(args: argparse.Namespace) -> int:
@@ -1083,6 +1113,23 @@ def build_parser() -> argparse.ArgumentParser:
         "no leading zeros; omitted anchors the highest confirmed block)",
     )
     p_state_proof.set_defaults(func=cmd_state_proof)
+
+    p_state_proofs = sub.add_parser(
+        "state-proofs",
+        help="fetch one signed batch of account-state Merkle inclusion proofs",
+    )
+    p_state_proofs.add_argument(
+        "accounts",
+        metavar="account",
+        nargs="*",
+        help="one or more distinct account ids (64 lowercase hex characters)",
+    )
+    p_state_proofs.add_argument(
+        "--height",
+        help="anchor at a historical confirmed block height (unsigned decimal, "
+        "no leading zeros; omitted anchors the highest confirmed block)",
+    )
+    p_state_proofs.set_defaults(func=cmd_state_proofs)
 
     p_proof = sub.add_parser("proof", help="fetch a Merkle inclusion proof")
     p_proof.add_argument("height", help="block height containing the transaction")

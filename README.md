@@ -777,6 +777,36 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   高度接口的单行 JSON 响应（含非 2xx 错误体）。`receipt-proofs-audit`
   缺少必填参数（FILE 或 `--expected-root`）时输出
   `{"ok":false,"error":"input"}`、退出码 1 且不请求服务。
+- **批量签名状态证明**：`POST /v1/accounts/attested-proofs` 请求体只含
+  `accounts` 与可选 `height`：`accounts` 是非空、互异的 64 位小写 hex 账户
+  数组，`height` 沿用单账户证明的严格十进制格式。解析失败、键缺失或额外、
+  类型错误、空列表、重复、账户或高度格式错误均为 `400` 且不改变状态；
+  锚点未知/非 canonical、链尾 pending 或任一账户在锚点不存在均为 `404`。
+  成功 `200` 顶层键序固定为 `state, proofs, auth`：`state` 是所有证明共享
+  的状态锚（`state_root, height, block_hash, account_count`），`proofs` 按
+  `account` 升序给出每个账户的完整单账户证明（字段与键序同 state-proof，
+  全部绑定同一 `state_root`/`height`/`block_hash`），整批只有一份 `auth`
+  审计签名，签名为对
+  `SHA256(UTF8("ledger-state-proofs-v1") ‖ canonical_json({state, proofs}))`
+  的 Ed25519 签名；链、状态树与当前审计签名者在同一把锁内取同一份 canonical
+  已确认状态快照，绝不拼接不同高度或状态根。
+- **批量签名状态证明离线校验**：
+  `ledger.light_client.verify_state_proofs(document, accounts, trust) -> dict`
+  为纯库 API，不读本地状态、不抛异常。`accounts` 是调用方钉住的非空互异
+  64 位小写 hex 列表；依次严格复核顶层与嵌套键序/类型、hex 编码、
+  `trust.audit_signers`（畸形为 `input`），按 `key_version` 取审计公钥并按
+  `ledger-state-proofs-v1` 域验整批唯一签名（未知版本或坏签名为 `auth`），
+  再核对 proofs 互异、按账户升序且账户集合与钉住列表完全一致、每份证明的
+  锚点绑定、index 范围与 Merkle 路径重算（不一致或篡改为 `integrity`）。
+  成功固定返回 `ok, accounts, height, block_hash, state_root`（`accounts`
+  升序）；失败只返回 `{"ok": false, "error"}`，`error` 取
+  `input`/`auth`/`integrity`。
+- **批量 CLI**：`state-proofs ACCOUNT... [--height H]` 一次请求并打印单行
+  JSON（保留契约键序）；参数缺失、重复或账户/高度格式非法时输出
+  `{"ok":false,"error":"input"}`、退出码 1 且不请求服务，HTTP 非 2xx 或
+  不可达同样退出码 1。单账户 `proof`、`attested-proof`、`state-root` 的
+  响应与错误码保持不变；并发查询、快照恢复与重启后同一批账户得到相同的
+  升序结果与锚点。
 
 ## 交易索引
 
@@ -1628,7 +1658,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 read/update/export，401/403 无副作用）与 `history_credential_changed` 事件 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `state-proofs` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
 
@@ -1952,6 +1982,8 @@ python -m ledger.cli state-root                 # 锚定最高已确认块
 python -m ledger.cli state-root --height H      # 历史已确认前缀
 python -m ledger.cli state-proof <pubkey-hex>
 python -m ledger.cli state-proof <pubkey-hex> --height H
+python -m ledger.cli state-proofs <pubkey-hex-1> <pubkey-hex-2>  # 批量签名状态证明
+python -m ledger.cli state-proofs <pubkey-hex-1> ... --height H
 python -m ledger.cli status 1
 python -m ledger.cli confirm 1
 python -m ledger.cli rollback 1
