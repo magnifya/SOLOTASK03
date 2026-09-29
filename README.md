@@ -1640,6 +1640,37 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 `consistency` 不发起任何网络请求；文件无法读取或内容不是 JSON 时输出
 `{"ok": false, "error": "input"}`，退出码成功 0、任何失败 1。
 
+## 多份历史状态锚导出的覆盖与一致性审计
+
+`ledger.light_client.audit_state_anchors_exports(documents,
+expected_pairs) -> dict` 是**纯库入口**（不读写任何本地文件、不抛异常，
+也没有 HTTP 或命令行包装；现有 HTTP 与 CLI 入口行为均不变）。
+`documents` 是按来源顺序给出的**非空**状态锚导出数组（每份即
+`export_state_anchors` 的自包含导出文档，允许重复来源），
+`expected_pairs` 是调用方钉住的**非空、互异**组合清单，每项恰为
+`{height, account}`（`height` 为非布尔非负整数，`account` 为 64 位小写
+hex；调用方可以任意顺序给出）。
+
+- 每份导出先**完整**套用 `verify_state_anchors_export` 的全部规则：参数、
+  文档结构、键序、类型、hex、混合键、非有限数或不可稳定 JSON 序列化的
+  内容为 `input`；未知审计签名版本或形状合法但 Ed25519 验签失败为
+  `auth`；导出摘要、记录排序、账户集合、锚点绑定、Merkle 证明路径或
+  同高度锚点被篡改为 `integrity`。
+- 全部导出各自验证通过后，命中的记录按 `(height, account)` 跨来源归并；
+  同一份导出内的重复记录、以及重复来源中的等价记录只计一次。相同组合在
+  不同来源必须给出同一 `block_hash`、`state_root` 与账户证明内容，同一
+  高度在所有来源（含未被钉住账户的记录）之间也必须共享
+  `block_hash` 与 `state_root`。
+- 成功返回固定键序 `ok, verified, missing, conflicts`，三组均为
+  `{height, account}` 项并按 `(height, account)` 稳定升序：`verified` 是
+  至少一个来源命中且全部命中来源证据一致的钉住组合；`missing` 是在**所有**
+  来源中都缺失的组合——某个来源没有该组合的记录不会单独判成冲突；
+  `conflicts` 是来源之间的证明内容或同高度锚点出现分歧的组合，结果指出
+  冲突的高度与账户。三组互不相交且恰好覆盖全部钉住组合。
+- 失败只返回 `{"ok": false, "error"}`，`error` 取
+  `input`/`auth`/`integrity`。审计是入参的纯函数：相同输入重复调用、
+  并发调用与跨进程调用得到同一份结果。
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：

@@ -11152,3 +11152,133 @@ def verify_state_anchors_export(document: object) -> dict:
             for record in records
         ],
     }
+
+
+STATE_ANCHORS_EXPORT_AUDIT_PAIR_KEYS = ("height", "account")
+STATE_ANCHORS_EXPORT_AUDIT_RESULT_KEYS = (
+    "ok",
+    "verified",
+    "missing",
+    "conflicts",
+)
+
+
+def _validate_state_anchors_audit_pairs(raw_pairs: object) -> list[tuple[int, str]]:
+    """Strictly validate the pinned non-empty ``{height, account}`` list.
+
+    The list must be non-empty; every item is a closed two-key object with a
+    non-boolean non-negative integer height and a 64-lowercase-hex account,
+    and no pair repeats. Caller order is arbitrary and the normalized result
+    is ascending. A non-stable (mixed-key, non-finite or non-serializable)
+    value is an input defect too.
+    """
+    _stable_canonical_json_bytes(raw_pairs)
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise _Failure(ERR_INPUT)
+    pairs: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for raw_pair in raw_pairs:
+        if (
+            not isinstance(raw_pair, dict)
+            or set(raw_pair.keys()) != set(STATE_ANCHORS_EXPORT_AUDIT_PAIR_KEYS)
+        ):
+            raise _Failure(ERR_INPUT)
+        height = raw_pair["height"]
+        account = raw_pair["account"]
+        if not _is_int(height) or height < 0:
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(account):
+            raise _Failure(ERR_INPUT)
+        pair = (height, account)
+        if pair in seen:
+            raise _Failure(ERR_INPUT)
+        seen.add(pair)
+        pairs.append(pair)
+    return sorted(pairs)
+
+
+def audit_state_anchors_exports(
+    documents: object,
+    expected_pairs: object,
+) -> dict:
+    """Audit coverage and cross-source consistency of anchor exports.
+
+    ``documents`` is a non-empty list of self-contained state-anchor exports
+    in source order and ``expected_pairs`` a non-empty list of distinct
+    ``{height, account}`` pins (caller order is arbitrary). Every document is
+    first fully replayed with :func:`verify_state_anchors_export`; an unknown
+    signer version or bad Ed25519 signature returns ``auth`` and digest,
+    ordering, account-set, anchor-binding, Merkle-path or same-height anchor
+    tampering returns ``integrity``. Argument, shape, key, type, hex,
+    mixed-key, non-finite-number or serialization defects (including empty or
+    duplicated pin lists) return ``input``.
+
+    Records for the pinned pairs are merged across sources: equivalent
+    records (including duplicate records inside one export or duplicate
+    sources) count once. A pair is ``verified`` when at least one source
+    carries it and every carrying source shares one block hash, state root
+    and account proof, and every record at that height across all sources
+    shares that anchor; ``missing`` when no source carries it (a source
+    lacking the pair alone never conflicts it); ``conflicts`` otherwise.
+    Each group entry is ``{height, account}`` in ascending ``(height,
+    account)`` order. Nothing is read or written and no malformed input
+    raises; the audit is a pure function of its arguments.
+    """
+    try:
+        pinned = _validate_state_anchors_audit_pairs(expected_pairs)
+        _stable_canonical_json_bytes(documents)
+        if not isinstance(documents, list) or not documents:
+            raise _Failure(ERR_INPUT)
+
+        wanted_pairs = set(pinned)
+        wanted_heights = {height for height, _ in pinned}
+        pair_variants: dict[
+            tuple[int, str], set[tuple[str, str, bytes]]
+        ] = {}
+        height_anchors: dict[int, set[tuple[str, str]]] = {}
+
+        for raw_document in documents:
+            result = verify_state_anchors_export(raw_document)
+            if not result.get("ok"):
+                raise _Failure(result["error"])
+            for raw_record in raw_document["records"]:
+                record = _parse_state_anchors_export_record(raw_record)
+                anchor = record["anchor"]
+                height = anchor["height"]
+                if height in wanted_heights:
+                    height_anchors.setdefault(height, set()).add(
+                        (anchor["block_hash"], anchor["state_root"])
+                    )
+                pair = (height, record["account"])
+                if pair in wanted_pairs:
+                    pair_variants.setdefault(pair, set()).add(
+                        (
+                            anchor["block_hash"],
+                            anchor["state_root"],
+                            _stable_canonical_json_bytes(record["proof"]),
+                        )
+                    )
+
+        verified: list[dict] = []
+        missing: list[dict] = []
+        conflicts: list[dict] = []
+        for height, account in pinned:
+            entry = {"height": height, "account": account}
+            variants = pair_variants.get((height, account))
+            if not variants:
+                missing.append(entry)
+            elif len(variants) > 1 or len(height_anchors.get(height, ())) > 1:
+                conflicts.append(entry)
+            else:
+                verified.append(entry)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    return {
+        "ok": True,
+        "verified": verified,
+        "missing": missing,
+        "conflicts": conflicts,
+    }
