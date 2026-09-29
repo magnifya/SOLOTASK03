@@ -772,11 +772,37 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   状态根（任一绑定或证明错误为 `integrity`）。成功键序固定为
   `ok, account, height, block_hash, state_root`；失败仅返回
   `{"ok": false, "error"}`，`error` 仅取 `input`/`auth`/`integrity`。
+- **批量签名状态证明**：`POST /v1/accounts/attested-proofs` 在同一把锁内
+  对同一份 canonical 已确认状态一次返回多个账户的签名证明。请求体只含
+  `accounts`（非空数组，账户非空、互异且为 64 位小写 hex）与可选 `height`
+  （字符串，严格格式同单账户证明）；解析失败、键缺失或额外、类型错误、空
+  列表、重复、账户或高度格式错误均 `400` 且不改变状态；链尾 pending、高度
+  未知或非 canonical、任一账户在锚点不存在均 `404`。成功 `200` 顶层键序
+  固定为 `state, proofs, auth`：`state` 复用 state-root 文档，`proofs` 复用
+  state-proof 文档并按 `account` **升序**排列、全部绑定同一
+  `state_root`/`height`/`block_hash` 锚点，整批只有**一份** `auth`
+  （`key_version, signature`），签名为对
+  `SHA256(UTF8("ledger-state-proofs-v1") ‖ canonical_json({state, proofs}))`
+  的 Ed25519 签名——不能拼接不同高度或状态根的证明。
+- **批量签名状态证明离线校验**：
+  `ledger.light_client.verify_state_proofs(document, accounts, trust)`
+  （纯库 API，不读本地状态、**不抛异常**）。`accounts` 为调用方钉住的非
+  空、互异 64 位小写 hex 账户列表（作为集合，顺序任意）。依次严格复核结构
+  /编码/hex/参数/trust（`input`）、未知 `key_version` 或形状合法但
+  Ed25519 验签失败（`auth`）、账户集合不一致或 proofs 非升序/重复、锚点
+  绑定、index 范围与每条 Merkle 路径（`integrity`）。成功键序固定为
+  `ok, accounts, height, block_hash, state_root`（`accounts` 为升序校验集
+  合）；失败只返回 `{"ok": false, "error"}`。
 - **CLI**：`state-root [--height H]` 与 `state-proof <account> [--height H]`
   两个子命令，`--height` 缺省时行为与输出完全不变；提供时逐字转发对应历史
   高度接口的单行 JSON 响应（含非 2xx 错误体）。`receipt-proofs-audit`
   缺少必填参数（FILE 或 `--expected-root`）时输出
   `{"ok":false,"error":"input"}`、退出码 1 且不请求服务。
+  新增 `state-proofs <account>... [--height H]`：一次请求批量签名状态证明并
+  打印单行 JSON；参数缺失、重复或格式非法时本地输出
+  `{"ok":false,"error":"input"}` 并退出 1（不请求服务），HTTP 非 2xx 或不
+  可达同样退出 1。单账户 proof、attested-proof、state-root 的响应与错误码
+  均保持不变；并发查询、快照恢复与重启后同一批账户始终得到同一升序结果。
 
 ## 交易索引
 
@@ -1628,7 +1654,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 read/update/export，401/403 无副作用）与 `history_credential_changed` 事件 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `state-proofs` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
 
 约定：
 
@@ -1742,6 +1768,18 @@ curl -s "localhost:8080/v1/accounts/<pubkey-hex>/attested-proof?height=H"
 # -> 200 {"state":{"state_root":"...","height":N,"block_hash":"...","account_count":K},
 #         "proof":{"account":"...","balance":...,"confirmed_transactions":[...],"index":I,
 #                  "state_root":"...","height":N,"block_hash":"...","siblings":[...]},
+#         "auth":{"key_version":1,"signature":"..."}}
+# 批量签名状态证明（accounts 须非空、互异、64 位小写 hex；height 可选且规则同单账户；
+# 畸形请求体 -> 400；锚点不可用或任一账户缺失 -> 404；proofs 按 account 升序、共享锚点，
+# 整批一份 auth.signature =
+# Ed25519(SHA256(UTF8("ledger-state-proofs-v1") || canonical_json({state,proofs})))，
+# 离线用 verify_state_proofs(document, accounts, trust) 校验）
+curl -s -X POST localhost:8080/v1/accounts/attested-proofs \
+  -H 'Content-Type: application/json' \
+  -d '{"accounts":["<pubkey-hex-1>","<pubkey-hex-2>"],"height":"H"}'
+# -> 200 {"state":{"state_root":"...","height":N,"block_hash":"...","account_count":K},
+#         "proofs":[{"account":"...","balance":...,"confirmed_transactions":[...],"index":I,
+#                    "state_root":"...","height":N,"block_hash":"...","siblings":[...]} 升序],
 #         "auth":{"key_version":1,"signature":"..."}}
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
@@ -1952,6 +1990,9 @@ python -m ledger.cli state-root                 # 锚定最高已确认块
 python -m ledger.cli state-root --height H      # 历史已确认前缀
 python -m ledger.cli state-proof <pubkey-hex>
 python -m ledger.cli state-proof <pubkey-hex> --height H
+# 批量签名状态证明（参数缺失/重复/非法本地输出 {"ok":false,"error":"input"} 退出 1；
+# 非 2xx 或不可达也退出 1；成功输出键序 state,proofs,auth 的单行 JSON）
+python -m ledger.cli state-proofs <pubkey-hex-1> <pubkey-hex-2> [--height H]
 python -m ledger.cli status 1
 python -m ledger.cli confirm 1
 python -m ledger.cli rollback 1
@@ -2073,6 +2114,7 @@ python tests/merkle_proof_bundle_test.py  # 批量 Merkle 证明（verify_merkle
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
 python tests/attested_state_proof_test.py  # 签名状态证明 GET /v1/accounts/{account}/attested-proof（height 可选单值规则同 state-proof；非法/重复/未知参数 400；未知/pending 锚点与缺失账户 404；200 固定键序 state,proof,auth，state/proof 复用 state-root/state-proof 字段键序，auth 键序 key_version,signature；ledger-state-proof-v1 域 SHA256+Ed25519、链状态签名者同锁；verify_state_proof input/auth/integrity 分类、账户/锚点/index 范围/Merkle 路径、轮换历史验签、不抛异常）与 HTTP 线序
+python tests/attested_state_proofs_test.py  # 批量签名状态证明 POST /v1/accounts/attested-proofs（accounts 非空互异 64 位小写 hex、可选 height 严格格式；解析/缺键/额外键/类型/空列表/重复/格式错误 400 不改状态；未知/非 canonical/pending 锚点与任一账户缺失 404；200 固定键序 state,proofs,auth，proofs 升序共享同一锚点、整批一份 ledger-state-proofs-v1 域签名；verify_state_proofs input/auth/integrity 分类、账户集合与排序/锚点绑定/Merkle 路径、域分离、轮换历史验签、不抛异常）、HTTP 线序与 CLI state-proofs
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验

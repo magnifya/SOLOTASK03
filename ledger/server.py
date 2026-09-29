@@ -212,6 +212,21 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.get_finalized_receipts(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/accounts/attested-proofs":
+                # POST /v1/accounts/attested-proofs — signed account-state
+                # inclusion proofs for a batch of accounts sharing one
+                # canonical anchor and one audit signature. The body is
+                # strictly {"accounts": [...]} or {"accounts": [...],
+                # "height": "H"} and is strictly validated by the service
+                # (400) before any state is read. The success document has
+                # the contract key order state, proofs, auth, so it is
+                # serialized in insertion order rather than alphabetically.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, payload)  # type: ignore[arg-type]
+                    return
+                status, body = service.get_attested_account_proofs(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:

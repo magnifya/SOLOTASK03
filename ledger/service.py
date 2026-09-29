@@ -990,6 +990,117 @@ class LedgerService:
                 "auth": auth,
             }
 
+    def get_attested_account_proofs(
+        self, payload: object
+    ) -> tuple[int, dict]:
+        """POST /v1/accounts/attested-proofs — signed state proofs for a
+        batch of accounts sharing one canonical anchor and one audit
+        signature.
+
+        The body is strictly ``{"accounts": [...]}`` or
+        ``{"accounts": [...], "height": "H"}``: a parse failure, missing or
+        extra keys, a wrong type, an empty list, duplicates or an account
+        that is not 64 lowercase hex characters is 400 before any state is
+        read; an optional ``height`` uses the same strict decimal form as the
+        single-account proof (a non-string or malformed value is 400). An
+        unknown, non-canonical or pending anchor, a pending default tip and
+        any account absent from the (historical) confirmed account set are
+        404.
+
+        The chain, the state tree and the current audit signer are
+        snapshotted together under one store lock. The success body has the
+        fixed key order ``state, proofs, auth``: ``state`` is the state-root
+        document, ``proofs`` is one complete account-state proof per
+        requested account, sorted by ascending account and all bound to the
+        same ``state_root``/``height``/``block_hash`` anchor, and ``auth`` is
+        the single Ed25519 envelope over
+        ``SHA256(UTF8("ledger-state-proofs-v1") || canonical_json({state,
+        proofs}))``.
+        """
+        if not isinstance(payload, dict) or set(payload) not in (
+            {"accounts"},
+            {"accounts", "height"},
+        ):
+            return 400, {
+                "error": "request body must be a JSON object with only 'accounts' and optional 'height'"
+            }
+        accounts_raw = payload["accounts"]
+        if not isinstance(accounts_raw, list) or not accounts_raw:
+            return 400, {
+                "error": "field 'accounts' must be a non-empty array"
+            }
+        if any(not crypto.is_hex64(account) for account in accounts_raw):
+            return 400, {
+                "error": "every account must be a string of 64 lowercase hex characters"
+            }
+        if len(set(accounts_raw)) != len(accounts_raw):
+            return 400, {"error": "accounts must be distinct"}
+        anchor_height: int | None = None
+        if "height" in payload:
+            anchor_height = _parse_decimal(payload["height"])
+            if anchor_height is None:
+                return 400, {
+                    "error": "height must be a non-negative decimal"
+                }
+
+        from . import light_client
+
+        with self.store.lock:
+            if anchor_height is None:
+                anchor = self.store.tip()
+            else:
+                anchor = self.store.block_at(anchor_height)
+                if anchor is None:
+                    return 404, {"error": "anchor block not found"}
+            if anchor.status != STATUS_CONFIRMED:
+                return 404, {"error": "chain tip is pending confirmation"}
+            prefix = (
+                self.store.chain
+                if anchor_height is None
+                else self.store.chain[: anchor.height + 1]
+            )
+            rows, leaves, root = self._state_tree(prefix)
+            rows_by_account = {name: i for i, (name, _b, _t) in enumerate(rows)}
+            if any(account not in rows_by_account for account in accounts_raw):
+                return 404, {"error": "account not found"}
+            state = {
+                "state_root": root,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "account_count": len(rows),
+            }
+            proofs = []
+            for account in sorted(set(accounts_raw)):
+                index = rows_by_account[account]
+                account_name, balance, transactions = rows[index]
+                siblings = crypto.merkle_proof(leaves, index)
+                proofs.append({
+                    "account": account_name,
+                    "balance": balance,
+                    "confirmed_transactions": transactions,
+                    "index": index,
+                    "state_root": root,
+                    "height": anchor.height,
+                    "block_hash": anchor.block_hash,
+                    "siblings": siblings,
+                })
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError("no audit signer available for state proofs")
+            auth = light_client.sign_state_proofs(
+                signer["private_key"], signer["version"], state, proofs
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "state": state,
+                "proofs": proofs,
+                "auth": auth,
+            }
+
     def confirmed_balance(self, account: str) -> int:
         """Balance from confirmed blocks only."""
         entry = self.store.accounts.get(account)

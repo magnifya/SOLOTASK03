@@ -1,6 +1,7 @@
 """Command line interface: send, tx, mine, block, account, proof, proofs,
 state-root,
-state-proof, confirm, rollback, status, candidates, chain, adopt, export,
+state-proof, state-proofs, confirm, rollback, status, candidates, chain,
+adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
 sync-state-audit, sync-plan,
@@ -181,6 +182,30 @@ def cmd_state_proof(args: argparse.Namespace) -> int:
         url = f"{url}?height={urllib.parse.quote(args.height, safe='')}"
     status, body = _request("GET", url, None)
     return _emit(status, body)
+
+
+def cmd_state_proofs(args: argparse.Namespace) -> int:
+    # Batch signed account-state proofs: validate the arguments the same
+    # strict way the server does (non-empty, distinct, 64-lowercase-hex
+    # accounts; strict non-negative decimal height) so a malformed invocation
+    # prints the {"ok": false, "error": "input"} body and exits 1 without
+    # contacting the server. The success document has a contract-fixed key
+    # order (state, proofs, auth), so it is printed in insertion order.
+    if not args.accounts:
+        return _input_failure()
+    if any(not crypto.is_hex64(account) for account in args.accounts):
+        return _input_failure()
+    if len(set(args.accounts)) != len(args.accounts):
+        return _input_failure()
+    if args.height is not None and _parse_cli_decimal(args.height) is None:
+        return _input_failure()
+    payload: dict = {"accounts": args.accounts}
+    if args.height is not None:
+        payload["height"] = args.height
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/accounts/attested-proofs", payload
+    )
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_proof(args: argparse.Namespace) -> int:
@@ -738,6 +763,19 @@ def _decimal_int(value: str) -> int | None:
         return None
 
 
+def _parse_cli_decimal(value: object) -> int | None:
+    """Strict non-negative decimal without leading zeros; None if malformed.
+
+    Mirrors the server's query/body height format so malformed client-side
+    arguments are rejected before any request is made.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if value != "0" and (not value.isdigit() or value[0] == "0"):
+        return None
+    return int(value)
+
+
 def _emit_result_document(body: dict) -> int:
     """Print one JSON line preserving the document's contract key order.
 
@@ -1083,6 +1121,23 @@ def build_parser() -> argparse.ArgumentParser:
         "no leading zeros; omitted anchors the highest confirmed block)",
     )
     p_state_proof.set_defaults(func=cmd_state_proof)
+
+    p_state_proofs = sub.add_parser(
+        "state-proofs",
+        help="fetch one signed state proof batch for several accounts",
+    )
+    p_state_proofs.add_argument(
+        "accounts",
+        metavar="account",
+        nargs="*",
+        help="one or more account ids (64 lowercase hex characters, distinct)",
+    )
+    p_state_proofs.add_argument(
+        "--height",
+        help="anchor at a historical confirmed block height (unsigned decimal, "
+        "no leading zeros; omitted anchors the highest confirmed block)",
+    )
+    p_state_proofs.set_defaults(func=cmd_state_proofs)
 
     p_proof = sub.add_parser("proof", help="fetch a Merkle inclusion proof")
     p_proof.add_argument("height", help="block height containing the transaction")
