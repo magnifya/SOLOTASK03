@@ -11289,3 +11289,136 @@ def audit_state_anchors_exports(documents: object, expected_pairs: object) -> di
         "missing": missing,
         "conflicts": conflicts,
     }
+
+
+# -- offline cross-archive coverage and consistency audit --------------------
+
+STATE_ANCHORS_ARCHIVES_AUDIT_RESULT_KEYS = (
+    "ok",
+    "verified",
+    "missing",
+    "conflicts",
+)
+
+
+def audit_state_anchors_archives(paths: object, expected_pairs: object) -> dict:
+    """Audit multiple local batch state-anchor archives offline.
+
+    ``paths`` is the source-ordered, non-empty list of non-empty mutually
+    distinct archive paths maintained by :func:`record_state_anchors`;
+    ``expected_pairs`` is a non-empty list of pinned
+    ``{"height", "account"}`` combinations (each height a non-boolean
+    non-negative integer and each account a 64-lowercase-hex string, with
+    no duplicate combination). Every existing archive is first strictly
+    loaded with the same rules :func:`read_state_anchors` enforces; an
+    archive that does not exist is an empty source, and equivalent
+    duplicate records inside one source count once. The hits are merged by
+    height and account; service state is never read and no archive is ever
+    written, cleaned or reordered.
+
+    Success returns ``{"ok": True, "verified", "missing", "conflicts"}`` in
+    that key order; every group holds ``{"height", "account"}`` entries
+    stably sorted by height then account, independent of the source order.
+    A pinned combination is ``verified`` when every source carrying it
+    agrees on block hash, state root and the full account-proof content and
+    every source agrees on that height's anchor; ``missing`` when no source
+    carries it at all (a source lacking the archive or the record never
+    causes a conflict); ``conflicts`` when sources that carry it disagree
+    on the anchor or proof content, or sources disagree on the anchor at
+    that height.
+
+    Failure returns only ``{"ok": False, "error": category}``: ``input``
+    for bad parameters, path-list or pair shapes, types, hex values,
+    duplicate paths or combinations, or non-stably-serializable input;
+    ``state`` for an archive failing its strict parse, key-order, digest,
+    proof-replay or internal-conflict checks; and ``io`` for a read
+    failure. Nothing is raised; identical inputs yield identical results
+    across repeated, concurrent and cross-restart calls.
+    """
+    try:
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or any(not isinstance(path, str) or not path for path in paths)
+            or len(set(paths)) != len(paths)
+        ):
+            return {"ok": False, "error": ERR_INPUT}
+        pairs = _validate_state_anchors_audit_pairs(expected_pairs)
+        _stable_canonical_json_bytes(paths)
+        _stable_canonical_json_bytes(expected_pairs)
+
+        # Per source: pair -> (anchor, proof), with equivalent duplicate
+        # records inside one archive counted once; each source contributes
+        # one anchor vote per height (same-height anchors within a valid
+        # archive are already guaranteed identical). A missing archive is
+        # an empty source rather than an error.
+        pair_evidence: list[dict[tuple, tuple]] = []
+        anchor_votes_by_height: dict[int, list[dict]] = {}
+        for path in paths:
+            lock = _checkpoint_lock(path)
+            with lock:
+                try:
+                    stored = _load_state_anchors_archive(path)
+                except _CheckpointError as failure:
+                    return {"ok": False, "error": failure.category}
+                except Exception:
+                    return {"ok": False, "error": ERR_STATE}
+            evidence: dict[tuple, tuple] = {}
+            source_anchors: dict[int, dict] = {}
+            if stored is not None:
+                for record in stored["records"]:
+                    anchor = {
+                        key: record["anchor"][key]
+                        for key in STATE_ANCHOR_ANCHOR_KEYS
+                    }
+                    height = anchor["height"]
+                    source_anchors.setdefault(height, anchor)
+                    for account in record["accounts"]:
+                        proof = _stored_state_anchor_proof(record, account)
+                        if proof is None:
+                            return {"ok": False, "error": ERR_STATE}
+                        pair = (height, account)
+                        evidence.setdefault(pair, (anchor, proof))
+            for height, anchor in source_anchors.items():
+                anchor_votes_by_height.setdefault(height, []).append(anchor)
+            pair_evidence.append(evidence)
+
+        verified: list[dict] = []
+        missing: list[dict] = []
+        conflicts: list[dict] = []
+        for height, account in sorted(pairs):
+            entry = {"height": height, "account": account}
+            hits = [
+                evidence[(height, account)]
+                for evidence in pair_evidence
+                if (height, account) in evidence
+            ]
+            if not hits:
+                missing.append(entry)
+                continue
+            pair_anchors = [anchor for anchor, _proof in hits]
+            proofs = [proof for _anchor, proof in hits]
+            first_anchor = pair_anchors[0]
+            divergent = any(anchor != first_anchor for anchor in pair_anchors)
+            divergent = divergent or any(
+                proof != proofs[0] for proof in proofs
+            )
+            height_votes = anchor_votes_by_height.get(height, [])
+            divergent = divergent or (
+                any(vote != first_anchor for vote in height_votes)
+            )
+            if divergent:
+                conflicts.append(entry)
+            else:
+                verified.append(entry)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    return {
+        "ok": True,
+        "verified": verified,
+        "missing": missing,
+        "conflicts": conflicts,
+    }
