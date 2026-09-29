@@ -808,6 +808,25 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   响应与错误码保持不变；并发查询、快照恢复与重启后同一批账户得到相同的
   升序结果与锚点。
 
+- **多份状态锚导出的覆盖与一致性审计（纯库）**：
+  `ledger.light_client.audit_state_anchors_exports(documents, expected_pairs)
+  -> dict` 只做离线审计，不读不写本地文件、不抛异常，HTTP 与命令行入口
+  均不新增、行为不变。`documents` 是按来源顺序给出的非空状态锚导出数组
+  （`export_state_anchors` 文档）；`expected_pairs` 是非空的钉住组合清单，
+  每项键序固定为 `height, account`，高度为非布尔非负整数、账户为 64 位
+  小写 hex，且组合不得重复（清单本身允许任意顺序）。每份导出先按
+  `verify_state_anchors_export` 既有规则完整验证，再把命中记录按
+  `(height, account)` 归并；同一来源内的等价重复记录只计一次。非法参数、
+  文档结构、键序、类型、hex、混合键、非有限数或不可稳定序列化内容返回
+  `input`；未知审计签名版本或形状合法但 Ed25519 验签失败返回 `auth`；
+  导出摘要、记录排序、账户集合、锚点绑定、证明路径或同高度锚点被篡改
+  返回 `integrity`。成功固定返回 `ok, verified, missing, conflicts`，三组
+  均为键序 `height, account` 的条目并按高度再账户稳定升序：所有来源命中
+  且区块哈希、状态根、账户证明内容与该高度锚点完全一致为 `verified`；
+  所有来源均无该组合记录为 `missing`（某一来源缺记录绝不判冲突）；来源
+  间锚点或证明内容分歧、或同一高度在来源间锚点不一致为 `conflicts`，
+  并指出冲突的高度与账户。相同输入重复调用、并发与跨进程结果一致。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
