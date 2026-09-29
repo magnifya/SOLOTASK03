@@ -578,6 +578,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -1696,6 +1697,36 @@ def _canonical_json_bytes(value: object) -> bytes:
     """Sorted-key, compact, unescaped-non-ASCII UTF-8 canonical JSON bytes."""
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _stable_canonical_json_bytes(value: object) -> bytes:
+    """Canonical JSON bytes that also reject non-stable JSON values."""
+
+    def validate(node: object) -> None:
+        if isinstance(node, dict):
+            if any(not isinstance(key, str) for key in node):
+                raise TypeError("object keys must be strings")
+            for key, child in node.items():
+                validate(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                validate(child)
+        elif isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError("finite numbers are required")
+        elif node is None or isinstance(node, (str, bool, int)):
+            return
+        else:
+            raise TypeError("value is not JSON serializable")
+
+    validate(value)
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -10544,8 +10575,8 @@ def record_state_anchors(
         return _failed_advance(ERR_INPUT)
     try:
         _state_anchors_input_stage(document, accounts, trust)
-        json.dumps(document, ensure_ascii=False)
-        json.dumps(trust, ensure_ascii=False)
+        _stable_canonical_json_bytes(document)
+        _stable_canonical_json_bytes(trust)
     except _Failure as failure:
         return _failed_advance(failure.category)
     except Exception:
@@ -10744,3 +10775,380 @@ def read_state_anchors(
             "generation": stored["generation"],
             "items": items,
         }
+
+
+# -- self-contained batch state-anchor export -------------------------------
+
+STATE_ANCHORS_EXPORT_VERSION = 1
+STATE_ANCHORS_EXPORT_KEYS = (
+    "v",
+    "generation",
+    "heights",
+    "accounts",
+    "records",
+    "digest",
+)
+STATE_ANCHORS_EXPORT_RECORD_KEYS = (
+    "generation",
+    "anchor",
+    "accounts",
+    "account",
+    "proof",
+    "document",
+    "trust",
+    "digest",
+)
+STATE_ANCHORS_EXPORT_RESULT_KEYS = ("ok", "document")
+STATE_ANCHORS_VERIFY_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "heights",
+    "accounts",
+    "records",
+)
+
+
+def _state_anchors_export_record_digest(record: dict) -> str:
+    body = {
+        key: record[key]
+        for key in STATE_ANCHORS_EXPORT_RECORD_KEYS
+        if key != "digest"
+    }
+    return hashlib.sha256(_stable_canonical_json_bytes(body)).hexdigest()
+
+
+def _state_anchors_export_digest(document: dict) -> str:
+    body = {
+        key: document[key]
+        for key in STATE_ANCHORS_EXPORT_KEYS
+        if key != "digest"
+    }
+    return hashlib.sha256(_stable_canonical_json_bytes(body)).hexdigest()
+
+
+def _validate_state_anchors_export_filter(
+    heights: object,
+    accounts: object,
+) -> tuple[list[int], list[str]]:
+    if not isinstance(heights, list) or not heights:
+        raise _Failure(ERR_INPUT)
+    if any(not _is_int(height) or height < 0 for height in heights):
+        raise _Failure(ERR_INPUT)
+    if not isinstance(accounts, list) or not accounts:
+        raise _Failure(ERR_INPUT)
+    if any(not crypto.is_hex64(account) for account in accounts):
+        raise _Failure(ERR_INPUT)
+    if len(set(accounts)) != len(accounts):
+        raise _Failure(ERR_INPUT)
+    return sorted(set(heights)), sorted(accounts)
+
+
+def export_state_anchors(
+    path: object,
+    heights: object,
+    accounts: object,
+) -> dict:
+    """Export selected verified historical batch state anchors.
+
+    The archive at ``path`` is read but never modified. ``heights`` is a
+    non-empty list of non-boolean non-negative integers and ``accounts`` a
+    non-empty list of distinct 64-lowercase-hex accounts; repeated requested
+    heights are normalized away and both filters are emitted ascending.
+
+    Success returns ``{"ok": True, "document"}``. The document has key order
+    ``v, generation, heights, accounts, records, digest``; a missing archive
+    yields ``generation: 0`` and no records. Each hit is flattened to one
+    record and keeps the archive generation, shared anchor, original batch
+    account set, selected account proof, complete batch proof document, trust
+    material and a self-excluding SHA-256 record digest. Records are sorted by
+    ``(height, account)``; ties retain the archive's deterministic batch
+    order. The top-level digest seals all records, including their digests.
+    Bad arguments are ``input``; archive parse, field, digest, ordering or
+    proof-replay damage is ``state``; read failures are ``io``.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    try:
+        selected_heights, selected_accounts = (
+            _validate_state_anchors_export_filter(heights, accounts)
+        )
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+
+    wanted_heights = set(selected_heights)
+    wanted_accounts = set(selected_accounts)
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            stored = _load_state_anchors_archive(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            return {"ok": False, "error": ERR_STATE}
+
+        if stored is None:
+            document = {
+                "v": STATE_ANCHORS_EXPORT_VERSION,
+                "generation": 0,
+                "heights": selected_heights,
+                "accounts": selected_accounts,
+                "records": [],
+            }
+            document["digest"] = _state_anchors_export_digest(document)
+            return {"ok": True, "document": document}
+
+        records: list[dict] = []
+        try:
+            for stored_record in stored["records"]:
+                anchor = stored_record["anchor"]
+                height = anchor["height"]
+                if height not in wanted_heights:
+                    continue
+                proofs = {
+                    proof["account"]: proof
+                    for proof in stored_record["document"]["proofs"]
+                }
+                for account in stored_record["accounts"]:
+                    if account not in wanted_accounts:
+                        continue
+                    proof = proofs.get(account)
+                    if proof is None:
+                        return {"ok": False, "error": ERR_STATE}
+                    record = {
+                        "generation": stored["generation"],
+                        "anchor": {
+                            key: anchor[key]
+                            for key in STATE_ANCHOR_ANCHOR_KEYS
+                        },
+                        "accounts": list(stored_record["accounts"]),
+                        "account": account,
+                        "proof": proof,
+                        "document": stored_record["document"],
+                        "trust": stored_record["trust"],
+                    }
+                    record["digest"] = (
+                        _state_anchors_export_record_digest(record)
+                    )
+                    records.append(record)
+
+            records.sort(
+                key=lambda item: (
+                    item["anchor"]["height"],
+                    item["account"],
+                )
+            )
+            document = {
+                "v": STATE_ANCHORS_EXPORT_VERSION,
+                "generation": stored["generation"],
+                "heights": selected_heights,
+                "accounts": selected_accounts,
+                "records": records,
+            }
+            document["digest"] = _state_anchors_export_digest(document)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": ERR_STATE}
+        except Exception:
+            return {"ok": False, "error": ERR_STATE}
+        return {"ok": True, "document": document}
+
+
+def _parse_state_anchors_export_record(raw_record: object) -> dict:
+    if (
+        not isinstance(raw_record, dict)
+        or tuple(raw_record.keys()) != STATE_ANCHORS_EXPORT_RECORD_KEYS
+    ):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_record["generation"]) or raw_record["generation"] < 1:
+        raise _Failure(ERR_INPUT)
+    raw_anchor = raw_record["anchor"]
+    if (
+        not isinstance(raw_anchor, dict)
+        or tuple(raw_anchor.keys()) != STATE_ANCHOR_ANCHOR_KEYS
+    ):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_anchor["height"]) or raw_anchor["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_anchor["block_hash"]):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_anchor["state_root"]):
+        raise _Failure(ERR_INPUT)
+    batch_accounts = raw_record["accounts"]
+    if (
+        not isinstance(batch_accounts, list)
+        or not batch_accounts
+        or any(not crypto.is_hex64(account) for account in batch_accounts)
+        or len(set(batch_accounts)) != len(batch_accounts)
+        or list(batch_accounts) != sorted(batch_accounts)
+    ):
+        raise _Failure(ERR_INPUT)
+    account = raw_record["account"]
+    if not crypto.is_hex64(account) or account not in batch_accounts:
+        raise _Failure(ERR_INPUT)
+    proof = _parse_state_proof_document(raw_record["proof"])
+    if proof["account"] != account:
+        raise _Failure(ERR_INTEGRITY)
+    raw_document = raw_record["document"]
+    if (
+        not isinstance(raw_document, dict)
+        or tuple(raw_document.keys()) != ATTESTED_STATE_PROOFS_KEYS
+    ):
+        raise _Failure(ERR_INPUT)
+    state = _parse_state_root_document(raw_document["state"])
+    proofs = [
+        _parse_state_proof_document(item)
+        for item in raw_document["proofs"]
+    ]
+    if not proofs:
+        raise _Failure(ERR_INPUT)
+    raw_auth = raw_document["auth"]
+    if (
+        not isinstance(raw_auth, dict)
+        or tuple(raw_auth.keys()) != STATE_PROOF_AUTH_KEYS
+    ):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_auth["key_version"]) or raw_auth["key_version"] < 1:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(raw_auth["signature"], str) or not crypto.is_hex128(
+        raw_auth["signature"]
+    ):
+        raise _Failure(ERR_INPUT)
+    trust = raw_record["trust"]
+    _validate_header_trust(trust)
+    digest = raw_record["digest"]
+    if not crypto.is_hex64(digest):
+        raise _Failure(ERR_INPUT)
+    document = {
+        "state": state,
+        "proofs": proofs,
+        "auth": {
+            "key_version": raw_auth["key_version"],
+            "signature": raw_auth["signature"],
+        },
+    }
+    return {
+        "generation": raw_record["generation"],
+        "anchor": {
+            key: raw_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS
+        },
+        "accounts": list(batch_accounts),
+        "account": account,
+        "proof": proof,
+        "document": document,
+        "trust": trust,
+        "digest": digest,
+    }
+
+
+def verify_state_anchors_export(document: object) -> dict:
+    """Verify a self-contained historical state-anchor export offline.
+
+    No path or local trust material is supplied. Structural, key-order,
+    raw-type, hex, mixed-key, non-finite-number or JSON-serialization defects
+    return ``input``. Every embedded batch is then replayed with
+    :func:`verify_state_proofs`; an unknown signer version or bad Ed25519
+    signature returns ``auth``. Anchor bindings, account sets, Merkle paths,
+    same-height anchor consistency, repeated-pair proof consistency, ordering
+    and either digest tampering return ``integrity``.
+
+    Success returns ``{"ok": True, "generation", "heights", "accounts",
+    "records"}`` with ``records`` as ascending ``{"height", "account"}``
+    summaries. Nothing is read or written and no malformed input raises.
+    """
+    try:
+        _stable_canonical_json_bytes(document)
+        if (
+            not isinstance(document, dict)
+            or tuple(document.keys()) != STATE_ANCHORS_EXPORT_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        if not _is_int(document["v"]) or document["v"] != (
+            STATE_ANCHORS_EXPORT_VERSION
+        ):
+            raise _Failure(ERR_INPUT)
+        generation = document["generation"]
+        if not _is_int(generation) or generation < 0:
+            raise _Failure(ERR_INPUT)
+        heights, accounts = _validate_state_anchors_export_filter(
+            document["heights"], document["accounts"]
+        )
+        raw_records = document["records"]
+        if not isinstance(raw_records, list):
+            raise _Failure(ERR_INPUT)
+        records = [
+            _parse_state_anchors_export_record(raw) for raw in raw_records
+        ]
+
+        anchors_by_height: dict[int, dict] = {}
+        proofs_by_pair: dict[tuple[int, str], dict] = {}
+        previous_pair: tuple[int, str] | None = None
+
+        for record in records:
+            pair = (
+                record["anchor"]["height"],
+                record["account"],
+            )
+            if previous_pair is not None and pair < previous_pair:
+                raise _Failure(ERR_INTEGRITY)
+            previous_pair = pair
+
+            if record["generation"] != generation or generation < 1:
+                raise _Failure(ERR_INTEGRITY)
+            if pair[0] not in heights or pair[1] not in accounts:
+                raise _Failure(ERR_INTEGRITY)
+
+            result = verify_state_proofs(
+                record["document"], record["accounts"], record["trust"]
+            )
+            if not result.get("ok"):
+                raise _Failure(result["error"])
+
+            state = record["document"]["state"]
+            anchor = record["anchor"]
+            if anchor != {
+                "height": state["height"],
+                "block_hash": state["block_hash"],
+                "state_root": state["state_root"],
+            }:
+                raise _Failure(ERR_INTEGRITY)
+
+            proof_by_account = {
+                proof["account"]: proof
+                for proof in record["document"]["proofs"]
+            }
+            if proof_by_account.get(record["account"]) != record["proof"]:
+                raise _Failure(ERR_INTEGRITY)
+
+            known_anchor = anchors_by_height.get(pair[0])
+            if known_anchor is not None and known_anchor != anchor:
+                raise _Failure(ERR_INTEGRITY)
+            anchors_by_height.setdefault(pair[0], anchor)
+
+            known_proof = proofs_by_pair.get(pair)
+            if known_proof is not None and known_proof != record["proof"]:
+                raise _Failure(ERR_INTEGRITY)
+            proofs_by_pair.setdefault(pair, record["proof"])
+
+            if _state_anchors_export_record_digest(record) != record["digest"]:
+                raise _Failure(ERR_INTEGRITY)
+
+        expected_digest = _state_anchors_export_digest(document)
+        if expected_digest != document["digest"]:
+            raise _Failure(ERR_INTEGRITY)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    return {
+        "ok": True,
+        "generation": generation,
+        "heights": heights,
+        "accounts": accounts,
+        "records": [
+            {
+                "height": record["anchor"]["height"],
+                "account": record["account"],
+            }
+            for record in records
+        ],
+    }
