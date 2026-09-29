@@ -827,6 +827,40 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   间锚点或证明内容分歧、或同一高度在来源间锚点不一致为 `conflicts`，
   并指出冲突的高度与账户。相同输入重复调用、并发与跨进程结果一致。
 
+- **多份本地归档的带签名审计报告（纯库）**：
+  `ledger.light_client.export_state_anchors_audit_report(paths,
+  expected_pairs, signing_key) -> dict` 把
+  `audit_state_anchors_archives` 的核对结果固化为自包含、可离线复核的
+  报告；纯库边界，不新增 HTTP/CLI 入口，既有状态锚文件与 record/
+  read/export/verify 行为全部不变。`paths` 是按来源顺序给出的非空、
+  非空串、互异归档路径；`expected_pairs` 同多来源审计的钉住组合规则
+  （非空、不重复、高度为非布尔非负整数、账户为 64 位小写 hex）；
+  `signing_key` 是 64 位小写 hex 的 Ed25519 种子。每份归档严格加载并重放
+  证明、锚点与摘要（结构、键序、摘要或证明损坏为 `state`，文件读取失败
+  为 `io`），缺失归档算空来源，某来源缺组合不算冲突；只读归档、绝不
+  改写。参数或不可稳定序列化内容为 `input`，任何失败只返回
+  `{"ok": false, "error"}`、不抛异常。成功固定键序
+  `v, sources, evidence, verified, missing, conflicts, public_key,
+  digest, signature`：`sources` 按来源顺序保存每份归档的代数、归档摘要
+  与该归档每个高度的锚点（缺失来源为 `present: false`、代数 0、空摘要、
+  无锚点）；`evidence` 按高度再账户稳定升序列出命中证据，每条命中以来源
+  下标引用来源并内嵌一份可独立重放的自包含导出形记录（含完整批量证明
+  文档、信任材料与记录摘要）；`verified`/`missing`/`conflicts` 的判定与
+  排序规则同 `audit_state_anchors_archives`，来源顺序不影响分组。正文
+  摘要是去除 `digest` 与 `signature` 后的紧凑 UTF-8 canonical JSON 的
+  SHA-256；签名消息为
+  `UTF8("ledger-state-anchors-audit-v1") ‖ ASCII(digest)` 上的 Ed25519
+  签名。相同输入与签名种子逐字节生成相同报告，重复调用不改归档。
+- **审计报告离线校验（纯库）**：
+  `ledger.light_client.verify_state_anchors_audit_report(report,
+  expected_pairs, public_key) -> dict` 只读报告、逐份复核证据并重算分组，
+  不接触任何本地文件。报告或参数的形状、键序、类型、hex 或序列化问题为
+  `input`；报告公钥与入参不符或域分隔 Ed25519 验签失败为 `auth`；正文
+  摘要不符、证据记录重放或其记录摘要失败、来源代数/锚点不一致、证据
+  越出钉住集合、或重算的 verified/missing/conflicts 与报告不符为
+  `integrity`。成功固定返回 `ok, verified, missing, conflicts`（均按高度
+  再账户稳定升序）；任何失败只返回 `{"ok": false, "error"}`、不抛异常。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。

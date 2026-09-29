@@ -11410,3 +11410,654 @@ def audit_state_anchors_archives(paths: object, expected_pairs: object) -> dict:
         "missing": missing,
         "conflicts": conflicts,
     }
+
+
+# -- signed, offline-recheckable multi-archive audit reports ----------------
+
+STATE_ANCHORS_AUDIT_REPORT_VERSION = 1
+STATE_ANCHORS_AUDIT_REPORT_DOMAIN = b"ledger-state-anchors-audit-v1"
+STATE_ANCHORS_AUDIT_REPORT_SOURCE_KEYS = (
+    "path",
+    "present",
+    "generation",
+    "digest",
+    "anchors",
+)
+STATE_ANCHORS_AUDIT_REPORT_HIT_KEYS = ("source", "record")
+STATE_ANCHORS_AUDIT_REPORT_EVIDENCE_KEYS = ("height", "account", "hits")
+STATE_ANCHORS_AUDIT_REPORT_KEYS = (
+    "v",
+    "sources",
+    "evidence",
+    "verified",
+    "missing",
+    "conflicts",
+    "public_key",
+    "digest",
+    "signature",
+)
+STATE_ANCHORS_AUDIT_REPORT_RESULT_KEYS = (
+    "ok",
+    "verified",
+    "missing",
+    "conflicts",
+)
+
+
+def _state_anchors_audit_report_digest(report: dict) -> str:
+    """SHA-256 over canonical JSON of the body minus digest and signature."""
+    body = {
+        key: value
+        for key, value in report.items()
+        if key not in ("digest", "signature")
+    }
+    return hashlib.sha256(_stable_canonical_json_bytes(body)).hexdigest()
+
+
+def _state_anchors_audit_report_message(digest: str) -> bytes:
+    """The domain-prefixed exact byte string covered by the Ed25519 seal."""
+    return STATE_ANCHORS_AUDIT_REPORT_DOMAIN + digest.encode("ascii")
+
+
+def _state_anchors_audit_groups(
+    pairs: list[tuple[int, str]],
+    pair_evidence: list[dict[tuple, tuple]],
+    anchor_votes_by_height: dict[int, list[dict]],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Group pinned pairs exactly like the archive/export audit rules."""
+    verified: list[dict] = []
+    missing: list[dict] = []
+    conflicts: list[dict] = []
+    for height, account in sorted(pairs):
+        entry = {"height": height, "account": account}
+        hits = [
+            evidence[(height, account)]
+            for evidence in pair_evidence
+            if (height, account) in evidence
+        ]
+        if not hits:
+            missing.append(entry)
+            continue
+        pair_anchors = [anchor for anchor, _proof in hits]
+        proofs = [proof for _anchor, proof in hits]
+        first_anchor = pair_anchors[0]
+        divergent = any(anchor != first_anchor for anchor in pair_anchors)
+        divergent = divergent or any(proof != proofs[0] for proof in proofs)
+        height_votes = anchor_votes_by_height.get(height, [])
+        divergent = divergent or (
+            any(vote != first_anchor for vote in height_votes)
+        )
+        if divergent:
+            conflicts.append(entry)
+        else:
+            verified.append(entry)
+    return verified, missing, conflicts
+
+
+def _state_anchors_evidence_record(
+    generation: int,
+    anchor: dict,
+    batch_accounts: list,
+    account: str,
+    proof: dict,
+    document: dict,
+    trust: object,
+) -> dict:
+    """Build one self-contained, sealed export-shaped evidence record."""
+    record = {
+        "generation": generation,
+        "anchor": {key: anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS},
+        "accounts": list(batch_accounts),
+        "account": account,
+        "proof": proof,
+        "document": document,
+        "trust": trust,
+    }
+    record["digest"] = _state_anchors_export_record_digest(record)
+    return record
+
+
+def _state_anchors_audit_pair_entry(raw_entry: object) -> tuple[int, str]:
+    """Parse one ``{"height", "account"}`` group entry or raise input."""
+    if (
+        not isinstance(raw_entry, dict)
+        or tuple(raw_entry.keys()) != STATE_ANCHORS_AUDIT_PAIR_KEYS
+    ):
+        raise _Failure(ERR_INPUT)
+    height = raw_entry["height"]
+    account = raw_entry["account"]
+    if not _is_int(height) or height < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(account):
+        raise _Failure(ERR_INPUT)
+    return height, account
+
+
+def export_state_anchors_audit_report(
+    paths: object,
+    expected_pairs: object,
+    signing_key: object,
+) -> dict:
+    """Export a signed, offline-recheckable multi-archive audit report.
+
+    ``paths`` is the source-ordered, non-empty list of non-empty distinct
+    archive path strings maintained by :func:`record_state_anchors`;
+    ``expected_pairs`` is a non-empty list of pinned
+    ``{"height", "account"}`` combinations (each height a non-boolean
+    non-negative integer and each account a 64-lowercase-hex string, with
+    no duplicate combination); ``signing_key`` is the 64-hex Ed25519 seed
+    sealing the report. Every existing archive is strictly loaded under
+    the batch state-anchor archive rules (shape, key order, digest, proof
+    replay and internal-conflict checks); a missing archive is an empty
+    source, not an error. Archives are read under their locks and never
+    written, cleaned or rearranged; identical inputs and signing seed
+    always yield a byte-identical report.
+
+    Success returns ``{"ok": True, "report"}`` with fixed report key
+    order ``v, sources, evidence, verified, missing, conflicts,
+    public_key, digest, signature``. Each source entry (key order
+    ``path, present, generation, digest, anchors``) pins the archive
+    generation, archive digest and one anchor per archive height; an
+    absent source records ``present: false``, generation 0, an empty
+    digest and no anchors. ``evidence`` lists, stably sorted by height
+    then account, one sealed export-shaped hit record per source
+    carrying a pinned combination; hits are sorted by source index.
+    ``verified``, ``missing`` and ``conflicts`` follow the same rules as
+    :func:`audit_state_anchors_archives` and source order never affects
+    grouping. ``digest`` is the SHA-256 of the compact sorted-key UTF-8
+    canonical JSON of the body with ``digest`` and ``signature``
+    removed; ``signature`` is the Ed25519 signature over
+    ``UTF8("ledger-state-anchors-audit-v1")`` concatenated with the
+    ASCII digest bytes.
+
+    Failure returns only ``{"ok": False, "error": category}``:
+    ``input`` for bad parameters or non-stably-serializable content,
+    ``state`` for archive structure, key-order, digest or proof-replay
+    damage and ``io`` for a read failure. Nothing is raised.
+    """
+    try:
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or any(not isinstance(path, str) or not path for path in paths)
+            or len(set(paths)) != len(paths)
+        ):
+            return {"ok": False, "error": ERR_INPUT}
+        pairs = _validate_state_anchors_audit_pairs(expected_pairs)
+        _stable_canonical_json_bytes(paths)
+        _stable_canonical_json_bytes(expected_pairs)
+        if not isinstance(signing_key, str) or not crypto.is_hex64(
+            signing_key
+        ):
+            return {"ok": False, "error": ERR_INPUT}
+        public_key = crypto.derive_public_key(signing_key)
+        if public_key is None:
+            return {"ok": False, "error": ERR_INPUT}
+
+        sources: list[dict] = []
+        # Per source: pair -> (anchor, proof) for grouping and
+        # pair -> sealed export record for the embedded evidence.
+        pair_evidence: list[dict[tuple, tuple]] = []
+        records_by_source: list[dict[tuple, dict]] = []
+        anchor_votes_by_height: dict[int, list[dict]] = {}
+        for path in paths:
+            lock = _checkpoint_lock(path)
+            with lock:
+                try:
+                    stored = _load_state_anchors_archive(path)
+                except _CheckpointError as failure:
+                    return {"ok": False, "error": failure.category}
+                except Exception:
+                    return {"ok": False, "error": ERR_STATE}
+            if stored is None:
+                sources.append(
+                    {
+                        "path": path,
+                        "present": False,
+                        "generation": 0,
+                        "digest": "",
+                        "anchors": [],
+                    }
+                )
+                pair_evidence.append({})
+                records_by_source.append({})
+                continue
+
+            evidence: dict[tuple, tuple] = {}
+            records_for_pair: dict[tuple, dict] = {}
+            source_anchors: dict[int, dict] = {}
+            for stored_record in stored["records"]:
+                anchor = {
+                    key: stored_record["anchor"][key]
+                    for key in STATE_ANCHOR_ANCHOR_KEYS
+                }
+                height = anchor["height"]
+                source_anchors.setdefault(height, anchor)
+                proof_docs = {
+                    proof["account"]: proof
+                    for proof in stored_record["document"]["proofs"]
+                }
+                for account in stored_record["accounts"]:
+                    proof = proof_docs.get(account)
+                    if proof is None:
+                        return {"ok": False, "error": ERR_STATE}
+                    pair = (height, account)
+                    if pair in evidence:
+                        continue
+                    record = _state_anchors_evidence_record(
+                        stored["generation"],
+                        anchor,
+                        stored_record["accounts"],
+                        account,
+                        proof,
+                        stored_record["document"],
+                        stored_record["trust"],
+                    )
+                    evidence[pair] = (anchor, proof)
+                    records_for_pair[pair] = record
+            ordered_anchors = [
+                source_anchors[height] for height in sorted(source_anchors)
+            ]
+            for anchor in ordered_anchors:
+                anchor_votes_by_height.setdefault(
+                    anchor["height"], []
+                ).append(anchor)
+            sources.append(
+                {
+                    "path": path,
+                    "present": True,
+                    "generation": stored["generation"],
+                    "digest": stored["hash"],
+                    "anchors": ordered_anchors,
+                }
+            )
+            pair_evidence.append(evidence)
+            records_by_source.append(records_for_pair)
+
+        verified, missing, conflicts = _state_anchors_audit_groups(
+            pairs, pair_evidence, anchor_votes_by_height
+        )
+
+        evidence_entries: list[dict] = []
+        for height, account in sorted(pairs):
+            if not any(
+                (height, account) in evidence for evidence in pair_evidence
+            ):
+                continue
+            hits = []
+            for source_index, evidence in enumerate(pair_evidence):
+                if (height, account) in evidence:
+                    hits.append(
+                        {
+                            "source": source_index,
+                            "record": records_by_source[source_index][
+                                (height, account)
+                            ],
+                        }
+                    )
+            evidence_entries.append(
+                {"height": height, "account": account, "hits": hits}
+            )
+
+        report: dict = {
+            "v": STATE_ANCHORS_AUDIT_REPORT_VERSION,
+            "sources": sources,
+            "evidence": evidence_entries,
+            "verified": verified,
+            "missing": missing,
+            "conflicts": conflicts,
+            "public_key": public_key,
+        }
+        digest = _state_anchors_audit_report_digest(report)
+        signature = crypto.sign_message(
+            signing_key, _state_anchors_audit_report_message(digest)
+        )
+        if signature is None or not crypto.is_hex128(signature):
+            return {"ok": False, "error": ERR_INPUT}
+        report["digest"] = digest
+        report["signature"] = signature
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    return {"ok": True, "report": report}
+
+
+def _parse_state_anchors_audit_report(raw_report: object) -> dict:
+    """Strictly validate report shape, key order, types and hex fields.
+
+    Every structural, key-order, raw-type, hex, mixed-key, non-finite or
+    JSON-serialization defect raises :class:`_Failure` with ``input``.
+    Nested evidence records are parsed with the export-record contract
+    but are neither replayed nor digest-checked here; those semantic
+    checks belong to :func:`verify_state_anchors_audit_report`.
+    """
+    _stable_canonical_json_bytes(raw_report)
+    if (
+        not isinstance(raw_report, dict)
+        or tuple(raw_report.keys()) != STATE_ANCHORS_AUDIT_REPORT_KEYS
+    ):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw_report["v"]) or raw_report["v"] != (
+        STATE_ANCHORS_AUDIT_REPORT_VERSION
+    ):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_report["public_key"]):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw_report["digest"]):
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex128(raw_report["signature"]):
+        raise _Failure(ERR_INPUT)
+
+    raw_sources = raw_report["sources"]
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise _Failure(ERR_INPUT)
+    sources = []
+    seen_paths: set[str] = set()
+    for raw_source in raw_sources:
+        if (
+            not isinstance(raw_source, dict)
+            or tuple(raw_source.keys())
+            != STATE_ANCHORS_AUDIT_REPORT_SOURCE_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        path = raw_source["path"]
+        present = raw_source["present"]
+        generation = raw_source["generation"]
+        digest = raw_source["digest"]
+        raw_anchors = raw_source["anchors"]
+        if not isinstance(path, str) or not path or path in seen_paths:
+            raise _Failure(ERR_INPUT)
+        seen_paths.add(path)
+        if not isinstance(present, bool):
+            raise _Failure(ERR_INPUT)
+        if not _is_int(generation):
+            raise _Failure(ERR_INPUT)
+        if present:
+            if generation < 1 or not crypto.is_hex64(digest):
+                raise _Failure(ERR_INPUT)
+        else:
+            if generation != 0 or digest != "":
+                raise _Failure(ERR_INPUT)
+        if not isinstance(raw_anchors, list):
+            raise _Failure(ERR_INPUT)
+        anchors = []
+        previous_height: int | None = None
+        for raw_anchor in raw_anchors:
+            if (
+                not isinstance(raw_anchor, dict)
+                or tuple(raw_anchor.keys()) != STATE_ANCHOR_ANCHOR_KEYS
+            ):
+                raise _Failure(ERR_INPUT)
+            height = raw_anchor["height"]
+            if not _is_int(height) or height < 0:
+                raise _Failure(ERR_INPUT)
+            if previous_height is not None and height <= previous_height:
+                raise _Failure(ERR_INPUT)
+            previous_height = height
+            if not crypto.is_hex64(raw_anchor["block_hash"]):
+                raise _Failure(ERR_INPUT)
+            if not crypto.is_hex64(raw_anchor["state_root"]):
+                raise _Failure(ERR_INPUT)
+            anchors.append(
+                {key: raw_anchor[key] for key in STATE_ANCHOR_ANCHOR_KEYS}
+            )
+        if not present and anchors:
+            raise _Failure(ERR_INPUT)
+        sources.append(
+            {
+                "path": path,
+                "present": present,
+                "generation": generation,
+                "digest": digest,
+                "anchors": anchors,
+            }
+        )
+
+    raw_evidence = raw_report["evidence"]
+    if not isinstance(raw_evidence, list):
+        raise _Failure(ERR_INPUT)
+    evidence = []
+    seen_pairs: set[tuple[int, str]] = set()
+    previous_pair: tuple[int, str] | None = None
+    for raw_entry in raw_evidence:
+        if (
+            not isinstance(raw_entry, dict)
+            or tuple(raw_entry.keys())
+            != STATE_ANCHORS_AUDIT_REPORT_EVIDENCE_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        pair = _state_anchors_audit_pair_entry(
+            {"height": raw_entry["height"], "account": raw_entry["account"]}
+        )
+        if pair in seen_pairs:
+            raise _Failure(ERR_INPUT)
+        seen_pairs.add(pair)
+        if previous_pair is not None and pair < previous_pair:
+            raise _Failure(ERR_INPUT)
+        previous_pair = pair
+        raw_hits = raw_entry["hits"]
+        if not isinstance(raw_hits, list) or not raw_hits:
+            raise _Failure(ERR_INPUT)
+        hits = []
+        seen_sources: set[int] = set()
+        previous_source: int | None = None
+        for raw_hit in raw_hits:
+            if (
+                not isinstance(raw_hit, dict)
+                or tuple(raw_hit.keys()) != STATE_ANCHORS_AUDIT_REPORT_HIT_KEYS
+            ):
+                raise _Failure(ERR_INPUT)
+            source_index = raw_hit["source"]
+            if not _is_int(source_index) or not 0 <= source_index < len(
+                sources
+            ):
+                raise _Failure(ERR_INPUT)
+            if source_index in seen_sources:
+                raise _Failure(ERR_INPUT)
+            seen_sources.add(source_index)
+            if previous_source is not None and source_index < previous_source:
+                raise _Failure(ERR_INPUT)
+            previous_source = source_index
+            record = _parse_state_anchors_export_record(raw_hit["record"])
+            hits.append({"source": source_index, "record": record})
+        evidence.append(
+            {"height": pair[0], "account": pair[1], "hits": hits}
+        )
+
+    groups = {}
+    for name in ("verified", "missing", "conflicts"):
+        raw_group = raw_report[name]
+        if not isinstance(raw_group, list):
+            raise _Failure(ERR_INPUT)
+        entries = [_state_anchors_audit_pair_entry(item) for item in raw_group]
+        if any(
+            entries[index] >= entries[index + 1]
+            for index in range(len(entries) - 1)
+        ):
+            raise _Failure(ERR_INPUT)
+        groups[name] = entries
+
+    return {
+        "v": STATE_ANCHORS_AUDIT_REPORT_VERSION,
+        "sources": sources,
+        "evidence": evidence,
+        "verified": groups["verified"],
+        "missing": groups["missing"],
+        "conflicts": groups["conflicts"],
+        "public_key": raw_report["public_key"],
+        "digest": raw_report["digest"],
+        "signature": raw_report["signature"],
+    }
+
+
+def verify_state_anchors_audit_report(
+    report: object,
+    expected_pairs: object,
+    public_key: object,
+) -> dict:
+    """Verify a signed state-anchors audit report offline.
+
+    The report is the sole evidence: no local file is read. ``report`` is
+    a document produced by :func:`export_state_anchors_audit_report`,
+    ``expected_pairs`` is the pinned non-empty duplicate-free
+    ``{"height", "account"}`` list and ``public_key`` is the caller's
+    pinned 64-lowercase-hex Ed25519 key. Report or parameter shape, key
+    order, type, hex or stable-serialization defects return ``input``.
+    A report public key different from the pinned key or a failing
+    Ed25519 signature returns ``auth``. A body-digest mismatch, an
+    evidence record failing replay or its own digest, a source
+    generation/anchor mismatch, a pinned combination appearing outside
+    the pinned set, or recomputed verified/missing/conflicts groups
+    differing from the report returns ``integrity``.
+
+    Success returns ``{"ok": True, "verified", "missing",
+    "conflicts"}`` with the recomputed, stably sorted groups. Nothing is
+    raised and arguments are never mutated.
+    """
+    try:
+        pairs = _validate_state_anchors_audit_pairs(expected_pairs)
+        _stable_canonical_json_bytes(expected_pairs)
+        if not isinstance(public_key, str) or not crypto.is_hex64(
+            public_key
+        ):
+            raise _Failure(ERR_INPUT)
+        parsed = _parse_state_anchors_audit_report(report)
+
+        if parsed["public_key"] != public_key:
+            return {"ok": False, "error": ERR_AUTH}
+        expected_digest = _state_anchors_audit_report_digest(
+            {
+                key: value
+                for key, value in report.items()
+                if key not in ("digest", "signature")
+            }
+        )
+        if expected_digest != parsed["digest"]:
+            return {"ok": False, "error": ERR_INTEGRITY}
+        if not crypto.verify_signature(
+            public_key,
+            _state_anchors_audit_report_message(parsed["digest"]),
+            parsed["signature"],
+        ):
+            return {"ok": False, "error": ERR_AUTH}
+
+        pinned = set(pairs)
+        declared = {
+            "verified": set(parsed["verified"]),
+            "missing": set(parsed["missing"]),
+            "conflicts": set(parsed["conflicts"]),
+        }
+        if (
+            declared["verified"] | declared["missing"]
+            | declared["conflicts"]
+            != pinned
+            or len(
+                declared["verified"]
+                | declared["missing"]
+                | declared["conflicts"]
+            )
+            != len(declared["verified"])
+            + len(declared["missing"])
+            + len(declared["conflicts"])
+        ):
+            return {"ok": False, "error": ERR_INTEGRITY}
+
+        pair_evidence: list[dict[tuple, tuple]] = [
+            {} for _source in parsed["sources"]
+        ]
+        source_anchor_maps = [
+            {anchor["height"]: anchor for anchor in source["anchors"]}
+            for source in parsed["sources"]
+        ]
+        anchor_votes_by_height: dict[int, list[dict]] = {}
+        for source_index, source in enumerate(parsed["sources"]):
+            for anchor in source["anchors"]:
+                anchor_votes_by_height.setdefault(
+                    anchor["height"], []
+                ).append(anchor)
+
+        for entry in parsed["evidence"]:
+            pair = (entry["height"], entry["account"])
+            if pair not in pinned:
+                return {"ok": False, "error": ERR_INTEGRITY}
+            for hit in entry["hits"]:
+                source_index = hit["source"]
+                source = parsed["sources"][source_index]
+                record = hit["record"]
+                if not source["present"]:
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                if record["generation"] != source["generation"]:
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                anchor = record["anchor"]
+                if (
+                    anchor["height"] != pair[0]
+                    or record["account"] != pair[1]
+                ):
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                source_anchor = source_anchor_maps[source_index].get(
+                    anchor["height"]
+                )
+                if source_anchor != anchor:
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                result = verify_state_proofs(
+                    record["document"], record["accounts"], record["trust"]
+                )
+                if not result.get("ok"):
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                state = record["document"]["state"]
+                if anchor != {
+                    "height": state["height"],
+                    "block_hash": state["block_hash"],
+                    "state_root": state["state_root"],
+                }:
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                proof_by_account = {
+                    proof["account"]: proof
+                    for proof in record["document"]["proofs"]
+                }
+                if proof_by_account.get(record["account"]) != record["proof"]:
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                if (
+                    _state_anchors_export_record_digest(record)
+                    != record["digest"]
+                ):
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                pair_evidence[source_index][pair] = (
+                    anchor,
+                    record["proof"],
+                )
+
+        verified, missing, conflicts = _state_anchors_audit_groups(
+            pairs, pair_evidence, anchor_votes_by_height
+        )
+        if (
+            verified
+            != [
+                {"height": height, "account": account}
+                for height, account in parsed["verified"]
+            ]
+            or missing
+            != [
+                {"height": height, "account": account}
+                for height, account in parsed["missing"]
+            ]
+            or conflicts
+            != [
+                {"height": height, "account": account}
+                for height, account in parsed["conflicts"]
+            ]
+        ):
+            return {"ok": False, "error": ERR_INTEGRITY}
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    return {
+        "ok": True,
+        "verified": verified,
+        "missing": missing,
+        "conflicts": conflicts,
+    }
