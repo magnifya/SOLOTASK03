@@ -576,6 +576,8 @@ files, and a failed write restores the original bytes best-effort.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -597,6 +599,7 @@ ERR_INTEGRITY = "integrity"
 ERR_PROOF = "proof"
 ERR_STATE = "state"
 ERR_IO = "io"
+ERR_NOT_FOUND = "not_found"
 
 # Descriptor fields of a chain tip, exactly as GET /v1/chain reports them.
 DESCRIPTOR_FIELDS = ("tip_hash", "height", "length", "status")
@@ -7887,9 +7890,6 @@ RECEIPT_PROOF_VERIFY_RESULT_KEYS = (
     "tx_id",
     "index",
 )
-ERR_NOT_FOUND = "not_found"
-
-
 def _receipt_index_hash(
     generation: int, finalized: dict, items: list[dict]
 ) -> str:
@@ -12061,3 +12061,320 @@ def verify_state_anchors_audit_report(
         "missing": missing,
         "conflicts": conflicts,
     }
+
+
+# -- durable signed audit-report archive -------------------------------------
+
+STATE_ANCHORS_AUDIT_REPORTS_VERSION = 1
+STATE_ANCHORS_AUDIT_REPORTS_KEYS = (
+    "v",
+    "generation",
+    "records",
+    "hash",
+)
+STATE_ANCHORS_AUDIT_REPORT_RECORD_KEYS = (
+    "generation",
+    "digest",
+    "report",
+)
+RECORD_STATE_ANCHORS_AUDIT_REPORT_RESULT_KEYS = (
+    "ok",
+    "digest",
+    "generation",
+)
+READ_STATE_ANCHORS_AUDIT_REPORT_RESULT_KEYS = (
+    "ok",
+    "report",
+    "generation",
+)
+
+
+def _state_anchors_audit_reports_hash(
+    generation: int, records: list[dict]
+) -> str:
+    """SHA-256 over the canonical JSON of the report archive except ``hash``."""
+    body = {
+        "v": STATE_ANCHORS_AUDIT_REPORTS_VERSION,
+        "generation": generation,
+        "records": records,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+@contextlib.contextmanager
+def _state_anchors_audit_report_file_lock(path: str):
+    """Serialize same-path report-archive access across threads and processes."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    thread_lock = _checkpoint_lock(path)
+    with thread_lock:
+        dir_fd = os.open(
+            directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            fcntl.flock(dir_fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(dir_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(dir_fd)
+
+
+def _validate_stored_state_anchors_audit_report_record(
+    raw_record: object, expected_generation: int
+) -> dict:
+    """Strictly validate one append-ordered stored report record."""
+    if (
+        not isinstance(raw_record, dict)
+        or tuple(raw_record.keys())
+        != STATE_ANCHORS_AUDIT_REPORT_RECORD_KEYS
+    ):
+        raise _CheckpointError(ERR_STATE)
+    generation = raw_record["generation"]
+    digest = raw_record["digest"]
+    report = raw_record["report"]
+    if not _is_int(generation) or generation != expected_generation:
+        raise _CheckpointError(ERR_STATE)
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+    try:
+        parsed_report = _parse_state_anchors_audit_report(report)
+    except _Failure as failure:
+        raise _CheckpointError(ERR_STATE) from failure
+    pinned_pairs = sorted(
+        set(
+            parsed_report["verified"]
+            + parsed_report["missing"]
+            + parsed_report["conflicts"]
+        )
+    )
+    expected_pairs = [
+        {"height": height, "account": account}
+        for height, account in pinned_pairs
+    ]
+    replayed = verify_state_anchors_audit_report(
+        report, expected_pairs, parsed_report["public_key"]
+    )
+    if not replayed.get("ok"):
+        raise _CheckpointError(ERR_STATE)
+    if parsed_report["digest"] != digest:
+        raise _CheckpointError(ERR_STATE)
+    if _state_anchors_audit_report_digest(report) != digest:
+        raise _CheckpointError(ERR_STATE)
+    return {
+        "generation": generation,
+        "digest": digest,
+        "report": report,
+    }
+
+
+def _validate_state_anchors_audit_reports_archive(data: object) -> dict:
+    """Strictly validate, digest and replay one report archive."""
+    if (
+        not isinstance(data, dict)
+        or tuple(data.keys()) != STATE_ANCHORS_AUDIT_REPORTS_KEYS
+    ):
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(data["v"]) or data["v"] != (
+        STATE_ANCHORS_AUDIT_REPORTS_VERSION
+    ):
+        raise _CheckpointError(ERR_STATE)
+    generation = data["generation"]
+    raw_records = data["records"]
+    if not _is_int(generation) or generation < 1:
+        raise _CheckpointError(ERR_STATE)
+    if not isinstance(raw_records, list) or len(raw_records) != generation:
+        raise _CheckpointError(ERR_STATE)
+
+    records = []
+    seen_digests: set[str] = set()
+    for index, raw_record in enumerate(raw_records):
+        record = _validate_stored_state_anchors_audit_report_record(
+            raw_record, index + 1
+        )
+        if record["digest"] in seen_digests:
+            raise _CheckpointError(ERR_STATE)
+        seen_digests.add(record["digest"])
+        records.append(record)
+
+    digest = data["hash"]
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+    if _state_anchors_audit_reports_hash(generation, records) != digest:
+        raise _CheckpointError(ERR_STATE)
+    return {
+        "v": STATE_ANCHORS_AUDIT_REPORTS_VERSION,
+        "generation": generation,
+        "records": records,
+        "hash": digest,
+    }
+
+
+def _load_state_anchors_audit_reports_archive(path: str) -> dict | None:
+    """Load a report archive without modifying it (None when absent)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    return _validate_state_anchors_audit_reports_archive(data)
+
+
+def record_state_anchors_audit_report(
+    path: object,
+    report: object,
+    expected_pairs: object,
+    public_key: object,
+) -> dict:
+    """Verify and durably record one signed state-anchors audit report.
+
+    The report is first checked with
+    :func:`verify_state_anchors_audit_report` against the pinned
+    height/account combinations and Ed25519 public key. Only a fully
+    verified report is written. Reports retain arrival order; each new
+    report increments the archive generation once, while resubmitting a
+    report with the same body digest is idempotent and returns the
+    original stored report's generation without touching the file.
+
+    Success returns ``{"ok": True, "digest", "generation"}``. Failures
+    return only ``{"ok": False, "error": category}`` with the report
+    verifier's ``input``/``auth``/``integrity`` categories, ``state`` for
+    archive parse, digest, ordering or replay damage and ``io`` for read
+    and write failures. Same-path callers are serialized across threads
+    and processes; replacement is atomic and failures never modify the
+    archive.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+
+    verification = verify_state_anchors_audit_report(
+        report, expected_pairs, public_key
+    )
+    if not verification.get("ok"):
+        return {"ok": False, "error": verification["error"]}
+
+    try:
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        os.makedirs(directory, exist_ok=True)
+        digest = report["digest"]
+        with _state_anchors_audit_report_file_lock(path):
+            try:
+                stored = _load_state_anchors_audit_reports_archive(path)
+            except _CheckpointError as failure:
+                return {"ok": False, "error": failure.category}
+            except Exception:
+                return {"ok": False, "error": ERR_STATE}
+
+            if stored is not None:
+                for existing in stored["records"]:
+                    if existing["digest"] == digest:
+                        return {
+                            "ok": True,
+                            "digest": digest,
+                            "generation": existing["generation"],
+                        }
+                generation = stored["generation"]
+                records = [
+                    {
+                        "generation": record["generation"],
+                        "digest": record["digest"],
+                        "report": record["report"],
+                    }
+                    for record in stored["records"]
+                ]
+            else:
+                generation = 0
+                records = []
+
+            next_generation = generation + 1
+            records.append(
+                {
+                    "generation": next_generation,
+                    "digest": digest,
+                    "report": report,
+                }
+            )
+            archive = {
+                "v": STATE_ANCHORS_AUDIT_REPORTS_VERSION,
+                "generation": next_generation,
+                "records": records,
+            }
+            archive["hash"] = _state_anchors_audit_reports_hash(
+                next_generation, records
+            )
+            try:
+                payload = _serialize_document(
+                    {
+                        key: archive[key]
+                        for key in STATE_ANCHORS_AUDIT_REPORTS_KEYS
+                    }
+                )
+                original = _read_bytes_or_none(path)
+                _atomic_write_bytes(path, payload)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": ERR_INPUT}
+            except OSError:
+                _restore_bytes(path, original)
+                return {"ok": False, "error": ERR_IO}
+    except _CheckpointError as failure:
+        return {"ok": False, "error": failure.category}
+    except OSError:
+        return {"ok": False, "error": ERR_IO}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    return {"ok": True, "digest": digest, "generation": next_generation}
+
+
+def read_state_anchors_audit_report(path: object, digest: object) -> dict:
+    """Read one report by digest from a durable report archive.
+
+    The call is read-only. A missing archive or unknown digest returns
+    ``not_found``; bad arguments return ``input``; archive parse, digest,
+    ordering or replay damage returns ``state``; read failures return
+    ``io``. Success returns ``{"ok": True, "report", "generation"}`` with
+    the report exactly as stored and the generation assigned when it was
+    recorded.
+    """
+    if not isinstance(path, str) or not path or not crypto.is_hex64(digest):
+        return {"ok": False, "error": ERR_INPUT}
+
+    try:
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        if not os.path.isdir(directory):
+            return {"ok": False, "error": ERR_NOT_FOUND}
+        with _state_anchors_audit_report_file_lock(path):
+            try:
+                stored = _load_state_anchors_audit_reports_archive(path)
+            except _CheckpointError as failure:
+                return {"ok": False, "error": failure.category}
+            except Exception:
+                return {"ok": False, "error": ERR_STATE}
+            if stored is None:
+                return {"ok": False, "error": ERR_NOT_FOUND}
+            for record in stored["records"]:
+                if record["digest"] == digest:
+                    return {
+                        "ok": True,
+                        "report": record["report"],
+                        "generation": record["generation"],
+                    }
+    except OSError:
+        return {"ok": False, "error": ERR_IO}
+    except Exception:
+        return {"ok": False, "error": ERR_STATE}
+
+    return {"ok": False, "error": ERR_NOT_FOUND}
+
+
+def query_state_anchors_audit_report(path: object, digest: object) -> dict:
+    """Read-only alias for :func:`read_state_anchors_audit_report`."""
+    return read_state_anchors_audit_report(path, digest)

@@ -861,6 +861,26 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `integrity`。成功固定返回 `ok, verified, missing, conflicts`（均按高度
   再账户稳定升序）；任何失败只返回 `{"ok": false, "error"}`、不抛异常。
 
+- **审计报告归档（纯库）**：
+  `ledger.light_client.record_state_anchors_audit_report(path, report,
+  expected_pairs, public_key) -> dict` 在写入前按
+  `verify_state_anchors_audit_report` 完整复核报告正文、来源证据、Ed25519
+  签名以及钉住的高度/账户组合；校验失败分别返回 `input`/`auth`/
+  `integrity`，不修改文件。成功返回固定键序 `ok, digest, generation`。
+  同一路径的记录与查询通过进程内锁和目录 `flock` 串行；写入先生成完整
+  临时文件，再 fsync 并原子替换，崩溃后只能观察到旧归档或完整新归档。
+  报告按首次记录的到达顺序保存，每份新报告代数加 1；相同 `digest` 重复
+  记录幂等，返回原报告的代数且不重写文件。归档外壳包含
+  `v, generation, records, hash`，加载时严格检查解析、报告摘要、密集记录
+  代数、排序、外壳摘要，并用报告自带公钥重放报告；这些损坏为 `state`，
+  读写失败为 `io`。
+  `ledger.light_client.read_state_anchors_audit_report(path, digest) ->
+  dict`（`query_state_anchors_audit_report` 为同义入口）按报告摘要取回
+  原报告，成功返回固定键序 `ok, report, generation`，查询只读不重写。
+  `path` 或摘要非法为 `input`；归档文件不存在或摘要未知为 `not_found`；
+  归档损坏为 `state`；读取失败为 `io`。HTTP、CLI、既有报告导出/离线校验
+  和状态锚归档文件均不改变。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
