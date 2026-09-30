@@ -577,6 +577,7 @@ files, and a failed write restores the original bytes best-effort.
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import math
 import os
@@ -11892,6 +11893,130 @@ def _parse_state_anchors_audit_report(raw_report: object) -> dict:
     }
 
 
+def _replay_state_anchors_audit_report(
+    parsed: dict,
+    pinned: set[tuple[int, str]],
+    evidence_auth: bool,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    group_dicts = _audit_report_group_dicts(parsed)
+    body = {
+        key: (
+            group_dicts[key] if key in group_dicts else parsed[key]
+        )
+        for key in STATE_ANCHORS_AUDIT_REPORT_KEYS
+        if key not in ("digest", "signature")
+    }
+    if _state_anchors_audit_report_digest(body) != parsed["digest"]:
+        raise _Failure(ERR_INTEGRITY)
+    if not crypto.verify_signature(
+        parsed["public_key"],
+        _state_anchors_audit_report_message(parsed["digest"]),
+        parsed["signature"],
+    ):
+        raise _Failure(ERR_AUTH)
+
+    declared = {name: set(parsed[name]) for name in group_dicts}
+    union = (
+        declared["verified"] | declared["missing"] | declared["conflicts"]
+    )
+    if union != pinned or len(union) != (
+        len(declared["verified"])
+        + len(declared["missing"])
+        + len(declared["conflicts"])
+    ):
+        raise _Failure(ERR_INTEGRITY)
+
+    pair_evidence: list[dict[tuple, tuple]] = [
+        {} for _source in parsed["sources"]
+    ]
+    source_anchor_maps = [
+        {anchor["height"]: anchor for anchor in source["anchors"]}
+        for source in parsed["sources"]
+    ]
+    anchor_votes_by_height: dict[int, list[dict]] = {}
+    for source_index, source in enumerate(parsed["sources"]):
+        for anchor in source["anchors"]:
+            anchor_votes_by_height.setdefault(anchor["height"], []).append(
+                anchor
+            )
+
+    for entry in parsed["evidence"]:
+        pair = (entry["height"], entry["account"])
+        if pair not in pinned:
+            raise _Failure(ERR_INTEGRITY)
+        for hit in entry["hits"]:
+            source_index = hit["source"]
+            source = parsed["sources"][source_index]
+            record = hit["record"]
+            if not source["present"]:
+                raise _Failure(ERR_INTEGRITY)
+            if record["generation"] != source["generation"]:
+                raise _Failure(ERR_INTEGRITY)
+            anchor = record["anchor"]
+            if anchor["height"] != pair[0] or record["account"] != pair[1]:
+                raise _Failure(ERR_INTEGRITY)
+            source_anchor = source_anchor_maps[source_index].get(
+                anchor["height"]
+            )
+            if source_anchor != anchor:
+                raise _Failure(ERR_INTEGRITY)
+            result = verify_state_proofs(
+                record["document"], record["accounts"], record["trust"]
+            )
+            if not result.get("ok"):
+                if evidence_auth and result["error"] == ERR_AUTH:
+                    raise _Failure(ERR_AUTH)
+                raise _Failure(ERR_INTEGRITY)
+            state = record["document"]["state"]
+            if anchor != {
+                "height": state["height"],
+                "block_hash": state["block_hash"],
+                "state_root": state["state_root"],
+            }:
+                raise _Failure(ERR_INTEGRITY)
+            proof_by_account = {
+                proof["account"]: proof
+                for proof in record["document"]["proofs"]
+            }
+            if proof_by_account.get(record["account"]) != record["proof"]:
+                raise _Failure(ERR_INTEGRITY)
+            if _state_anchors_export_record_digest(record) != record["digest"]:
+                raise _Failure(ERR_INTEGRITY)
+            pair_evidence[source_index][pair] = (anchor, record["proof"])
+
+    verified, missing, conflicts = _state_anchors_audit_groups(
+        sorted(pinned), pair_evidence, anchor_votes_by_height
+    )
+    expected_groups = group_dicts
+    if (
+        verified != expected_groups["verified"]
+        or missing != expected_groups["missing"]
+        or conflicts != expected_groups["conflicts"]
+    ):
+        raise _Failure(ERR_INTEGRITY)
+    return verified, missing, conflicts
+
+
+def _audit_report_group_dicts(parsed: dict) -> dict:
+    """The parsed report's pair groups as contract-shaped dict lists."""
+    return {
+        name: [
+            {"height": height, "account": account}
+            for height, account in parsed[name]
+        ]
+        for name in ("verified", "missing", "conflicts")
+    }
+
+
+def _canonical_state_anchors_audit_report(parsed: dict) -> dict:
+    """The sealed report document in fixed key order with dict groups."""
+    group_dicts = _audit_report_group_dicts(parsed)
+    return {
+        key: (group_dicts[key] if key in group_dicts else parsed[key])
+        for key in STATE_ANCHORS_AUDIT_REPORT_KEYS
+    }
+
+
 def verify_state_anchors_audit_report(
     report: object,
     expected_pairs: object,
@@ -11927,129 +12052,9 @@ def verify_state_anchors_audit_report(
 
         if parsed["public_key"] != public_key:
             return {"ok": False, "error": ERR_AUTH}
-        expected_digest = _state_anchors_audit_report_digest(
-            {
-                key: value
-                for key, value in report.items()
-                if key not in ("digest", "signature")
-            }
+        verified, missing, conflicts = _replay_state_anchors_audit_report(
+            parsed, set(pairs), False
         )
-        if expected_digest != parsed["digest"]:
-            return {"ok": False, "error": ERR_INTEGRITY}
-        if not crypto.verify_signature(
-            public_key,
-            _state_anchors_audit_report_message(parsed["digest"]),
-            parsed["signature"],
-        ):
-            return {"ok": False, "error": ERR_AUTH}
-
-        pinned = set(pairs)
-        declared = {
-            "verified": set(parsed["verified"]),
-            "missing": set(parsed["missing"]),
-            "conflicts": set(parsed["conflicts"]),
-        }
-        if (
-            declared["verified"] | declared["missing"]
-            | declared["conflicts"]
-            != pinned
-            or len(
-                declared["verified"]
-                | declared["missing"]
-                | declared["conflicts"]
-            )
-            != len(declared["verified"])
-            + len(declared["missing"])
-            + len(declared["conflicts"])
-        ):
-            return {"ok": False, "error": ERR_INTEGRITY}
-
-        pair_evidence: list[dict[tuple, tuple]] = [
-            {} for _source in parsed["sources"]
-        ]
-        source_anchor_maps = [
-            {anchor["height"]: anchor for anchor in source["anchors"]}
-            for source in parsed["sources"]
-        ]
-        anchor_votes_by_height: dict[int, list[dict]] = {}
-        for source_index, source in enumerate(parsed["sources"]):
-            for anchor in source["anchors"]:
-                anchor_votes_by_height.setdefault(
-                    anchor["height"], []
-                ).append(anchor)
-
-        for entry in parsed["evidence"]:
-            pair = (entry["height"], entry["account"])
-            if pair not in pinned:
-                return {"ok": False, "error": ERR_INTEGRITY}
-            for hit in entry["hits"]:
-                source_index = hit["source"]
-                source = parsed["sources"][source_index]
-                record = hit["record"]
-                if not source["present"]:
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                if record["generation"] != source["generation"]:
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                anchor = record["anchor"]
-                if (
-                    anchor["height"] != pair[0]
-                    or record["account"] != pair[1]
-                ):
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                source_anchor = source_anchor_maps[source_index].get(
-                    anchor["height"]
-                )
-                if source_anchor != anchor:
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                result = verify_state_proofs(
-                    record["document"], record["accounts"], record["trust"]
-                )
-                if not result.get("ok"):
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                state = record["document"]["state"]
-                if anchor != {
-                    "height": state["height"],
-                    "block_hash": state["block_hash"],
-                    "state_root": state["state_root"],
-                }:
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                proof_by_account = {
-                    proof["account"]: proof
-                    for proof in record["document"]["proofs"]
-                }
-                if proof_by_account.get(record["account"]) != record["proof"]:
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                if (
-                    _state_anchors_export_record_digest(record)
-                    != record["digest"]
-                ):
-                    return {"ok": False, "error": ERR_INTEGRITY}
-                pair_evidence[source_index][pair] = (
-                    anchor,
-                    record["proof"],
-                )
-
-        verified, missing, conflicts = _state_anchors_audit_groups(
-            pairs, pair_evidence, anchor_votes_by_height
-        )
-        if (
-            verified
-            != [
-                {"height": height, "account": account}
-                for height, account in parsed["verified"]
-            ]
-            or missing
-            != [
-                {"height": height, "account": account}
-                for height, account in parsed["missing"]
-            ]
-            or conflicts
-            != [
-                {"height": height, "account": account}
-                for height, account in parsed["conflicts"]
-            ]
-        ):
-            return {"ok": False, "error": ERR_INTEGRITY}
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
@@ -12061,3 +12066,274 @@ def verify_state_anchors_audit_report(
         "missing": missing,
         "conflicts": conflicts,
     }
+
+
+# -- durable restartable audit-report archive -------------------------------
+#
+# A local archive of signed state-anchors audit reports that have already
+# passed the full offline report rules against the recorder's pinned public
+# key and pinned height/account combinations. One version-1 file at a path
+# holds the reports in their original recording order; the archive is sealed
+# by a self-excluding SHA-256 and rewritten through a fsynced temp file plus
+# an atomic replace.
+
+AUDIT_REPORT_ARCHIVE_VERSION = 1
+AUDIT_REPORT_ARCHIVE_KEYS = ("v", "generation", "reports", "hash")
+RECORD_AUDIT_REPORT_RESULT_KEYS = ("ok", "digest", "generation")
+READ_AUDIT_REPORT_RESULT_KEYS = ("ok", "report", "generation")
+
+
+def _audit_report_archive_hash(generation: int, reports: list) -> str:
+    """SHA-256 over the canonical JSON bytes of every field but ``hash``."""
+    body = {
+        "v": AUDIT_REPORT_ARCHIVE_VERSION,
+        "generation": generation,
+        "reports": reports,
+    }
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
+def _validate_audit_report_archive(data: object) -> dict:
+    """Strictly validate one version-1 audit-report archive.
+
+    Exact key order ``v, generation, reports, hash``; the generation runs
+    consecutively with the number of records (idempotent resubmissions do
+    not grow either); reports keep their original recording order with no
+    duplicate digest, and every stored report passes the same parse,
+    digest/signature and evidence-replay checks as the offline verifier
+    (checked against the public key sealed inside the report). The archive
+    ``hash`` is recomputed last. Every defect is existing-state corruption.
+    """
+    if not isinstance(data, dict) or tuple(data.keys()) != (
+        AUDIT_REPORT_ARCHIVE_KEYS
+    ):
+        raise _CheckpointError(ERR_STATE)
+    if not _is_int(data["v"]) or data["v"] != AUDIT_REPORT_ARCHIVE_VERSION:
+        raise _CheckpointError(ERR_STATE)
+    generation = data["generation"]
+    if not _is_int(generation) or generation < 1:
+        raise _CheckpointError(ERR_STATE)
+    raw_reports = data["reports"]
+    if not isinstance(raw_reports, list) or not raw_reports:
+        raise _CheckpointError(ERR_STATE)
+    reports: list[dict] = []
+    seen_digests: set[str] = set()
+    for raw_report in raw_reports:
+        try:
+            parsed = _parse_state_anchors_audit_report(raw_report)
+            pinned = (
+                set(parsed["verified"])
+                | set(parsed["missing"])
+                | set(parsed["conflicts"])
+            )
+            _replay_state_anchors_audit_report(parsed, pinned, False)
+            ordered = _canonical_state_anchors_audit_report(parsed)
+        except _Failure as failure:
+            raise _CheckpointError(ERR_STATE) from failure
+        if parsed["digest"] in seen_digests:
+            raise _CheckpointError(ERR_STATE)
+        seen_digests.add(parsed["digest"])
+        reports.append(ordered)
+    if generation != len(reports):
+        raise _CheckpointError(ERR_STATE)
+    digest = data["hash"]
+    if not crypto.is_hex64(digest):
+        raise _CheckpointError(ERR_STATE)
+    if _audit_report_archive_hash(generation, reports) != digest:
+        raise _CheckpointError(ERR_STATE)
+    return {
+        "v": AUDIT_REPORT_ARCHIVE_VERSION,
+        "generation": generation,
+        "reports": reports,
+        "hash": digest,
+    }
+
+
+def _load_audit_report_archive(path: str) -> dict | None:
+    """Strictly load the audit-report archive at ``path``.
+
+    Returns None when the archive is absent. An unreadable file is ``io``;
+    bad UTF-8, malformed JSON and every shape/ordering/digest/replay defect
+    is ``state``. The archive is never truncated or rebuilt by a read.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise _CheckpointError(ERR_STATE) from exc
+    return _validate_audit_report_archive(data)
+
+
+def _atomic_write_audit_report_archive(path: str, archive: dict) -> None:
+    """Write the archive in declared key order and atomically replace."""
+    ordered = {key: archive[key] for key in AUDIT_REPORT_ARCHIVE_KEYS}
+    _atomic_write_bytes(path, _serialize_document(ordered))
+
+
+def record_state_anchors_audit_report(
+    path: object,
+    report: object,
+    expected_pairs: object,
+    public_key: object,
+) -> dict:
+    """Record a fully re-verified signed audit report durably.
+
+    ``report`` is a document produced by
+    :func:`export_state_anchors_audit_report`, ``expected_pairs`` the
+    recorder's pinned non-empty duplicate-free ``{"height", "account"}``
+    list and ``public_key`` the pinned 64-lowercase-hex Ed25519 key. The
+    report body digest, source evidence replay and grouping, the Ed25519
+    seal and the pinned height/account coverage are all rechecked under the
+    existing report rules before anything is written; the report public key
+    must equal the pinned key.
+
+    Reports are appended to the version-1 archive at ``path`` in their
+    original recording order; the first report starts generation 1 and each
+    genuinely new report increments it once. Resubmitting a report with the
+    same digest is idempotent: the file and generation hold and the stored
+    report is left byte-identical. A same-digest submission with different
+    content is ``integrity``.
+
+    Success returns ``{"ok": True, "digest", "generation"}`` in that key
+    order. Failure returns only ``{"ok": False, "error": category}``:
+    ``input`` for bad parameters or report shape/type/hex/serialization,
+    ``auth`` for a public-key mismatch, an unknown signature version or a
+    failing Ed25519 seal, ``integrity`` for body-digest, evidence-replay,
+    grouping or same-digest content conflicts, ``state`` for a corrupt
+    existing archive (parse, digest, ordering or replay) and ``io`` for a
+    read/write failure. Same-path calls are serialized and the write lands
+    via a fsynced temp file and atomic replace; a crash only ever exposes
+    the old archive or the complete new one. Nothing is raised and a
+    failure never changes a file.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    try:
+        pairs = _validate_state_anchors_audit_pairs(expected_pairs)
+        _stable_canonical_json_bytes(expected_pairs)
+        _stable_canonical_json_bytes(report)
+        if not isinstance(public_key, str) or not crypto.is_hex64(
+            public_key
+        ):
+            raise _Failure(ERR_INPUT)
+        parsed = _parse_state_anchors_audit_report(report)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+
+    if parsed["public_key"] != public_key:
+        return {"ok": False, "error": ERR_AUTH}
+    try:
+        _replay_state_anchors_audit_report(parsed, set(pairs), True)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        return {"ok": False, "error": ERR_INPUT}
+    canonical_report = _canonical_state_anchors_audit_report(parsed)
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            stored = _load_audit_report_archive(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            return {"ok": False, "error": ERR_STATE}
+
+        if stored is None:
+            reports: list[dict] = []
+            generation = 0
+        else:
+            reports = stored["reports"]
+            generation = stored["generation"]
+
+        for existing in reports:
+            if existing["digest"] != canonical_report["digest"]:
+                continue
+            if existing != canonical_report:
+                return {"ok": False, "error": ERR_INTEGRITY}
+            return {
+                "ok": True,
+                "digest": existing["digest"],
+                "generation": generation,
+            }
+
+        reports.append(canonical_report)
+        next_generation = generation + 1
+        archive = {
+            "v": AUDIT_REPORT_ARCHIVE_VERSION,
+            "generation": next_generation,
+            "reports": reports,
+        }
+        archive["hash"] = _audit_report_archive_hash(
+            next_generation, reports
+        )
+        try:
+            original = _read_bytes_or_none(path)
+        except OSError:
+            return {"ok": False, "error": ERR_IO}
+        try:
+            _atomic_write_audit_report_archive(path, archive)
+        except (TypeError, ValueError):
+            _restore_bytes(path, original)
+            return {"ok": False, "error": ERR_INPUT}
+        except OSError:
+            _restore_bytes(path, original)
+            return {"ok": False, "error": ERR_IO}
+
+        return {
+            "ok": True,
+            "digest": canonical_report["digest"],
+            "generation": next_generation,
+        }
+
+
+def read_state_anchors_audit_report(path: object, digest: object) -> dict:
+    """Read one recorded audit report back by digest, restart-safe and read-only.
+
+    ``path`` is the archive maintained by
+    :func:`record_state_anchors_audit_report` and ``digest`` the report's
+    64-lowercase-hex body digest. The call never writes, rewrites or cleans
+    the archive. Success returns ``{"ok": True, "report", "generation"}`` in
+    that key order with the original report document and the archive
+    generation it belongs to.
+
+    Failure returns only ``{"ok": False, "error": category}``: ``input`` for
+    a bad path or digest, ``not_found`` for a missing archive or an unknown
+    digest, ``state`` for archive parse/digest/ordering/replay corruption
+    and ``io`` for a read failure. Same-path calls share the writer lock and
+    nothing is raised; identical file bytes yield identical results across
+    restarts.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not isinstance(digest, str) or not crypto.is_hex64(digest):
+        return {"ok": False, "error": ERR_INPUT}
+
+    lock = _checkpoint_lock(path)
+    with lock:
+        try:
+            stored = _load_audit_report_archive(path)
+        except _CheckpointError as failure:
+            return {"ok": False, "error": failure.category}
+        except Exception:
+            return {"ok": False, "error": ERR_STATE}
+        if stored is None:
+            return {"ok": False, "error": ERR_NOT_FOUND}
+        for report in stored["reports"]:
+            if report["digest"] == digest:
+                return {
+                    "ok": True,
+                    "report": copy.deepcopy(report),
+                    "generation": stored["generation"],
+                }
+        return {"ok": False, "error": ERR_NOT_FOUND}
