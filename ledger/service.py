@@ -51,6 +51,8 @@ from .store import (
     attested_message,
     attested_range_fingerprint,
     attested_range_message,
+    canonical_request_body,
+    request_fingerprint,
 )
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
@@ -134,6 +136,104 @@ class LedgerService:
             self.initial_balance = initial_balance
         else:
             self.initial_balance = store.initial_balance
+
+    # -- uniform request idempotency ----------------------------------------
+
+    def execute_idempotent(
+        self,
+        method: str,
+        target: str,
+        key: str,
+        body: object,
+        callback,
+        sort_keys: bool = True,
+    ) -> tuple[int, dict, bool, str | None]:
+        """Run one state-changing request under uniform idempotency.
+
+        The fingerprint is the SHA-256 over the HTTP method, the full request
+        target and the canonicalized (key-sorted, compact) JSON body. With the
+        store lock held for the whole request:
+
+        * a known key with the same fingerprint replays the cached 2xx status
+          and the exact cached JSON text without executing the callback,
+          touching the ledger or appending audit events — ``replayed=True``;
+        * a known key with a different fingerprint is a 409 conflict and does
+          not execute the callback;
+        * a first request executes the callback while every persistence call
+          is deferred. A 4xx/5xx result restores the full in-memory snapshot,
+          runs any registered external-file undos and occupies no key; a 2xx
+          result installs the record (status plus the exact response text) and
+          performs exactly one atomic write carrying the business change, its
+          audit events and the record. A failing final write is reported 500
+          (``persistence failed``), rolls everything back and occupies no key.
+
+        Returns ``(status, body, replayed, cached_text)``: ``cached_text`` is
+        the exact on-wire JSON text for a 2xx first/replay response (so first
+        and replay bytes are identical), otherwise None.
+        """
+        canonical = canonical_request_body(body)
+        if canonical is None:
+            return (
+                400,
+                {"error": "request fingerprint could not be formed"},
+                False,
+                None,
+            )
+        fingerprint = request_fingerprint(method, target, canonical)
+        with self.store.lock:
+            record = self.store.idempotency.get(key)
+            if record is not None:
+                if record["fingerprint"] != fingerprint:
+                    return (
+                        409,
+                        {"error": "idempotency key conflict"},
+                        False,
+                        None,
+                    )
+                return (
+                    record["status"],
+                    json.loads(record["body"]),
+                    True,
+                    record["body"],
+                )
+
+            snapshot = self.store.snapshot_mutable_state()
+            self.store.begin_persistence()
+            try:
+                status, result = callback()
+            except BaseException:
+                # A business method raises only after its own save() failed
+                # (its internal rollback already ran); perform the final
+                # all-or-nothing restoration and answer persistence failed.
+                self.store.abort_persistence()
+                self.store.restore_mutable_state(snapshot)
+                return 500, {"error": "persistence failed"}, False, None
+            if not isinstance(status, int) or not (200 <= status < 300):
+                # A 4xx/5xx business answer occupies no key: discard every
+                # incidental mutation (e.g. an expired-sync sweep), run the
+                # deferred external-file undos and leave the prior state.
+                self.store.abort_persistence()
+                self.store.restore_mutable_state(snapshot)
+                return status, result, False, None
+            text = json.dumps(
+                result, ensure_ascii=False, sort_keys=sort_keys
+            )
+            entry = {
+                "key": key,
+                "method": method,
+                "target": target,
+                "request": canonical,
+                "fingerprint": fingerprint,
+                "status": status,
+                "body": text,
+            }
+            try:
+                self.store.commit_persistence(entry)
+            except BaseException:
+                self.store.abort_persistence()
+                self.store.restore_mutable_state(snapshot)
+                return 500, {"error": "persistence failed"}, False, None
+            return status, result, False, text
 
     # -- transactions -------------------------------------------------------
 
@@ -4860,6 +4960,20 @@ class LedgerService:
                 "history_head": history_head,
             },
         )
+        if self.store._persist_deferred and restore is not None:
+            # Uniform-idempotency mode: the ledger snapshot write is deferred
+            # until the wrapper commits. Register the external log-file undos
+            # so a later business 4xx or the final write failing restores the
+            # signer log's original bytes.
+            from . import light_client
+
+            for path, original in restore:
+                self.store.defer_rollback(
+                    lambda path=path, original=original: (
+                        light_client.restore_file_bytes(path, original)
+                    )
+                )
+            return
         try:
             self.store.save()
         except BaseException:

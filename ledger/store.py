@@ -133,6 +133,17 @@ EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
 # the main state file. They double as crash-recovery candidates on startup.
 SNAPSHOT_PREFIX = ".ledger-"
 
+# Uniform request-idempotency protection (the Idempotency-Key HTTP header).
+# A key is 1..128 visible ASCII characters (0x21..0x7E, i.e. no spaces or
+# control characters). A stored record pins the request fingerprint (method,
+# full request target and the canonicalized JSON body) together with the first
+# successful response (status + body), all in the same atomic snapshot as the
+# ledger/admin change the first request made. A replay after a restart returns
+# the cached response without touching the ledger or appending audit events.
+IDEMPOTENCY_KEY_MIN = 1
+IDEMPOTENCY_KEY_MAX = 128
+IDEMPOTENCY_SECTION = "idempotency"
+
 # Fallback per-identity endowment used only for snapshots written before
 # state.initial_balance was recorded; mirrors service.DEFAULT_INITIAL_BALANCE
 # without importing the service layer (which imports this module).
@@ -233,6 +244,53 @@ def attested_range_fingerprint(
         source, request_id, expires_at, anchor, blocks, tip
     )
     return hashlib.sha256(message + signature.encode("ascii")).hexdigest()
+
+
+def valid_idempotency_key(value: object) -> bool:
+    """Validate an Idempotency-Key header value.
+
+    A key is 1..128 visible ASCII characters (0x21..0x7E): no spaces, tabs or
+    other control characters.
+    """
+    if not isinstance(value, str):
+        return False
+    if not (IDEMPOTENCY_KEY_MIN <= len(value) <= IDEMPOTENCY_KEY_MAX):
+        return False
+    return all(0x21 <= ord(char) <= 0x7E for char in value)
+
+
+def canonical_request_body(body: object) -> str | None:
+    """Canonical JSON text of a parsed request body.
+
+    Key order and insignificant whitespace never matter: the parsed value is
+    re-serialized with sorted keys and compact separators. An empty body is
+    the empty string. Returns ``None`` when no stable fingerprint can be
+    formed (a non-JSON value that does not round-trip deterministically).
+    """
+    if body is None:
+        return ""
+    try:
+        return json.dumps(
+            body, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def request_fingerprint(method: str, target: str, canonical_body: str) -> str:
+    """Stable fingerprint of method, the full request target and the body.
+
+    The fingerprint is the SHA-256 of ``METHOD \\0 TARGET \\0 CANONICAL_BODY``
+    where ``TARGET`` is the request line's full target (path plus query) and
+    ``CANONICAL_BODY`` is :func:`canonical_request_body` output.
+    """
+    digest = hashlib.sha256()
+    digest.update(method.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(target.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(canonical_body.encode("utf-8"))
+    return digest.hexdigest()
 
 
 class SyncSummary:
@@ -380,6 +438,14 @@ class LedgerStore:
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
+        # Uniform Idempotency-Key records keyed by the header value. Each
+        # record pins the request fingerprint (method, full request target and
+        # canonicalized JSON body) and freezes the first successful response
+        # (status + the exact on-wire JSON text). A record is persisted in the
+        # same atomic snapshot as the ledger/admin change it deduplicated, so a
+        # replay after restart returns the cached response without touching
+        # the ledger or appending audit events.
+        self.idempotency: dict[str, dict] = {}
         # Monotonic counter bumped on every successful atomic write. It is
         # persisted with each snapshot and lets startup pick the newest one.
         self.generation: int = 0
@@ -387,6 +453,14 @@ class LedgerStore:
         self.tx_index: dict[str, int] = {}
         self.accounts: dict[str, dict] = {}
         self._lock = threading.RLock()
+        # Deferred-persistence mode used by the service idempotency wrapper:
+        # while active, every save() is held back (nothing hits disk and no
+        # generation advances) until commit_persistence() performs exactly one
+        # real atomic write carrying the idempotency record. Rollback
+        # callbacks registered while deferred restore external files (e.g. the
+        # managed history log) if that final write fails.
+        self._persist_deferred = False
+        self._deferred_rollback: list = []
         self.load()
 
     @property
@@ -455,7 +529,8 @@ class LedgerStore:
                 #           expired_records, audit_checkpoint, audit_repair,
                 #           signer_state, recorded_state_root, attested_syncs,
                 #           attested_expired_records, source_key_history,
-                #           key_history_repair, history_credential)
+                #           key_history_repair, history_credential,
+                #           idempotency)
                 valid.append(
                     (
                         parsed[2],
@@ -478,6 +553,7 @@ class LedgerStore:
                         parsed[16],
                         parsed[17],
                         parsed[18],
+                        parsed[19],
                     )
                 )
 
@@ -498,7 +574,8 @@ class LedgerStore:
             # initial_balance, syncs, trust_sources, allowlist, audit_events,
             # expired_records, audit_checkpoint, audit_repair, signer_state,
             # recorded_state_root, attested_syncs, attested_expired_records,
-            # source_key_history, key_history_repair, history_credential)
+            # source_key_history, key_history_repair, history_credential,
+            # idempotency)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -514,6 +591,7 @@ class LedgerStore:
                 top[0][15],
                 top[0][17],
                 history_credential=top[0][19],
+                idempotency=top[0][20],
             )
             for item in top[1:]:
                 if (
@@ -532,6 +610,7 @@ class LedgerStore:
                         item[15],
                         item[17],
                         history_credential=item[19],
+                        idempotency=item[20],
                     )
                     != reference
                 ):
@@ -570,6 +649,7 @@ class LedgerStore:
                 source_key_history,
                 key_history_repair,
                 history_credential,
+                idempotency,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -646,6 +726,7 @@ class LedgerStore:
             self.audit_signer = audit_signer
             self.audit_signer_history = signer_history
             self.history_credential = history_credential
+            self.idempotency = idempotency
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -785,6 +866,7 @@ class LedgerStore:
         attested_syncs: dict[tuple[str, str], dict] | None = None,
         source_key_history: dict[str, list[dict]] | None = None,
         history_credential: dict | None = None,
+        idempotency: dict[str, dict] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -848,6 +930,10 @@ class LedgerStore:
             {"source": source, "keys": [dict(entry) for entry in history]}
             for source, history in sorted((source_key_history or {}).items())
         ]
+        idempotency_records = [
+            {"key": key, **rec}
+            for key, rec in sorted((idempotency or {}).items())
+        ]
         return json.dumps(
             {
                 "initial_balance": initial_balance,
@@ -872,6 +958,7 @@ class LedgerStore:
                     if history_credential is not None
                     else None
                 ),
+                "idempotency": idempotency_records,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -936,6 +1023,7 @@ class LedgerStore:
         dict[str, list[dict]],
         bool,
         dict | None,
+        dict[str, dict],
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -1173,6 +1261,9 @@ class LedgerStore:
         history_credential = self._parse_persisted_history_credential(
             data.get("history_credential"), audit_events, path
         )
+        idempotency = self._parse_persisted_idempotency(
+            data.get(IDEMPOTENCY_SECTION), path
+        )
         return (
             chain,
             pending,
@@ -1193,6 +1284,7 @@ class LedgerStore:
             source_key_history,
             _key_history_repair,
             history_credential,
+            idempotency,
         )
 
     @staticmethod
@@ -2088,6 +2180,118 @@ class LedgerStore:
         return credential
 
     @staticmethod
+    def _parse_persisted_idempotency(raw: object, path: str) -> dict[str, dict]:
+        """Strictly parse the uniform Idempotency-Key record section.
+
+        The section is optional (a snapshot written before the feature omits
+        it and starts with an empty table). A present section must be a list of
+        complete records, each carrying exactly ``key, method, target, request,
+        fingerprint, status, body``:
+
+        * the key is 1..128 visible ASCII characters and appears at most once;
+        * the method is POST or DELETE and the target is a non-empty string;
+        * ``request`` is the canonical JSON request text (empty string for an
+          empty body) and ``fingerprint`` must recompute from
+          method/target/request — a missing linkage, a duplicate fingerprint
+          or a contradicting fingerprint is fatal corruption;
+        * ``status`` is a successful (2xx) status and ``body`` is the cached
+          JSON object returned to replays.
+        """
+        if raw is None:
+            return {}
+        if not isinstance(raw, list):
+            raise StateRecoveryError(
+                path, "idempotency section must be a list of records"
+            )
+        records: dict[str, dict] = {}
+        seen_fingerprints: set[str] = set()
+        for index, entry in enumerate(raw):
+            where = f"idempotency record {index}"
+            if not isinstance(entry, dict):
+                raise StateRecoveryError(path, f"{where} is not a JSON object")
+            required = ("key", "method", "target", "request", "fingerprint", "status", "body")
+            if set(entry) != set(required):
+                raise StateRecoveryError(
+                    path,
+                    f"{where} must contain exactly the keys {', '.join(required)}",
+                )
+            key = entry["key"]
+            if not valid_idempotency_key(key):
+                raise StateRecoveryError(
+                    path, f"{where} has an invalid Idempotency-Key"
+                )
+            if key in records:
+                raise StateRecoveryError(
+                    path, f"duplicate idempotency key {key!r} in snapshot"
+                )
+            method = entry["method"]
+            target = entry["target"]
+            request_text = entry["request"]
+            fingerprint = entry["fingerprint"]
+            status = entry["status"]
+            body_text = entry["body"]
+            if method not in ("POST", "DELETE"):
+                raise StateRecoveryError(path, f"{where} has an invalid method")
+            if not isinstance(target, str) or not target:
+                raise StateRecoveryError(path, f"{where} has an invalid target")
+            if not isinstance(request_text, str):
+                raise StateRecoveryError(path, f"{where} request text must be a string")
+            # The stored request text must itself be canonical (round-trip
+            # stable): empty for an empty body, otherwise its own parse
+            # re-serialized with sorted keys and compact separators.
+            if request_text != "":
+                try:
+                    reparsed = json.loads(request_text)
+                except ValueError:
+                    raise StateRecoveryError(
+                        path, f"{where} request text is not valid JSON"
+                    ) from None
+                if canonical_request_body(reparsed) != request_text:
+                    raise StateRecoveryError(
+                        path, f"{where} request text is not canonicalized"
+                    )
+            if not crypto.is_hex64(fingerprint):
+                raise StateRecoveryError(path, f"{where} fingerprint must be 64 hex")
+            recomputed = request_fingerprint(method, target, request_text)
+            if fingerprint != recomputed:
+                raise StateRecoveryError(
+                    path, f"{where} fingerprint does not match its request"
+                )
+            if fingerprint in seen_fingerprints:
+                raise StateRecoveryError(
+                    path,
+                    f"duplicate idempotency fingerprint {fingerprint} in snapshot",
+                )
+            if isinstance(status, bool) or not isinstance(status, int) or not (
+                200 <= status <= 299
+            ):
+                raise StateRecoveryError(
+                    path, f"{where} status must be a successful 2xx integer"
+                )
+            if not isinstance(body_text, str):
+                raise StateRecoveryError(path, f"{where} body text must be a string")
+            try:
+                cached_body = json.loads(body_text)
+            except ValueError:
+                raise StateRecoveryError(
+                    path, f"{where} cached body is not valid JSON"
+                ) from None
+            if not isinstance(cached_body, dict):
+                raise StateRecoveryError(
+                    path, f"{where} cached body must be a JSON object"
+                )
+            seen_fingerprints.add(fingerprint)
+            records[key] = {
+                "method": method,
+                "target": target,
+                "request": request_text,
+                "fingerprint": fingerprint,
+                "status": status,
+                "body": body_text,
+            }
+        return records
+
+    @staticmethod
     def _parse_persisted_audit_events(raw: object, path: str) -> list[dict]:
         """Strictly parse the append-only audit event log.
 
@@ -2980,6 +3184,108 @@ class LedgerStore:
         ]
         return crypto.account_state_root(leaves), leaves
 
+    # -- deferred persistence (uniform Idempotency-Key support) -------------
+
+    def begin_persistence(self) -> None:
+        """Enter deferred-persistence mode for one idempotent request.
+
+        While active, every :meth:`save` is a no-op: no temp snapshot is
+        written, nothing is promoted and the in-memory generation does not
+        advance. :meth:`commit_persistence` then performs exactly one real
+        atomic write carrying the business change, its audit events and the
+        idempotency record together. Caller must hold the store lock.
+        """
+        self._persist_deferred = True
+        self._deferred_rollback = []
+
+    def defer_rollback(self, callback) -> None:
+        """Register a best-effort undo for an external-file write made while
+        persistence is deferred (the managed history signer log uses this so a
+        failed final snapshot restores its original bytes)."""
+        self._deferred_rollback.append(callback)
+
+    def commit_persistence(self, idempotency_entry: dict | None = None) -> None:
+        """Leave deferred mode and perform the single real atomic write.
+
+        When ``idempotency_entry`` is given it is installed first (keyed by its
+        ``key``), so the write that publishes the business change is the same
+        write that publishes the idempotency record. Raises (leaving deferred
+        mode engaged, with registered rollback callbacks already run by the
+        caller's snapshot) on failure.
+        """
+        self._persist_deferred = False
+        if idempotency_entry is not None:
+            self.idempotency[idempotency_entry["key"]] = {
+                field: idempotency_entry[field]
+                for field in (
+                    "method",
+                    "target",
+                    "request",
+                    "fingerprint",
+                    "status",
+                    "body",
+                )
+            }
+        try:
+            self.save()
+        except BaseException:
+            if idempotency_entry is not None:
+                self.idempotency.pop(idempotency_entry["key"], None)
+            raise
+
+    def abort_persistence(self) -> None:
+        """Leave deferred mode without writing; run external-file undos."""
+        self._persist_deferred = False
+        callbacks = self._deferred_rollback
+        self._deferred_rollback = []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    # Every mutable in-memory section the idempotency wrapper must be able to
+    # restore after a 4xx (business validation rejects only after some
+    # incidental mutation such as an expired-sync sweep) or a raised write. A
+    # deep copy is taken only for requests carrying an Idempotency-Key, so the
+    # no-header path keeps its original cost.
+    _MUTABLE_STATE_ATTRS = (
+        "chain",
+        "pending",
+        "forks",
+        "syncs",
+        "attested_syncs",
+        "trust_sources",
+        "source_key_history",
+        "allowlist",
+        "audit_events",
+        "audit_checkpoint",
+        "history_credential",
+        "audit_signer",
+        "audit_signer_history",
+        "idempotency",
+        "generation",
+        "tx_index",
+        "accounts",
+        "initial_balance",
+    )
+
+    def snapshot_mutable_state(self) -> dict:
+        """Deep-copy every mutable section for an all-or-nothing rollback."""
+        import copy
+
+        return {
+            attr: copy.deepcopy(getattr(self, attr))
+            for attr in self._MUTABLE_STATE_ATTRS
+        }
+
+    def restore_mutable_state(self, snapshot: dict) -> None:
+        """Restore every mutable section from a :meth:`snapshot_mutable_state`."""
+        import copy
+
+        for attr in self._MUTABLE_STATE_ATTRS:
+            setattr(self, attr, copy.deepcopy(snapshot[attr]))
+
     def save(self) -> None:
         """Atomically persist chain, state, pending set, index and accounts.
 
@@ -2990,7 +3296,14 @@ class LedgerStore:
         startup scan finds it as a recovery candidate. The in-memory
         ``generation`` is advanced only after the promotion succeeds, so every
         *successful* atomic write corresponds to exactly one generation.
+
+        In deferred-persistence mode (:meth:`begin_persistence`) the call is a
+        no-op: the idempotency wrapper performs one real write via
+        :meth:`commit_persistence` once the response and the idempotency
+        record are ready.
         """
+        if self._persist_deferred:
+            return
         # Compute the prospective confirmed-only views WITHOUT publishing them:
         # they describe the *post-write* chain and must not become visible in
         # memory until the promotion succeeds. A failure anywhere below leaves
@@ -3157,6 +3470,23 @@ class LedgerStore:
                 )
                 for key in HISTORY_CREDENTIAL_KEYS
             }
+        # Uniform Idempotency-Key records are part of the same atomic document
+        # as the ledger/admin change they deduplicated. The frozen request
+        # canonical text and the exact on-wire response JSON text are stored as
+        # strings so key order and byte shape survive a snapshot round-trip.
+        if self.idempotency:
+            data[IDEMPOTENCY_SECTION] = [
+                {
+                    "key": key,
+                    "method": rec["method"],
+                    "target": rec["target"],
+                    "request": rec["request"],
+                    "fingerprint": rec["fingerprint"],
+                    "status": rec["status"],
+                    "body": rec["body"],
+                }
+                for key, rec in sorted(self.idempotency.items())
+            ]
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
         # Hold the class-wide recovery lock while a .ledger-* snapshot exists

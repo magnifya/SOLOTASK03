@@ -73,6 +73,8 @@ Two failure categories are returned, never raised:
 """
 from __future__ import annotations
 
+import json
+
 from . import audit
 from . import crypto
 from .models import (
@@ -97,6 +99,9 @@ from .store import (
     TRUST_ACTIVE,
     TRUST_REVOKED,
     LedgerStore,
+    canonical_request_body,
+    request_fingerprint,
+    valid_idempotency_key,
 )
 
 # Public error categories.
@@ -110,7 +115,9 @@ REQUIRED_SECTIONS = ("state", "chain", "pending", "index", "accounts", "audit_ch
 # durable state but their own invariants are not part of this self-contained
 # check; audit_events is optional because a pre-audit-chain snapshot omits it;
 # the trust extensions are optional because a pre-feature snapshot omits them
-# (each is strictly verified when present).
+# (each is strictly verified when present). The uniform idempotency section is
+# self-contained (its fingerprints recompute from method/target/request) and is
+# strictly verified when present.
 KNOWN_OPTIONAL_SECTIONS = (
     "audit_events",
     "forks",
@@ -120,6 +127,7 @@ KNOWN_OPTIONAL_SECTIONS = (
     "allowlist",
     "source_key_history",
     "history_credential",
+    "idempotency",
 )
 
 # Raw keys every stored block document must carry ("status" defaults to
@@ -288,6 +296,9 @@ def _verify(data: dict) -> dict:
 
     # -- persistent permissioned history credential --------------------------
     _verify_history_credential(data.get("history_credential"), events)
+
+    # -- uniform Idempotency-Key records --------------------------------------
+    _verify_idempotency(data.get("idempotency"))
 
     return {
         "generation": generation,
@@ -614,6 +625,77 @@ def _parse_history_credential(raw: object) -> dict:
         "permissions": normalized,
         "status": status,
     }
+
+
+def _verify_idempotency(raw: object) -> None:
+    """Verify the optional uniform Idempotency-Key record section.
+
+    The section is absent on pre-feature snapshots. When present it must be a
+    list of complete, uniquely-keyed records, each carrying exactly
+    key/method/target/request/fingerprint/status/body: the key is 1..128
+    visible ASCII characters, the fingerprint recomputes from method/target/
+    canonical request text (a missing linkage, a duplicate fingerprint or a
+    contradicting fingerprint is an integrity failure), the status is a 2xx
+    integer and the cached body is a JSON object.
+    """
+    if raw is None:
+        return
+    if not isinstance(raw, list):
+        raise _Failure(ERR_INPUT)
+    required = (
+        "key",
+        "method",
+        "target",
+        "request",
+        "fingerprint",
+        "status",
+        "body",
+    )
+    keys: set[str] = set()
+    fingerprints: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict) or set(entry) != set(required):
+            raise _Failure(ERR_INPUT)
+        key = entry["key"]
+        method = entry["method"]
+        target = entry["target"]
+        request_text = entry["request"]
+        fingerprint = entry["fingerprint"]
+        status = entry["status"]
+        body_text = entry["body"]
+        if not valid_idempotency_key(key) or key in keys:
+            raise _Failure(ERR_INPUT)
+        keys.add(key)
+        if method not in ("POST", "DELETE"):
+            raise _Failure(ERR_INPUT)
+        if not isinstance(target, str) or not target:
+            raise _Failure(ERR_INPUT)
+        if not isinstance(request_text, str):
+            raise _Failure(ERR_INPUT)
+        if request_text != "":
+            try:
+                reparsed = json.loads(request_text)
+            except ValueError:
+                raise _Failure(ERR_INTEGRITY) from None
+            if canonical_request_body(reparsed) != request_text:
+                raise _Failure(ERR_INTEGRITY)
+        if not isinstance(fingerprint, str):
+            raise _Failure(ERR_INPUT)
+        if fingerprint != request_fingerprint(method, target, request_text):
+            raise _Failure(ERR_INTEGRITY)
+        if fingerprint in fingerprints:
+            raise _Failure(ERR_INTEGRITY)
+        fingerprints.add(fingerprint)
+        if not _is_int(status) or not (200 <= status <= 299):
+            raise _Failure(ERR_INPUT)
+        if not isinstance(body_text, str):
+            raise _Failure(ERR_INPUT)
+        try:
+            cached_body = json.loads(body_text)
+        except ValueError:
+            raise _Failure(ERR_INTEGRITY) from None
+        if not isinstance(cached_body, dict):
+            raise _Failure(ERR_INTEGRITY)
 
 
 def _verify_history_credential(raw: object, events: list[dict]) -> None:

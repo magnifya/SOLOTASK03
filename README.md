@@ -1745,6 +1745,53 @@ read/update/export，401/403 无副作用）与 `history_credential_changed` 事
   重复花用同一笔钱。身份首次出现在已确认区块后，账户才可查询（此前返回 404）。
 - 创世区块高度为 0，`prev_hash` 为 64 个 `0`，不含交易；服务首次启动时自动创建。
 
+## 统一请求幂等保护（Idempotency-Key）
+
+所有**改变账本或管理状态**的 POST 与 DELETE 入口（交易提交、打包、确认/
+回滚、候选分叉提交/采用、整链与增量（含签名）同步、来源信任注册/轮换/
+撤销、allowlist 新增/删除、审计签名者轮换、历史签名者日志追加、历史分
+页导出与持久分权历史凭据管理）都支持统一的请求幂等保护。只读 POST
+（如 `/v1/blocks/{height}/proofs`、`/v1/chain/headers/locate`、
+`/v1/chain/sync-plan`、各类批量证明/回执/审计）与所有 GET **不改变**。
+
+- **请求头**：客户端可发送 `Idempotency-Key`，值为 **1 到 128 个可见 ASCII
+  字符**（0x21–0x7E，无空格或控制字符）。不发送该头时行为逐字保持现状
+  （响应也不携带任何幂等头）；重复发送该头或值非法返回 **400**，状态、
+  快照与审计均不变。
+- **指纹**：按 HTTP 方法、**完整请求目标**（路径含查询串）与请求体 JSON
+  的规范化内容确定。规范化即 `json.dumps(value, sort_keys=True,
+  ensure_ascii=False, separators=(",",":"))`；键序与空白不算差异，无请求体
+  记为空串。带合法 key 但 JSON 非法、UTF-8 非法，或方法/目标/请求体不能
+  稳定形成指纹时返回 **400**，状态、快照、审计不变。
+- **首次成功**：保留入口原有的状态码、响应体与 JSON 键序（不统一改写为
+  201/202/200）；成功响应回显 `Idempotency-Key` 与
+  `Idempotency-Replayed: false`。首次执行与幂等记录在**同一次原子写入**
+  中落盘（业务变更、幂等记录、审计事件同生共死），保存失败返回
+  **500** 与 `{"error":"persistence failed"}`，业务变更、幂等记录、审计
+  一律不留，key 不被占用。
+- **重放**：同 key 且方法、完整请求目标、规范化请求体完全相同的后续请求
+  不重复执行业务、不追加审计事件，返回缓存的状态码与字节一致的 JSON，并
+  回显 `Idempotency-Key` 与 `Idempotency-Replayed: true`；重启后仍可重放。
+  同 key 但方法、目标或请求体不同时返回 **409** 与
+  `{"error":"idempotency key conflict"}`。既有入口自身的 401/403/404 与业
+  务 409 含义不变。
+- **失败不占 key**：业务 4xx/5xx（含同步中顺带发生的过期清理等附带变更）
+  不写入幂等记录、不推进 generation、不留下审计事件，同一 key 可随后用于
+  成功请求；请求处理期间的全部内存改动在非 2xx 时整体回滚。
+- **并发**：同一 key 的并发请求在账本锁上串行，只有一个请求真正执行变更，
+  其余请求在其持久化成功后拿到字节相同的重放响应；不同 key 互不影响。
+- **快照与恢复**：幂等记录持久化在快照顶层 `idempotency` 区段，每条含
+  `key, method, target, request, fingerprint, status, body`。恢复时严格校验
+  key 形态与唯一性、2xx 状态、缓存体为 JSON 对象，并由 method/target/
+  canonical 请求文本重算 `fingerprint`；记录缺失关联、指纹重复或与请求矛
+  盾时，启动恢复按既有 `StateRecoveryError` 损坏语义拒绝该快照。该区段也
+  参与同代快照内容冲突比较，并被 `consistency` 离线核验（结构错为
+  `input`、指纹/缓存体矛盾为 `integrity`）。
+- 既有的业务级幂等入口（信任注册/allowlist 的同内容 200、重复确认、重复
+  撤销、历史签名者日志的幂等 200 等）在无 `Idempotency-Key` 时语义完全不
+  变；在带 key 时，首次响应（如 201）原样冻结、随后按统一规则重放。CLI
+  不发送该头，因此命令行行为保持不变。
+
 ## 安装依赖
 
 需要 Python 3.10+ 与 cryptography（系统已装可跳过安装）：
