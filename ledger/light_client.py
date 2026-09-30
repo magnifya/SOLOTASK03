@@ -576,6 +576,8 @@ files, and a failed write restores the original bytes best-effort.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import copy
 import json
@@ -12178,6 +12180,42 @@ def _atomic_write_audit_report_archive(path: str, archive: dict) -> None:
     _atomic_write_bytes(path, _serialize_document(ordered))
 
 
+@contextlib.contextmanager
+def _audit_report_archive_process_lock(path: str, shared: bool):
+    """Cross-process mutex for the audit-report archive at ``path``.
+
+    An exclusive ``flock`` (writers) or shared ``flock`` (readers) is taken
+    on a sibling ``<path>.lock`` file so that processes restarting or
+    running concurrently still serialize on the same archive. The kernel
+    releases the lock when a process dies, so a crash never strands it.
+    Callers already hold the per-path in-process lock, which guarantees a
+    single open lock description per process at a time (Linux ``flock`` is
+    tied to the open file description, not the thread). The archive file
+    itself is never touched here.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    lock_path = os.path.abspath(path) + ".lock"
+    try:
+        os.makedirs(directory, exist_ok=True)
+        lock_fh = open(lock_path, "a+b")
+    except OSError as exc:
+        raise _CheckpointError(ERR_IO) from exc
+    try:
+        fcntl.flock(
+            lock_fh.fileno(),
+            fcntl.LOCK_SH if shared else fcntl.LOCK_EX,
+        )
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        lock_fh.close()
+
+
 def record_state_anchors_audit_report(
     path: object,
     report: object,
@@ -12243,58 +12281,62 @@ def record_state_anchors_audit_report(
     lock = _checkpoint_lock(path)
     with lock:
         try:
-            stored = _load_audit_report_archive(path)
+            with _audit_report_archive_process_lock(path, shared=False):
+                try:
+                    stored = _load_audit_report_archive(path)
+                except _CheckpointError as failure:
+                    return {"ok": False, "error": failure.category}
+                except Exception:
+                    return {"ok": False, "error": ERR_STATE}
+
+                if stored is None:
+                    reports: list[dict] = []
+                    generation = 0
+                else:
+                    reports = stored["reports"]
+                    generation = stored["generation"]
+
+                for existing in reports:
+                    if existing["digest"] != canonical_report["digest"]:
+                        continue
+                    if existing != canonical_report:
+                        return {"ok": False, "error": ERR_INTEGRITY}
+                    return {
+                        "ok": True,
+                        "digest": existing["digest"],
+                        "generation": generation,
+                    }
+
+                reports.append(canonical_report)
+                next_generation = generation + 1
+                archive = {
+                    "v": AUDIT_REPORT_ARCHIVE_VERSION,
+                    "generation": next_generation,
+                    "reports": reports,
+                }
+                archive["hash"] = _audit_report_archive_hash(
+                    next_generation, reports
+                )
+                try:
+                    original = _read_bytes_or_none(path)
+                except OSError:
+                    return {"ok": False, "error": ERR_IO}
+                try:
+                    _atomic_write_audit_report_archive(path, archive)
+                except (TypeError, ValueError):
+                    _restore_bytes(path, original)
+                    return {"ok": False, "error": ERR_INPUT}
+                except OSError:
+                    _restore_bytes(path, original)
+                    return {"ok": False, "error": ERR_IO}
+
+                return {
+                    "ok": True,
+                    "digest": canonical_report["digest"],
+                    "generation": next_generation,
+                }
         except _CheckpointError as failure:
             return {"ok": False, "error": failure.category}
-        except Exception:
-            return {"ok": False, "error": ERR_STATE}
-
-        if stored is None:
-            reports: list[dict] = []
-            generation = 0
-        else:
-            reports = stored["reports"]
-            generation = stored["generation"]
-
-        for existing in reports:
-            if existing["digest"] != canonical_report["digest"]:
-                continue
-            if existing != canonical_report:
-                return {"ok": False, "error": ERR_INTEGRITY}
-            return {
-                "ok": True,
-                "digest": existing["digest"],
-                "generation": generation,
-            }
-
-        reports.append(canonical_report)
-        next_generation = generation + 1
-        archive = {
-            "v": AUDIT_REPORT_ARCHIVE_VERSION,
-            "generation": next_generation,
-            "reports": reports,
-        }
-        archive["hash"] = _audit_report_archive_hash(
-            next_generation, reports
-        )
-        try:
-            original = _read_bytes_or_none(path)
-        except OSError:
-            return {"ok": False, "error": ERR_IO}
-        try:
-            _atomic_write_audit_report_archive(path, archive)
-        except (TypeError, ValueError):
-            _restore_bytes(path, original)
-            return {"ok": False, "error": ERR_INPUT}
-        except OSError:
-            _restore_bytes(path, original)
-            return {"ok": False, "error": ERR_IO}
-
-        return {
-            "ok": True,
-            "digest": canonical_report["digest"],
-            "generation": next_generation,
-        }
 
 
 def read_state_anchors_audit_report(path: object, digest: object) -> dict:
@@ -12322,18 +12364,22 @@ def read_state_anchors_audit_report(path: object, digest: object) -> dict:
     lock = _checkpoint_lock(path)
     with lock:
         try:
-            stored = _load_audit_report_archive(path)
+            with _audit_report_archive_process_lock(path, shared=True):
+                try:
+                    stored = _load_audit_report_archive(path)
+                except _CheckpointError as failure:
+                    return {"ok": False, "error": failure.category}
+                except Exception:
+                    return {"ok": False, "error": ERR_STATE}
+                if stored is None:
+                    return {"ok": False, "error": ERR_NOT_FOUND}
+                for report in stored["reports"]:
+                    if report["digest"] == digest:
+                        return {
+                            "ok": True,
+                            "report": copy.deepcopy(report),
+                            "generation": stored["generation"],
+                        }
+                return {"ok": False, "error": ERR_NOT_FOUND}
         except _CheckpointError as failure:
             return {"ok": False, "error": failure.category}
-        except Exception:
-            return {"ok": False, "error": ERR_STATE}
-        if stored is None:
-            return {"ok": False, "error": ERR_NOT_FOUND}
-        for report in stored["reports"]:
-            if report["digest"] == digest:
-                return {
-                    "ok": True,
-                    "report": copy.deepcopy(report),
-                    "generation": stored["generation"],
-                }
-        return {"ok": False, "error": ERR_NOT_FOUND}

@@ -344,6 +344,196 @@ class StateAnchorsAuditReportArchiveTest(unittest.TestCase):
             self.assertTrue(fetched["ok"], fetched)
             self.assertEqual(fetched["generation"], 3)
 
+    def _worker_script(self, archive, report_path, pairs_path, key):
+        return (
+            "import json, sys; sys.path.insert(0, %r);"
+            "from ledger import light_client;"
+            "report = json.load(open(%r));"
+            "pairs = json.load(open(%r));"
+            "print(json.dumps(light_client.record_state_anchors_audit_report("
+            "%r, report, pairs, %r), sort_keys=True))"
+            % (
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                report_path,
+                pairs_path,
+                archive,
+                key,
+            )
+        )
+
+    def _start_worker(self, archive, report, pairs):
+        report_path = os.path.join(
+            self.tmp, "input-%s.json" % report["digest"][:16])
+        pairs_path = os.path.join(
+            self.tmp, "pairs-%s.json" % report["digest"][:16])
+        with open(report_path, "w", encoding="utf-8") as fh:
+            json.dump(report, fh)
+        with open(pairs_path, "w", encoding="utf-8") as fh:
+            json.dump(pairs, fh)
+        code = self._worker_script(
+            archive, report_path, pairs_path, self.report_key)
+        return subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _build_distinct_reports(self):
+        sources = []
+        pair_list = []
+        for index, account in enumerate(
+            (self.account_a, self.account_b, self.account_c)
+        ):
+            sources.append(self._anchor_archive(
+                f"proc-anchors-{index}.json", [account]))
+            pair_list.append((1, account))
+        reports = []
+        for index in range(3):
+            pairs = self._pairs(*pair_list[: index + 1])
+            reports.append((self._report(sources[: index + 1], pairs), pairs))
+        return reports
+
+    def test_concurrent_records_from_separate_processes(self) -> None:
+        reports = self._build_distinct_reports()
+        archive = os.path.join(self.tmp, "proc-reports.json")
+
+        processes = [
+            self._start_worker(archive, report, pairs)
+            for report, pairs in reports
+        ]
+        outcomes = []
+        for process in processes:
+            stdout, stderr = process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            outcomes.append(json.loads(stdout))
+
+        self.assertTrue(all(outcome["ok"] for outcome in outcomes), outcomes)
+        generations = sorted(outcome["generation"] for outcome in outcomes)
+        self.assertEqual(generations, [1, 2, 3])
+
+        document = json.loads(open(archive, encoding="utf-8").read())
+        self.assertEqual(document["generation"], 3)
+        self.assertEqual(len(document["reports"]), 3)
+        digest_by_generation = {
+            outcome["generation"]: outcome["digest"] for outcome in outcomes
+        }
+        for generation in (1, 2, 3):
+            digest = digest_by_generation[generation]
+            self.assertEqual(
+                document["reports"][generation - 1]["digest"], digest)
+            fetched = light_client.read_state_anchors_audit_report(
+                archive, digest)
+            self.assertTrue(fetched["ok"], fetched)
+            self.assertEqual(fetched["generation"], 3)
+
+        self.assertTrue(os.path.exists(archive + ".lock"))
+        # A restarted process observes exactly the same sealed archive.
+        for report, _pairs in reports:
+            code = (
+                "import json, sys; sys.path.insert(0, %r);"
+                "from ledger import light_client;"
+                "print(json.dumps(light_client.read_state_anchors_audit_report("
+                "%r, %r)))"
+                % (
+                    os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__))),
+                    archive,
+                    report["digest"],
+                )
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True, text=True, check=True)
+            result = json.loads(completed.stdout)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["report"], report)
+            self.assertEqual(result["generation"], 3)
+    def test_same_digest_concurrent_records_share_generation(self) -> None:
+        source = self._anchor_archive("dup-anchors.json", [self.account_a])
+        pairs = self._pairs((1, self.account_a))
+        report = self._report([source], pairs)
+        archive = os.path.join(self.tmp, "dup-reports.json")
+        self.assertTrue(light_client.record_state_anchors_audit_report(
+            archive, report, pairs, self.report_key)["ok"])
+        before = open(archive, "rb").read()
+
+        processes = [
+            self._start_worker(archive, report, pairs) for _ in range(4)
+        ]
+        for process in processes:
+            stdout, stderr = process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(
+                json.loads(stdout),
+                {"ok": True, "digest": report["digest"], "generation": 1},
+            )
+        self.assertEqual(open(archive, "rb").read(), before)
+
+        fetched = light_client.read_state_anchors_audit_report(
+            archive, report["digest"])
+        self.assertTrue(fetched["ok"], fetched)
+        self.assertEqual(fetched["report"], report)
+        self.assertEqual(fetched["generation"], 1)
+
+    def test_concurrent_queries_while_processes_record(self) -> None:
+        reports = self._build_distinct_reports()
+        archive = os.path.join(self.tmp, "busy-reports.json")
+        digests = [report["digest"] for report, _pairs in reports]
+
+        reader_code = (
+            "import json, subprocess, sys; sys.path.insert(0, %r);"
+            "from ledger import light_client;"
+            "seen = [];"
+            "digests = %r;"
+            "\nfor _ in range(50):"
+            "\n    for digest in digests:"
+            "\n        outcome = light_client.read_state_anchors_audit_report("
+            "%r, digest)"
+            "\n        if outcome['ok']:"
+            "\n            assert outcome['report']['digest'] == digest"
+            "\n            assert 1 <= outcome['generation'] <= 3"
+            "\n            seen.append([digest, outcome['generation']])"
+            "\n        else:"
+            "\n            assert outcome['error'] == 'not_found', outcome"
+            "\nprint(json.dumps(seen))"
+            % (
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                digests,
+                archive,
+            )
+        )
+        readers = [
+            subprocess.Popen(
+                [sys.executable, "-c", reader_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(3)
+        ]
+        writers = [
+            self._start_worker(archive, report, pairs)
+            for report, pairs in reports
+        ]
+        for process in writers:
+            stdout, stderr = process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertTrue(json.loads(stdout)["ok"], stdout)
+        for process in readers:
+            stdout, stderr = process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            for digest, generation in json.loads(stdout):
+                self.assertIn(digest, digests)
+                self.assertIn(generation, (1, 2, 3))
+
+        document = json.loads(open(archive, encoding="utf-8").read())
+        self.assertEqual(document["generation"], 3)
+        self.assertEqual(
+            sorted(item["digest"] for item in document["reports"]),
+            sorted(digests),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
