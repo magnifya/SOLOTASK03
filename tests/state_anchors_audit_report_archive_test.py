@@ -130,7 +130,7 @@ class StateAnchorsAuditReportArchiveTest(unittest.TestCase):
             archive, json.loads(json.dumps(first)), pairs, self.report_key)
         self.assertEqual(
             repeat,
-            {"ok": True, "digest": first["digest"], "generation": 2},
+            {"ok": True, "digest": first["digest"], "generation": 1},
         )
         self.assertEqual(open(archive, "rb").read(), before)
 
@@ -144,6 +144,7 @@ class StateAnchorsAuditReportArchiveTest(unittest.TestCase):
         fetched = light_client.read_state_anchors_audit_report(
             archive, first["digest"])
         self.assertTrue(fetched["ok"], fetched)
+        self.assertEqual(fetched["generation"], 1)
         self.assertEqual(fetched["report"], first)
         self.assertEqual(open(archive, "rb").read(), before)
 
@@ -338,11 +339,16 @@ class StateAnchorsAuditReportArchiveTest(unittest.TestCase):
         document = json.loads(open(archive, encoding="utf-8").read())
         self.assertEqual(document["generation"], 3)
         self.assertEqual(len(document["reports"]), 3)
+        expected_position = {
+            item["digest"]: position
+            for position, item in enumerate(document["reports"], start=1)
+        }
         for report in reports:
             fetched = light_client.read_state_anchors_audit_report(
                 archive, report["digest"])
             self.assertTrue(fetched["ok"], fetched)
-            self.assertEqual(fetched["generation"], 3)
+            self.assertEqual(
+                fetched["generation"], expected_position[report["digest"]])
 
     def test_concurrent_records_from_separate_processes(self) -> None:
         sources = []
@@ -423,15 +429,14 @@ class StateAnchorsAuditReportArchiveTest(unittest.TestCase):
 
         def reader(repeat: int) -> None:
             for _ in range(repeat):
-                for report, expected_first in zip(
-                    reports, sorted(generations)
-                ):
+                for report in reports:
                     fetched = light_client.read_state_anchors_audit_report(
                         archive, report["digest"])
                     if not fetched["ok"]:
                         query_errors.append(fetched)
                         continue
-                    if fetched["generation"] != 3:
+                    if (fetched["generation"]
+                            != digest_generation[report["digest"]]):
                         query_errors.append(fetched)
                     if fetched["report"] != report:
                         query_errors.append(fetched)
@@ -461,7 +466,8 @@ class StateAnchorsAuditReportArchiveTest(unittest.TestCase):
             check=True)
         restarted = json.loads(completed.stdout)
         self.assertTrue(restarted["ok"], restarted)
-        self.assertEqual(restarted["generation"], 3)
+        self.assertEqual(
+            restarted["generation"], digest_generation[first_digest])
         self.assertEqual(restarted["report"], first_report)
 
 
