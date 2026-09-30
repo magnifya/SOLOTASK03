@@ -28,6 +28,7 @@ transaction in an empty ledger could never be accepted.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import hmac
 import json
@@ -54,6 +55,32 @@ from .store import (
 )
 
 DEFAULT_INITIAL_BALANCE = 1_000_000
+
+# Descriptor of the Idempotency-Key request currently executing on this
+# thread, or None when the business method runs without one (the CLI and all
+# in-process callers keep their exact, key-less behavior). A ContextVar keeps
+# concurrent HTTP worker threads from ever sharing one request's descriptor.
+_idem_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "idempotency_context", default=None
+)
+
+
+def request_fingerprint(method: str, target: str, payload: object) -> str:
+    """Stable SHA-256 fingerprint of (HTTP method, full request target, body).
+
+    The body is the parsed JSON document re-serialized canonically
+    (``sort_keys``, compact separators, ``ensure_ascii=False``), so JSON key
+    order and insignificant whitespace never distinguish two fingerprints; a
+    body-less request (mine/confirm/rollback/adopt/DELETE) contributes JSON
+    ``null``. The method and the complete origin-form target (including any
+    query string) bind the fingerprint to exactly one route.
+    """
+    canonical_body = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    material = "\n".join((method, target, canonical_body))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
 
 REQUIRED_TX_FIELDS = ("from", "to", "amount", "signature")
 
@@ -135,6 +162,175 @@ class LedgerService:
         else:
             self.initial_balance = store.initial_balance
 
+    # -- unified HTTP request idempotency -----------------------------------
+
+    @staticmethod
+    def _idem_serialize(body: dict, sort_keys: bool) -> str:
+        """Freeze a success response as the cached JSON text.
+
+        Uses the exact same serialization options as the HTTP layer so a
+        replay's re-serialization reproduces the first response byte for byte
+        (including the contract-fixed insertion orders sent with
+        ``sort_keys=False``).
+        """
+        return json.dumps(body, ensure_ascii=False, sort_keys=sort_keys)
+
+    def _idem_make_record(
+        self, status: int, body: dict, sort_keys: bool
+    ) -> dict | None:
+        """Build the staged record for the request context, or None.
+
+        None means either the request carries no Idempotency-Key (the CLI and
+        all in-process callers keep their exact behavior) or the request
+        fingerprint is already cached under a DIFFERENT key: the snapshot
+        invariant requires each fingerprint to be cached at most once, so
+        such a request still succeeds with the business response verbatim but
+        occupies no second record (the fingerprint's durable response already
+        exists and the business operation itself is idempotent).
+        """
+        ctx = _idem_context.get()
+        if ctx is None or ctx.get("fingerprint_occupied"):
+            return None
+        return self.store.make_idempotency_record(
+            ctx["key"],
+            ctx["method"],
+            ctx["target"],
+            ctx["fingerprint"],
+            status,
+            self._idem_serialize(body, sort_keys),
+        )
+
+    def _idem_stage(self, status: int, body: dict, sort_keys: bool = True) -> None:
+        """Stage the current request's record to ride the next business save.
+
+        No-op for a request without an Idempotency-Key (the CLI, in-process
+        callers and all read-only routes). Must be called on the success path
+        immediately before the mutation's single atomic ``save()``: the staged
+        record is serialized in that same document and published only once the
+        promotion is durable; a failed save discards it and leaves the key
+        unoccupied.
+        """
+        record = self._idem_make_record(status, body, sort_keys)
+        if record is not None:
+            self.store.stage_idempotency_record(record)
+
+    def run_idempotent(
+        self,
+        key: str,
+        method: str,
+        target: str,
+        payload: object,
+        callback,
+        sort_keys: bool = True,
+        prune_syncs: bool = False,
+    ) -> tuple[int, dict, bool]:
+        """Execute a state-changing request under unified idempotency.
+
+        ``callback`` is the ordinary business operation (already bound with
+        its arguments) and returns ``(status, body)``; the caller passes the
+        route's response serialization mode. Returns
+        ``(status, body, replayed)`` where ``replayed`` distinguishes the
+        cached replay of a prior successful mutation from a first execution.
+
+        ``prune_syncs`` drains due sync-record expiries BEFORE the keyed
+        operation: fork/sync methods normally sweep as their first in-lock
+        action (an independent atomic write), and draining it up front keeps
+        the business method's own sweep a no-op so the idempotency record and
+        the mutation still share exactly one save.
+
+        * A key already cached with the same (method, target, fingerprint)
+          short-circuits to the frozen status/body without re-executing the
+          operation or appending an audit event.
+        * The same key with a different method, target or normalized body is a
+          409 ``idempotency key conflict``.
+        * A 4xx/5xx result occupies no key and is returned verbatim.
+        * A business persistence failure (the callback raises) answers 500
+          ``persistence failed``: the business method has already rolled its
+          mutation and the audit append back, and the staged record is
+          discarded, so nothing is left behind.
+        """
+        fingerprint = request_fingerprint(method, target, payload)
+        with self.store.lock:
+            token = _idem_context.set(
+                {
+                    "key": key,
+                    "method": method,
+                    "target": target,
+                    "fingerprint": fingerprint,
+                    "fingerprint_occupied": False,
+                }
+            )
+            try:
+                # Drain due sync-record expiries first (fork/sync routes
+                # normally sweep in-lock as their first, independent save);
+                # doing it here makes the business method's own sweep a
+                # no-op so the idempotency record and the mutation share
+                # one save. A sweep persistence failure is reported exactly
+                # like a business one.
+                if prune_syncs:
+                    self._prune_expired_syncs()
+                existing = self.store.get_idempotency_record(key)
+                if existing is not None:
+                    if (
+                        existing["method"] != method
+                        or existing["target"] != target
+                        or existing["fingerprint"] != fingerprint
+                    ):
+                        return 409, {"error": "idempotency key conflict"}, False
+                    return existing["status"], json.loads(existing["body"]), True
+                # The snapshot invariant caches each request fingerprint at
+                # most once. The same fingerprint under a different key can
+                # still reach here (a genuinely business-idempotent
+                # operation such as a repeated confirm/re-registration):
+                # execute it normally — its business path writes nothing and
+                # appends no audit event — but never install a second,
+                # fingerprint-duplicate record.
+                occupied = any(
+                    rec["fingerprint"] == fingerprint
+                    for rec in self.store.idempotency_records.values()
+                )
+                if occupied:
+                    _idem_context.get()["fingerprint_occupied"] = True
+                status, body = callback()
+                if status >= 500:
+                    # A keyed request whose business method reports an
+                    # internal/persistence failure (the history routes return
+                    # 500/io rather than raising) gets the contract's single
+                    # persistence-failed response; its rollback/compensation
+                    # already ran and the key stays free.
+                    self.store.clear_staged_idempotency()
+                    return 500, {"error": "persistence failed"}, False
+                if 200 <= status < 300:
+                    # A genuine state change already published its staged
+                    # record together with the business save. A
+                    # side-effect-free success (an idempotent
+                    # re-registration/re-revoke, a cached sync replay, an
+                    # already-confirmed confirm) staged its cached response
+                    # but performed no business save, so publish that staged
+                    # record with one record-only save: the replay must
+                    # survive a restart even though the first call changed no
+                    # ledger state. When the fingerprint was already cached
+                    # under another key the business method staged nothing,
+                    # so no second record and no empty save is made.
+                    if self.store.has_staged_idempotency():
+                        try:
+                            self.store.commit_staged_idempotency()
+                        except BaseException:
+                            return 500, {"error": "persistence failed"}, False
+                return status, body, False
+            except Exception:
+                # Any unexpected failure (a business callback that raises
+                # after rolling its own mutation back, or a failed expiry
+                # sweep) must surface as the single persistence-failed
+                # response: nothing durably changed and the key stays free.
+                self.store.clear_staged_idempotency()
+                return 500, {"error": "persistence failed"}, False
+            finally:
+                _idem_context.reset(token)
+                # Defensive: never leak a staged record into the next request
+                # on the same thread.
+                self.store.clear_staged_idempotency()
+
     # -- transactions -------------------------------------------------------
 
     def submit_transaction(self, payload: object) -> tuple[int, dict]:
@@ -173,6 +369,8 @@ class LedgerService:
             if self.available_balance(sender) < amount:
                 return 400, {"error": "insufficient balance"}
             self.store.pending[tx.tx_id] = tx
+            success_body = {"tx_id": tx.tx_id}
+            self._idem_stage(202, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -180,7 +378,7 @@ class LedgerService:
                 # keeps matching the last durably committed state.
                 self.store.pending.pop(tx.tx_id, None)
                 raise
-        return 202, {"tx_id": tx.tx_id}
+        return 202, success_body
 
     def get_transaction(self, tx_id: object) -> tuple[int, dict]:
         """GET /v1/transactions/{tx_id} — one transaction receipt.
@@ -579,6 +777,13 @@ class LedgerService:
             )
             self.store.chain.append(block)
             removed = [self.store.pending.pop(tx.tx_id) for tx in ordered]
+            success_body = {
+                "height": block.height,
+                "block_hash": block.block_hash,
+                "merkle_root": block.merkle_root,
+                "status": block.status,
+            }
+            self._idem_stage(201, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -586,12 +791,7 @@ class LedgerService:
                 self.store.chain.pop()
                 self.store.pending.update({tx.tx_id: tx for tx in removed})
                 raise
-        return 201, {
-            "height": block.height,
-            "block_hash": block.block_hash,
-            "merkle_root": block.merkle_root,
-            "status": block.status,
-        }
+        return 201, success_body
 
     def get_block(self, height: object) -> tuple[int, dict]:
         height_int = _parse_height(height)
@@ -630,7 +830,12 @@ class LedgerService:
             if block is None:
                 return 409, {"error": "block cannot be confirmed"}
             if block.status == STATUS_CONFIRMED:
-                # Idempotent re-confirm.
+                # Idempotent re-confirm (no business write; when the request
+                # itself carries an Idempotency-Key the response is cached with
+                # a dedicated record-only save by run_idempotent).
+                self._idem_stage(
+                    200, {"height": block.height, "status": STATUS_CONFIRMED}
+                )
                 return 200, {"height": block.height, "status": STATUS_CONFIRMED}
             if block is not self.store.tip():
                 return 409, {"error": "only the chain tip can be confirmed"}
@@ -638,12 +843,14 @@ class LedgerService:
             if parent is None or parent.status != STATUS_CONFIRMED:
                 return 409, {"error": "previous block is not confirmed"}
             block.status = STATUS_CONFIRMED
+            success_body = {"height": block.height, "status": STATUS_CONFIRMED}
+            self._idem_stage(200, success_body)
             try:
                 self.store.save()
             except BaseException:
                 block.status = STATUS_PENDING
                 raise
-            return 200, {"height": block.height, "status": STATUS_CONFIRMED}
+            return 200, success_body
 
     def rollback_block(self, height: object) -> tuple[int, dict]:
         """Roll back a pending tip block: delete it and restore its transactions.
@@ -664,6 +871,8 @@ class LedgerService:
                 return 409, {"error": "only the chain tip can be rolled back"}
             pending_before = set(self.store.pending)
             rolled_back = self.store.rollback_tip()
+            success_body = {"height": rolled_back.height, "status": "rolled_back"}
+            self._idem_stage(200, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -673,7 +882,7 @@ class LedgerService:
                     if tx_id not in pending_before:
                         del self.store.pending[tx_id]
                 raise
-            return 200, {"height": rolled_back.height, "status": "rolled_back"}
+            return 200, success_body
 
     def get_proof(self, height: object, tx_id: object) -> tuple[int, dict]:
         """Return a Merkle inclusion proof for tx_id at the given height.
@@ -1186,12 +1395,14 @@ class LedgerService:
             if tip_hash in self.store.forks:
                 return 409, {"error": "candidate fork already exists", "tip_hash": tip_hash}
             self.store.forks[tip_hash] = fork
+            success_body = self._fork_summary(fork)
+            self._idem_stage(201, success_body)
             try:
                 self.store.save()
             except BaseException:
                 self.store.forks.pop(tip_hash, None)
                 raise
-        return 201, self._fork_summary(fork)
+        return 201, success_body
 
     def get_chain(self) -> tuple[int, dict]:
         """GET /v1/chain — canonical chain, candidates sorted by tip hash and
@@ -1271,6 +1482,8 @@ class LedgerService:
                 if rec_mode is not None:
                     payload["mode"] = rec_mode
                 self.store.append_audit_event(EVENT_SYNC_ADOPTED, payload)
+            success_body = self._fork_summary(fork)
+            self._idem_stage(200, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -1281,7 +1494,7 @@ class LedgerService:
                 self.store.rebuild_derived()
                 self.store.truncate_audit_events(adopted_count)
                 raise
-            return 200, self._fork_summary(fork)
+            return 200, success_body
 
     def export_fork(self, tip_hash: object) -> tuple[int, dict]:
         """GET /v1/forks/{tip_hash}/export — full export of a candidate fork.
@@ -2323,13 +2536,18 @@ class LedgerService:
                         "length": None,
                         "status": None,
                     }
-                return 200, {
+                replay_body = {
                     "tip_hash": descriptor["tip_hash"],
                     "height": descriptor.get("height"),
                     "length": descriptor.get("length"),
                     "status": descriptor.get("status"),
                     "expires_at": existing["expires_at"],
                 }
+                # The business-level replay writes nothing; when the HTTP
+                # request carries an Idempotency-Key its 200 is cached by
+                # run_idempotent's record-only save.
+                self._idem_stage(200, replay_body)
+                return 200, replay_body
 
             if any(tip_hash == block.block_hash for block in self.store.chain):
                 return 409, {"error": "fork is identical to the canonical chain"}
@@ -2363,6 +2581,7 @@ class LedgerService:
                     "status": summary["status"],
                 },
             )
+            self._idem_stage(201, {**summary, "expires_at": expires_at})
             try:
                 self.store.save()
             except BaseException:
@@ -2538,13 +2757,18 @@ class LedgerService:
                         "length": None,
                         "status": None,
                     }
-                return 200, {
+                replay_body = {
                     "tip_hash": descriptor["tip_hash"],
                     "height": descriptor.get("height"),
                     "length": descriptor.get("length"),
                     "status": descriptor.get("status"),
                     "expires_at": existing["expires_at"],
                 }
+                # The business-level replay writes nothing; when the HTTP
+                # request carries an Idempotency-Key its 200 is cached by
+                # run_idempotent's record-only save.
+                self._idem_stage(200, replay_body)
+                return 200, replay_body
 
             if any(tip_hash == block.block_hash for block in self.store.chain):
                 return 409, {"error": "fork is identical to the canonical chain"}
@@ -2588,6 +2812,7 @@ class LedgerService:
                     "status": summary["status"],
                 },
             )
+            self._idem_stage(201, {**summary, "expires_at": expires_at})
             try:
                 self.store.save()
             except BaseException:
@@ -2770,13 +2995,18 @@ class LedgerService:
                         "length": None,
                         "status": None,
                     }
-                return 200, {
+                replay_body = {
                     "tip_hash": descriptor["tip_hash"],
                     "height": descriptor.get("height"),
                     "length": descriptor.get("length"),
                     "status": descriptor.get("status"),
                     "expires_at": existing["expires_at"],
                 }
+                # The business-level replay writes nothing; when the HTTP
+                # request carries an Idempotency-Key its 200 is cached by
+                # run_idempotent's record-only save.
+                self._idem_stage(200, replay_body)
+                return 200, replay_body
 
             # New delivery follows the full-sync order: authorization (403),
             # then the request deadline (410), before the anchor or chain is
@@ -2860,6 +3090,7 @@ class LedgerService:
                     "status": summary["status"],
                 },
             )
+            self._idem_stage(201, {**summary, "expires_at": expires_at})
             try:
                 self.store.save()
             except BaseException:
@@ -3096,13 +3327,18 @@ class LedgerService:
                         "length": None,
                         "status": None,
                     }
-                return 200, {
+                replay_body = {
                     "tip_hash": descriptor["tip_hash"],
                     "height": descriptor.get("height"),
                     "length": descriptor.get("length"),
                     "status": descriptor.get("status"),
                     "expires_at": existing["expires_at"],
                 }
+                # The business-level replay writes nothing; when the HTTP
+                # request carries an Idempotency-Key its 200 is cached by
+                # run_idempotent's record-only save.
+                self._idem_stage(200, replay_body)
+                return 200, replay_body
 
             if any(tip_hash == block.block_hash for block in self.store.chain):
                 return 409, {"error": "fork is identical to the canonical chain"}
@@ -3148,6 +3384,7 @@ class LedgerService:
                     "status": summary["status"],
                 },
             )
+            self._idem_stage(201, {**summary, "expires_at": expires_at})
             try:
                 self.store.save()
             except BaseException:
@@ -4081,7 +4318,9 @@ class LedgerService:
                 ):
                     # Idempotent re-registration: the stored record is reported
                     # unchanged, with no new version and no new audit event.
-                    return 200, self._trust_record(source, existing)
+                    repeat_body = self._trust_record(source, existing)
+                    self._idem_stage(200, repeat_body)
+                    return 200, repeat_body
                 return 409, {"error": "trust source already exists with different content"}
             record = {
                 "public_key": public_key,
@@ -4109,6 +4348,8 @@ class LedgerService:
                     "activated_event_id": event["event_id"],
                 }
             ]
+            success_body = self._trust_record(source, record)
+            self._idem_stage(201, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -4117,7 +4358,7 @@ class LedgerService:
                 self.store.source_key_history.pop(source, None)
                 self.store.truncate_audit_events(1)
                 raise
-            return 201, self._trust_record(source, record)
+            return 201, success_body
 
     def rotate_trust_source(self, source: object, payload: object) -> tuple[int, dict]:
         """POST /v1/trust/sources/{source}/rotate — install a new public key.
@@ -4174,6 +4415,8 @@ class LedgerService:
                     "activated_event_id": event["event_id"],
                 }
             )
+            success_body = self._trust_record(source, existing)
+            self._idem_stage(200, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -4184,7 +4427,7 @@ class LedgerService:
                     self.store.source_key_history.pop(source, None)
                 self.store.truncate_audit_events(1)
                 raise
-            return 200, self._trust_record(source, existing)
+            return 200, success_body
 
     def revoke_trust_source(self, source: object, payload: object) -> tuple[int, dict]:
         """POST /v1/trust/sources/{source}/revoke — revoke a trusted source.
@@ -4215,7 +4458,9 @@ class LedgerService:
                 return 409, {"error": "expected_version does not match the current version"}
             if existing["status"] == TRUST_REVOKED:
                 # Idempotent repeat revocation: no second event, no new write.
-                return 200, self._trust_record(source, existing)
+                repeat_body = self._trust_record(source, existing)
+                self._idem_stage(200, repeat_body)
+                return 200, repeat_body
             old_status = existing["status"]
             existing["status"] = TRUST_REVOKED
             self.store.append_audit_event(
@@ -4227,13 +4472,15 @@ class LedgerService:
                     "version": existing["version"],
                 },
             )
+            success_body = self._trust_record(source, existing)
+            self._idem_stage(200, success_body)
             try:
                 self.store.save()
             except BaseException:
                 existing["status"] = old_status
                 self.store.truncate_audit_events(1)
                 raise
-            return 200, self._trust_record(source, existing)
+            return 200, success_body
 
     def get_trust_document(self) -> tuple[int, dict]:
         """GET /v1/trust — the offline light-client verify document.
@@ -4317,13 +4564,17 @@ class LedgerService:
                 if existing == expires_at:
                     # Idempotent re-add: the stored entry is reported
                     # unchanged, with no new audit event and no new write.
-                    return 200, self._allowlist_entry(source, existing)
+                    repeat_body = self._allowlist_entry(source, existing)
+                    self._idem_stage(200, repeat_body)
+                    return 200, repeat_body
                 return 409, {"error": "allowlist entry already exists with different content"}
             self.store.allowlist[source] = expires_at
             self.store.append_audit_event(
                 EVENT_ALLOWLIST_ADDED,
                 {"source": source, "expires_at": expires_at},
             )
+            success_body = self._allowlist_entry(source, expires_at)
+            self._idem_stage(201, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -4332,7 +4583,7 @@ class LedgerService:
                 self.store.allowlist.pop(source, None)
                 self.store.truncate_audit_events(1)
                 raise
-            return 201, self._allowlist_entry(source, expires_at)
+            return 201, success_body
 
     def remove_allowlist_entry(self, source: object) -> tuple[int, dict]:
         """DELETE /v1/trust/allowlist/{source} — remove a keyless entry.
@@ -4355,6 +4606,8 @@ class LedgerService:
                 EVENT_ALLOWLIST_REMOVED,
                 {"source": source, "expires_at": existing},
             )
+            success_body = {"source": source, "removed": True}
+            self._idem_stage(200, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -4362,7 +4615,7 @@ class LedgerService:
                 self.store.allowlist[source] = existing
                 self.store.truncate_audit_events(1)
                 raise
-            return 200, {"source": source, "removed": True}
+            return 200, success_body
 
     # -- audit log ------------------------------------------------------------
 
@@ -4435,6 +4688,8 @@ class LedgerService:
                     "activated_event_id": event["event_id"],
                 }
             )
+            success_body = {"version": new_version, "public_key": public_key}
+            self._idem_stage(200, success_body)
             try:
                 self.store.save()
             except BaseException:
@@ -4445,7 +4700,7 @@ class LedgerService:
                 del self.store.audit_signer_history[history_length:]
                 self.store.truncate_audit_events(1)
                 raise
-            return 200, {"version": new_version, "public_key": public_key}
+            return 200, success_body
 
     def list_audit_events(self, params: dict) -> tuple[int, dict]:
         """GET /v1/audit/events — paginated append-only audit log.
@@ -4761,8 +5016,12 @@ class LedgerService:
                 ):
                     # Idempotent re-revoke: report the unchanged revoked
                     # record with no event and no write (a second revoke event
-                    # would be rejected on recovery).
-                    return 200, self._history_credential_response(current)
+                    # would be rejected on recovery). With an Idempotency-Key
+                    # the response is still cached (record-only save) by
+                    # run_idempotent.
+                    repeat_body = self._history_credential_response(current)
+                    self._idem_stage(200, repeat_body, sort_keys=False)
+                    return 200, repeat_body
                 created = False
 
             previous = current
@@ -4791,6 +5050,10 @@ class LedgerService:
                     "status": credential["status"],
                 },
             )
+            success_body = self._history_credential_response(credential)
+            self._idem_stage(
+                201 if created else 200, success_body, sort_keys=False
+            )
             try:
                 self.store.save()
             except Exception:
@@ -4798,10 +5061,9 @@ class LedgerService:
                 # back together; no half state survives an unserviced write.
                 self.store.history_credential = previous
                 self.store.truncate_audit_events(1)
+                self.store.clear_staged_idempotency()
                 return 500, {"ok": False, "error": "io"}
-            return (
-                201 if created else 200
-            ), self._history_credential_response(credential)
+            return (201 if created else 200), success_body
 
     def _history_heads(self) -> tuple[str | None, str | None]:
         """Current (trust_head, history_head); null for a not-yet-created file.
@@ -4979,6 +5241,12 @@ class LedgerService:
                         or len(result["records"]) > before_count
                     )
                     trust_head, history_head = self._history_heads()
+                    # Every append (201 or the 200 tail no-op) also records an
+                    # update history_access event and saves, so the idempotency
+                    # record rides that same atomic write.
+                    self._idem_stage(
+                        201 if created else 200, result, sort_keys=False
+                    )
                     self._append_history_access_and_save(
                         "update",
                         trust_head,
@@ -5054,6 +5322,9 @@ class LedgerService:
                     if result.get("ok") is False:
                         return self._history_failure(result)
                     trust_head, history_head = self._history_heads()
+                    # The export audit event always saves, so the cached
+                    # response rides that same atomic write.
+                    self._idem_stage(200, result, sort_keys=False)
                     self._append_history_access_and_save(
                         "export", trust_head, history_head
                     )

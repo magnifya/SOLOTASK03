@@ -78,6 +78,43 @@ TRUST_REVOKED = "revoked"
 HISTORY_CREDENTIAL_ACTIVE = "active"
 HISTORY_CREDENTIAL_REVOKED = "revoked"
 
+# HTTP methods covered by the unified request idempotency protection; only
+# state-changing POST/DELETE routes carry an Idempotency-Key (read-only POSTs
+# and GETs never persist one).
+IDEMPOTENCY_METHODS = ("POST", "DELETE")
+IDEMPOTENCY_KEY_MIN_LENGTH = 1
+IDEMPOTENCY_KEY_MAX_LENGTH = 128
+
+
+def is_visible_ascii(value: object) -> bool:
+    """Whether ``value`` is a string of visible ASCII characters only.
+
+    Visible ASCII is the range 0x21..0x7E: spaces, tabs and control characters
+    are excluded (an Idempotency-Key and an origin-form request target could
+    not carry them unambiguously).
+    """
+    return isinstance(value, str) and all(
+        0x21 <= ord(char) <= 0x7E for char in value
+    )
+
+
+def valid_idempotency_key(value: object) -> bool:
+    """Validate an Idempotency-Key: 1..128 visible ASCII characters."""
+    return (
+        is_visible_ascii(value)
+        and IDEMPOTENCY_KEY_MIN_LENGTH <= len(value) <= IDEMPOTENCY_KEY_MAX_LENGTH
+    )
+
+
+def valid_request_target(value: object) -> bool:
+    """Validate an origin-form request target persisted with an idempotency key.
+
+    A non-empty visible-ASCII string beginning with ``/`` (it includes any
+    query string verbatim, so two targets differing only by query are
+    distinct).
+    """
+    return is_visible_ascii(value) and bool(value) and value.startswith("/")
+
 # Credential permission scopes in the fixed response/audit order. Each scope
 # authorizes one kind of route: read (GET the signer log), update (POST the
 # signer log) and export (POST a signed history page).
@@ -377,6 +414,19 @@ class LedgerStore:
         # audit_signer_rotated event id. Public keys are retained forever so
         # historical checkpoints stay verifiable offline.
         self.audit_signer_history: list[dict] = []
+        # Unified HTTP request-idempotency table keyed by Idempotency-Key.
+        # Each record is self-contained and caches the first successful
+        # response of a state-changing POST/DELETE:
+        # {"key", "method", "target", "fingerprint", "status", "body"} where
+        # body is the exact JSON text returned the first time (its key order
+        # frozen byte-for-byte). A record is inserted, in full, only right
+        # before the business change's single atomic save and is rolled back
+        # together with that change if the save fails, so it always describes
+        # a durably committed mutation. 4xx responses never occupy the key.
+        self.idempotency_records: dict[str, dict] = {}
+        # At most one record staged for the next save(), published into the
+        # table only after a durable promotion (see stage_idempotency_record).
+        self._idem_staged: dict | None = None
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
@@ -427,6 +477,7 @@ class LedgerStore:
                 self.audit_events = []
                 self.audit_checkpoint = audit.make_checkpoint([])
                 self.history_credential = None
+                self.idempotency_records = {}
                 # A brand-new node mints its version 1 checkpoint key; the
                 # first signer is activated at event 0 (the empty log).
                 self.audit_signer = self._make_audit_signer(1, 0)
@@ -455,7 +506,8 @@ class LedgerStore:
                 #           expired_records, audit_checkpoint, audit_repair,
                 #           signer_state, recorded_state_root, attested_syncs,
                 #           attested_expired_records, source_key_history,
-                #           key_history_repair, history_credential)
+                #           key_history_repair, history_credential,
+                #           idempotency_records)
                 valid.append(
                     (
                         parsed[2],
@@ -478,6 +530,7 @@ class LedgerStore:
                         parsed[16],
                         parsed[17],
                         parsed[18],
+                        parsed[19],
                     )
                 )
 
@@ -498,7 +551,8 @@ class LedgerStore:
             # initial_balance, syncs, trust_sources, allowlist, audit_events,
             # expired_records, audit_checkpoint, audit_repair, signer_state,
             # recorded_state_root, attested_syncs, attested_expired_records,
-            # source_key_history, key_history_repair, history_credential)
+            # source_key_history, key_history_repair, history_credential,
+            # idempotency_records)
             reference = self._canonical_view(
                 top[0][2],
                 top[0][3],
@@ -514,6 +568,7 @@ class LedgerStore:
                 top[0][15],
                 top[0][17],
                 history_credential=top[0][19],
+                idempotency_records=top[0][20],
             )
             for item in top[1:]:
                 if (
@@ -532,6 +587,7 @@ class LedgerStore:
                         item[15],
                         item[17],
                         history_credential=item[19],
+                        idempotency_records=item[20],
                     )
                     != reference
                 ):
@@ -570,6 +626,7 @@ class LedgerStore:
                 source_key_history,
                 key_history_repair,
                 history_credential,
+                idempotency_records,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -646,6 +703,7 @@ class LedgerStore:
             self.audit_signer = audit_signer
             self.audit_signer_history = signer_history
             self.history_credential = history_credential
+            self.idempotency_records = idempotency_records
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -785,6 +843,7 @@ class LedgerStore:
         attested_syncs: dict[tuple[str, str], dict] | None = None,
         source_key_history: dict[str, list[dict]] | None = None,
         history_credential: dict | None = None,
+        idempotency_records: dict[str, dict] | None = None,
     ) -> str:
         """Order-independent canonical content hash for conflict detection.
 
@@ -804,7 +863,10 @@ class LedgerStore:
         per-source key history participates too: a twin disagreeing about a
         source's historical public keys is a conflict. The persistent
         history credential participates too: a twin disagreeing about its
-        token hash, permissions, status or version is a conflict.
+        token hash, permissions, status or version is a conflict. The
+        unified idempotency table participates as well: a twin disagreeing
+        about a cached key's method, target, fingerprint, status or response
+        body is a conflict.
         """
         sync_records = [
             {
@@ -848,6 +910,17 @@ class LedgerStore:
             {"source": source, "keys": [dict(entry) for entry in history]}
             for source, history in sorted((source_key_history or {}).items())
         ]
+        idempotency_entries = [
+            {
+                "key": key,
+                "method": rec["method"],
+                "target": rec["target"],
+                "fingerprint": rec["fingerprint"],
+                "status": rec["status"],
+                "body": rec["body"],
+            }
+            for key, rec in sorted((idempotency_records or {}).items())
+        ]
         return json.dumps(
             {
                 "initial_balance": initial_balance,
@@ -872,6 +945,7 @@ class LedgerStore:
                     if history_credential is not None
                     else None
                 ),
+                "idempotency": idempotency_entries,
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -936,6 +1010,7 @@ class LedgerStore:
         dict[str, list[dict]],
         bool,
         dict | None,
+        dict[str, dict],
     ]:
         """Strictly validate one decoded snapshot.
 
@@ -1173,6 +1248,9 @@ class LedgerStore:
         history_credential = self._parse_persisted_history_credential(
             data.get("history_credential"), audit_events, path
         )
+        idempotency_records = self._parse_persisted_idempotency(
+            data.get("idempotency"), path
+        )
         return (
             chain,
             pending,
@@ -1193,6 +1271,7 @@ class LedgerStore:
             source_key_history,
             _key_history_repair,
             history_credential,
+            idempotency_records,
         )
 
     @staticmethod
@@ -2086,6 +2165,116 @@ class LedgerStore:
                 "reconstructed from history_credential_changed events",
             )
         return credential
+
+    def _parse_persisted_idempotency(
+        self, raw: object, path: str
+    ) -> dict[str, dict]:
+        """Strictly parse the persisted unified idempotency record table.
+
+        The section is optional (a snapshot written before the feature omits
+        it). Unlike sync records, an idempotency record is authoritative
+        replay metadata: any defect is snapshot corruption and fails recovery,
+        never a silent prune. Each entry must contain exactly
+        ``key, method, target, fingerprint, status, body``: a unique 1..128
+        visible-ASCII key, a POST/DELETE method, a visible-ASCII origin-form
+        target beginning with ``/``, a 64-char lowercase hex fingerprint, a
+        2xx status code and a JSON-serializable response text (reparsed here
+        so replay can never emit invalid JSON). Duplicate keys, duplicate
+        fingerprints (the same request fingerprint could only be cached once,
+        on its first durable mutation) and any type/shape contradiction fail
+        recovery.
+        """
+        if raw is None:
+            return {}
+        if not isinstance(raw, list):
+            raise StateRecoveryError(path, "'idempotency' must be a list")
+        records: dict[str, dict] = {}
+        seen_fingerprints: set[str] = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise StateRecoveryError(
+                    path, "idempotency entry must be an object"
+                )
+            if set(entry) != {
+                "key",
+                "method",
+                "target",
+                "fingerprint",
+                "status",
+                "body",
+            }:
+                raise StateRecoveryError(
+                    path,
+                    "idempotency entry must contain exactly key, method, "
+                    "target, fingerprint, status and body",
+                )
+            key = entry["key"]
+            method = entry["method"]
+            target = entry["target"]
+            fingerprint = entry["fingerprint"]
+            status = entry["status"]
+            body = entry["body"]
+            if not valid_idempotency_key(key):
+                raise StateRecoveryError(
+                    path,
+                    "idempotency key must be 1-128 visible ASCII characters",
+                )
+            if key in records:
+                raise StateRecoveryError(
+                    path, f"duplicate idempotency key {key!r} in snapshot"
+                )
+            if method not in IDEMPOTENCY_METHODS:
+                raise StateRecoveryError(
+                    path, f"idempotency record for {key!r} has invalid method"
+                )
+            if not valid_request_target(target):
+                raise StateRecoveryError(
+                    path,
+                    f"idempotency record for {key!r} has an invalid target",
+                )
+            if not crypto.is_hex64(fingerprint):
+                raise StateRecoveryError(
+                    path,
+                    f"idempotency record for {key!r} fingerprint must be 64 "
+                    "lowercase hex characters",
+                )
+            if fingerprint in seen_fingerprints:
+                raise StateRecoveryError(
+                    path,
+                    f"idempotency record for {key!r} duplicates an existing "
+                    "fingerprint",
+                )
+            if (
+                isinstance(status, bool)
+                or not isinstance(status, int)
+                or not 200 <= status < 300
+            ):
+                raise StateRecoveryError(
+                    path,
+                    f"idempotency record for {key!r} must cache a 2xx status",
+                )
+            if not isinstance(body, str):
+                raise StateRecoveryError(
+                    path,
+                    f"idempotency record for {key!r} body must be JSON text",
+                )
+            try:
+                json.loads(body)
+            except ValueError:
+                raise StateRecoveryError(
+                    path,
+                    f"idempotency record for {key!r} body is not valid JSON",
+                ) from None
+            records[key] = {
+                "key": key,
+                "method": method,
+                "target": target,
+                "fingerprint": fingerprint,
+                "status": status,
+                "body": body,
+            }
+            seen_fingerprints.add(fingerprint)
+        return records
 
     @staticmethod
     def _parse_persisted_audit_events(raw: object, path: str) -> list[dict]:
@@ -3157,6 +3346,42 @@ class LedgerStore:
                 )
                 for key in HISTORY_CREDENTIAL_KEYS
             }
+        # The unified idempotency table is persisted in the same atomic
+        # document as the mutation each record caches. A record is inserted
+        # into self.idempotency_records only right before the single business
+        # save, so what lands here always describes a durable change; the
+        # cached body is JSON text whose key order is preserved verbatim.
+        if self.idempotency_records:
+            data["idempotency"] = [
+                {
+                    "key": key,
+                    "method": rec["method"],
+                    "target": rec["target"],
+                    "fingerprint": rec["fingerprint"],
+                    "status": rec["status"],
+                    "body": rec["body"],
+                }
+                for key, rec in sorted(self.idempotency_records.items())
+            ]
+        # A record staged for THIS save rides the business mutation: serialize
+        # it in the same document while keeping the in-memory table untouched
+        # until the promotion is durable.
+        staged = self._idem_staged
+        if staged is not None:
+            staged_entries = [
+                {
+                    "key": key,
+                    "method": rec["method"],
+                    "target": rec["target"],
+                    "fingerprint": rec["fingerprint"],
+                    "status": rec["status"],
+                    "body": rec["body"],
+                }
+                for key, rec in sorted(
+                    {**self.idempotency_records, staged["key"]: staged}.items()
+                )
+            ]
+            data["idempotency"] = staged_entries
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
         # Hold the class-wide recovery lock while a .ledger-* snapshot exists
@@ -3182,12 +3407,21 @@ class LedgerStore:
                 promoted = True
                 self._fsync_dir(directory)
                 # Promotion is durable: now publish the prospective derived
-                # views and advance the generation, together and last, so a
-                # successful write is the only thing that changes memory.
+                # views, advance the generation and install any staged
+                # idempotency record, together and last, so a successful write
+                # is the only thing that changes memory.
                 self.tx_index = next_index
                 self.accounts = next_accounts
                 self.generation = next_generation
+                if staged is not None:
+                    self.idempotency_records[staged["key"]] = staged
+                self._idem_staged = None
             finally:
+                if not promoted:
+                    # A failed/aborted promotion never publishes the staged
+                    # record: drop it so an uncommitted attempt does not occupy
+                    # the Idempotency-Key.
+                    self._idem_staged = None
                 if not promoted and os.path.exists(tmp_path):
                     # Promotion never happened: drop the half-written candidate so
                     # it cannot masquerade as a recoverable snapshot. A candidate
@@ -3675,3 +3909,64 @@ class LedgerStore:
             target.setdefault(key, rec)
         for tip, fork in forks.items():
             self.forks.setdefault(tip, fork)
+
+    # -- unified HTTP request idempotency -------------------------------------
+
+    @staticmethod
+    def make_idempotency_record(
+        key: str,
+        method: str,
+        target: str,
+        fingerprint: str,
+        status: int,
+        body_text: str,
+    ) -> dict:
+        """Build one cached first-success idempotency record."""
+        return {
+            "key": key,
+            "method": method,
+            "target": target,
+            "fingerprint": fingerprint,
+            "status": status,
+            "body": body_text,
+        }
+
+    def stage_idempotency_record(self, record: dict) -> None:
+        """Stage a completed first-success record for the NEXT save.
+
+        The record rides the business mutation's single atomic save: it is
+        serialized together with the change but is *published* into the
+        in-memory table only after the promotion succeeds. A failed save (or
+        any save followed by a business rollback) discards the staged record
+        in :meth:`save`'s cleanup, so the key is never occupied by an
+        uncommitted attempt. Caller must hold the lock and call this only on
+        the success path, immediately before the business save.
+        """
+        self._idem_staged = record
+
+    def clear_staged_idempotency(self) -> None:
+        """Drop any staged-but-unpublished idempotency record."""
+        self._idem_staged = None
+
+    def has_staged_idempotency(self) -> bool:
+        """Whether a record is waiting to ride the next save."""
+        return self._idem_staged is not None
+
+    def commit_staged_idempotency(self) -> None:
+        """Persist an already-staged record that accompanied a no-write
+        (side-effect-free) business success.
+
+        Some business successes deliberately perform no mutation save (an
+        already-idempotent re-registration, a re-revoke, a cached sync
+        replay). When such a request itself carries an Idempotency-Key the
+        business method still staged its cached response; one save publishes
+        it without changing any ledger section. A failed save raises and
+        leaves the key free. Caller must hold the lock.
+        """
+        if self._idem_staged is None:
+            return
+        self.save()
+
+    def get_idempotency_record(self, key: str) -> dict | None:
+        """Return the cached record for an Idempotency-Key, or None."""
+        return self.idempotency_records.get(key)

@@ -6,8 +6,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote
 
 from .service import LedgerService
+from .store import valid_idempotency_key
 
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies
+
+# Optional request header selecting unified idempotency for a state-changing
+# POST/DELETE. Its value is 1..128 visible ASCII characters; absent, the
+# request behaves exactly as before the feature.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_REPLAYED_HEADER = "Idempotency-Replayed"
+
+# The 400 body used when an Idempotency-Key itself is malformed. The contract
+# pins the conflict body ({"error": "idempotency key conflict"}) but leaves
+# other 400s to each route's existing error shape; the token-gated history
+# routes use their ordered {"ok", "error"} input document instead.
+DEFAULT_IDEMPOTENCY_400 = {"error": "invalid Idempotency-Key"}
+HISTORY_IDEMPOTENCY_400 = {"ok": False, "error": "input"}
 
 # Token-gated checkpoint-history routes. Every request to one of these is
 # rejected before the body is read or any state is touched unless the node was
@@ -32,7 +46,11 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
         # -- helpers --------------------------------------------------------
 
         def _send_json(
-            self, status: int, body: dict, sort_keys: bool = True
+            self,
+            status: int,
+            body: dict,
+            sort_keys: bool = True,
+            extra_headers: list[tuple[str, str]] | None = None,
         ) -> None:
             data = json.dumps(
                 body, ensure_ascii=False, sort_keys=sort_keys
@@ -40,6 +58,8 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            for name, value in extra_headers or ():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
 
@@ -94,6 +114,115 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             except (ValueError, UnicodeDecodeError):
                 return False, {"error": "request body must be valid JSON"}
 
+        def _idempotency_key(self) -> str | None | bool:
+            """The request's Idempotency-Key: None (absent), False (invalid)
+            or the validated 1..128 visible-ASCII value."""
+            raw = self.headers.get(IDEMPOTENCY_HEADER)
+            if raw is None:
+                return None
+            if not valid_idempotency_key(raw):
+                return False
+            return raw
+
+        def _valid_fingerprint_target(self) -> bool:
+            """Whether the full request target can form a stable fingerprint.
+
+            The HTTP origin-form target (path plus any query string) must be
+            visible ASCII beginning with ``/``.
+            """
+            target = self.path
+            return (
+                isinstance(target, str)
+                and bool(target)
+                and target.startswith("/")
+                and all(0x21 <= ord(char) <= 0x7E for char in target)
+            )
+
+        def _drain_optional_body(self) -> tuple[bool, object]:
+            """Read an optional JSON body for a normally body-less route.
+
+            Returns the parsed payload (or None when no body is present,
+            including an explicit empty ``Content-Length: 0`` — the route
+            takes no body and the idempotency fingerprint canonicalizes the
+            absent body to JSON null). A present, non-empty body that is not
+            valid JSON reports the route-neutral 400 only when an
+            Idempotency-Key is in play (the fingerprint could not be formed);
+            key-less requests keep the legacy drain-and-ignore behavior.
+            """
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return True, None
+            ok, payload = self._read_json()
+            if ok:
+                return True, payload
+            if self._idempotency_key() is None:
+                # Preserve the legacy drain-and-ignore behavior exactly.
+                return True, None
+            return False, payload
+
+        def _run_mutation(
+            self,
+            invoke,
+            payload: object,
+            sort_keys: bool = True,
+            ordered_error: bool = False,
+            prune_syncs: bool = False,
+        ) -> None:
+            """Dispatch one state-changing POST/DELETE, honoring an optional
+            Idempotency-Key.
+
+            Without the header the business method runs and its response is
+            sent verbatim (the exact legacy behavior, CLI included). With a
+            valid key the request is executed through the service's unified
+            idempotency unit: the first success echoes the key with
+            ``Idempotency-Replayed: false``, a same-key/same-fingerprint
+            retry returns the cached status and JSON with
+            ``Idempotency-Replayed: true``, and a same-key/different-fingerprint
+            retry is the contract's 409 conflict body. A malformed key (or a
+            target that could not fingerprint) answers 400 before the business
+            method ever runs, so no state, snapshot or audit entry changes.
+            """
+            key = self._idempotency_key()
+            if key is False or (
+                key is not None and not self._valid_fingerprint_target()
+            ):
+                if ordered_error:
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                else:
+                    self._send_json(400, DEFAULT_IDEMPOTENCY_400)
+                return
+            if key is None:
+                status, body = invoke()
+                self._send_json(status, body, sort_keys=sort_keys)
+                return
+            status, body, replayed = service.run_idempotent(
+                key,
+                self.command,
+                self.path,
+                payload,
+                invoke,
+                sort_keys=sort_keys,
+                prune_syncs=prune_syncs,
+            )
+            # The Idempotency-Key echo and the replay marker describe a
+            # successful first execution or its cached replay only; a 409
+            # key-conflict (or any other 4xx/5xx) is an ordinary error and
+            # carries neither header.
+            extra = (
+                [
+                    (IDEMPOTENCY_HEADER, key),
+                    (IDEMPOTENCY_REPLAYED_HEADER, "true" if replayed else "false"),
+                ]
+                if 200 <= status < 300
+                else None
+            )
+            self._send_json(status, body, sort_keys=sort_keys, extra_headers=extra)
+
         # -- routing --------------------------------------------------------
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
@@ -113,8 +242,12 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                         400, {"ok": False, "error": "input"}, sort_keys=False
                     )
                     return
-                status, body = service.manage_history_credential(payload)
-                self._send_json(status, body, sort_keys=False)
+                self._run_mutation(
+                    lambda: service.manage_history_credential(payload),
+                    payload,
+                    sort_keys=False,
+                    ordered_error=True,
+                )
             elif path == "/v1/history/trust":
                 # POST /v1/history/trust — append one signer certificate; the
                 # success document is the contract-ordered
@@ -125,8 +258,12 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                         400, {"ok": False, "error": "input"}, sort_keys=False
                     )
                     return
-                status, body = service.update_history_trust(payload)
-                self._send_json(status, body, sort_keys=False)
+                self._run_mutation(
+                    lambda: service.update_history_trust(payload),
+                    payload,
+                    sort_keys=False,
+                    ordered_error=True,
+                )
             elif path == "/v1/history/export":
                 # POST /v1/history/export — one signed page; the success
                 # document has the contract key order
@@ -137,14 +274,16 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                         400, {"ok": False, "error": "input"}, sort_keys=False
                     )
                     return
-                status, body = service.export_history_page(payload)
-                self._send_json(status, body, sort_keys=False)
+                self._run_mutation(
+                    lambda: service.export_history_page(payload),
+                    payload,
+                    sort_keys=False,
+                    ordered_error=True,
+                )
             elif path == "/v1/chain/headers/locate":
-                # POST /v1/chain/headers/locate — fork location by ordered
-                # block locators; the success document has the contract key
-                # order anchor, headers, tip, auth (same signed header page
-                # shape as GET /v1/chain/headers), so it is serialized in
-                # insertion order rather than alphabetically.
+                # READ-ONLY POST: fork location by ordered block locators; no
+                # idempotency record is ever created. The success document has
+                # the contract key order anchor, headers, tip, auth.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
@@ -152,12 +291,8 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.locate_header_fork(payload)
                 self._send_json(status, body, sort_keys=False)
             elif path == "/v1/chain/finalities/locate":
-                # POST /v1/chain/finalities/locate — fork location for the
-                # signed finality history by ordered block locators; the
-                # success document reuses the GET /v1/chain/finalities
-                # contract key order anchor, finalities, next, head (only
-                # anchor names the matched locator), so it is serialized in
-                # insertion order rather than alphabetically.
+                # READ-ONLY POST: fork location for the signed finality
+                # history; no idempotency record is ever created.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
@@ -165,14 +300,8 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.locate_finality_fork(payload)
                 self._send_json(status, body, sort_keys=False)
             elif path == "/v1/chain/sync-plan":
-                # POST /v1/chain/sync-plan — read-only sync precheck. The
-                # body is strictly the ordered {"locators", "tip",
-                # "finalized"} document (400 with the ordered {"ok",
-                # "error"} input body otherwise, never touching state); no
-                # shared ancestor is 409. The success document has the
-                # contract key order ok, ancestor, relation, pull, error,
-                # so it is serialized in insertion order rather than
-                # alphabetically.
+                # READ-ONLY POST: the sync precheck never touches state and no
+                # idempotency record is created.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(
@@ -182,14 +311,8 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.build_sync_plan(payload)
                 self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions/receipt-proofs/audit":
-                # POST /v1/transactions/receipt-proofs/audit — offline audit
-                # summary for a batch of receipt_proof documents. The body is
-                # strictly {"documents", "expected_root"} in that order (400
-                # with the ordered {"ok", "error"} body otherwise, never
-                # touching state). The success document has the contract key
-                # order ok, root, total, succeeded, errors, entries, digest,
-                # so it is serialized in insertion order rather than
-                # alphabetically.
+                # READ-ONLY POST: the offline receipt-proof audit never touches
+                # state and no idempotency record is created.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(
@@ -199,13 +322,8 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.audit_receipt_proofs(payload)
                 self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions/finalized-receipts":
-                # POST /v1/transactions/finalized-receipts — a batch of
-                # finalized receipts sharing one signed chain snapshot. The
-                # body is strictly {"tx_ids": [...]} (400), existence is
-                # 404 and any unconfirmed item 409. The success document has
-                # a contract-fixed key order (items, headers, finality), so
-                # it is serialized in insertion order rather than
-                # alphabetically.
+                # READ-ONLY POST: a batch of finalized receipts; no state
+                # change and no idempotency record.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
@@ -213,14 +331,8 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.get_finalized_receipts(payload)
                 self._send_json(status, body, sort_keys=False)
             elif path == "/v1/accounts/attested-proofs":
-                # POST /v1/accounts/attested-proofs — a batch of signed
-                # account-state inclusion proofs sharing one state anchor and
-                # one audit signature. The body is strictly {"accounts":
-                # [...], optional "height"} (400), anchor/account existence is
-                # 404 and a pending tip anchors nothing (404). The success
-                # document has the contract-fixed key order state, proofs,
-                # auth, so it is serialized in insertion order rather than
-                # alphabetically.
+                # READ-ONLY POST: a batch of signed account-state inclusion
+                # proofs; no state change and no idempotency record.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
@@ -232,43 +344,59 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.submit_transaction(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.submit_transaction(payload), payload
+                )
             elif path == "/v1/forks/candidates":
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.submit_fork_candidate(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.submit_fork_candidate(payload),
+                    payload,
+                    prune_syncs=True,
+                )
             elif path == "/v1/forks/sync/range":
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.submit_fork_sync_range(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.submit_fork_sync_range(payload),
+                    payload,
+                    prune_syncs=True,
+                )
             elif path == "/v1/forks/sync/range/attested":
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.submit_fork_sync_range_attested(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.submit_fork_sync_range_attested(payload),
+                    payload,
+                    prune_syncs=True,
+                )
             elif path == "/v1/forks/sync/attested":
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.submit_fork_sync_attested(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.submit_fork_sync_attested(payload),
+                    payload,
+                    prune_syncs=True,
+                )
             elif path == "/v1/forks/sync":
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.submit_fork_sync(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.submit_fork_sync(payload),
+                    payload,
+                    prune_syncs=True,
+                )
             elif path == "/v1/audit/signer/rotate":
                 # POST /v1/audit/signer/rotate — rotate the Ed25519 key that
                 # authenticates audit export checkpoints.
@@ -276,16 +404,18 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.rotate_audit_signer(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.rotate_audit_signer(payload), payload
+                )
             elif path == "/v1/trust/sources":
                 # POST /v1/trust/sources — register a trusted source.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.register_trust_source(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.register_trust_source(payload), payload
+                )
             elif (
                 path.startswith("/v1/trust/sources/")
                 and (path.endswith("/rotate") or path.endswith("/revoke"))
@@ -298,42 +428,53 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 remainder = path[len("/v1/trust/sources/") :]
                 if remainder.endswith("/rotate"):
                     source = unquote(remainder[: -len("/rotate")])
-                    status, body = service.rotate_trust_source(source, payload)
+                    self._run_mutation(
+                        lambda: service.rotate_trust_source(source, payload),
+                        payload,
+                    )
                 else:
                     source = unquote(remainder[: -len("/revoke")])
-                    status, body = service.revoke_trust_source(source, payload)
-                self._send_json(status, body)
+                    self._run_mutation(
+                        lambda: service.revoke_trust_source(source, payload),
+                        payload,
+                    )
             elif path == "/v1/trust/allowlist":
                 # POST /v1/trust/allowlist — add a keyless offline-verify entry.
                 ok, payload = self._read_json()
                 if not ok:
                     self._send_json(400, payload)  # type: ignore[arg-type]
                     return
-                status, body = service.add_allowlist_entry(payload)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.add_allowlist_entry(payload), payload
+                )
             elif path.startswith("/v1/forks/") and path.endswith("/adopt"):
                 # POST /v1/forks/{tip_hash}/adopt — a body is not required.
-                if self.headers.get("Content-Length"):
-                    self._read_json()
+                ok, extra = self._drain_optional_body()
+                if not ok:
+                    self._send_json(
+                        400, {"error": "request body must be valid JSON"}
+                    )
+                    return
                 tip_hash = unquote(path[len("/v1/forks/") : -len("/adopt")])
-                status, body = service.adopt_fork(tip_hash)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.adopt_fork(tip_hash),
+                    extra,
+                    prune_syncs=True,
+                )
             elif path == "/v1/blocks":
                 # A body is not required; drain one if present.
-                if self.headers.get("Content-Length"):
-                    self._read_json()
-                status, body = service.mine_block()
-                self._send_json(status, body)
+                ok, extra = self._drain_optional_body()
+                if not ok:
+                    self._send_json(
+                        400, {"error": "request body must be valid JSON"}
+                    )
+                    return
+                self._run_mutation(service.mine_block, extra)
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
                 if remainder.endswith("/proofs"):
-                    # POST /v1/blocks/{height}/proofs — batch Merkle proofs.
-                    # The body is {"tx_ids": [...]} and is strictly validated
-                    # by the service (400), before any state is read. The
-                    # success document has a contract-fixed key order
-                    # (height, block_hash, merkle_root, transaction_ids,
-                    # proofs), so it is serialized in insertion order rather
-                    # than alphabetically.
+                    # READ-ONLY POST: batch Merkle proofs; no state change and
+                    # no idempotency record.
                     height = unquote(remainder[: -len("/proofs")])
                     ok, payload = self._read_json()
                     if not ok:
@@ -343,27 +484,35 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(status, body, sort_keys=False)
                 else:
                     # POST /v1/blocks/{height}/confirm | /v1/blocks/{height}/rollback
-                    if self.headers.get("Content-Length"):
-                        self._read_json()
+                    ok, extra = self._drain_optional_body()
+                    if not ok:
+                        self._send_json(
+                            400, {"error": "request body must be valid JSON"}
+                        )
+                        return
                     if remainder.endswith("/confirm"):
                         height = unquote(remainder[: -len("/confirm")])
-                        status, body = service.confirm_block(height)
+                        self._run_mutation(
+                            lambda: service.confirm_block(height), extra
+                        )
                     elif remainder.endswith("/rollback"):
                         height = unquote(remainder[: -len("/rollback")])
-                        status, body = service.rollback_block(height)
+                        self._run_mutation(
+                            lambda: service.rollback_block(height), extra
+                        )
                     else:
-                        status, body = 404, {"error": "not found"}
-                    self._send_json(status, body)
+                        self._send_json(404, {"error": "not found"})
             else:
                 self._send_json(404, {"error": "not found"})
 
         def do_DELETE(self) -> None:  # noqa: N802 (stdlib naming)
             path = self.path.split("?", 1)[0]
             if path.startswith("/v1/trust/allowlist/"):
-                # DELETE /v1/trust/allowlist/{source}
+                # DELETE /v1/trust/allowlist/{source} — a keyless entry removal.
                 source = unquote(path[len("/v1/trust/allowlist/") :])
-                status, body = service.remove_allowlist_entry(source)
-                self._send_json(status, body)
+                self._run_mutation(
+                    lambda: service.remove_allowlist_entry(source), None
+                )
             else:
                 self._send_json(404, {"error": "not found"})
 

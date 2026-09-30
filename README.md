@@ -1774,6 +1774,37 @@ python -m ledger --host 0.0.0.0 --port 8080 --state ledger_state.json
 
 ## HTTP 接口
 
+### 统一请求幂等（`Idempotency-Key`）
+
+所有会改变账本或管理状态的 **POST 与 DELETE**（交易提交、打包、确认/回滚、
+候选分叉、四类同步、分叉采用、来源信任注册/轮换/撤销、allowlist 新增与删除、
+审计签名者轮换、令牌保护的 `/v1/history/access`、`/v1/history/trust`、
+`/v1/history/export`）都支持可选请求头 `Idempotency-Key`；只读 POST
+（`locate`、`sync-plan`、各类 proof/receipt 批量查询、receipt-proofs 审计）与
+GET 一律忽略该头。规则如下：
+
+- **头值**：1..128 个可见 ASCII 字符（0x21..0x7E，不含空白/控制字符）。
+  无头时逐字保持原有行为（CLI 从不发送该头，完全兼容）；头值非法、JSON 非法，
+  或方法/完整请求目标（含查询串）/规范化 JSON 请求体无法稳定形成指纹时返回
+  **400**，状态、快照、审计均不变（`/v1/history/*` 的 400 用其固定键序
+  `{"ok":false,"error":"input"}`）。
+- **指纹**：由 HTTP 方法、完整请求目标与请求体 JSON 的规范化内容（排序键、
+  紧凑分隔，键序与空白不计差异；无体视为 JSON `null`）经 SHA-256 确定。
+- **首次成功**：保留原状态码（不统一改写 200/201/202）、原响应体与原 JSON 键序；
+  回显 `Idempotency-Key: <key>` 与 `Idempotency-Replayed: false`。幂等记录与
+  业务变更、审计事件在**同一次原子快照**中持久化，重启后仍可重放。
+- **同键同指纹的后续请求**：不重复执行、不追加审计事件，返回缓存的状态码与
+  JSON，并带 `Idempotency-Replayed: true`。同键但改方法、目标或请求体返回
+  **409** `{"error":"idempotency key conflict"}`（不携带成功/重放头）。
+- **失败不占键**：4xx/5xx（含既有 401/403/404/业务 409）不记录，键可重用；
+  持久化失败返回 **500** `{"error":"persistence failed"}`，业务变更、幂等记录、
+  审计全部回滚，键不占用。
+- **并发**：同键并发只允许一个变更落盘，其余请求在持久化成功后得到相同重放。
+- **恢复**：幂等节区是权威元数据；启动恢复时若记录缺失字段、缓存体不是合法
+  JSON、键重复或指纹重复/矛盾，按 `StateRecoveryError` 损坏语义拒绝该快照。
+  同一指纹已在另一键下缓存时，业务本身幂等的成功（如重复确认、重复注册、同步
+  业务级 200 重放）照常返回但不再建立第二条指纹重复记录。
+
 ```bash
 # 提交交易（signature 用 from 对应私钥对规范化消息签名）
 curl -s -X POST localhost:8080/v1/transactions \
