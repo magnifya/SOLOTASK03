@@ -344,6 +344,126 @@ class StateAnchorsAuditReportArchiveTest(unittest.TestCase):
             self.assertTrue(fetched["ok"], fetched)
             self.assertEqual(fetched["generation"], 3)
 
+    def test_concurrent_records_from_separate_processes(self) -> None:
+        sources = []
+        pair_lists = []
+        for index, account in enumerate(
+            (self.account_a, self.account_b, self.account_c)
+        ):
+            sources.append(self._anchor_archive(
+                f"anchors-x-{index}.json", [account]))
+            pairs = self._pairs(
+                *((1, acc) for acc in
+                  (self.account_a, self.account_b, self.account_c)[: index + 1])
+            )
+            pair_lists.append(pairs)
+        reports = [
+            self._report(sources[: index + 1], pair_lists[index])
+            for index in range(3)
+        ]
+        archive = os.path.join(self.tmp, "multi-reports.json")
+        payload = os.path.join(self.tmp, "pending-reports.json")
+        with open(payload, "w", encoding="utf-8") as fh:
+            json.dump(
+                [
+                    {
+                        "report": report,
+                        "pairs": pairs,
+                        "public_key": self.report_key,
+                    }
+                    for report, pairs in zip(reports, pair_lists)
+                ],
+                fh,
+            )
+
+        repo_root = os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))
+        code = (
+            "import json, sys; sys.path.insert(0, %r);"
+            "from ledger import light_client;"
+            "items = json.load(open(%r, encoding='utf-8'));"
+            "item = items[int(sys.argv[1])];"
+            "print(json.dumps(light_client."
+            "record_state_anchors_audit_report("
+            "%r, item['report'], item['pairs'], item['public_key'])))"
+            % (repo_root, payload, archive)
+        )
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(index)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for index in range(3)
+        ]
+        outcomes = []
+        for index, process in enumerate(processes):
+            stdout, stderr = process.communicate()
+            self.assertEqual(process.returncode, 0, stderr)
+            outcomes.append(json.loads(stdout))
+
+        self.assertTrue(all(item["ok"] for item in outcomes), outcomes)
+        generations = sorted(item["generation"] for item in outcomes)
+        self.assertEqual(generations, [1, 2, 3])
+        digest_generation = {
+            item["digest"]: item["generation"] for item in outcomes
+        }
+
+        document = json.loads(open(archive, encoding="utf-8").read())
+        self.assertEqual(document["generation"], 3)
+        self.assertEqual(len(document["reports"]), 3)
+        ordered_digests = [item["digest"] for item in document["reports"]]
+        self.assertEqual(
+            ordered_digests,
+            sorted(ordered_digests, key=digest_generation.__getitem__),
+        )
+
+        query_errors = []
+
+        def reader(repeat: int) -> None:
+            for _ in range(repeat):
+                for report, expected_first in zip(
+                    reports, sorted(generations)
+                ):
+                    fetched = light_client.read_state_anchors_audit_report(
+                        archive, report["digest"])
+                    if not fetched["ok"]:
+                        query_errors.append(fetched)
+                        continue
+                    if fetched["generation"] != 3:
+                        query_errors.append(fetched)
+                    if fetched["report"] != report:
+                        query_errors.append(fetched)
+
+        threads = [threading.Thread(target=reader, args=(5,))
+                   for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertFalse(query_errors, query_errors)
+
+        # The first recorded generation is preserved verbatim across a
+        # fresh-process restart.
+        first_digest = min(digest_generation, key=digest_generation.get)
+        first_report = next(
+            report for report in reports if report["digest"] == first_digest)
+        code = (
+            "import json, sys; sys.path.insert(0, %r);"
+            "from ledger import light_client;"
+            "print(json.dumps(light_client."
+            "read_state_anchors_audit_report(%r, %r)))"
+            % (repo_root, archive, first_digest)
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            check=True)
+        restarted = json.loads(completed.stdout)
+        self.assertTrue(restarted["ok"], restarted)
+        self.assertEqual(restarted["generation"], 3)
+        self.assertEqual(restarted["report"], first_report)
+
 
 if __name__ == "__main__":
     unittest.main()

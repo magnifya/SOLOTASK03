@@ -578,6 +578,7 @@ from __future__ import annotations
 
 import hashlib
 import copy
+import fcntl
 import json
 import math
 import os
@@ -12082,6 +12083,70 @@ AUDIT_REPORT_ARCHIVE_KEYS = ("v", "generation", "reports", "hash")
 RECORD_AUDIT_REPORT_RESULT_KEYS = ("ok", "digest", "generation")
 READ_AUDIT_REPORT_RESULT_KEYS = ("ok", "report", "generation")
 
+_audit_report_locks: dict[str, threading.RLock] = {}
+_audit_report_locks_guard = threading.Lock()
+
+
+class _AuditReportArchiveLock:
+    """Same-archive mutex shared by threads and by separate processes.
+
+    An in-process :class:`~threading.RLock` orders threads without touching
+    the kernel; an exclusive ``flock`` on the ``<path>.lock`` sidecar orders
+    processes against the same archive. Recorders and readers take the very
+    same lock, so a query only ever observes a complete archive and two
+    recorders cannot replace each other's generation. The kernel releases the
+    flock automatically if a process dies while holding it.
+    """
+
+    def __init__(self, path: str, *, create: bool) -> None:
+        self._path = path
+        self._create = create
+        key = os.path.abspath(path)
+        with _audit_report_locks_guard:
+            thread_lock = _audit_report_locks.get(key)
+            if thread_lock is None:
+                thread_lock = threading.RLock()
+                _audit_report_locks[key] = thread_lock
+        self._thread_lock = thread_lock
+        self._handle = None
+
+    def __enter__(self) -> "_AuditReportArchiveLock":
+        self._thread_lock.acquire()
+        directory = os.path.dirname(os.path.abspath(self._path)) or "."
+        if not self._create and not os.path.isdir(directory):
+            # Without a parent directory there cannot be an archive to read;
+            # the strict loader below reports not_found without creating
+            # anything.
+            return self
+        lock_path = self._path + ".lock"
+        try:
+            if self._create:
+                os.makedirs(directory, exist_ok=True)
+            handle = open(lock_path, "a+b")
+        except FileNotFoundError as exc:
+            self._thread_lock.release()
+            category = ERR_IO if self._create else ERR_NOT_FOUND
+            raise _CheckpointError(category) from exc
+        except OSError as exc:
+            self._thread_lock.release()
+            raise _CheckpointError(ERR_IO) from exc
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            handle.close()
+            self._thread_lock.release()
+            raise _CheckpointError(ERR_IO) from exc
+        self._handle = handle
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if self._handle is not None:
+            try:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._handle.close()
+        self._thread_lock.release()
+
 
 def _audit_report_archive_hash(generation: int, reports: list) -> str:
     """SHA-256 over the canonical JSON bytes of every field but ``hash``."""
@@ -12209,10 +12274,11 @@ def record_state_anchors_audit_report(
     failing Ed25519 seal, ``integrity`` for body-digest, evidence-replay,
     grouping or same-digest content conflicts, ``state`` for a corrupt
     existing archive (parse, digest, ordering or replay) and ``io`` for a
-    read/write failure. Same-path calls are serialized and the write lands
-    via a fsynced temp file and atomic replace; a crash only ever exposes
-    the old archive or the complete new one. Nothing is raised and a
-    failure never changes a file.
+    read/write failure. Same-path calls are serialized across threads and
+    across processes (an exclusive flock on the ``<path>.lock`` sidecar)
+    and the write lands via a fsynced temp file and atomic replace; a crash
+    only ever exposes the old archive or the complete new one. Nothing is
+    raised and a failure never changes a file.
     """
     if not isinstance(path, str) or not path:
         return {"ok": False, "error": ERR_INPUT}
@@ -12240,61 +12306,63 @@ def record_state_anchors_audit_report(
         return {"ok": False, "error": ERR_INPUT}
     canonical_report = _canonical_state_anchors_audit_report(parsed)
 
-    lock = _checkpoint_lock(path)
-    with lock:
-        try:
-            stored = _load_audit_report_archive(path)
-        except _CheckpointError as failure:
-            return {"ok": False, "error": failure.category}
-        except Exception:
-            return {"ok": False, "error": ERR_STATE}
+    try:
+        with _AuditReportArchiveLock(path, create=True):
+            try:
+                stored = _load_audit_report_archive(path)
+            except _CheckpointError as failure:
+                return {"ok": False, "error": failure.category}
+            except Exception:
+                return {"ok": False, "error": ERR_STATE}
 
-        if stored is None:
-            reports: list[dict] = []
-            generation = 0
-        else:
-            reports = stored["reports"]
-            generation = stored["generation"]
+            if stored is None:
+                reports: list[dict] = []
+                generation = 0
+            else:
+                reports = stored["reports"]
+                generation = stored["generation"]
 
-        for existing in reports:
-            if existing["digest"] != canonical_report["digest"]:
-                continue
-            if existing != canonical_report:
-                return {"ok": False, "error": ERR_INTEGRITY}
+            for existing in reports:
+                if existing["digest"] != canonical_report["digest"]:
+                    continue
+                if existing != canonical_report:
+                    return {"ok": False, "error": ERR_INTEGRITY}
+                return {
+                    "ok": True,
+                    "digest": existing["digest"],
+                    "generation": generation,
+                }
+
+            reports.append(canonical_report)
+            next_generation = generation + 1
+            archive = {
+                "v": AUDIT_REPORT_ARCHIVE_VERSION,
+                "generation": next_generation,
+                "reports": reports,
+            }
+            archive["hash"] = _audit_report_archive_hash(
+                next_generation, reports
+            )
+            try:
+                original = _read_bytes_or_none(path)
+            except OSError:
+                return {"ok": False, "error": ERR_IO}
+            try:
+                _atomic_write_audit_report_archive(path, archive)
+            except (TypeError, ValueError):
+                _restore_bytes(path, original)
+                return {"ok": False, "error": ERR_INPUT}
+            except OSError:
+                _restore_bytes(path, original)
+                return {"ok": False, "error": ERR_IO}
+
             return {
                 "ok": True,
-                "digest": existing["digest"],
-                "generation": generation,
+                "digest": canonical_report["digest"],
+                "generation": next_generation,
             }
-
-        reports.append(canonical_report)
-        next_generation = generation + 1
-        archive = {
-            "v": AUDIT_REPORT_ARCHIVE_VERSION,
-            "generation": next_generation,
-            "reports": reports,
-        }
-        archive["hash"] = _audit_report_archive_hash(
-            next_generation, reports
-        )
-        try:
-            original = _read_bytes_or_none(path)
-        except OSError:
-            return {"ok": False, "error": ERR_IO}
-        try:
-            _atomic_write_audit_report_archive(path, archive)
-        except (TypeError, ValueError):
-            _restore_bytes(path, original)
-            return {"ok": False, "error": ERR_INPUT}
-        except OSError:
-            _restore_bytes(path, original)
-            return {"ok": False, "error": ERR_IO}
-
-        return {
-            "ok": True,
-            "digest": canonical_report["digest"],
-            "generation": next_generation,
-        }
+    except _CheckpointError as failure:
+        return {"ok": False, "error": failure.category}
 
 
 def read_state_anchors_audit_report(path: object, digest: object) -> dict:
@@ -12310,30 +12378,33 @@ def read_state_anchors_audit_report(path: object, digest: object) -> dict:
     Failure returns only ``{"ok": False, "error": category}``: ``input`` for
     a bad path or digest, ``not_found`` for a missing archive or an unknown
     digest, ``state`` for archive parse/digest/ordering/replay corruption
-    and ``io`` for a read failure. Same-path calls share the writer lock and
-    nothing is raised; identical file bytes yield identical results across
-    restarts.
+    and ``io`` for a read failure. Same-path reads share the recorder's
+    cross-process lock, so the report is always fetched from one complete
+    archive; nothing is raised and identical file bytes yield identical
+    results across restarts.
     """
     if not isinstance(path, str) or not path:
         return {"ok": False, "error": ERR_INPUT}
     if not isinstance(digest, str) or not crypto.is_hex64(digest):
         return {"ok": False, "error": ERR_INPUT}
 
-    lock = _checkpoint_lock(path)
-    with lock:
-        try:
-            stored = _load_audit_report_archive(path)
-        except _CheckpointError as failure:
-            return {"ok": False, "error": failure.category}
-        except Exception:
-            return {"ok": False, "error": ERR_STATE}
-        if stored is None:
+    try:
+        with _AuditReportArchiveLock(path, create=False):
+            try:
+                stored = _load_audit_report_archive(path)
+            except _CheckpointError as failure:
+                return {"ok": False, "error": failure.category}
+            except Exception:
+                return {"ok": False, "error": ERR_STATE}
+            if stored is None:
+                return {"ok": False, "error": ERR_NOT_FOUND}
+            for report in stored["reports"]:
+                if report["digest"] == digest:
+                    return {
+                        "ok": True,
+                        "report": copy.deepcopy(report),
+                        "generation": stored["generation"],
+                    }
             return {"ok": False, "error": ERR_NOT_FOUND}
-        for report in stored["reports"]:
-            if report["digest"] == digest:
-                return {
-                    "ok": True,
-                    "report": copy.deepcopy(report),
-                    "generation": stored["generation"],
-                }
-        return {"ok": False, "error": ERR_NOT_FOUND}
+    except _CheckpointError as failure:
+        return {"ok": False, "error": failure.category}
