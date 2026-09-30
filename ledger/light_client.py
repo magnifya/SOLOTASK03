@@ -12262,10 +12262,13 @@ def record_state_anchors_audit_report(
 
     Reports are appended to the version-1 archive at ``path`` in their
     original recording order; the first report starts generation 1 and each
-    genuinely new report increments it once. Resubmitting a report with the
-    same digest is idempotent: the file and generation hold and the stored
-    report is left byte-identical. A same-digest submission with different
-    content is ``integrity``.
+    genuinely new report occupies the next consecutive generation, so the
+    archive generation always equals the number of stored reports.
+    Resubmitting a report with the same digest is idempotent: the file,
+    report order and generations all hold, the stored report is left
+    byte-identical and the result repeats the generation assigned on the
+    report's first write (even after other reports were recorded later). A
+    same-digest submission with different content is ``integrity``.
 
     Success returns ``{"ok": True, "digest", "generation"}`` in that key
     order. Failure returns only ``{"ok": False, "error": category}``:
@@ -12322,7 +12325,7 @@ def record_state_anchors_audit_report(
                 reports = stored["reports"]
                 generation = stored["generation"]
 
-            for existing in reports:
+            for position, existing in enumerate(reports, start=1):
                 if existing["digest"] != canonical_report["digest"]:
                     continue
                 if existing != canonical_report:
@@ -12330,7 +12333,7 @@ def record_state_anchors_audit_report(
                 return {
                     "ok": True,
                     "digest": existing["digest"],
-                    "generation": generation,
+                    "generation": position,
                 }
 
             reports.append(canonical_report)
@@ -12372,8 +12375,9 @@ def read_state_anchors_audit_report(path: object, digest: object) -> dict:
     :func:`record_state_anchors_audit_report` and ``digest`` the report's
     64-lowercase-hex body digest. The call never writes, rewrites or cleans
     the archive. Success returns ``{"ok": True, "report", "generation"}`` in
-    that key order with the original report document and the archive
-    generation it belongs to.
+    that key order with the original report document and the fixed
+    generation assigned when that report was first recorded (its 1-based
+    position in recording order, never the archive's current generation).
 
     Failure returns only ``{"ok": False, "error": category}``: ``input`` for
     a bad path or digest, ``not_found`` for a missing archive or an unknown
@@ -12398,12 +12402,12 @@ def read_state_anchors_audit_report(path: object, digest: object) -> dict:
                 return {"ok": False, "error": ERR_STATE}
             if stored is None:
                 return {"ok": False, "error": ERR_NOT_FOUND}
-            for report in stored["reports"]:
+            for position, report in enumerate(stored["reports"], start=1):
                 if report["digest"] == digest:
                     return {
                         "ok": True,
                         "report": copy.deepcopy(report),
-                        "generation": stored["generation"],
+                        "generation": position,
                     }
             return {"ok": False, "error": ERR_NOT_FOUND}
     except _CheckpointError as failure:
