@@ -408,6 +408,234 @@ class LedgerService:
                 raise
         return 202, {"tx_id": tx.tx_id, "nonce": nonce}
 
+    def _validate_sequenced_batch(
+        self, payload: object
+    ) -> tuple[int, dict | None, list[Transaction] | None]:
+        """Validate a sequenced-batch request body.
+
+        Returns ``(None, None, transactions)`` when the shape, types and
+        signatures are all sound, otherwise ``(status, body, None)``. The
+        envelope is exactly ``{"transactions": [item, ...]}`` with a
+        non-empty list; each item carries exactly the five single-entry
+        fields with the single-entry types. Field/type and signature defects
+        are ``400 {"error": "input", "index": I}`` at the first offending
+        item; envelope defects are ``400 {"error": "input"}``.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"transactions"}:
+            return 400, {"error": "input"}, None
+        items = payload["transactions"]
+        if not isinstance(items, list) or not items:
+            return 400, {"error": "input"}, None
+        transactions: list[Transaction] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or set(item) != set(
+                REQUIRED_SEQUENCED_TX_FIELDS
+            ):
+                return 400, {"error": "input", "index": index}, None
+            sender = item["from"]
+            recipient = item["to"]
+            amount = item["amount"]
+            nonce = item["nonce"]
+            signature = item["signature"]
+            if not isinstance(sender, str) or not sender:
+                return 400, {"error": "input", "index": index}, None
+            if not isinstance(recipient, str) or not recipient:
+                return 400, {"error": "input", "index": index}, None
+            if (
+                isinstance(amount, bool)
+                or not isinstance(amount, int)
+                or amount <= 0
+            ):
+                return 400, {"error": "input", "index": index}, None
+            if (
+                isinstance(nonce, bool)
+                or not isinstance(nonce, int)
+                or nonce < 0
+            ):
+                return 400, {"error": "input", "index": index}, None
+            if not isinstance(signature, str) or not signature:
+                return 400, {"error": "input", "index": index}, None
+            message = crypto.sequenced_message(sender, recipient, amount, nonce)
+            if not crypto.verify_signature(sender, message, signature):
+                return 400, {"error": "input", "index": index}, None
+            transactions.append(
+                Transaction(sender, recipient, amount, signature, nonce)
+            )
+        return None, None, transactions
+
+    def submit_sequenced_batch(
+        self, payload: object
+    ) -> tuple[int, dict]:
+        """POST /v1/transactions/sequenced/batch — atomically reserve a batch
+        of nonce-ordered sequenced transfers. Returns ``(status, body)``.
+
+        The body is exactly ``{"transactions": [item, ...]}`` with a
+        non-empty list; every item is signed exactly like
+        ``submit_sequenced_transaction``. The batch succeeds only when every
+        item passes together under the store lock and lands in a single
+        atomic write; a rejected batch changes no state.
+
+        Checks run in this order and the first offending item (smallest
+        input index) is reported:
+
+        * field/type defects and bad signatures are
+          ``400 {"error": "input", "index": I}`` (envelope defects carry no
+          index);
+        * a repeated ``(sender, nonce)`` inside the batch is
+          ``400 {"error": "input", "index": I}``, and so is an internal gap
+          in a sender's fresh batch nonces;
+        * a batch starting above the live ``next_sequence`` or carrying a
+          different transaction on an occupied nonce is
+          ``409 {"error": "sequence_conflict", "index": I,
+          "next_sequence": N}``;
+        * a sender's total batch spend (replayed items excluded) over the
+          available balance — confirmed balance minus every pending-tip and
+          mempool spend, unconfirmed credits never counted — is
+          ``409 {"error": "insufficient_balance", "index": I}``;
+        * an item whose tx_id already exists while the batch is not an exact
+          whole-batch replay is
+          ``409 {"error": "transaction_exists", "index": I}``.
+
+        Every item already existing replays the batch: 200 with ``items``
+        (each ``{tx_id, nonce, location}`` in request order, ``location``
+        pending/confirmed) and ``total``, touching no state. A first
+        successful batch answers 202 with ``items`` (each
+        ``{tx_id, nonce}``) and ``total``; each newly admitted transaction
+        appends one ``transaction_submitted`` event in the same atomic
+        write, whose failure answers ``500 {"error": "persistence failed"}``
+        after restoring the pre-request state.
+        """
+        status, error, transactions = self._validate_sequenced_batch(payload)
+        if status is not None:
+            return status, error  # type: ignore[return-value]
+        assert transactions is not None
+        txs = transactions
+
+        with self.store.lock:
+            # Per-sender nonce placement visited in request order; items of
+            # different senders may interleave freely. Tracked per sender:
+            # the next expected nonce (live dense prefix extended by the
+            # batch slots accepted so far), whether the batch has filled any
+            # fresh slot for the sender, and the batch nonces seen.
+            #
+            # * a live slot (< next_sequence) holding this same tx_id is a
+            #   replay item; holding a different transaction is a reservation
+            #   conflict (409);
+            # * the sender's first fresh batch slot must equal next_sequence,
+            #   otherwise the batch starts misaligned (409);
+            # * once batch slots were filled, a jump over or back before the
+            #   current expectation is an in-batch gap/duplicate (400).
+            #
+            # The 400 category wins across senders; within one category the
+            # smallest input index is reported.
+            existing: list[bool] = [False] * len(txs)
+            gap_index: int | None = None
+            conflict_index: int | None = None
+            conflict_next: dict[str, int] = {}
+            per_sender: dict[str, dict] = {}
+            for index, tx in enumerate(txs):
+                state = self.store.sequences.get(tx.sender)
+                next_sequence = self.store.sequence_next(state)
+                track = per_sender.setdefault(
+                    tx.sender,
+                    {"expected": next_sequence, "started": False, "seen": set()},
+                )
+                if tx.nonce in track["seen"]:
+                    if gap_index is None:
+                        gap_index = index
+                    continue
+                track["seen"].add(tx.nonce)
+                if tx.nonce < next_sequence:
+                    occupant = None
+                    if state is not None:
+                        occupant = state["confirmed"].get(tx.nonce)
+                        if occupant is None:
+                            occupant = state["pending"].get(tx.nonce)
+                    if occupant == tx.tx_id:
+                        existing[index] = True
+                    elif conflict_index is None or index < conflict_index:
+                        conflict_index = index
+                        conflict_next[tx.sender] = next_sequence
+                elif not track["started"]:
+                    if tx.nonce != next_sequence:
+                        if conflict_index is None or index < conflict_index:
+                            conflict_index = index
+                            conflict_next[tx.sender] = next_sequence
+                    track["expected"] = tx.nonce + 1
+                    track["started"] = True
+                elif tx.nonce == track["expected"]:
+                    track["expected"] = tx.nonce + 1
+                elif gap_index is None:
+                    # After the batch reserved slots for this sender, the
+                    # next item skips a nonce or names one already passed.
+                    gap_index = index
+            if gap_index is not None:
+                return 400, {"error": "input", "index": gap_index}
+            if conflict_index is not None:
+                sender = txs[conflict_index].sender
+                return 409, {
+                    "error": "sequence_conflict",
+                    "index": conflict_index,
+                    "next_sequence": conflict_next.get(sender, 0),
+                }
+
+            # Balance is the single-entry gate summed per sender over the
+            # whole batch, replayed items excluded (their spend is already
+            # deducted from the mempool/chain view). Items are visited in
+            # request order so the first over-drawing item names the index.
+            batch_spend: dict[str, int] = {}
+            for index, tx in enumerate(txs):
+                if existing[index]:
+                    continue
+                spent = batch_spend.get(tx.sender, 0) + tx.amount
+                if self.available_balance(tx.sender) - spent < 0:
+                    return 409, {
+                        "error": "insufficient_balance",
+                        "index": index,
+                    }
+                batch_spend[tx.sender] = spent
+
+            # Partial overlap: after every other gate, a live item outside a
+            # whole-batch replay is rejected.
+            if any(existing) and not all(existing):
+                return 409, {
+                    "error": "transaction_exists",
+                    "index": existing.index(True),
+                }
+
+            if all(existing):
+                items = [
+                    {
+                        "tx_id": tx.tx_id,
+                        "nonce": tx.nonce,
+                        "location": self._sequenced_tx_location(tx.tx_id),
+                    }
+                    for tx in txs
+                ]
+                return 200, {"items": items, "total": len(items)}
+
+            for tx in txs:
+                self.store.pending[tx.tx_id] = tx
+                self.store.append_audit_event(
+                    EVENT_TRANSACTION_SUBMITTED,
+                    {
+                        "tx_id": tx.tx_id,
+                        "from": tx.sender,
+                        "to": tx.recipient,
+                        "amount": tx.amount,
+                        "nonce": tx.nonce,
+                    },
+                )
+            try:
+                self.store.save()
+            except BaseException:
+                for tx in txs:
+                    self.store.pending.pop(tx.tx_id, None)
+                self.store.truncate_audit_events(len(txs))
+                return 500, {"error": "persistence failed"}
+            items = [{"tx_id": tx.tx_id, "nonce": tx.nonce} for tx in txs]
+            return 202, {"items": items, "total": len(items)}
+
     def _sequenced_tx_location(self, tx_id: str) -> str | None:
         """Locate a tx_id across the canonical chain and mempool.
 

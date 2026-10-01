@@ -958,6 +958,48 @@ nonce。**陌生账户**返回 `next_sequence=0` 与两个空数组。该端点�
 - CLI 提供 `send-sequenced --to --amount --nonce [--signing-key|--from
   --signature]` 与 `sequence ACCOUNT`。
 
+### 批量序列转账
+
+`POST /v1/transactions/sequenced/batch` 在单笔入口之外提供**整批原子**的序列转
+账。请求体只接受 `{"transactions": [...]}`，数组非空；每项只允许
+`from,to,amount,nonce,signature` 五个字段，字段类型、签名消息（
+`ledger-sequenced-transfer-v1` 域）与 `tx_id` 派生同单笔入口，批内 `tx_id` 必须
+互异。各发送方的 nonce 从其 `next_sequence` 起在批内连续递增，**不同发送方可
+交错排列**；余额按每个发送方在批内的总支出对其可用余额（确认余额减去内存池与
+pending 末块支出，未确认收入不计）一次性校验。校验顺序固定，首个出错项的下标
+`I` 随错误返回：
+
+- 字段缺失/多余/类型错误、签名错误为 `400 {"error": "input", "index": I}`；
+  信封层错误（非对象、缺/多顶层键、`transactions` 非非空数组）为不带 `index`
+  的 `400 {"error": "input"}`；
+- 批内重复 `(from, nonce)`（含完全重复项）或批内 nonce 断档为
+  `400 {"error": "input", "index": I}`；
+- 整批起始 nonce 与 `next_sequence` 错位（起始错位），或已预留槽位由另一笔交
+  易占用（预留冲突），为
+  `409 {"error": "sequence_conflict", "index": I, "next_sequence": N}`；
+- 某发送方批内总支出超出可用余额为
+  `409 {"error": "insufficient_balance", "index": I}`；
+- 部分交易的 `tx_id` 已存在（但整批并非完全重放）为
+  `409 {"error": "transaction_exists", "index": I}`。
+
+任一项失败整批拒绝：**同一把账本锁、同一次原子写入，全入或全不入**，不改任何
+状态。首次成功返回 `202`，响应固定键序 `items,total`；`items` 按输入顺序给出
+`{"tx_id","nonce"}`，`total` 为批内交易数，每笔新交易各记一次
+`transaction_submitted` 审计事件（与入池同一原子写入）。
+
+`Idempotency-Key` 沿用统一幂等规则（命中缓存重放原始 2xx，本接口首次为 202）。
+无该头时，**整批交易全部已存在**才视为重放：返回 `200`，`items` 按输入顺序给
+出 `{"tx_id","nonce","location"}`（`location` 为 `pending` 或 `confirmed`），
+不改状态、不追加事件；只有部分存在则按 `transaction_exists` 拒绝。落盘失败为
+`500 {"error": "persistence failed"}`，状态恢复到请求前。
+
+批次交易入池后与单笔序列交易完全一致地参与打包、确认与回滚；重启恢复交易、连续
+nonce 与审计链；并发提交与同 `Idempotency-Key` 重试下只有一个请求改变状态。
+
+CLI 提供 `send-sequenced-batch --file PATH`：从 JSON 文件读取请求体，`--file -`
+读标准输入，原样输出服务端 JSON；2xx 退出码 0，其余为 1。本地文件读取或 JSON
+解析失败时直接输出 `{"error":"input"}` 并以 1 退出，不请求服务。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。

@@ -378,6 +378,28 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     lambda: service.submit_sequenced_transaction(payload),
                     payload,
                 )
+            elif path == "/v1/transactions/sequenced/batch":
+                # POST /v1/transactions/sequenced/batch — an atomic batch of
+                # nonce-ordered sequenced transfers, body strictly
+                # {"transactions": [...]} (non-empty; each item carries
+                # exactly the single-entry fields). The first valid batch
+                # returns 202 with the contract key order items,total; an
+                # exact whole-batch replay returns 200 with each item's
+                # location appended. Field/signature defects and batch gaps
+                # or duplicates are 400; start/reservation conflicts,
+                # insufficient total balance and partial overlaps are 409;
+                # every error names the first offending item index. The
+                # ordered bodies are serialized in insertion order.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                self._json_mutation(
+                    "POST",
+                    lambda: service.submit_sequenced_batch(payload),
+                    payload,
+                    sort_keys=False,
+                )
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
