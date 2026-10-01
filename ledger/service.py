@@ -73,6 +73,13 @@ EVENT_ALLOWLIST_ADDED = "allowlist_added"
 EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 EVENT_HISTORY_ACCESS = "history_access"
 EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
+# Core ledger lifecycle events mirroring ledger.store's literal values:
+# one event per successful submit/mine/confirm/rollback transition, appended
+# in the same atomic write as the change it describes.
+EVENT_TRANSACTION_SUBMITTED = "transaction_submitted"
+EVENT_BLOCK_MINED = "block_mined"
+EVENT_BLOCK_CONFIRMED = "block_confirmed"
+EVENT_BLOCK_ROLLED_BACK = "block_rolled_back"
 
 
 def _parse_height(height: object) -> int | None:
@@ -273,12 +280,25 @@ class LedgerService:
             if self.available_balance(sender) < amount:
                 return 400, {"error": "insufficient balance"}
             self.store.pending[tx.tx_id] = tx
+            # First successful enqueue: one transaction_submitted event,
+            # persisted in the same atomic write as the mempool change.
+            self.store.append_audit_event(
+                EVENT_TRANSACTION_SUBMITTED,
+                {
+                    "tx_id": tx.tx_id,
+                    "from": tx.sender,
+                    "to": tx.recipient,
+                    "amount": tx.amount,
+                },
+            )
             try:
                 self.store.save()
             except BaseException:
-                # Persistence failed: drop the in-memory enqueue so memory
-                # keeps matching the last durably committed state.
+                # Persistence failed: drop the in-memory enqueue and its
+                # event so memory keeps matching the last durably committed
+                # state.
                 self.store.pending.pop(tx.tx_id, None)
+                self.store.truncate_audit_events(1)
                 raise
         return 202, {"tx_id": tx.tx_id}
 
@@ -679,12 +699,25 @@ class LedgerService:
             )
             self.store.chain.append(block)
             removed = [self.store.pending.pop(tx.tx_id) for tx in ordered]
+            # First creation of this pending block: one block_mined event
+            # carrying the block's ascending in-block transaction order.
+            self.store.append_audit_event(
+                EVENT_BLOCK_MINED,
+                {
+                    "height": block.height,
+                    "block_hash": block.block_hash,
+                    "merkle_root": block.merkle_root,
+                    "transaction_ids": [tx.tx_id for tx in ordered],
+                },
+            )
             try:
                 self.store.save()
             except BaseException:
-                # Undo the in-memory block so nothing un-persisted is visible.
+                # Undo the in-memory block and its event so nothing
+                # un-persisted is visible.
                 self.store.chain.pop()
                 self.store.pending.update({tx.tx_id: tx for tx in removed})
+                self.store.truncate_audit_events(1)
                 raise
         return 201, {
             "height": block.height,
@@ -738,10 +771,17 @@ class LedgerService:
             if parent is None or parent.status != STATUS_CONFIRMED:
                 return 409, {"error": "previous block is not confirmed"}
             block.status = STATUS_CONFIRMED
+            # First confirmation of the pending tip: one block_confirmed
+            # event; the idempotent re-confirm above appends nothing.
+            self.store.append_audit_event(
+                EVENT_BLOCK_CONFIRMED,
+                {"height": block.height, "block_hash": block.block_hash},
+            )
             try:
                 self.store.save()
             except BaseException:
                 block.status = STATUS_PENDING
+                self.store.truncate_audit_events(1)
                 raise
             return 200, {"height": block.height, "status": STATUS_CONFIRMED}
 
@@ -764,6 +804,22 @@ class LedgerService:
                 return 409, {"error": "only the chain tip can be rolled back"}
             pending_before = set(self.store.pending)
             rolled_back = self.store.rollback_tip()
+            # Record exactly the transactions that actually returned to the
+            # mempool (rollback_tip de-duplicates ids already present), in the
+            # block's ascending in-block order.
+            restored_ids = [
+                tx.tx_id
+                for tx in rolled_back.transactions
+                if tx.tx_id not in pending_before
+            ]
+            self.store.append_audit_event(
+                EVENT_BLOCK_ROLLED_BACK,
+                {
+                    "height": rolled_back.height,
+                    "block_hash": rolled_back.block_hash,
+                    "transaction_ids": restored_ids,
+                },
+            )
             try:
                 self.store.save()
             except BaseException:
@@ -772,6 +828,7 @@ class LedgerService:
                 for tx_id in list(self.store.pending):
                     if tx_id not in pending_before:
                         del self.store.pending[tx_id]
+                self.store.truncate_audit_events(1)
                 raise
             return 200, {"height": rolled_back.height, "status": "rolled_back"}
 

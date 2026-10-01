@@ -655,14 +655,31 @@ JSON 解析失败或任何键/值非法一律返回 `400` 及**有序**
   read/update/export，无头时为 `null`）；持久分权历史凭据的轮换/撤销记录
   `history_credential_changed`（载荷为 `action` 后接凭据响应四字段
   `version,token_hash,permissions,status`，`action` 为 rotate/revoke，
-  首版版本为 0）。事件一旦写入永不删除：候选
+  首版版本为 0）。核心账本变化同样逐项入链：交易**首次写入 mempool** 记录
+  `transaction_submitted`（字段 `tx_id,from,to,amount`，`tx_id` 必须由
+  from/to/amount 重算一致）；**首次生成 pending 区块**记录 `block_mined`
+  （字段 `height,block_hash,merkle_root,transaction_ids`，`transaction_ids`
+  按区块内升序保存，Merkle 根与区块哈希必须由载荷重算一致）；**首次确认
+  pending tip** 记录 `block_confirmed`（字段 `height,block_hash`，幂等重复
+  确认不再追加）；**成功回滚 pending tip** 记录 `block_rolled_back`（字段
+  `height,block_hash,transaction_ids`，`transaction_ids` 为实际回到
+  mempool 的交易，保持区块内顺序、为区块交易的子集）。四条事件与业务状态、
+  幂等记录在**同一原子持久化**内提交，落盘失败时状态、generation、审计链头
+  与内存数据整体回到调用前；带 `Idempotency-Key` 的首次成功写入只追加一条，
+  同键重放、同键冲突与非成功结果均不追加。事件一旦写入永不删除：候选
   **采用或过期之后仍可按 source/kind 分页查询**。
 - **恢复语义**：信任注册表、allowlist、来源公钥历史与审计流是权威配置而非
   可丢弃缓存，快照恢复时逐项严格校验（公钥格式、整数、正版本号、合法状态；
   allowlist 条目键唯一且 `expires_at` 为非布尔整数；`event_id`
   必须从 1 起连续无重复；每条 `prev_hash`/`event_hash` 必须重算一致，
   `audit_checkpoint` 必须钉住真实链头，`allowlist_added`/`allowlist_removed`
-  事件也必须携带非空 `source` 与整数 `expires_at`）。任一项损坏，或同代
+  事件也必须携带非空 `source` 与整数 `expires_at`；
+  `transaction_submitted`/`block_mined`/`block_confirmed`/
+  `block_rolled_back` 严格校验字段类型、64 位小写十六进制格式、
+  `transaction_ids` 的升序与区块内顺序，并按事件重放
+  提交→出块→确认/回滚状态机、核对被引用区块与交易事实及父区块哈希——
+  只有分叉采用（`sync_adopted` 或直接采用候选）允许在无账本事件的情况下
+  替换区块）。任一项损坏，或同代
   快照内容冲突，都抛 `StateRecoveryError`，绝不静默新建。来源公钥历史同样
   严格校验：持久化的 `source_key_history` 每项必须结构合法（版本自 1 起
   稠密、`activated_event_id` 升序、公钥为 64 位小写 hex），并与注册表记录

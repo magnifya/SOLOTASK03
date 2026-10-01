@@ -128,6 +128,22 @@ EVENT_HISTORY_ACCESS = "history_access"
 # response document (version, token_hash, permissions, status).
 # service.EVENT_HISTORY_CREDENTIAL_CHANGED mirrors this literal value.
 EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
+# Core ledger lifecycle events, one per successful state transition:
+# transaction_submitted (first mempool enqueue), block_mined (first pending
+# block creation at a height), block_confirmed (first confirmation of the
+# pending tip) and block_rolled_back (successful pending-tip rollback). The
+# service layer appends them in the same atomic write as the change they
+# describe; recovery strictly re-validates their payloads and lifecycle.
+EVENT_TRANSACTION_SUBMITTED = "transaction_submitted"
+EVENT_BLOCK_MINED = "block_mined"
+EVENT_BLOCK_CONFIRMED = "block_confirmed"
+EVENT_BLOCK_ROLLED_BACK = "block_rolled_back"
+LEDGER_EVENT_KINDS = (
+    EVENT_TRANSACTION_SUBMITTED,
+    EVENT_BLOCK_MINED,
+    EVENT_BLOCK_CONFIRMED,
+    EVENT_BLOCK_ROLLED_BACK,
+)
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
@@ -1264,6 +1280,17 @@ class LedgerStore:
         idempotency = self._parse_persisted_idempotency(
             data.get(IDEMPOTENCY_SECTION), path
         )
+        # The four core ledger lifecycle events describe the actual chain
+        # transitions (submit/mine/confirm/rollback). Their hash links were
+        # already verified above; here their payloads, inter-event state
+        # machine and referenced block/transaction facts are strictly
+        # reconciled against the recovered canonical chain, surviving forks
+        # and mempool. Fork adoption is the only operation that removes
+        # blocks without a lifecycle event, so an unreachable block is only
+        # accepted when a later sync_adopted explains it.
+        self._validate_ledger_lifecycle_events(
+            audit_events, chain, pending, forks, path
+        )
         return (
             chain,
             pending,
@@ -2329,6 +2356,31 @@ class LedgerStore:
         # events carrying the action and the heads the two external files had
         # at access time (64-hex, or null when the file did not exist yet).
         history_access_kinds = {EVENT_HISTORY_ACCESS}
+        # The four core ledger lifecycle events carry strictly typed,
+        # exact-key-set payloads; their inter-event state machine and the
+        # facts they reference are cross-checked separately by
+        # _validate_ledger_lifecycle_events once the whole chain is parsed.
+        ledger_event_payload_keys = {
+            EVENT_TRANSACTION_SUBMITTED: (
+                "tx_id",
+                "from",
+                "to",
+                "amount",
+            ),
+            EVENT_BLOCK_MINED: (
+                "height",
+                "block_hash",
+                "merkle_root",
+                "transaction_ids",
+            ),
+            EVENT_BLOCK_CONFIRMED: ("height", "block_hash"),
+            EVENT_BLOCK_ROLLED_BACK: (
+                "height",
+                "block_hash",
+                "transaction_ids",
+            ),
+        }
+        ledger_event_kinds = set(ledger_event_payload_keys)
         events: list[dict] = []
         for i, event in enumerate(raw):
             if not isinstance(event, dict):
@@ -2458,8 +2510,504 @@ class LedgerStore:
                             f"audit event {event_id} ({kind}) {head_field} "
                             "must be 64 lowercase hex characters or null",
                         )
+            elif kind in ledger_event_kinds:
+                # The lifecycle event must carry exactly its documented
+                # payload keys in addition to the five chain fields
+                # (event_id, kind, at, prev_hash, event_hash).
+                expected_payload = ledger_event_payload_keys[kind]
+                allowed = set(expected_payload) | {
+                    "event_id",
+                    "kind",
+                    "at",
+                    "prev_hash",
+                    "event_hash",
+                }
+                if set(event) != allowed:
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) must carry exactly "
+                        f"the payload keys {', '.join(expected_payload)}",
+                    )
+                if kind == EVENT_TRANSACTION_SUBMITTED:
+                    tx_id = event["tx_id"]
+                    sender = event["from"]
+                    recipient = event["to"]
+                    amount = event["amount"]
+                    if not crypto.is_hex64(tx_id):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_submitted) "
+                            "tx_id must be 64 lowercase hex characters",
+                        )
+                    if not isinstance(sender, str) or not sender:
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_submitted) "
+                            "'from' must be a non-empty string",
+                        )
+                    if not isinstance(recipient, str) or not recipient:
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_submitted) "
+                            "'to' must be a non-empty string",
+                        )
+                    if (
+                        isinstance(amount, bool)
+                        or not isinstance(amount, int)
+                        or amount <= 0
+                    ):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_submitted) "
+                            "amount must be a positive integer",
+                        )
+                else:
+                    height = event["height"]
+                    block_hash = event["block_hash"]
+                    if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} ({kind}) height must be a "
+                            "positive integer",
+                        )
+                    if not crypto.is_hex64(block_hash):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} ({kind}) block_hash must "
+                            "be 64 lowercase hex characters",
+                        )
+                    if kind == EVENT_BLOCK_MINED:
+                        merkle_root = event["merkle_root"]
+                        if not crypto.is_hex64(merkle_root):
+                            raise StateRecoveryError(
+                                path,
+                                f"audit event {event_id} (block_mined) "
+                                "merkle_root must be 64 lowercase hex characters",
+                            )
+                    tx_ids = event.get("transaction_ids")
+                    if tx_ids is not None:
+                        # A core-mined block always packs at least one
+                        # transaction; a rolled-back adopted fork tip may
+                        # carry none, so the empty list is only legal on
+                        # block_rolled_back.
+                        if not isinstance(tx_ids, list):
+                            raise StateRecoveryError(
+                                path,
+                                f"audit event {event_id} ({kind}) "
+                                "transaction_ids must be a list",
+                            )
+                        if kind == EVENT_BLOCK_MINED and not tx_ids:
+                            raise StateRecoveryError(
+                                path,
+                                f"audit event {event_id} (block_mined) "
+                                "transaction_ids must be a non-empty list",
+                            )
+                        if any(not crypto.is_hex64(value) for value in tx_ids):
+                            raise StateRecoveryError(
+                                path,
+                                f"audit event {event_id} ({kind}) every "
+                                "transaction id must be 64 lowercase hex "
+                                "characters",
+                            )
+                        if len(set(tx_ids)) != len(tx_ids) or tx_ids != sorted(tx_ids):
+                            raise StateRecoveryError(
+                                path,
+                                f"audit event {event_id} ({kind}) "
+                                "transaction_ids must be distinct and "
+                                "ascending in block order",
+                            )
             events.append(dict(event))
         return events
+
+    def _validate_ledger_lifecycle_events(
+        self,
+        audit_events: list[dict],
+        chain: list[Block],
+        pending: dict[str, Transaction],
+        forks: dict[str, list[Block]],
+        path: str,
+    ) -> None:
+        """Strictly reconcile the four core lifecycle events with the facts.
+
+        Runs after every block, mempool transaction, fork and audit hash link
+        has already been independently validated, and replays the
+        submit/mine/confirm/rollback state machine recorded by
+        ``transaction_submitted`` / ``block_mined`` / ``block_confirmed`` /
+        ``block_rolled_back`` events:
+
+        * a ``transaction_submitted`` tx_id must recompute from its
+          from/to/amount and the same tx_id is submitted at most once;
+        * a ``block_mined`` event must carry the recomputed Merkle root, its
+          transaction_ids must be ascending distinct facts (a prior
+          submission, the recovered mempool, or a cryptographically verified
+          block), and its block_hash must recompute against a verified parent
+          block at height-1 (genesis at height 1); the same height may be
+          mined again only after a rollback;
+        * ``block_confirmed`` / ``block_rolled_back`` must close the open
+          pending-tip epoch (opened by ``block_mined`` or by the
+          ``sync_adopted`` adoption of a pending tip), naming its exact hash;
+          the rollback transaction_ids must stay within that tip's block
+          order (the events record the transactions actually restored);
+        * the recovered canonical chain is reconciled with the final epoch
+          per height, except for heights delivered by a later fork adoption
+          (``sync_adopted``), the only operation that replaces blocks
+          without a lifecycle event.
+
+        Any defect is snapshot corruption and raises StateRecoveryError.
+        """
+
+        def fail(reason: str) -> None:
+            raise StateRecoveryError(path, reason)
+
+        genesis_hash = chain[0].block_hash
+        # Verified block facts by (height, block_hash) from the canonical
+        # chain and every surviving fork.
+        block_facts: dict[int, dict[str, Block]] = {}
+        for fact_chain in [chain, *forks.values()]:
+            for block in fact_chain:
+                block_facts.setdefault(block.height, {})[block.block_hash] = block
+        # Transaction facts: the recovered mempool plus every transaction in
+        # the canonical chain and surviving forks, all independently
+        # signature/tx_id verified by their own parsers.
+        tx_facts: set[str] = set(pending)
+        for fact_chain in [chain, *forks.values()]:
+            for block in fact_chain:
+                for fact_tx in block.transactions:
+                    tx_facts.add(fact_tx.tx_id)
+
+        # Block-lifecycle events (mined/confirmed/rolled back). A snapshot
+        # written before this feature carries none: its blocks are all legacy
+        # and the chain parser alone vouches for them. Once the log contains
+        # any block lifecycle event, every recovered block at or above the
+        # first such height must be explained by the replay, except for
+        # heights later superseded by a fork adoption (sync_adopted), which is
+        # the one operation that replaces blocks without a lifecycle event.
+        block_event_kinds = {
+            EVENT_BLOCK_MINED,
+            EVENT_BLOCK_CONFIRMED,
+            EVENT_BLOCK_ROLLED_BACK,
+        }
+        block_lifecycle_indices = [
+            index
+            for index, event in enumerate(audit_events)
+            if event.get("kind") in block_event_kinds
+        ]
+        # Precompute, per height, the index of the last adoption covering it
+        # and the set of heights ultimately superseded by an adoption that
+        # happened after that height's own last lifecycle event.
+        adoption_at: dict[int, int] = {}
+        for index, event in enumerate(audit_events):
+            if event.get("kind") != EVENT_SYNC_ADOPTED:
+                continue
+            ad_height = event.get("height")
+            if (
+                not isinstance(ad_height, bool)
+                and isinstance(ad_height, int)
+                and ad_height >= 0
+            ):
+                for covered in range(1, ad_height + 1):
+                    adoption_at[covered] = index
+        last_lifecycle_at: dict[int, int] = {}
+        for index, event in enumerate(audit_events):
+            if event.get("kind") in block_event_kinds:
+                height = event.get("height")
+                if isinstance(height, int) and not isinstance(height, bool):
+                    last_lifecycle_at[height] = index
+        adopted_away = {
+            height
+            for height, adoption_index in adoption_at.items()
+            if adoption_index > last_lifecycle_at.get(height, -1)
+        }
+        # The feature boundary. A snapshot written before the feature carries
+        # no block lifecycle events at all. When events exist, the first block
+        # event is either a block_mined at height H (every lower block is a
+        # legacy confirmed block) or the one-time confirm/rollback at H of the
+        # single pending tip that existed at deployment (that block is legacy
+        # too). Recovered blocks strictly below this height are vouched for by
+        # the chain parser alone.
+        first_block_index = block_lifecycle_indices[0] if block_lifecycle_indices else None
+        if first_block_index is None:
+            cutoff_height = None
+        elif (
+            audit_events[first_block_index].get("kind") == EVENT_BLOCK_MINED
+        ):
+            cutoff_height = audit_events[first_block_index]["height"]
+        else:
+            # The legacy pending-tip transition itself is at this height;
+            # regular per-event coverage starts strictly above it.
+            cutoff_height = audit_events[first_block_index]["height"] + 1
+
+        # Replay state.
+        # block_hash hashes proven by validated block_mined events, by height.
+        mined_hashes: dict[int, set[str]] = {}
+        # Ordered phases per height: each a (phase, hash, tx_ids) tuple where
+        # phase is "mined"/"adopted" (open), "confirmed" or "rolled_back" and
+        # tx_ids is the opening block's order (or None when unresolvable).
+        phases: dict[int, list[tuple[str, str, list[str] | None]]] = {}
+        # The currently open pending tip: (height, hash, tx_ids).
+        open_tip: tuple[int, str, list[str] | None] | None = None
+
+        for index, event in enumerate(audit_events):
+            kind = event.get("kind")
+            if kind == EVENT_SYNC_ADOPTED:
+                # Fork adoption is the only operation that replaces blocks
+                # without a lifecycle event. Its frozen summary names the
+                # adopted tip height and the status that tip had.
+                ad_height = event.get("height")
+                tip_hash = event.get("tip_hash")
+                ad_status = event.get("status")
+                if (
+                    not isinstance(ad_height, bool)
+                    and isinstance(ad_height, int)
+                    and ad_height >= 0
+                    and crypto.is_hex64(tip_hash)
+                ):
+                    if ad_status == STATUS_PENDING:
+                        tx_list: list[str] | None = None
+                        adopted_block = block_facts.get(ad_height, {}).get(tip_hash)
+                        if adopted_block is not None:
+                            tx_list = [tx.tx_id for tx in adopted_block.transactions]
+                        open_tip = (ad_height, tip_hash, tx_list)
+                        phases.setdefault(ad_height, []).append(
+                            ("adopted", tip_hash, tx_list)
+                        )
+                    else:
+                        open_tip = None
+                continue
+            if kind not in LEDGER_EVENT_KINDS:
+                continue
+            event_id = event["event_id"]
+            height = event.get("height")
+            if kind == EVENT_TRANSACTION_SUBMITTED:
+                tx_id = event["tx_id"]
+                amount = event["amount"]
+                message = crypto.canonical_message(
+                    event["from"], event["to"], amount
+                )
+                if crypto.compute_tx_id(message) != tx_id:
+                    fail(
+                        f"audit event {event_id} (transaction_submitted) tx_id "
+                        "does not recompute from its payload"
+                    )
+                # A second submission event for one tx_id is only reachable
+                # after fork adoption dropped the old pending tip carrying it
+                # (the tx left both the chain and the mempool, so a fresh
+                # submit succeeds); ordinary rollback keeps it in the pool and
+                # only ever answers 409. This is not itself corruption, so it
+                # is not rejected — the recomputed tx_id binds every copy.
+                tx_facts.add(tx_id)
+                continue
+
+            assert isinstance(height, int)
+            block_hash = event["block_hash"]
+            history = phases.setdefault(height, [])
+            if kind == EVENT_BLOCK_MINED:
+                tx_ids = list(event["transaction_ids"])
+                # Mining is only possible with the previous tip confirmed; a
+                # fork adoption is the one event that can move the open tip
+                # without a block lifecycle event.
+                if open_tip is not None and open_tip[0] >= height:
+                    fail(
+                        f"audit event {event_id} (block_mined) at height "
+                        f"{height} while a pending tip is still open"
+                    )
+                last_phase = history[-1] if history else None
+                if last_phase is not None and last_phase[0] != "rolled_back":
+                    fail(
+                        f"audit event {event_id} (block_mined) reopens height "
+                        f"{height} that was not rolled back"
+                    )
+                # Every packed id must be a verified fact and the list is the
+                # block's ascending in-block order.
+                if any(tx_id not in tx_facts for tx_id in tx_ids):
+                    fail(
+                        f"audit event {event_id} (block_mined) names a "
+                        "transaction with no verifiable submission or block"
+                    )
+                recomputed_merkle = crypto.merkle_root(tx_ids)
+                if recomputed_merkle != event["merkle_root"]:
+                    fail(
+                        f"audit event {event_id} (block_mined) Merkle root "
+                        "does not recompute from its transaction_ids"
+                    )
+                # Parent candidates at height-1: genesis, any verified block
+                # fact surviving in the chain/forks, or a previously mined
+                # event hash. One of them must reproduce the stored hash;
+                # heights later swept away by a fork adoption cannot be
+                # re-linked against the final state and are exempt there.
+                if height not in adopted_away:
+                    if height == 1:
+                        parent_hashes = {genesis_hash}
+                    else:
+                        parent_hashes = set(block_facts.get(height - 1, {}))
+                        parent_hashes |= mined_hashes.get(height - 1, set())
+                    if not parent_hashes or not any(
+                        compute_block_hash(
+                            height, parent_hash, recomputed_merkle
+                        )
+                        == block_hash
+                        for parent_hash in parent_hashes
+                    ):
+                        fail(
+                            f"audit event {event_id} (block_mined) block_hash "
+                            "does not recompute against the verified parent "
+                            "block"
+                        )
+                # When the block itself survives in the recovered state, its
+                # stored transactions must match the event one-for-one.
+                surviving = block_facts.get(height, {}).get(block_hash)
+                if (
+                    surviving is not None
+                    and height not in adopted_away
+                    and [tx.tx_id for tx in surviving.transactions] != tx_ids
+                ):
+                    fail(
+                        f"audit event {event_id} (block_mined) transaction_ids "
+                        "do not match the referenced block"
+                    )
+                mined_hashes.setdefault(height, set()).add(block_hash)
+                history.append(("mined", block_hash, tx_ids))
+                open_tip = (height, block_hash, tx_ids)
+            elif kind == EVENT_BLOCK_CONFIRMED:
+                if (
+                    open_tip is None
+                    or open_tip[0] != height
+                    or open_tip[1] != block_hash
+                ):
+                    # The pending tip is not the one the replay had open when
+                    # it was installed by an operation that leaves no ledger
+                    # event: a direct-candidate adoption (only synced
+                    # adoptions emit sync_adopted) or the single pre-feature
+                    # pending tip. Confirmation leaves the block in the chain,
+                    # so its exact hash must always remain a cryptographically
+                    # verified fact at that height.
+                    if block_hash not in block_facts.get(height, {}):
+                        fail(
+                            f"audit event {event_id} (block_confirmed) at "
+                            f"height {height} does not close the open pending "
+                            "tip and names no verified block"
+                        )
+                else:
+                    last_phase = history[-1]
+                    if last_phase is None or last_phase[0] not in (
+                        "mined",
+                        "adopted",
+                    ):
+                        fail(
+                            f"audit event {event_id} (block_confirmed) at "
+                            f"height {height} confirms a block that was never "
+                            "mined"
+                        )
+                history.append(("confirmed", block_hash, None))
+                open_tip = None
+            else:  # EVENT_BLOCK_ROLLED_BACK
+                tx_ids = list(event["transaction_ids"])
+                if (
+                    open_tip is not None
+                    and open_tip[0] == height
+                    and open_tip[1] == block_hash
+                ):
+                    opening_ids = open_tip[2]
+                    last_phase = history[-1]
+                    if last_phase is None or last_phase[0] not in (
+                        "mined",
+                        "adopted",
+                    ):
+                        fail(
+                            f"audit event {event_id} (block_rolled_back) at "
+                            f"height {height} rolls back a block that was "
+                            "never mined"
+                        )
+                else:
+                    # An untracked pending tip (a direct-candidate adoption
+                    # that leaves no audit event, or the single pre-feature
+                    # tip). The rollback deletes the block and the adopted
+                    # candidate is removed from the fork table on adoption,
+                    # so its exact hash may no longer be resolvable. A
+                    # surviving twin fork still binds the transaction subset;
+                    # otherwise every restored id must itself be a verified
+                    # fact (it was returned to the mempool or re-packed).
+                    legacy_twin = block_facts.get(height, {}).get(block_hash)
+                    opening_ids = (
+                        [tx.tx_id for tx in legacy_twin.transactions]
+                        if legacy_twin is not None
+                        else None
+                    )
+                # Every restored id must be a verified fact from the recovered
+                # mempool/chain (the rollback put it back in the pool, or a
+                # later block packed it again).
+                if any(tx_id not in tx_facts for tx_id in tx_ids):
+                    fail(
+                        f"audit event {event_id} (block_rolled_back) names a "
+                        "transaction with no verifiable fact"
+                    )
+                if opening_ids is not None:
+                    # The rollback records exactly the transactions that
+                    # actually returned to the mempool, in block order: a
+                    # subset of the tip block, ascending, never duplicated.
+                    if not set(tx_ids) <= set(opening_ids):
+                        fail(
+                            f"audit event {event_id} (block_rolled_back) names "
+                            "a transaction absent from the rolled-back block"
+                        )
+                    restored = [
+                        tx_id for tx_id in opening_ids if tx_id in set(tx_ids)
+                    ]
+                    if restored != tx_ids:
+                        fail(
+                            f"audit event {event_id} (block_rolled_back) "
+                            "transaction_ids are not in the block's order"
+                        )
+                history.append(("rolled_back", block_hash, None))
+                open_tip = None
+
+        if cutoff_height is None:
+            # A pre-feature event log: the events' own hash chain is the only
+            # lifecycle evidence; nothing to reconcile against blocks.
+            return
+
+        # Forward reconciliation limited to what is provable after a chain
+        # switch. Fork adoption (a synced tip proven by sync_adopted, or a
+        # directly submitted candidate whose adoption leaves no durable event
+        # by design) is the one operation that legitimately replaces blocks
+        # without lifecycle events, so a recovered block that does not match
+        # the replay's final hash cannot on its own be called corruption:
+        # the chain parser has already recomputed every hash and signature.
+        # What IS provable:
+        for block in chain[1:]:
+            height = block.height
+            if height < cutoff_height or height in adopted_away:
+                continue
+            history = phases.get(height)
+            if not history:
+                continue
+            final_phase = history[-1]
+            if final_phase[1] != block.block_hash:
+                # A different valid block at this height can only be the
+                # result of an (possibly unrecorded direct-candidate)
+                # adoption; its own hashes were independently verified.
+                continue
+            # Same hash: its recorded lifecycle phase must agree with the
+            # recovered status — a confirmed event may not sit on a pending
+            # block nor an open/rolled-back phase on a confirmed one.
+            if block.status == STATUS_CONFIRMED:
+                if final_phase[0] != "confirmed":
+                    fail(
+                        f"recovered confirmed block at height {height} does "
+                        "not match its block lifecycle audit events"
+                    )
+            elif final_phase[0] == "confirmed":
+                fail(
+                    f"recovered pending block at height {height} has a "
+                    "block_confirmed audit event"
+                )
+            # A block carrying the exact hash of a block_rolled_back event
+            # returned without an adoption explaining it is corruption.
+            if final_phase[0] == "rolled_back":
+                fail(
+                    f"block at height {height} is present after a "
+                    "block_rolled_back event naming its exact hash"
+                )
 
     def _parse_persisted_syncs(
         self,

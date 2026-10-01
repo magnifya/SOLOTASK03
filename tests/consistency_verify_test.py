@@ -127,7 +127,9 @@ class VerifySuccessTests(SnapshotFixture):
             result["state_root"], self.store.state_root_for(self.store.chain, 1000)[0]
         )
         self.assertEqual(result["audit_checkpoint"], self.store.audit_checkpoint)
-        self.assertEqual(result["audit_checkpoint"]["event_id"], 1)
+        # submit/mined/confirmed for the first transaction, one further
+        # submission still in the mempool, then the trust registration.
+        self.assertEqual(result["audit_checkpoint"]["event_id"], 5)
 
     def test_pending_tip_snapshot_verifies(self) -> None:
         self.svc.submit_transaction(signed_tx(self.ka, self.A, self.B, 5))
