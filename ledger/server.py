@@ -361,6 +361,23 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.get_attested_account_proofs(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions/sequenced":
+                # POST /v1/transactions/sequenced — a retryable, nonce-ordered
+                # sequenced transfer. The first valid request returns 202 with
+                # tx_id and nonce; an identical retry returns 200 with the
+                # same result and no new state. Input/type/signature/balance
+                # defects are 400 {"error": "input"}; a stale, skipping or
+                # conflicting nonce is 409 {"error": "sequence_conflict",
+                # "next_sequence": N}.
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                self._json_mutation(
+                    "POST",
+                    lambda: service.submit_sequenced_transaction(payload),
+                    payload,
+                )
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
@@ -824,6 +841,24 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 remainder = path[len("/v1/accounts/") :]
                 if not remainder:
                     self._send_json(404, {"error": "account not found"})
+                    return
+                if remainder.endswith("/sequence"):
+                    # GET /v1/accounts/{account}/sequence — next_sequence and
+                    # the ascending pending/confirmed {nonce, tx_id} lists. A
+                    # stranger account answers 200 with 0 and empty arrays;
+                    # the endpoint takes no query parameters.
+                    encoded_account = remainder[: -len("/sequence")]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    if parse_qs(query, keep_blank_values=True):
+                        self._send_json(
+                            400, {"error": "sequence endpoint takes no parameters"}
+                        )
+                        return
+                    status, body = service.get_account_sequence(account)
+                    self._send_json(status, body)
                     return
                 if remainder.endswith("/attested-proof"):
                     # GET /v1/accounts/{account}/attested-proof[?height=H] —

@@ -930,6 +930,7 @@ def _recompute_chain(candidate_raw: list, trust: dict) -> list[Block]:
             amount = raw_tx.get("amount")
             signature = raw_tx.get("signature")
             stored_tx_id = raw_tx.get("tx_id")
+            nonce = raw_tx.get("nonce")
             if not isinstance(sender, str) or not sender:
                 raise _Failure(ERR_INTEGRITY)
             if not isinstance(recipient, str) or not recipient:
@@ -941,7 +942,17 @@ def _recompute_chain(candidate_raw: list, trust: dict) -> list[Block]:
                 raise _Failure(ERR_INPUT)
             if not isinstance(signature, str) or not signature:
                 raise _Failure(ERR_INTEGRITY)
-            message = crypto.canonical_message(sender, recipient, amount)
+            # A present nonce marks a sequenced transfer: it must already be a
+            # non-boolean non-negative integer and its tx_id/signature use the
+            # sequenced message domain; an absent nonce is a legacy transfer.
+            if nonce is not None and (not _is_int(nonce) or nonce < 0):
+                raise _Failure(ERR_INPUT)
+            if nonce is None:
+                message = crypto.canonical_message(sender, recipient, amount)
+            else:
+                message = crypto.sequenced_message(
+                    sender, recipient, amount, nonce
+                )
             tx_id = crypto.compute_tx_id(message)
             if stored_tx_id != tx_id or not crypto.is_hex64(stored_tx_id):
                 raise _Failure(ERR_INTEGRITY)
@@ -1548,6 +1559,7 @@ def _recompute_range_tail(anchor: dict, blocks_raw: list) -> list[Block]:
             amount = raw_tx.get("amount")
             signature = raw_tx.get("signature")
             stored_tx_id = raw_tx.get("tx_id")
+            nonce = raw_tx.get("nonce")
             if not isinstance(sender, str) or not sender:
                 raise _Failure(ERR_INTEGRITY)
             if not isinstance(recipient, str) or not recipient:
@@ -1558,7 +1570,16 @@ def _recompute_range_tail(anchor: dict, blocks_raw: list) -> list[Block]:
                 raise _Failure(ERR_INPUT)
             if not isinstance(signature, str) or not signature:
                 raise _Failure(ERR_INTEGRITY)
-            message = crypto.canonical_message(sender, recipient, amount)
+            # A present nonce marks a sequenced transfer and switches the
+            # tx_id/signature to the sequenced message domain.
+            if nonce is not None and (not _is_int(nonce) or nonce < 0):
+                raise _Failure(ERR_INPUT)
+            if nonce is None:
+                message = crypto.canonical_message(sender, recipient, amount)
+            else:
+                message = crypto.sequenced_message(
+                    sender, recipient, amount, nonce
+                )
             tx_id = crypto.compute_tx_id(message)
             if stored_tx_id != tx_id or not crypto.is_hex64(stored_tx_id):
                 raise _Failure(ERR_INTEGRITY)
@@ -7387,6 +7408,10 @@ RECEIPT_KEYS = (
     "block_hash",
     "index",
 )
+# A sequenced transfer's receipt appends one field, nonce, after index; a
+# legacy receipt carries exactly RECEIPT_KEYS.
+RECEIPT_NONCE_KEY = "nonce"
+RECEIPT_KEYS_WITH_NONCE = RECEIPT_KEYS + (RECEIPT_NONCE_KEY,)
 SINGLE_TX_PROOF_KEYS = (
     "height",
     "tx_id",
@@ -7399,8 +7424,16 @@ PROOF_SIBLING_KEYS = ("direction", "hash")
 
 
 def _parse_finalized_receipt_receipt(raw: object) -> dict:
-    """Stage 1a: exact key order and raw types of the nine-field receipt."""
-    if not isinstance(raw, dict) or tuple(raw.keys()) != RECEIPT_KEYS:
+    """Stage 1a: exact key order and raw types of the receipt.
+
+    A legacy transfer carries exactly the nine RECEIPT_KEYS fields; a
+    sequenced transfer appends one further field, nonce (a non-boolean
+    non-negative integer), after index in RECEIPT_KEYS_WITH_NONCE order.
+    """
+    if not isinstance(raw, dict) or tuple(raw.keys()) not in (
+        RECEIPT_KEYS,
+        RECEIPT_KEYS_WITH_NONCE,
+    ):
         raise _Failure(ERR_INPUT)
     if not crypto.is_hex64(raw["tx_id"]) or not crypto.is_hex64(raw["block_hash"]):
         raise _Failure(ERR_INPUT)
@@ -7425,7 +7458,13 @@ def _parse_finalized_receipt_receipt(raw: object) -> dict:
         raise _Failure(ERR_INPUT)
     if not _is_int(raw["index"]) or raw["index"] < 0:
         raise _Failure(ERR_INPUT)
-    return {key: raw[key] for key in RECEIPT_KEYS}
+    keys = RECEIPT_KEYS
+    if RECEIPT_NONCE_KEY in raw:
+        nonce = raw[RECEIPT_NONCE_KEY]
+        if not _is_int(nonce) or nonce < 0:
+            raise _Failure(ERR_INPUT)
+        keys = RECEIPT_KEYS_WITH_NONCE
+    return {key: raw[key] for key in keys}
 
 
 def _parse_finalized_receipt_proof(
@@ -7599,9 +7638,15 @@ def _receipt_item_self_consistent(receipt: dict, proof: dict) -> None:
     """
     if receipt["status"] != STATUS_CONFIRMED:
         raise _Failure(ERR_INTEGRITY)
-    message = crypto.canonical_message(
-        receipt["from"], receipt["to"], receipt["amount"]
-    )
+    nonce = receipt.get("nonce")
+    if nonce is None:
+        message = crypto.canonical_message(
+            receipt["from"], receipt["to"], receipt["amount"]
+        )
+    else:
+        message = crypto.sequenced_message(
+            receipt["from"], receipt["to"], receipt["amount"], nonce
+        )
     if crypto.compute_tx_id(message) != receipt["tx_id"]:
         raise _Failure(ERR_INTEGRITY)
     if not crypto.verify_signature(
@@ -8702,7 +8747,10 @@ def _receipt_proof_named_tx_id(document: object) -> str | None:
     ) != FINALIZED_RECEIPT_ITEM_KEYS:
         return None
     receipt = raw_item["receipt"]
-    if not isinstance(receipt, dict) or tuple(receipt.keys()) != RECEIPT_KEYS:
+    if not isinstance(receipt, dict) or tuple(receipt.keys()) not in (
+        RECEIPT_KEYS,
+        RECEIPT_KEYS_WITH_NONCE,
+    ):
         return None
     tx_id = receipt["tx_id"]
     return tx_id if crypto.is_hex64(tx_id) else None

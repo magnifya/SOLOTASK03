@@ -1,4 +1,4 @@
-"""Command line interface: send, tx, mine, block, account, proof, proofs,
+"""Command line interface: send, send-sequenced, sequence, tx, mine, block, account, proof, proofs,
 state-root,
 state-proof, state-proofs, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
@@ -137,6 +137,36 @@ def cmd_send(args: argparse.Namespace) -> int:
     return _emit(status, body)
 
 
+def cmd_send_sequenced(args: argparse.Namespace) -> int:
+    if args.signing_key:
+        try:
+            key = _load_signing_key(args.signing_key)
+        except (ValueError, OSError, TypeError) as exc:
+            return _emit(400, {"error": f"invalid signing key: {exc}"})
+        sender = _public_key_hex(key)
+        message = crypto.sequenced_message(sender, args.to, args.amount, args.nonce)
+        signature = key.sign(message).hex()
+    else:
+        if not args.sender or not args.signature:
+            return _emit(
+                400,
+                {"error": "provide either --signing-key or both --from and --signature"},
+            )
+        sender, signature = args.sender, args.signature
+
+    payload = {
+        "from": sender,
+        "to": args.to,
+        "amount": args.amount,
+        "nonce": args.nonce,
+        "signature": signature,
+    }
+    status, body = _request(
+        "POST", f"{args.base_url}/v1/transactions/sequenced", payload
+    )
+    return _emit(status, body)
+
+
 def cmd_mine(args: argparse.Namespace) -> int:
     status, body = _request("POST", f"{args.base_url}/v1/blocks", {})
     return _emit(status, body)
@@ -161,6 +191,14 @@ def cmd_account(args: argparse.Namespace) -> int:
     quoted = urllib.parse.quote(args.account, safe="")
     status, body = _request(
         "GET", f"{args.base_url}/v1/accounts/{quoted}", None
+    )
+    return _emit(status, body)
+
+
+def cmd_account_sequence(args: argparse.Namespace) -> int:
+    quoted = urllib.parse.quote(args.account, safe="")
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/accounts/{quoted}/sequence", None
     )
     return _emit(status, body)
 
@@ -1078,6 +1116,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--signature", help="raw Ed25519 signature hex")
     p_send.set_defaults(func=cmd_send)
 
+    p_send_sequenced = sub.add_parser(
+        "send-sequenced", help="submit a retryable nonce-ordered sequenced transfer"
+    )
+    p_send_sequenced.add_argument("--to", required=True, help="recipient account id")
+    p_send_sequenced.add_argument("--amount", required=True, type=int, help="integer amount")
+    p_send_sequenced.add_argument(
+        "--nonce",
+        required=True,
+        type=int,
+        help="sender's next non-negative sequence nonce",
+    )
+    p_send_sequenced.add_argument(
+        "--signing-key", help="sender Ed25519 private key: hex or @file (PEM/hex)"
+    )
+    p_send_sequenced.add_argument(
+        "--from", dest="sender", help="sender public key hex (with --signature)"
+    )
+    p_send_sequenced.add_argument("--signature", help="raw Ed25519 signature hex")
+    p_send_sequenced.set_defaults(func=cmd_send_sequenced)
+
     p_mine = sub.add_parser("mine", help="pack pending transactions into a block")
     p_mine.set_defaults(func=cmd_mine)
 
@@ -1092,6 +1150,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_account = sub.add_parser("account", help="fetch an account")
     p_account.add_argument("account", help="account id (public key hex)")
     p_account.set_defaults(func=cmd_account)
+
+    p_sequence = sub.add_parser(
+        "sequence", help="fetch an account's next nonce and sequence lists"
+    )
+    p_sequence.add_argument("account", help="account id (public key hex)")
+    p_sequence.set_defaults(func=cmd_account_sequence)
 
     p_state_root = sub.add_parser(
         "state-root", help="fetch the confirmed account-state Merkle root"

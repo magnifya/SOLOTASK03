@@ -58,6 +58,7 @@ from .store import (
 DEFAULT_INITIAL_BALANCE = 1_000_000
 
 REQUIRED_TX_FIELDS = ("from", "to", "amount", "signature")
+REQUIRED_SEQUENCED_TX_FIELDS = ("from", "to", "amount", "nonce", "signature")
 
 # Audit event kinds. The log is append-only: trust lifecycle changes
 # (registered/rotated/revoked) and inter-node sync events
@@ -302,6 +303,164 @@ class LedgerService:
                 raise
         return 202, {"tx_id": tx.tx_id}
 
+    # -- sequenced (retryable, nonce-ordered) transactions ------------------
+
+    def submit_sequenced_transaction(
+        self, payload: object
+    ) -> tuple[int, dict]:
+        """POST /v1/transactions/sequenced — validate and reserve a sequenced
+        transfer. Returns ``(status, body)``.
+
+        The payload is exactly ``{from, to, amount, nonce, signature}``:
+        ``from``/``to`` non-empty strings, ``amount`` a positive non-boolean
+        integer, ``nonce`` a non-negative non-boolean integer and ``signature``
+        a non-empty string; the signed message is
+        ``ledger-sequenced-transfer-v1\\n{"amount":A,"from":F,"nonce":N,"to":T}``
+        and the signing key must derive ``from``. Every field, type,
+        signature or balance defect is ``400 {"error": "input"}``.
+
+        Sequencing: ``nonce`` must equal the account's current
+        ``next_sequence`` (the dense prefix of confirmed nonces plus the
+        contiguous pending-tip/mempool reservations). A smaller nonce that
+        names a different transaction, or any nonce past the next one (a
+        gap), is ``409 {"error": "sequence_conflict", "next_sequence": N}``.
+        A retried identical request (same from/to/amount/nonce/signature,
+        hence same tx_id) is idempotent: it replays the first result with
+        status 200 and no new state or audit event, whether the transfer is
+        still queued, packed into the pending tip or already confirmed.
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "input"}
+        for field in REQUIRED_SEQUENCED_TX_FIELDS:
+            if field not in payload:
+                return 400, {"error": "input"}
+
+        sender = payload["from"]
+        recipient = payload["to"]
+        amount = payload["amount"]
+        nonce = payload["nonce"]
+        signature = payload["signature"]
+
+        if not isinstance(sender, str) or not sender:
+            return 400, {"error": "input"}
+        if not isinstance(recipient, str) or not recipient:
+            return 400, {"error": "input"}
+        # bool is a subclass of int: reject it and all non-int types explicitly.
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            return 400, {"error": "input"}
+        # bool is likewise rejected for nonce; negatives and non-ints too.
+        if isinstance(nonce, bool) or not isinstance(nonce, int) or nonce < 0:
+            return 400, {"error": "input"}
+        if not isinstance(signature, str) or not signature:
+            return 400, {"error": "input"}
+
+        message = crypto.sequenced_message(sender, recipient, amount, nonce)
+        if not crypto.verify_signature(sender, message, signature):
+            return 400, {"error": "input"}
+
+        tx = Transaction(sender, recipient, amount, signature, nonce)
+        with self.store.lock:
+            # Idempotent retries are decided before any sequence or balance
+            # gate: the same signed request (same tx_id) always returns the
+            # original result, whether it is queued, packed unconfirmed or
+            # confirmed, and never appends a second transaction_submitted
+            # event.
+            existing_status = self._sequenced_tx_location(tx.tx_id)
+            if existing_status is not None:
+                return 200, {"tx_id": tx.tx_id, "nonce": nonce}
+
+            # A different transaction already occupying this (sender, nonce)
+            # slot, or a nonce past the next acceptable value, is a sequence
+            # conflict naming the current next_sequence.
+            state = self.store.sequences.get(sender)
+            next_sequence = self.store.sequence_next(state)
+            if nonce != next_sequence:
+                return 409, {
+                    "error": "sequence_conflict",
+                    "next_sequence": next_sequence,
+                }
+            # Balance is checked exactly like a legacy submission against
+            # the available (confirmed minus pending-tip and mempool spends)
+            # balance; sequenced reservations spend like any mempool entry.
+            if self.available_balance(sender) < amount:
+                return 400, {"error": "input"}
+            self.store.pending[tx.tx_id] = tx
+            # First successful reservation: one transaction_submitted event
+            # (carrying nonce), persisted in the same atomic write as the
+            # mempool change.
+            self.store.append_audit_event(
+                EVENT_TRANSACTION_SUBMITTED,
+                {
+                    "tx_id": tx.tx_id,
+                    "from": tx.sender,
+                    "to": tx.recipient,
+                    "amount": tx.amount,
+                    "nonce": tx.nonce,
+                },
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Persistence failed: drop the in-memory reservation and its
+                # event so memory keeps matching the last committed state.
+                self.store.pending.pop(tx.tx_id, None)
+                self.store.truncate_audit_events(1)
+                raise
+        return 202, {"tx_id": tx.tx_id, "nonce": nonce}
+
+    def _sequenced_tx_location(self, tx_id: str) -> str | None:
+        """Locate a tx_id across the canonical chain and mempool.
+
+        Returns ``"confirmed"`` when it is in a confirmed block,
+        ``"pending"`` when it is in the unconfirmed tip or the mempool, or
+        None when nothing holds it. Caller must hold the store lock.
+        """
+        for block in self.store.chain:
+            if any(tx.tx_id == tx_id for tx in block.transactions):
+                return (
+                    STATUS_CONFIRMED
+                    if block.status == STATUS_CONFIRMED
+                    else STATUS_PENDING
+                )
+        if tx_id in self.store.pending:
+            return STATUS_PENDING
+        return None
+
+    def get_account_sequence(self, account: object) -> tuple[int, dict]:
+        """GET /v1/accounts/{account}/sequence — the account's nonce stream.
+
+        Returns ``{account, next_sequence, pending_sequences,
+        confirmed_sequences}``; the two arrays list ``{nonce, tx_id}`` pairs
+        ascending by nonce. An account that has never sent a sequenced
+        transfer (a "stranger") still answers 200 with next_sequence 0 and
+        empty arrays. A non-string or empty account is 400 input.
+        """
+        if not isinstance(account, str) or not account:
+            return 400, {"error": "input"}
+        with self.store.lock:
+            state = self.store.sequences.get(account)
+            if state is None:
+                return 200, {
+                    "account": account,
+                    "next_sequence": 0,
+                    "pending_sequences": [],
+                    "confirmed_sequences": [],
+                }
+            confirmed = [
+                {"nonce": nonce, "tx_id": state["confirmed"][nonce]}
+                for nonce in sorted(state["confirmed"])
+            ]
+            reserved = [
+                {"nonce": nonce, "tx_id": state["pending"][nonce]}
+                for nonce in sorted(state["pending"])
+            ]
+            return 200, {
+                "account": account,
+                "next_sequence": self.store.sequence_next(state),
+                "pending_sequences": reserved,
+                "confirmed_sequences": confirmed,
+            }
+
     def get_transaction(self, tx_id: object) -> tuple[int, dict]:
         """GET /v1/transactions/{tx_id} — one transaction receipt.
 
@@ -370,6 +529,10 @@ class LedgerService:
             and tx.amount > 0
             and isinstance(tx.signature, str)
             and bool(tx.signature)
+            and (
+                tx.nonce is None
+                or (isinstance(tx.nonce, int) and not isinstance(tx.nonce, bool) and tx.nonce >= 0)
+            )
         )
 
     @staticmethod
@@ -380,8 +543,13 @@ class LedgerService:
         block_hash: str | None,
         index: int | None,
     ) -> dict:
-        """The fixed nine-field receipt shape."""
-        return {
+        """The fixed nine-field receipt shape for legacy transfers.
+
+        A sequenced transfer appends one further field, ``nonce`` (its
+        non-negative sequence number), after ``index``; a legacy transfer
+        keeps the exact nine-field document unchanged.
+        """
+        receipt = {
             "tx_id": tx.tx_id,
             "from": tx.sender,
             "to": tx.recipient,
@@ -392,6 +560,9 @@ class LedgerService:
             "block_hash": block_hash,
             "index": index,
         }
+        if tx.nonce is not None:
+            receipt["nonce"] = tx.nonce
+        return receipt
 
     def get_finalized_receipt(self, tx_id: object) -> tuple[int, dict]:
         """GET /v1/transactions/{tx_id}/finalized-receipt — an offline-verifiable

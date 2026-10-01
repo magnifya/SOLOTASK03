@@ -117,7 +117,8 @@ REQUIRED_SECTIONS = ("state", "chain", "pending", "index", "accounts", "audit_ch
 # the trust extensions are optional because a pre-feature snapshot omits them
 # (each is strictly verified when present). The uniform idempotency section is
 # self-contained (its fingerprints recompute from method/target/request) and is
-# strictly verified when present.
+# strictly verified when present. The sequences section is a pure derived view
+# of the chain and mempool and is recomputed when present.
 KNOWN_OPTIONAL_SECTIONS = (
     "audit_events",
     "forks",
@@ -128,6 +129,7 @@ KNOWN_OPTIONAL_SECTIONS = (
     "source_key_history",
     "history_credential",
     "idempotency",
+    "sequences",
 )
 
 # Raw keys every stored block document must carry ("status" defaults to
@@ -250,9 +252,16 @@ def _verify(data: dict) -> dict:
 
     # -- chain recomputation -------------------------------------------------
     blocks, seen_tx_ids = _recompute_chain(chain_raw)
+    # The per-sender sequenced nonce stream is a structural chain invariant:
+    # each block's per-sender nonce set continues the stream from the lower
+    # blocks with no gap, inversion or duplicate.
+    try:
+        LedgerStore.replay_sequenced_nonces(blocks)
+    except ValueError:
+        raise _Failure(ERR_INTEGRITY) from None
 
     # -- mempool --------------------------------------------------------------
-    _verify_pending(pending_raw, seen_tx_ids)
+    pending_txs = _verify_pending(pending_raw, seen_tx_ids)
 
     tip = blocks[-1]
     if state.get("height") is not None and state["height"] != tip.height:
@@ -269,6 +278,9 @@ def _verify(data: dict) -> dict:
     expected_index, expected_accounts = _compute_derived(blocks)
     _verify_index(index_raw, expected_index)
     _verify_accounts(accounts_raw, expected_accounts)
+
+    # -- optional derived sequenced-transfer reservations --------------------
+    _verify_sequences(data.get("sequences"), blocks, pending_txs)
 
     leaves = [
         crypto.account_state_leaf(account, balance, transactions)
@@ -418,9 +430,13 @@ def _parse_transaction(tx_raw: object) -> Transaction:
     return tx
 
 
-def _verify_pending(pending_raw: list, chain_tx_ids: set[str]) -> None:
-    """Mempool entries are well-formed, unique, and disjoint from the chain."""
-    pending: set[str] = set()
+def _verify_pending(pending_raw: list, chain_tx_ids: set[str]) -> dict[str, Transaction]:
+    """Mempool entries are well-formed, unique, and disjoint from the chain.
+
+    Returns the parsed mempool keyed by tx_id so the derived sequences view
+    can be recomputed.
+    """
+    pending: dict[str, Transaction] = {}
     for tx_raw in pending_raw:
         tx = _parse_transaction(tx_raw)
         if tx.tx_id in pending:
@@ -429,7 +445,8 @@ def _verify_pending(pending_raw: list, chain_tx_ids: set[str]) -> None:
         if tx.tx_id in chain_tx_ids:
             # A mempool transaction already sealed into a block.
             raise _Failure(ERR_INTEGRITY)
-        pending.add(tx.tx_id)
+        pending[tx.tx_id] = tx
+    return pending
 
 
 def _compute_derived(
@@ -480,6 +497,71 @@ def _verify_accounts(raw: dict, expected: dict[str, dict]) -> None:
         if any(not isinstance(tx_id, str) for tx_id in transactions):
             raise _Failure(ERR_INPUT)
     if raw != expected:
+        raise _Failure(ERR_INTEGRITY)
+
+
+def _verify_sequences(
+    raw: object, blocks: list[Block], pending_txs: dict[str, Transaction]
+) -> None:
+    """Verify the optional derived ``sequences`` section.
+
+    The section is a pure derived view of the sequenced transfers in the chain
+    (confirmed plus the pending tip) and the mempool; its shape is an input
+    concern and any disagreement with the recomputed view, a non-dense nonce
+    partition, or a section missing while sequenced transfers exist is
+    integrity corruption.
+    """
+
+    def parse_pairs(value: object) -> dict[int, str]:
+        if not isinstance(value, list):
+            raise _Failure(ERR_INPUT)
+        pairs: dict[int, str] = {}
+        previous = -1
+        for item in value:
+            if not isinstance(item, dict) or tuple(item.keys()) != ("nonce", "tx_id"):
+                raise _Failure(ERR_INPUT)
+            nonce = item["nonce"]
+            tx_id = item["tx_id"]
+            if not _is_int(nonce) or nonce < 0:
+                raise _Failure(ERR_INPUT)
+            if not isinstance(tx_id, str) or not crypto.is_hex64(tx_id):
+                raise _Failure(ERR_INPUT)
+            if nonce <= previous:
+                raise _Failure(ERR_INPUT)
+            pairs[nonce] = tx_id
+            previous = nonce
+        return pairs
+
+    try:
+        expected = LedgerStore.compute_sequence_state(blocks, pending_txs)
+        LedgerStore.validate_sequence_partitions(expected)
+    except ValueError:
+        raise _Failure(ERR_INTEGRITY) from None
+
+    if raw is None:
+        if expected:
+            raise _Failure(ERR_INTEGRITY)
+        return
+    if not isinstance(raw, list):
+        raise _Failure(ERR_INPUT)
+    parsed: dict[str, dict] = {}
+    for entry in raw:
+        if not isinstance(entry, dict) or tuple(entry.keys()) != (
+            "account",
+            "confirmed",
+            "pending",
+        ):
+            raise _Failure(ERR_INPUT)
+        account = entry["account"]
+        if not isinstance(account, str) or not account:
+            raise _Failure(ERR_INPUT)
+        if account in parsed:
+            raise _Failure(ERR_INPUT)
+        parsed[account] = {
+            "confirmed": parse_pairs(entry["confirmed"]),
+            "pending": parse_pairs(entry["pending"]),
+        }
+    if parsed != expected:
         raise _Failure(ERR_INTEGRITY)
 
 

@@ -24,6 +24,36 @@ def canonical_message(sender: str, recipient: str, amount: int) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+# Domain prefix of a sequenced-transfer signature message: the UTF-8 prefix
+# line (including its trailing LF) followed by the compact JSON payload. It
+# binds a sequenced signature to this protocol and keeps it disjoint from the
+# legacy canonical-message signature domain.
+SEQUENCED_MESSAGE_PREFIX = "ledger-sequenced-transfer-v1\n"
+
+
+def sequenced_message(
+    sender: str, recipient: str, amount: int, nonce: int
+) -> bytes:
+    """Deterministic byte representation of a sequenced-transfer payload.
+
+    The message is the UTF-8 text ``ledger-sequenced-transfer-v1`` followed by
+    a single LF and the compact JSON document
+    ``{"amount":A,"from":F,"nonce":N,"to":T}`` with its keys sorted
+    (amount, from, nonce, to) and no whitespace, so the same
+    (from, to, amount, nonce) tuple always yields identical bytes.
+    """
+    payload = {
+        "amount": amount,
+        "from": sender,
+        "nonce": nonce,
+        "to": recipient,
+    }
+    body = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return (SEQUENCED_MESSAGE_PREFIX + body).encode("utf-8")
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

@@ -878,6 +878,86 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `integrity`。成功固定返回 `ok, verified, missing, conflicts`（均按高度
   再账户稳定升序）；任何失败只返回 `{"ok": false, "error"}`、不抛异常。
 
+## 可重试的序列转账
+
+在旧式 `POST /v1/transactions` 之外提供按发送方账户严格排序、可安全重试的序列
+转账入口 `POST /v1/transactions/sequenced`，以及账户序列查询
+`GET /v1/accounts/{account}/sequence`。旧式转账、`send` CLI 与既有查询、证明
+行为完全不变。
+
+### 提交
+
+请求体是 JSON，含 `from`、`to`、`amount`、`nonce`、`signature`：`from`、`to`
+为非空字符串；`amount` 为正整数（布尔、浮点、字符串、零与负数均拒绝）；
+`nonce` 为**非布尔非负整数**；`signature` 为非空字符串。签名消息固定为
+UTF-8 文本
+
+```
+ledger-sequenced-transfer-v1
+{"amount":A,"from":F,"nonce":N,"to":T}
+```
+
+即域前缀行 `ledger-sequenced-transfer-v1` 加一个换行，再接按 `amount,from,
+nonce,to` 排序、紧凑分隔符（无空白）的 JSON。`tx_id` 是该消息的 SHA-256
+小写十六进制；签名私钥必须属于 `from`（签名在该独立消息域下验证，与旧式
+`{amount,from,to}` 消息域互不通用）。
+
+- 首次有效请求返回 `202 {"tx_id", "nonce"}`，并在同一原子写入中记录**一次**
+  `transaction_submitted` 审计事件（载荷额外带 `nonce`）。
+- **幂等重试**：完全相同的请求（同一 from/to/amount/nonce/signature，即同一
+  `tx_id`）无论交易仍在内存池、已打包进 pending 末块还是已确认，都返回
+  `200` 与同一 `{tx_id, nonce}`，不产生新状态、不追加审计事件。
+- 任何字段缺失、类型错误、签名错误或余额不合格都返回
+  `400 {"error": "input"}`。
+- `nonce` 小于 `next_sequence`、跳号（超过下一个可接收 nonce），或用不同交易
+  占用同一已预留 nonce，均返回
+  `409 {"error": "sequence_conflict", "next_sequence": N}`。
+
+### 序列语义
+
+`next_sequence` 是账户下一个可接收的 nonce。待处理交易**连续预留** nonce：
+nonce `0..k-1` 构成连续前缀后，下一个可接收值才是 `k`，预留不允许空洞。
+
+- **挖矿**：序列交易与旧式交易同在内存池中，打包仍按既有规则**按入池顺序**
+  收集并按 `tx_id` 升序入块；同一发送者相邻 nonce 的两笔可在同一块中以任意
+  块内（tx_id）顺序出现。打包进 pending 末块后 nonce **仍预留**（待处理区包含
+  内存池与未确认末块）。
+- **回滚**：pending 末块回滚后，其中序列交易按原顺序回到待处理区，nonce 预留
+  保持不变；重新挖矿得到与原先逐字节相同的区块。
+- **确认**：仅在区块确认后，对应 nonce 才从待处理转入已确认前缀，
+  `next_sequence` 前移。
+- **恢复 / 分叉 / 同步**：重启、分叉采用与区间同步后序列不得跳号或回退。分叉
+  采用会把被新链取代的、仍占连续 nonce 的序列交易退回待处理区；若新链已用
+  另一笔交易占用该 `(from, nonce)` 槽位，则旧交易随旧链退役而不是占用已被
+  占据的槽位。任何候选链/区间自身若存在 nonce 跳号、重复或跨块倒置，都会在
+  签名、哈希、余额重放之外被拒绝。
+
+### 账户序列查询
+
+`GET /v1/accounts/{account}/sequence` 返回 `200` 与固定键序
+
+```
+{account, next_sequence, pending_sequences, confirmed_sequences}
+```
+
+`pending_sequences` 与 `confirmed_sequences` 都是 `{nonce, tx_id}` 数组，按
+`nonce` 升序：前者覆盖内存池与未确认末块中仍预留的 nonce，后者覆盖已确认
+nonce。**陌生账户**返回 `next_sequence=0` 与两个空数组。该端点不接受查询参数
+（任何查询参数返回 `400`）。
+
+### 与既有机制的关系
+
+- 序列交易可与旧式交易混入同一区块，沿用既有的块内 `tx_id` 排序、区块哈希、
+  Merkle 根、Merkle 证明与余额语义；`GET /v1/transactions/{tx_id}` 回执在九
+  个固定字段后对序列交易额外追加一个 `nonce` 字段（旧式交易仍恰为九字段），
+  最终化回执及其离线/批量验证器同样接受该可选 `nonce` 并在序列消息域下重算
+  `tx_id` 与验签。
+- 序列预留是链（含 pending 末块）与内存池的纯派生视图，随快照原子持久化于
+  `sequences` section；恢复时严格重算并逐字节比对，旧快照无该 section 时按
+  空记录恢复（旧快照若含带 nonce 的交易却缺该 section 则判为损坏）。
+- CLI 提供 `send-sequenced --to --amount --nonce [--signing-key|--from
+  --signature]` 与 `sequence ACCOUNT`。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
@@ -1764,7 +1844,8 @@ read/update/export，401/403 无副作用）与 `history_credential_changed` 事
 
 ## 统一请求幂等保护（Idempotency-Key）
 
-所有**改变账本或管理状态**的 POST 与 DELETE 入口（交易提交、打包、确认/
+所有**改变账本或管理状态**的 POST 与 DELETE 入口（旧式交易提交、序列
+转账提交、打包、确认/
 回滚、候选分叉提交/采用、整链与增量（含签名）同步、来源信任注册/轮换/
 撤销、allowlist 新增/删除、审计签名者轮换、历史签名者日志追加、历史分
 页导出与持久分权历史凭据管理）都支持统一的请求幂等保护。只读 POST
@@ -1844,6 +1925,18 @@ curl -s -X POST localhost:8080/v1/transactions \
   -H 'Content-Type: application/json' \
   -d '{"from":"<pubkey-hex>","to":"<pubkey-hex>","amount":100,"signature":"<sig-hex>"}'
 # -> 202 {"tx_id": "..."}；签名错误/余额不足 -> 400 {"error": "..."}
+
+# 提交可重试的序列转账（签名消息见「可重试的序列转账」；首次 202，相同请求重试 200）
+curl -s -X POST localhost:8080/v1/transactions/sequenced \
+  -H 'Content-Type: application/json' \
+  -d '{"from":"<pubkey-hex>","to":"<pubkey-hex>","amount":10,"nonce":0,"signature":"<sig-hex>"}'
+# -> 202 {"tx_id":"...","nonce":0}（相同请求重试 -> 200 同结果）
+# 字段/类型/签名/余额不合格 -> 400 {"error":"input"}
+# nonce 落后/跳号/同 nonce 冲突 -> 409 {"error":"sequence_conflict","next_sequence":N}
+# 账户序列（陌生账户也返回 200：next_sequence=0、两个空数组；不接受查询参数）
+curl -s localhost:8080/v1/accounts/<pubkey-hex>/sequence
+# -> 200 {"account":"...","next_sequence":N,"pending_sequences":[{"nonce","tx_id"}...],
+#         "confirmed_sequences":[{"nonce","tx_id"}...]}
 
 # 打包
 curl -s -X POST localhost:8080/v1/blocks
