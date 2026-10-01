@@ -118,6 +118,16 @@ REQUIRED_SECTIONS = ("state", "chain", "pending", "index", "accounts", "audit_ch
 # (each is strictly verified when present). The uniform idempotency section is
 # self-contained (its fingerprints recompute from method/target/request) and is
 # strictly verified when present.
+# Strictly verified when present. forks/syncs/attested_syncs are
+# durable state but their own invariants are not part of this self-contained
+# check; audit_events is optional because a pre-audit-chain snapshot omits it;
+# the trust extensions are optional because a pre-feature snapshot omits them
+# (each is strictly verified when present). The uniform idempotency section is
+# self-contained (its fingerprints recompute from method/target/request) and is
+# strictly verified when present. The sequence_index section is likewise
+# optional (a pre-sequenced-transfer snapshot omits it) but strictly
+# recomputed and cross-checked when present — an omitted section is only
+# consistent when the chain and mempool contain no sequenced transfers.
 KNOWN_OPTIONAL_SECTIONS = (
     "audit_events",
     "forks",
@@ -128,13 +138,15 @@ KNOWN_OPTIONAL_SECTIONS = (
     "source_key_history",
     "history_credential",
     "idempotency",
+    "sequence_index",
 )
 
 # Raw keys every stored block document must carry ("status" defaults to
 # confirmed for legacy snapshots).
 _BLOCK_KEYS = ("height", "prev_hash", "merkle_root", "block_hash", "transactions")
 
-# Raw keys every stored transaction document must carry.
+# Raw keys every stored transaction document must carry. A sequenced transfer
+# additionally carries "nonce"; it is parsed strictly by Transaction.from_dict.
 _TX_KEYS = ("from", "to", "amount", "signature", "tx_id")
 
 # Exact key sets of the trust extension records.
@@ -253,6 +265,26 @@ def _verify(data: dict) -> dict:
 
     # -- mempool --------------------------------------------------------------
     _verify_pending(pending_raw, seen_tx_ids)
+
+    # -- sequenced-transfer nonce reservations --------------------------------
+    # The chain (including a pending tip) must use every sender's sequenced
+    # nonces densely from zero; the mempool continues that prefix densely. A
+    # present sequence_index section must match the recomputation exactly; an
+    # omitted section is legacy and consistent only when no sequenced transfer
+    # exists in the chain or mempool.
+    pending_txs = {}
+    for tx_raw in pending_raw:
+        tx = _parse_transaction(tx_raw)
+        pending_txs[tx.tx_id] = tx
+    try:
+        expected_sequence_index = LedgerStore._expected_sequence_index(
+            blocks, pending_txs
+        )
+    except ValueError:
+        raise _Failure(ERR_INTEGRITY) from None
+    _verify_sequence_index(
+        data.get("sequence_index"), expected_sequence_index
+    )
 
     tip = blocks[-1]
     if state.get("height") is not None and state["height"] != tip.height:
@@ -430,6 +462,51 @@ def _verify_pending(pending_raw: list, chain_tx_ids: set[str]) -> None:
             # A mempool transaction already sealed into a block.
             raise _Failure(ERR_INTEGRITY)
         pending.add(tx.tx_id)
+
+
+def _verify_sequence_index(
+    raw: object, expected: dict[str, list[dict]]
+) -> None:
+    """Verify the optional sequenced-transfer reservation section.
+
+    Mirrors the node's recovery parser: an omitted section is legacy and
+    consistent only when no sequenced transfer exists; a present section must
+    be an ``{account: [{"nonce", "tx_id"}, ...]}`` object with dense
+    non-negative nonces, 64-lowercase-hex tx ids and exact equality with the
+    chain+mempool recomputation. Structural/type defects are input; every
+    mismatch with the facts is integrity.
+    """
+    if raw is None:
+        if expected:
+            raise _Failure(ERR_INTEGRITY)
+        return
+    if not isinstance(raw, dict):
+        raise _Failure(ERR_INPUT)
+    parsed: dict[str, list[dict]] = {}
+    for account, entries in raw.items():
+        if not isinstance(account, str) or not account:
+            raise _Failure(ERR_INPUT)
+        if not isinstance(entries, list) or not entries:
+            raise _Failure(ERR_INPUT)
+        record: list[dict] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or tuple(entry.keys()) != (
+                "nonce",
+                "tx_id",
+            ):
+                raise _Failure(ERR_INPUT)
+            nonce = entry["nonce"]
+            tx_id = entry["tx_id"]
+            if not _is_int(nonce) or nonce < 0:
+                raise _Failure(ERR_INPUT)
+            if not crypto.is_hex64(tx_id):
+                raise _Failure(ERR_INPUT)
+            record.append({"nonce": nonce, "tx_id": tx_id})
+        if [entry["nonce"] for entry in record] != list(range(len(record))):
+            raise _Failure(ERR_INTEGRITY)
+        parsed[account] = record
+    if parsed != expected:
+        raise _Failure(ERR_INTEGRITY)
 
 
 def _compute_derived(

@@ -878,6 +878,48 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `integrity`。成功固定返回 `ok, verified, missing, conflicts`（均按高度
   再账户稳定升序）；任何失败只返回 `{"ok": false, "error"}`、不抛异常。
 
+## 可重试的序列转账
+
+`POST /v1/transactions/sequenced` 在既有 `POST /v1/transactions` 之外提供按账户
+nonce 连续预留、可安全重试的转账。旧式转账、`send` 与所有既有查询/证明行为保持
+不变，两类交易可以混入同一区块。
+
+请求体为 `{from, to, amount, nonce, signature}`：`from`、`to` 为非空字符串，
+`amount` 为正整数，`nonce` 为**非布尔非负整数**，`signature` 为非空字符串。
+签名消息固定为 UTF-8 的
+
+```
+ledger-sequenced-transfer-v1
+{"amount":A,"from":F,"nonce":N,"to":T}
+```
+
+（域前缀、一个换行、再按 `amount,from,nonce,to` 排序的紧凑 JSON），签名私钥属于
+`from`；`tx_id` 是该签名消息的 SHA-256 小写十六进制。
+
+- 首次有效请求返回 `202` 与 `{tx_id, nonce}`，并在同一原子写入中记录**一次**
+  `transaction_submitted`（其负载额外携带 `nonce`）。
+- 相同请求重试返回 `200` 与**同一结果**，不新增任何状态或审计事件——无论交易仍在
+  内存池、已打包进未确认末块还是已经确认。
+- 字段、类型、签名或余额不合格返回 `400` 与 `{"error": "input"}`。
+- `nonce` 小于账户 `next_sequence`（且不是同一笔的重试）、跳号，或与已占用该
+  nonce 的另一笔交易冲突时，返回 `409` 与
+  `{"error": "sequence_conflict", "next_sequence": N}`。
+
+`next_sequence` 是账户下一个可接收的 nonce：内存池中的序列交易连续预留 nonce，
+挖矿按入池顺序打包，回滚后按原顺序回到待处理区且预留不释放；确认、崩溃恢复、
+分叉采用与节点同步后均不得跳号或回退。
+
+`GET /v1/accounts/{account}/sequence` 返回
+`{account, next_sequence, pending_sequences, confirmed_sequences}`；
+`pending_sequences` 覆盖仍在内存池或未确认末块中的预留，`confirmed_sequences`
+覆盖已确认的部分，两个数组的每项都是 `{nonce, tx_id}` 且按 nonce 升序。陌生账户
+返回 `200`、`next_sequence=0` 与两个空数组（不返回 404）。
+
+序列交易的区块排序、区块哈希、Merkle 根、证明与余额语义与旧式交易完全一致；其
+交易回执（含最终化回执）在 `amount` 之后额外携带 `nonce` 字段，旧式回执保持九
+字段形状。预留状态以 `sequence_index` 段随快照原子持久化，恢复时从链与内存池重
+算并严格对账；不含该段的旧快照仅当链上无序列交易时按空表恢复。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。

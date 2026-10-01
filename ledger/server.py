@@ -361,6 +361,22 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.get_attested_account_proofs(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions/sequenced":
+                # POST /v1/transactions/sequenced — a retryable nonce-sequenced
+                # transfer. The first valid request is 202; the identical
+                # request retried is 200 with the same result. Field/type/
+                # signature/balance failures are 400 (error=input); a nonce
+                # behind, a gap or a same-nonce conflict is 409
+                # (sequence_conflict with next_sequence).
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                self._json_mutation(
+                    "POST",
+                    lambda: service.submit_sequenced_transaction(payload),
+                    payload,
+                )
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
@@ -824,6 +840,19 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 remainder = path[len("/v1/accounts/") :]
                 if not remainder:
                     self._send_json(404, {"error": "account not found"})
+                    return
+                if remainder.endswith("/sequence"):
+                    # GET /v1/accounts/{account}/sequence — next nonce plus the
+                    # pending and confirmed {nonce, tx_id} sequences, nonce
+                    # ascending. An unknown account is 200 with next_sequence 0
+                    # and empty lists.
+                    encoded_account = remainder[: -len("/sequence")]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    status, body = service.get_account_sequence(account)
+                    self._send_json(status, body)
                     return
                 if remainder.endswith("/attested-proof"):
                     # GET /v1/accounts/{account}/attested-proof[?height=H] —

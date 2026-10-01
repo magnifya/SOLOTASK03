@@ -68,7 +68,7 @@ from . import crypto
 GENESIS_PREV_HASH = "0" * 64
 
 # On-disk schema version, stored under "state" so future migrations are possible.
-STATE_VERSION = 10
+STATE_VERSION = 11
 
 # Trust lifecycle states for persisted sources.
 TRUST_ACTIVE = "active"
@@ -388,6 +388,15 @@ class LedgerStore:
         self.history_trust_path = history_trust_path
         self.chain: list[Block] = []
         self.pending: dict[str, Transaction] = {}
+        # Per-account sequenced-transfer reservations and confirmations. Keyed
+        # by sender account; each value is the dense, nonce-ascending list of
+        # {"nonce", "tx_id"} entries covering every sequenced transfer of that
+        # account that is either still in the mempool / pending tip (its nonce
+        # reserved) or already confirmed on the canonical chain. Entries start
+        # at nonce 0 with no gaps and stay nonce-ascending: a mempool rollback
+        # preserves them and a fork adoption rebuilds the section from the
+        # adopted chain plus the surviving continuous mempool prefix.
+        self.sequence_index: dict[str, list[dict]] = {}
         # Candidate fork chains keyed by tip block hash. Each value is the
         # fork's full block list (including the shared genesis block).
         self.forks: dict[str, list[Block]] = {}
@@ -508,6 +517,7 @@ class LedgerStore:
                 os.makedirs(directory, exist_ok=True)
                 self.chain = [self.create_genesis()]
                 self.pending = {}
+                self.sequence_index = {}
                 self.forks = {}
                 self.syncs = {}
                 self.attested_syncs = {}
@@ -570,6 +580,7 @@ class LedgerStore:
                         parsed[17],
                         parsed[18],
                         parsed[19],
+                        parsed[20],
                     )
                 )
 
@@ -666,6 +677,7 @@ class LedgerStore:
                 key_history_repair,
                 history_credential,
                 idempotency,
+                expected_sequence_index,
             ) = winner
 
             # The single winning snapshot is the only one whose recorded
@@ -743,6 +755,7 @@ class LedgerStore:
             self.audit_signer_history = signer_history
             self.history_credential = history_credential
             self.idempotency = idempotency
+            self.sequence_index = expected_sequence_index
             self.generation = generation
             # Prefer the endowment recorded by the writer; fall back to the
             # value this instance was constructed with, and finally to the
@@ -1182,6 +1195,18 @@ class LedgerStore:
                 )
             pending[tx.tx_id] = tx
 
+        # Sequenced-transfer nonce invariants across the canonical chain:
+        # every sender's sequenced nonces (including transfers in a pending
+        # tip, which keep reserving theirs) must be dense from zero with no
+        # repetition, and the mempool must continue that prefix densely.
+        try:
+            expected_sequence_index = self._expected_sequence_index(chain, pending)
+        except ValueError as exc:
+            fail(str(exc))
+        self._parse_persisted_sequence_index(
+            data.get("sequence_index"), expected_sequence_index, path
+        )
+
         # Cross-check the persisted tip summary against the chain tail.
         tip = chain[-1]
         if state.get("height") is not None and state["height"] != tip.height:
@@ -1312,6 +1337,7 @@ class LedgerStore:
             _key_history_repair,
             history_credential,
             idempotency,
+            expected_sequence_index,
         )
 
     @staticmethod
@@ -2011,6 +2037,94 @@ class LedgerStore:
         return history, False
 
     @staticmethod
+    def _parse_persisted_sequence_index(
+        raw: object, expected: dict[str, list[dict]], path: str
+    ) -> dict[str, list[dict]]:
+        """Strictly parse and cross-check the sequenced-transfer reservations.
+
+        The section is ``{account: [{"nonce", "tx_id"}, ...]}`` with non-empty
+        account keys, non-boolean non-negative densely ascending nonces and
+        64-lowercase-hex tx ids; its content must exactly equal the
+        chain+mempool recomputation (same accounts, same order and bindings).
+        A snapshot predating the feature omits the section: it recovers as the
+        empty table, which is only consistent when the chain and mempool carry
+        no sequenced transfers at all (a snapshot holding one without its
+        table is corruption).
+        """
+        expected_clean = {
+            account: [dict(entry) for entry in entries]
+            for account, entries in expected.items()
+        }
+        if raw is None:
+            if expected_clean:
+                raise StateRecoveryError(
+                    path,
+                    "snapshot carries sequenced transfers but no "
+                    "'sequence_index' section",
+                )
+            return {}
+        if not isinstance(raw, dict):
+            raise StateRecoveryError(
+                path, "'sequence_index' must be a JSON object"
+            )
+        parsed: dict[str, list[dict]] = {}
+        for account, entries in raw.items():
+            if not isinstance(account, str) or not account:
+                raise StateRecoveryError(
+                    path, "sequence_index account must be a non-empty string"
+                )
+            if not isinstance(entries, list) or not entries:
+                raise StateRecoveryError(
+                    path,
+                    f"sequence_index entries for {account!r} must be a "
+                    "non-empty list",
+                )
+            record: list[dict] = []
+            for entry in entries:
+                if not isinstance(entry, dict) or tuple(entry.keys()) != (
+                    "nonce",
+                    "tx_id",
+                ):
+                    raise StateRecoveryError(
+                        path,
+                        "each sequence_index entry must carry exactly "
+                        "nonce and tx_id",
+                    )
+                nonce = entry["nonce"]
+                tx_id = entry["tx_id"]
+                if (
+                    isinstance(nonce, bool)
+                    or not isinstance(nonce, int)
+                    or nonce < 0
+                ):
+                    raise StateRecoveryError(
+                        path,
+                        "sequence_index nonce must be a non-negative integer",
+                    )
+                if not crypto.is_hex64(tx_id):
+                    raise StateRecoveryError(
+                        path,
+                        "sequence_index tx_id must be 64 lowercase hex "
+                        "characters",
+                    )
+                record.append({"nonce": nonce, "tx_id": tx_id})
+            nonces = [entry["nonce"] for entry in record]
+            if nonces != list(range(len(nonces))):
+                raise StateRecoveryError(
+                    path,
+                    f"sequence_index nonces for {account!r} must be dense "
+                    "from zero and ascending",
+                )
+            parsed[account] = record
+        if parsed != expected_clean:
+            raise StateRecoveryError(
+                path,
+                "'sequence_index' does not match the sequenced transfers in "
+                "the chain and mempool",
+            )
+        return expected_clean
+
+    @staticmethod
     def _parse_persisted_allowlist(raw: object, path: str) -> dict[str, int]:
         """Strictly parse the keyless ``{source: expires_at}`` allowlist."""
         if raw is None:
@@ -2366,6 +2480,7 @@ class LedgerStore:
                 "from",
                 "to",
                 "amount",
+                "nonce",
             ),
             EVENT_BLOCK_MINED: (
                 "height",
@@ -2522,7 +2637,17 @@ class LedgerStore:
                     "prev_hash",
                     "event_hash",
                 }
-                if set(event) != allowed:
+                # A sequenced transfer carries nonce in its submission event;
+                # an event written before the feature omits it. Legacy events
+                # are accepted without the key but never with a malformed one.
+                if kind == EVENT_TRANSACTION_SUBMITTED:
+                    if not (set(event) == allowed or set(event) == allowed - {"nonce"}):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} ({kind}) must carry exactly "
+                            f"the payload keys {', '.join(expected_payload)}",
+                        )
+                elif set(event) != allowed:
                     raise StateRecoveryError(
                         path,
                         f"audit event {event_id} ({kind}) must carry exactly "
@@ -2560,6 +2685,17 @@ class LedgerStore:
                             path,
                             f"audit event {event_id} (transaction_submitted) "
                             "amount must be a positive integer",
+                        )
+                    nonce = event.get("nonce")
+                    if nonce is not None and (
+                        isinstance(nonce, bool)
+                        or not isinstance(nonce, int)
+                        or nonce < 0
+                    ):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_submitted) "
+                            "nonce must be a non-negative integer",
                         )
                 else:
                     height = event["height"]
@@ -2781,9 +2917,15 @@ class LedgerStore:
             if kind == EVENT_TRANSACTION_SUBMITTED:
                 tx_id = event["tx_id"]
                 amount = event["amount"]
-                message = crypto.canonical_message(
-                    event["from"], event["to"], amount
-                )
+                nonce = event.get("nonce")
+                if nonce is None:
+                    message = crypto.canonical_message(
+                        event["from"], event["to"], amount
+                    )
+                else:
+                    message = crypto.sequenced_message(
+                        event["from"], event["to"], amount, nonce
+                    )
                 if crypto.compute_tx_id(message) != tx_id:
                     fail(
                         f"audit event {event_id} (transaction_submitted) tx_id "
@@ -3635,12 +3777,156 @@ class LedgerStore:
             raise StateRecoveryError(
                 path, f"transaction {getattr(tx, 'sender', '?')} has non-positive amount"
             )
+        if tx.nonce is not None and (
+            isinstance(tx.nonce, bool) or not isinstance(tx.nonce, int) or tx.nonce < 0
+        ):
+            raise StateRecoveryError(
+                path, "transaction nonce must be a non-negative integer"
+            )
         if not isinstance(tx.signature, str) or not tx.signature:
             raise StateRecoveryError(path, "transaction is missing a signature")
         if not crypto.verify_signature(tx.sender, tx.message, tx.signature):
             raise StateRecoveryError(
                 path, f"transaction {tx.tx_id} has an invalid signature"
             )
+
+    @staticmethod
+    def _sequence_usage_from_blocks(
+        blocks: list[Block],
+    ) -> dict[str, list[dict]]:
+        """Per-sender sequenced-nonce usage over complete chains.
+
+        Scans the blocks in chain order (then each block's stored order) and
+        returns ``{sender: [{"nonce", "tx_id"}, ...]}`` with every list sorted
+        by nonce ascending. A sender's sequenced nonces must form exactly the
+        dense set ``0..k-1`` with no repetition — the no-gap/no-regress chain
+        invariant that submission, mining and fork adoption all maintain.
+        Raises ValueError on any gap, duplicate or negative nonce. The scan
+        includes a pending tip block: a packed-but-unconfirmed transfer keeps
+        reserving its nonce until it is either confirmed or rolled back.
+        """
+        collected: dict[str, list[tuple[int, str]]] = {}
+        for block in blocks:
+            for tx in block.transactions:
+                if tx.nonce is not None:
+                    collected.setdefault(tx.sender, []).append(
+                        (tx.nonce, tx.tx_id)
+                    )
+        usage: dict[str, list[dict]] = {}
+        for sender, entries in collected.items():
+            by_nonce = sorted(entries, key=lambda item: item[0])
+            nonces = [nonce for nonce, _ in by_nonce]
+            if nonces != list(range(len(nonces))):
+                raise ValueError(
+                    f"sender {sender} sequenced nonces are not dense from zero"
+                )
+            usage[sender] = [
+                {"nonce": nonce, "tx_id": tx_id} for nonce, tx_id in by_nonce
+            ]
+        return usage
+
+    @staticmethod
+    def _sequence_nonces_in_tail(blocks: list[Block]) -> dict[str, list[int]]:
+        """Per-sender sequenced nonces appearing in an incremental tail.
+
+        Standalone counterpart of :meth:`_sequence_usage_from_blocks` for range
+        deliveries: without the anchor prefix the tail cannot prove density
+        from zero, but it must never repeat one of its own nonces. Returns the
+        nonces in tail order; raises ValueError on a duplicate.
+        """
+        per_sender: dict[str, list[int]] = {}
+        for block in blocks:
+            for tx in block.transactions:
+                if tx.nonce is not None:
+                    seen = per_sender.setdefault(tx.sender, [])
+                    if tx.nonce in seen:
+                        raise ValueError(
+                            f"sender {tx.sender} repeats sequenced nonce {tx.nonce}"
+                        )
+                    seen.append(tx.nonce)
+        return per_sender
+
+    @staticmethod
+    def _expected_sequence_index(
+        blocks: list[Block], pending: dict[str, Transaction]
+    ) -> dict[str, list[dict]]:
+        """Recompute the authoritative sequence reservations from the facts.
+
+        Chains every block (including a pending tip, whose transfers stay
+        reserved) followed by the mempool: each sender's chain nonces must be
+        the dense prefix ``0..c-1`` and its mempool nonces must continue it
+        densely ``c..c+m-1``. Raises StateRecoveryError-style ValueError on a
+        gap, duplicate, nonce/chain conflict or mismatched tx binding — exactly
+        the state a correct node persists atomically.
+        """
+        usage = LedgerStore._sequence_usage_from_blocks(blocks)
+        pool_entries: dict[str, list[tuple[int, str]]] = {}
+        for tx in pending.values():
+            if tx.nonce is not None:
+                pool_entries.setdefault(tx.sender, []).append(
+                    (tx.nonce, tx.tx_id)
+                )
+        for sender, entries in pool_entries.items():
+            chain_count = len(usage.get(sender, ()))
+            ordered = sorted(entries, key=lambda item: item[0])
+            nonces = [nonce for nonce, _ in ordered]
+            if nonces != list(range(chain_count, chain_count + len(nonces))):
+                raise ValueError(
+                    f"pending sequenced transfers for {sender} do not continue "
+                    "the on-chain nonce prefix"
+                )
+            usage.setdefault(sender, []).extend(
+                {"nonce": nonce, "tx_id": tx_id} for nonce, tx_id in ordered
+            )
+        return usage
+
+    def rebuild_sequence_index(self) -> None:
+        """Rebuild the dense chain+mempool sequence reservations in memory.
+
+        Used at startup validation and after a fork adoption, where the adopted
+        chain can occupy different nonces. Mempool sequenced transfers whose
+        nonce is already spent on the chain (by any transaction), that conflict
+        with an earlier pool reservation for the same nonce, or that no longer
+        continue the chain's dense prefix are removed from the mempool; with
+        them gone the surviving reservations are dense by construction.
+        Caller persists.
+        """
+        chain_usage = self._sequence_usage_from_blocks(self.chain)
+        chain_nonces: dict[str, dict[int, str]] = {
+            sender: {entry["nonce"]: entry["tx_id"] for entry in entries}
+            for sender, entries in chain_usage.items()
+        }
+        pool_by_sender: dict[str, list[Transaction]] = {}
+        for tx in self.pending.values():
+            if tx.nonce is not None:
+                pool_by_sender.setdefault(tx.sender, []).append(tx)
+        keep_tx_ids: set[str] = set()
+        index: dict[str, list[dict]] = {}
+        for sender in set(chain_usage) | set(pool_by_sender):
+            entries = list(chain_usage.get(sender, ()))
+            occupied = chain_nonces.get(sender, {})
+            expected = len(entries)
+            reserved: set[int] = set()
+            # Dict order is mempool insertion order; the earliest submission
+            # for a nonce keeps it, every later one is dropped.
+            for tx in pool_by_sender.get(sender, []):
+                if tx.nonce in occupied or tx.nonce in reserved:
+                    continue
+                if tx.nonce != expected:
+                    continue
+                entries.append({"nonce": tx.nonce, "tx_id": tx.tx_id})
+                reserved.add(tx.nonce)
+                keep_tx_ids.add(tx.tx_id)
+                expected += 1
+            index[sender] = entries
+        for tx_id in [
+            tx_id
+            for tx_id, tx in self.pending.items()
+            if tx.nonce is not None and tx_id not in keep_tx_ids
+        ]:
+            del self.pending[tx_id]
+        self.sequence_index = index
+
 
     @staticmethod
     def create_genesis() -> Block:
@@ -3815,6 +4101,7 @@ class LedgerStore:
         "generation",
         "tx_index",
         "accounts",
+        "sequence_index",
         "initial_balance",
     )
 
@@ -3860,6 +4147,17 @@ class LedgerStore:
         # restores the rest of the fields to.
         next_index, next_accounts = self._compute_derived()
         next_generation = self.generation + 1
+        # The prospective sequence reservations are recomputed from the
+        # post-write chain and mempool exactly like the other derived views, so
+        # a snapshot always binds the nonce table to the facts it stores.
+        try:
+            next_sequence_index = self._expected_sequence_index(
+                self.chain, self.pending
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"sequence reservations do not match the chain/mempool: {exc}"
+            ) from exc
         # The account-state Merkle root covers confirmed accounts only. It is
         # anchored to the highest block by the API; while a pending tip exists
         # the state endpoints report 404, but the root itself is still
@@ -3920,6 +4218,13 @@ class LedgerStore:
             "pending": [tx.to_dict() for tx in self.pending.values()],
             "index": dict(next_index),
             "accounts": next_accounts,
+            # Per-account dense sequenced-transfer reservations
+            # ({"nonce", "tx_id"} lists, nonce ascending); recovery recomputes
+            # this from the chain and mempool and requires an exact match.
+            "sequence_index": {
+                sender: [dict(entry) for entry in entries]
+                for sender, entries in sorted(next_sequence_index.items())
+            },
             "audit_checkpoint": dict(self.audit_checkpoint),
         }
         # The rotatable checkpoint key and every retained public key live in
@@ -4064,6 +4369,7 @@ class LedgerStore:
                 # successful write is the only thing that changes memory.
                 self.tx_index = next_index
                 self.accounts = next_accounts
+                self.sequence_index = next_sequence_index
                 self.generation = next_generation
             finally:
                 if not promoted and os.path.exists(tmp_path):
@@ -4223,6 +4529,13 @@ class LedgerStore:
                     )
                 balances[tx.sender] = sender_balance - tx.amount
                 balances[tx.recipient] = balances.get(tx.recipient, endowment) + tx.amount
+        # Sequenced transfers of every sender must use nonces densely from
+        # zero across the whole chain (a pending tip transfer keeps reserving
+        # its nonce). Legacy transfers have no nonce and participate nowhere.
+        try:
+            self._sequence_usage_from_blocks(blocks)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         return blocks
 
     def validate_fork_blocks(self, blocks_raw: object) -> list[Block]:
@@ -4315,6 +4628,14 @@ class LedgerStore:
                 raise ValueError(f"block {i} block_hash mismatch")
             expected_prev = block.block_hash
             tail.append(block)
+        # The anchor prefix is unavailable here, so the tail can only prove
+        # that it never repeats one of a sender's own sequenced nonces; the
+        # dense continuation is checked on the assembled whole chain by the
+        # receiver at first reception (and by recovery).
+        try:
+            LedgerStore._sequence_nonces_in_tail(tail)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
         return tail
 
     @staticmethod
@@ -4378,6 +4699,11 @@ class LedgerStore:
         """Atomically adopt a fork: swap the canonical chain, reconcile the
         mempool (old-chain-only confirmed transactions return de-duplicated;
         pending-block transactions never enter the pool) and rebuild indexes.
+
+        The sequenced-transfer reservations are rebuilt last: a nonce the
+        adopted chain already spends (possibly via a different transfer) can
+        no longer stay reserved, and any gap the adoption opens drops the
+        stranded later nonces, so reservations stay dense and never regress.
         Does not save; the caller persists.
         """
         old_confirmed_ids = {
@@ -4403,6 +4729,7 @@ class LedgerStore:
             self.pending.pop(tx_id, None)
         self.chain = new_chain
         self.rebuild_derived()
+        self.rebuild_sequence_index()
 
     # -- sync records ---------------------------------------------------------
 

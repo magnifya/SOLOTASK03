@@ -18,24 +18,45 @@ class Transaction:
     recipient: str
     amount: int
     signature: str
+    # Sequence number for a sequenced transfer (POST
+    # /v1/transactions/sequenced); None marks a legacy transfer whose message
+    # and tx_id follow the original canonical (from, to, amount) scheme. The
+    # two kinds may be mixed freely inside one block.
+    nonce: int | None = None
 
     @property
     def message(self) -> bytes:
-        return crypto.canonical_message(self.sender, self.recipient, self.amount)
+        if self.nonce is None:
+            return crypto.canonical_message(self.sender, self.recipient, self.amount)
+        return crypto.sequenced_message(
+            self.sender, self.recipient, self.amount, self.nonce
+        )
 
     @property
     def tx_id(self) -> str:
         return crypto.compute_tx_id(self.message)
 
+    @property
+    def sequenced(self) -> bool:
+        return self.nonce is not None
+
     def to_dict(self) -> dict:
-        """JSON-safe representation used both for storage and API output."""
-        return {
+        """JSON-safe representation used both for storage and API output.
+
+        Legacy transfers keep their original four-field-plus-tx_id shape
+        byte-for-byte (no ``nonce`` key); a sequenced transfer additionally
+        carries ``nonce`` between ``amount`` and ``signature``.
+        """
+        result = {
             "from": self.sender,
             "to": self.recipient,
             "amount": self.amount,
-            "signature": self.signature,
-            "tx_id": self.tx_id,
         }
+        if self.nonce is not None:
+            result["nonce"] = self.nonce
+        result["signature"] = self.signature
+        result["tx_id"] = self.tx_id
+        return result
 
     @classmethod
     def from_dict(cls, data: dict) -> "Transaction":
@@ -46,11 +67,20 @@ class Transaction:
         amount = data["amount"]
         if isinstance(amount, bool) or not isinstance(amount, int):
             raise ValueError("transaction amount must be an integer")
+        # An absent or JSON-null "nonce" marks a legacy transfer. A present
+        # value must already be a non-boolean non-negative integer; it is
+        # never coerced.
+        nonce = data.get("nonce")
+        if nonce is not None and (
+            isinstance(nonce, bool) or not isinstance(nonce, int) or nonce < 0
+        ):
+            raise ValueError("transaction nonce must be a non-negative integer")
         return cls(
             sender=data["from"],
             recipient=data["to"],
             amount=amount,
             signature=data["signature"],
+            nonce=nonce,
         )
 
 
