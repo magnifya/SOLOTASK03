@@ -1,4 +1,4 @@
-"""Command line interface: send, send-sequenced, sequence, tx, mine, block, account, proof, proofs,
+"""Command line interface: send, send-sequenced, send-sequenced-batch, sequence, tx, mine, block, account, proof, proofs,
 state-root,
 state-proof, state-proofs, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
@@ -41,7 +41,7 @@ DEFAULT_BASE_URL = os.environ.get("LEDGER_BASE_URL", "http://127.0.0.1:8080")
 
 
 def _request(
-    method: str, url: str, payload: dict | None, sort_keys: bool = True
+    method: str, url: str, payload: object | None, sort_keys: bool = True
 ) -> tuple[int, dict]:
     data = None
     headers = {"Accept": "application/json"}
@@ -165,6 +165,28 @@ def cmd_send_sequenced(args: argparse.Namespace) -> int:
         "POST", f"{args.base_url}/v1/transactions/sequenced", payload
     )
     return _emit(status, body)
+
+
+def cmd_send_sequenced_batch(args: argparse.Namespace) -> int:
+    try:
+        if args.file == "-":
+            raw = sys.stdin.read()
+        else:
+            with open(args.file, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+        payload = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError):
+        print(json.dumps({"error": "input"}, ensure_ascii=False))
+        return 1
+
+    status, body = _request(
+        "POST",
+        f"{args.base_url}/v1/transactions/sequenced/batch",
+        payload,
+        sort_keys=False,
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if 200 <= status < 300 else 1
 
 
 def cmd_mine(args: argparse.Namespace) -> int:
@@ -1135,6 +1157,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_send_sequenced.add_argument("--signature", help="raw Ed25519 signature hex")
     p_send_sequenced.set_defaults(func=cmd_send_sequenced)
+
+    p_send_sequenced_batch = sub.add_parser(
+        "send-sequenced-batch",
+        help="submit an atomic batch of sequenced transfers from a JSON file",
+    )
+    p_send_sequenced_batch.add_argument(
+        "--file",
+        required=True,
+        help="JSON request file, or - to read from standard input",
+    )
+    p_send_sequenced_batch.set_defaults(func=cmd_send_sequenced_batch)
 
     p_mine = sub.add_parser("mine", help="pack pending transactions into a block")
     p_mine.set_defaults(func=cmd_mine)

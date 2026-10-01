@@ -880,8 +880,9 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
 
 ## 可重试的序列转账
 
-在旧式 `POST /v1/transactions` 之外提供按发送方账户严格排序、可安全重试的序列
-转账入口 `POST /v1/transactions/sequenced`，以及账户序列查询
+在旧式 `POST /v1/transactions` 之外提供按发送方账户严格排序、可安全重试的单笔
+与批量序列转账入口 `POST /v1/transactions/sequenced`、
+`POST /v1/transactions/sequenced/batch`，以及账户序列查询
 `GET /v1/accounts/{account}/sequence`。旧式转账、`send` CLI 与既有查询、证明
 行为完全不变。
 
@@ -912,6 +913,33 @@ nonce,to` 排序、紧凑分隔符（无空白）的 JSON。`tx_id` 是该消息
 - `nonce` 小于 `next_sequence`、跳号（超过下一个可接收 nonce），或用不同交易
   占用同一已预留 nonce，均返回
   `409 {"error": "sequence_conflict", "next_sequence": N}`。
+
+### 批量提交
+
+`POST /v1/transactions/sequenced/batch` 的请求体只能为
+`{"transactions":[...]}`，数组非空；每项只能含单笔入口的
+`from,to,amount,nonce,signature` 五个字段，签名消息与 `tx_id` 派生与单笔完全
+相同，批内 `tx_id` 必须互异。不同发送方的交易可按任意顺序交错；每个发送方在
+批内使用的 nonce 从当前 `next_sequence` 起连续递增。余额按该发送方在整批中的
+总支出一次性校验，未确认收入不计入可用余额。
+
+- 按输入下标报错：字段/类型、签名、批内重复项或批内 nonce 断档为
+  `400 {"error":"input","index":I}`；起始错位或与已预留 nonce 冲突为
+  `409 {"error":"sequence_conflict","index":I,"next_sequence":N}`；总余额不足为
+  `409 {"error":"insufficient_balance","index":I}`。
+- 无 `Idempotency-Key` 时，仅当整批交易都已存在才返回
+  `200 {"items":[{"tx_id","nonce","location"}...],"total":N}`，`location` 为
+  `pending` 或 `confirmed`；部分存在时按最早存在项返回
+  `409 {"error":"transaction_exists","index":I}`。
+- 全部校验通过后，所有交易在同一把账本锁与同一次原子写入中入池；任一校验或
+  落盘失败都全批不入池。首次成功返回固定键序
+  `{"items":[{"tx_id","nonce"}...],"total":N}`，状态码 `202`，每笔新交易各记录
+  一次 `transaction_submitted`。
+- 带 `Idempotency-Key` 时沿用统一幂等规则。无该头时落盘失败返回
+  `500 {"error":"persistence failed"}`，响应前内存状态恢复到请求前。
+- CLI：`send-sequenced-batch --file PATH` 读取 JSON 请求，`--file -` 从标准输入
+  读取；本地文件读取或 JSON 解析失败时输出 `{"error":"input"}`、退出 1，且不
+  访问服务。所有 2xx 输出退出 0，其他响应退出 1。
 
 ### 序列语义
 
@@ -956,7 +984,7 @@ nonce。**陌生账户**返回 `next_sequence=0` 与两个空数组。该端点�
   `sequences` section；恢复时严格重算并逐字节比对，旧快照无该 section 时按
   空记录恢复（旧快照若含带 nonce 的交易却缺该 section 则判为损坏）。
 - CLI 提供 `send-sequenced --to --amount --nonce [--signing-key|--from
-  --signature]` 与 `sequence ACCOUNT`。
+  --signature]`、`send-sequenced-batch --file PATH|-` 与 `sequence ACCOUNT`。
 
 ## 交易索引
 
@@ -1844,8 +1872,8 @@ read/update/export，401/403 无副作用）与 `history_credential_changed` 事
 
 ## 统一请求幂等保护（Idempotency-Key）
 
-所有**改变账本或管理状态**的 POST 与 DELETE 入口（旧式交易提交、序列
-转账提交、打包、确认/
+所有**改变账本或管理状态**的 POST 与 DELETE 入口（旧式交易提交、单笔与批量
+序列转账提交、打包、确认/
 回滚、候选分叉提交/采用、整链与增量（含签名）同步、来源信任注册/轮换/
 撤销、allowlist 新增/删除、审计签名者轮换、历史签名者日志追加、历史分
 页导出与持久分权历史凭据管理）都支持统一的请求幂等保护。只读 POST
@@ -1933,6 +1961,13 @@ curl -s -X POST localhost:8080/v1/transactions/sequenced \
 # -> 202 {"tx_id":"...","nonce":0}（相同请求重试 -> 200 同结果）
 # 字段/类型/签名/余额不合格 -> 400 {"error":"input"}
 # nonce 落后/跳号/同 nonce 冲突 -> 409 {"error":"sequence_conflict","next_sequence":N}
+
+# 原子提交一批序列转账（body 只能为 {"transactions":[...]}；返回键序 items,total）
+curl -s -X POST localhost:8080/v1/transactions/sequenced/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transactions":[{"from":"<pubkey-hex>","to":"<pubkey-hex>","amount":10,"nonce":0,"signature":"<sig-hex>"}]}'
+# -> 202 {"items":[{"tx_id":"...","nonce":0}],"total":1}
+# 整批已存在且无 Idempotency-Key -> 200，item 额外有 location=pending|confirmed
 # 账户序列（陌生账户也返回 200：next_sequence=0、两个空数组；不接受查询参数）
 curl -s localhost:8080/v1/accounts/<pubkey-hex>/sequence
 # -> 200 {"account":"...","next_sequence":N,"pending_sequences":[{"nonce","tx_id"}...],

@@ -490,6 +490,10 @@ class LedgerStore:
     def lock(self) -> threading.RLock:
         return self._lock
 
+    @property
+    def persistence_deferred(self) -> bool:
+        return self._persist_deferred
+
     # Serializes startup scans/promotions between threads (or two store
     # instances on the same path) within one process. All later mutations take
     # the per-store re-entrant lock.

@@ -408,6 +408,184 @@ class LedgerService:
                 raise
         return 202, {"tx_id": tx.tx_id, "nonce": nonce}
 
+    def submit_sequenced_transaction_batch(
+        self, payload: object
+    ) -> tuple[int, dict]:
+        """Atomically submit a non-empty batch of sequenced transfers."""
+        if not isinstance(payload, dict) or set(payload) != {"transactions"}:
+            return 400, {"error": "input"}
+        raw_transactions = payload["transactions"]
+        if not isinstance(raw_transactions, list) or not raw_transactions:
+            return 400, {"error": "input"}
+
+        transactions: list[Transaction] = []
+        for index, item in enumerate(raw_transactions):
+            if not isinstance(item, dict) or set(item) != set(
+                REQUIRED_SEQUENCED_TX_FIELDS
+            ):
+                return 400, {"error": "input", "index": index}
+
+            sender = item["from"]
+            recipient = item["to"]
+            amount = item["amount"]
+            nonce = item["nonce"]
+            signature = item["signature"]
+
+            if not isinstance(sender, str) or not sender:
+                return 400, {"error": "input", "index": index}
+            if not isinstance(recipient, str) or not recipient:
+                return 400, {"error": "input", "index": index}
+            if (
+                isinstance(amount, bool)
+                or not isinstance(amount, int)
+                or amount <= 0
+            ):
+                return 400, {"error": "input", "index": index}
+            if (
+                isinstance(nonce, bool)
+                or not isinstance(nonce, int)
+                or nonce < 0
+            ):
+                return 400, {"error": "input", "index": index}
+            if not isinstance(signature, str) or not signature:
+                return 400, {"error": "input", "index": index}
+
+            transactions.append(
+                Transaction(sender, recipient, amount, signature, nonce)
+            )
+
+        for index, tx in enumerate(transactions):
+            if not crypto.verify_signature(
+                tx.sender, tx.message, tx.signature
+            ):
+                return 400, {"error": "input", "index": index}
+
+        seen_tx_ids: set[str] = set()
+        for index, tx in enumerate(transactions):
+            if tx.tx_id in seen_tx_ids:
+                return 400, {"error": "input", "index": index}
+            seen_tx_ids.add(tx.tx_id)
+
+        with self.store.lock:
+            locations: list[str | None] = []
+            all_existing = True
+            first_existing_index: int | None = None
+            for index, tx in enumerate(transactions):
+                location = self._sequenced_tx_location(tx.tx_id)
+                locations.append(location)
+                if location is not None:
+                    if first_existing_index is None:
+                        first_existing_index = index
+                else:
+                    all_existing = False
+
+            if all_existing:
+                return 200, {
+                    "items": [
+                        {
+                            "tx_id": tx.tx_id,
+                            "nonce": tx.nonce,
+                            "location": locations[index],
+                        }
+                        for index, tx in enumerate(transactions)
+                    ],
+                    "total": len(transactions),
+                }
+
+            base_next = {
+                sender: self.store.sequence_next(state)
+                for sender, state in self.store.sequences.items()
+            }
+            batch_nonce_slots: dict[str, set[int]] = {}
+            first_sequence_error: tuple[int, str, int] | None = None
+            for index, tx in enumerate(transactions):
+                start = base_next.get(tx.sender, 0)
+                slots = batch_nonce_slots.setdefault(tx.sender, set())
+                if locations[index] is not None:
+                    continue
+                if tx.nonce < start or tx.nonce in slots:
+                    first_sequence_error = (index, "sequence_conflict", start)
+                    break
+                expected = start + len(slots)
+                if tx.nonce == expected:
+                    slots.add(tx.nonce)
+                else:
+                    if slots:
+                        first_sequence_error = (index, "input", start)
+                    else:
+                        first_sequence_error = (
+                            index,
+                            "sequence_conflict",
+                            start,
+                        )
+                    break
+
+            if first_sequence_error is not None:
+                index, error, next_sequence = first_sequence_error
+                if error == "input":
+                    return 400, {"error": "input", "index": index}
+                return 409, {
+                    "error": "sequence_conflict",
+                    "index": index,
+                    "next_sequence": next_sequence,
+                }
+
+            batch_totals: dict[str, int] = {}
+            first_sender_index: dict[str, int] = {}
+            for index, tx in enumerate(transactions):
+                if locations[index] is None:
+                    batch_totals[tx.sender] = (
+                        batch_totals.get(tx.sender, 0) + tx.amount
+                    )
+                    first_sender_index.setdefault(tx.sender, index)
+
+            for sender, total in batch_totals.items():
+                if self.available_balance(sender) < total:
+                    return 409, {
+                        "error": "insufficient_balance",
+                        "index": first_sender_index[sender],
+                    }
+
+            if first_existing_index is not None:
+                return 409, {
+                    "error": "transaction_exists",
+                    "index": first_existing_index,
+                }
+
+            added_tx_ids: list[str] = []
+            appended_event_count = 0
+            try:
+                for tx in transactions:
+                    self.store.pending[tx.tx_id] = tx
+                    added_tx_ids.append(tx.tx_id)
+                    self.store.append_audit_event(
+                        EVENT_TRANSACTION_SUBMITTED,
+                        {
+                            "tx_id": tx.tx_id,
+                            "from": tx.sender,
+                            "to": tx.recipient,
+                            "amount": tx.amount,
+                            "nonce": tx.nonce,
+                        },
+                    )
+                    appended_event_count += 1
+                self.store.save()
+            except BaseException:
+                for tx_id in added_tx_ids:
+                    self.store.pending.pop(tx_id, None)
+                self.store.truncate_audit_events(appended_event_count)
+                if self.store.persistence_deferred:
+                    raise
+                return 500, {"error": "persistence failed"}
+
+            return 202, {
+                "items": [
+                    {"tx_id": tx.tx_id, "nonce": tx.nonce}
+                    for tx in transactions
+                ],
+                "total": len(transactions),
+            }
+
     def _sequenced_tx_location(self, tx_id: str) -> str | None:
         """Locate a tx_id across the canonical chain and mempool.
 

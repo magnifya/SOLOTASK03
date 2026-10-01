@@ -378,6 +378,17 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     lambda: service.submit_sequenced_transaction(payload),
                     payload,
                 )
+            elif path == "/v1/transactions/sequenced/batch":
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                self._json_mutation(
+                    "POST",
+                    lambda: service.submit_sequenced_transaction_batch(payload),
+                    payload,
+                    sort_keys=False,
+                )
             elif path == "/v1/transactions":
                 ok, payload = self._read_json()
                 if not ok:
