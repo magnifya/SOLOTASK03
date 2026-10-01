@@ -129,6 +129,22 @@ EVENT_HISTORY_ACCESS = "history_access"
 # service.EVENT_HISTORY_CREDENTIAL_CHANGED mirrors this literal value.
 EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
 
+# Core ledger lifecycle event kinds; service.EVENT_* constants mirror these
+# literal values. Each successful, durable state transition appends exactly
+# one:
+#   transaction_submitted — a transaction first enters the mempool
+#       {tx_id, from, to, amount};
+#   block_mined — a pending block is first created
+#       {height, block_hash, merkle_root, transaction_ids (in-block order)};
+#   block_confirmed — a pending tip is first confirmed {height, block_hash};
+#   block_rolled_back — a pending tip is successfully rolled back
+#       {height, block_hash, transaction_ids (the txs actually restored to
+#       the mempool, in-block order)}.
+EVENT_TRANSACTION_SUBMITTED = "transaction_submitted"
+EVENT_BLOCK_MINED = "block_mined"
+EVENT_BLOCK_CONFIRMED = "block_confirmed"
+EVENT_BLOCK_ROLLED_BACK = "block_rolled_back"
+
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
 # the main state file. They double as crash-recovery candidates on startup.
 SNAPSHOT_PREFIX = ".ledger-"
@@ -1213,7 +1229,7 @@ class LedgerStore:
         # reconciliation returned below is applied once, by load(), to the
         # single winning snapshot.
         audit_events = self._parse_persisted_audit_events(
-            data.get("audit_events", []), path
+            data.get("audit_events", []), path, chain, pending
         )
         audit_checkpoint, audit_repair = self._assess_audit_chain(
             data, audit_events, path
@@ -2292,7 +2308,12 @@ class LedgerStore:
         return records
 
     @staticmethod
-    def _parse_persisted_audit_events(raw: object, path: str) -> list[dict]:
+    def _parse_persisted_audit_events(
+        raw: object,
+        path: str,
+        chain: "list[Block] | None" = None,
+        pending: "dict[str, Transaction] | None" = None,
+    ) -> list[dict]:
         """Strictly parse the append-only audit event log.
 
         Every event is a JSON object carrying an integer ``at`` timestamp and a
@@ -2311,6 +2332,15 @@ class LedgerStore:
         keyless-allowlist events ``allowlist_added`` / ``allowlist_removed``
         likewise require a non-empty ``source`` and an integer
         ``expires_at``.
+
+        The four core ledger lifecycle events (``transaction_submitted``,
+        ``block_mined``, ``block_confirmed``, ``block_rolled_back``) are
+        validated field-by-field: exact payload key sets, plain integer types,
+        64-char lowercase hex hashes, ascending unique ``transaction_ids`` and
+        the Merkle root they commit to. When the entity an event references
+        still exists in the recovered chain/mempool it is cross-checked against
+        that fact (a rolled-back or fork-adopted-away entity may legitimately
+        be absent and is then checked only through the event stream).
         """
         if raw is None:
             return []
@@ -2329,6 +2359,28 @@ class LedgerStore:
         # events carrying the action and the heads the two external files had
         # at access time (64-hex, or null when the file did not exist yet).
         history_access_kinds = {EVENT_HISTORY_ACCESS}
+        # Fact tables for the core lifecycle events, built once from the
+        # already-parsed canonical chain and mempool.
+        chain_by_hash: dict[str, Block] = {}
+        tx_facts: dict[str, tuple[str, str, int]] = {}
+        if chain is not None:
+            for block in chain:
+                chain_by_hash[block.block_hash] = block
+                for tx in block.transactions:
+                    tx_facts[tx.tx_id] = (tx.sender, tx.recipient, tx.amount)
+        if pending is not None:
+            for tx in pending.values():
+                tx_facts.setdefault(
+                    tx.tx_id, (tx.sender, tx.recipient, tx.amount)
+                )
+        # (height, block_hash) -> ordered tx ids of every block_mined event
+        # seen so far, so a rollback event can be checked against its block.
+        mined_blocks: dict[tuple[int, str], list[str]] = {}
+        # (height, block_hash) -> lifecycle state recorded by the stream:
+        # "pending" after a block_mined, "confirmed" after a block_confirmed,
+        # "rolled_back" after a block_rolled_back. A block may be mined again
+        # only after a rollback; confirm/rollback require a pending mine.
+        mined_states: dict[tuple[int, str], str] = {}
         events: list[dict] = []
         for i, event in enumerate(raw):
             if not isinstance(event, dict):
@@ -2416,6 +2468,41 @@ class LedgerStore:
                     raise StateRecoveryError(
                         path, f"audit event {event_id} ({kind}) has invalid mode"
                     )
+                if kind == EVENT_SYNC_ADOPTED:
+                    # Fork adoption installs an externally delivered chain:
+                    # every block of that fork reaches the canonical chain
+                    # through adoption, not through a local block_mined. Reset
+                    # the tracked lifecycle of blocks the stream had recorded
+                    # locally (e.g. mined and then rolled back, with the very
+                    # same block later arriving on the adopted fork): an
+                    # adopted confirmed fork marks its whole prefix confirmed;
+                    # an adopted pending fork marks its ancestors confirmed and
+                    # the tip "adopted_pending", so a later block_confirmed /
+                    # block_rolled_back event stays valid.
+                    adopted_tip_status = status
+                    if adopted_tip_status is None:
+                        adopted_tip = chain_by_hash.get(tip_hash)
+                        if adopted_tip is not None:
+                            adopted_tip_status = adopted_tip.status
+                    cursor_hash = tip_hash
+                    at_tip = True
+                    while True:
+                        adopted_block = chain_by_hash.get(cursor_hash)
+                        if adopted_block is None:
+                            break
+                        tracked_key = (
+                            adopted_block.height,
+                            adopted_block.block_hash,
+                        )
+                        if tracked_key in mined_states:
+                            if at_tip and adopted_tip_status == STATUS_PENDING:
+                                mined_states[tracked_key] = "adopted_pending"
+                            else:
+                                mined_states[tracked_key] = "confirmed"
+                        cursor_hash = adopted_block.prev_hash
+                        at_tip = False
+                        if cursor_hash == GENESIS_PREV_HASH:
+                            break
             elif kind in allowlist_kinds:
                 # The keyless allowlist is authoritative configuration (exactly
                 # like trust_sources): an allowlist_added/removed event must
@@ -2458,8 +2545,358 @@ class LedgerStore:
                             f"audit event {event_id} ({kind}) {head_field} "
                             "must be 64 lowercase hex characters or null",
                         )
+            elif kind == EVENT_TRANSACTION_SUBMITTED:
+                LedgerStore._validate_submitted_event(
+                    event, event_id, tx_facts, path
+                )
+            elif kind == EVENT_BLOCK_MINED:
+                mined = LedgerStore._validate_mined_event(
+                    event, event_id, chain_by_hash, path
+                )
+                key = (mined[0], mined[1])
+                state = mined_states.get(key)
+                if state is not None and state != "rolled_back":
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) re-mines block "
+                        f"{mined[1]} that was not rolled back",
+                    )
+                mined_states[key] = "pending"
+                mined_blocks[key] = mined[2]
+            elif kind in (EVENT_BLOCK_CONFIRMED, EVENT_BLOCK_ROLLED_BACK):
+                height, block_hash, ids = LedgerStore._validate_block_ref_event(
+                    event,
+                    event_id,
+                    kind,
+                    chain_by_hash,
+                    mined_blocks,
+                    tx_facts,
+                    path,
+                )
+                key = (height, block_hash)
+                # A block delivered through fork adoption and never locally
+                # mined is validated structurally only. A pending adopted tip
+                # whose key was tracked from an earlier local lifecycle takes
+                # the same pending transition as a freshly mined block.
+                state = mined_states.get(key)
+                if state is not None:
+                    if state not in ("pending", "adopted_pending"):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} ({kind}) references block "
+                            f"{block_hash} that is not a pending tip",
+                        )
+                    if kind == EVENT_BLOCK_CONFIRMED:
+                        mined_states[key] = "confirmed"
+                    else:
+                        mined_states[key] = "rolled_back"
             events.append(dict(event))
+
+        # Final cross-check: every block the event stream tracks that is still
+        # part of the recovered canonical chain must be in the lifecycle state
+        # the stream leaves it in (confirmed blocks "confirmed", a pending tip
+        # "pending" — including a pending tip installed by fork adoption).
+        # Blocks delivered confirmed through adoption with no prior local
+        # lifecycle are untracked and deliberately skipped.
+        for block in chain_by_hash.values():
+            state = mined_states.get((block.height, block.block_hash))
+            if state is None:
+                continue
+            expected = (
+                ("pending", "adopted_pending")
+                if block.status == STATUS_PENDING
+                else ("confirmed",)
+            )
+            if state not in expected:
+                raise StateRecoveryError(
+                    path,
+                    f"audit lifecycle of block {block.block_hash} ends at "
+                    f"{state!r} but the recovered block is {block.status!r}",
+                )
         return events
+
+    # Keys carried by every stored audit event besides the kind-specific
+    # payload: dense id, kind, timestamp and both hash-chain links.
+    _BASE_AUDIT_EVENT_KEYS = frozenset(
+        ("event_id", "kind", "at", "prev_hash", "event_hash")
+    )
+
+    @staticmethod
+    def _check_lifecycle_keys(
+        event: dict,
+        event_id: int,
+        kind: str,
+        payload_keys: tuple[str, ...],
+        path: str,
+    ) -> None:
+        """Enforce an exact payload key set on a core lifecycle event: no
+        missing fields, no unexpected fields (both are snapshot corruption)."""
+        allowed = LedgerStore._BASE_AUDIT_EVENT_KEYS | frozenset(payload_keys)
+        missing = [key for key in payload_keys if key not in event]
+        unexpected = sorted(set(event) - allowed)
+        if missing:
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) is missing field(s) "
+                f"{missing}",
+            )
+        if unexpected:
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) has unexpected field(s) "
+                f"{unexpected}",
+            )
+
+    @staticmethod
+    def _check_sorted_hex64_list(
+        value: object,
+        event_id: int,
+        kind: str,
+        field: str,
+        path: str,
+        allow_empty: bool = False,
+    ) -> list[str]:
+        """Validate a transaction_ids payload: a list of distinct, ascending
+        64-char lowercase hex strings (non-empty unless explicitly allowed)."""
+        if not isinstance(value, list):
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) {field} must be a list",
+            )
+        if not allow_empty and not value:
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) {field} must not be empty",
+            )
+        for item in value:
+            if not crypto.is_hex64(item):
+                raise StateRecoveryError(
+                    path,
+                    f"audit event {event_id} ({kind}) {field} entries must be "
+                    "64 lowercase hex characters",
+                )
+        if len(set(value)) != len(value):
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) {field} has duplicates",
+            )
+        if list(value) != sorted(value):
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) {field} is not in "
+                "ascending order",
+            )
+        return list(value)
+
+    @staticmethod
+    def _validate_submitted_event(
+        event: dict,
+        event_id: int,
+        tx_facts: dict[str, tuple[str, str, int]],
+        path: str,
+    ) -> None:
+        """Strictly validate one transaction_submitted event.
+
+        Exact fields tx_id/from/to/amount with plain types and 64-hex tx_id;
+        the tx_id must recompute from the canonical signed message of the
+        payload fields. When the transaction still exists in the recovered
+        chain or mempool, every field must match that stored transaction.
+        """
+        kind = EVENT_TRANSACTION_SUBMITTED
+        LedgerStore._check_lifecycle_keys(
+            event, event_id, kind, ("tx_id", "from", "to", "amount"), path
+        )
+        tx_id = event["tx_id"]
+        sender = event["from"]
+        recipient = event["to"]
+        amount = event["amount"]
+        if not crypto.is_hex64(tx_id):
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) tx_id must be 64 lowercase hex characters"
+            )
+        if not isinstance(sender, str) or not sender:
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) 'from' must be a non-empty string"
+            )
+        if not isinstance(recipient, str) or not recipient:
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) 'to' must be a non-empty string"
+            )
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) amount must be a positive integer"
+            )
+        if crypto.compute_tx_id(
+            crypto.canonical_message(sender, recipient, amount)
+        ) != tx_id:
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) tx_id does not match its "
+                "from/to/amount fields",
+            )
+        fact = tx_facts.get(tx_id)
+        if fact is not None and fact != (sender, recipient, amount):
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) for {tx_id} disagrees with "
+                "the stored transaction",
+            )
+
+    @staticmethod
+    def _validate_mined_event(
+        event: dict,
+        event_id: int,
+        chain_by_hash: dict[str, "Block"],
+        path: str,
+    ) -> tuple[int, str, list[str]]:
+        """Strictly validate one block_mined event; return (height, hash, ids)."""
+        kind = EVENT_BLOCK_MINED
+        LedgerStore._check_lifecycle_keys(
+            event,
+            event_id,
+            kind,
+            ("height", "block_hash", "merkle_root", "transaction_ids"),
+            path,
+        )
+        height = event["height"]
+        block_hash = event["block_hash"]
+        merkle_root = event["merkle_root"]
+        if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) height must be a positive integer"
+            )
+        if not crypto.is_hex64(block_hash):
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) block_hash must be 64 lowercase hex characters"
+            )
+        if not crypto.is_hex64(merkle_root):
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) merkle_root must be 64 lowercase hex characters"
+            )
+        tx_ids = LedgerStore._check_sorted_hex64_list(
+            event["transaction_ids"], event_id, kind, "transaction_ids", path
+        )
+        if crypto.merkle_root(tx_ids) != merkle_root:
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) merkle_root does not match "
+                "its transaction_ids",
+            )
+        block = chain_by_hash.get(block_hash)
+        if block is not None:
+            if block.height != height:
+                raise StateRecoveryError(
+                    path,
+                    f"audit event {event_id} ({kind}) height disagrees with "
+                    "the referenced block",
+                )
+            if block.merkle_root != merkle_root:
+                raise StateRecoveryError(
+                    path,
+                    f"audit event {event_id} ({kind}) merkle_root disagrees "
+                    "with the referenced block",
+                )
+            block_ids = [tx.tx_id for tx in block.transactions]
+            if block_ids != tx_ids:
+                raise StateRecoveryError(
+                    path,
+                    f"audit event {event_id} ({kind}) transaction_ids disagree "
+                    "with the referenced block",
+                )
+        return height, block_hash, tx_ids
+
+    @staticmethod
+    def _validate_block_ref_event(
+        event: dict,
+        event_id: int,
+        kind: str,
+        chain_by_hash: dict[str, "Block"],
+        mined_blocks: dict[tuple[int, str], list[str]],
+        tx_facts: dict[str, tuple[str, str, int]],
+        path: str,
+    ) -> tuple[int, str, list[str]]:
+        """Strictly validate a block_confirmed/block_rolled_back event.
+
+        Returns ``(height, block_hash, ids)`` (empty ids for a confirm event).
+        Two origins are accepted:
+
+        * a locally mined block — the (height, block_hash) must match a prior
+          block_mined event and rollback transaction_ids must be a subset of
+          that block's in-order ids;
+        * a block delivered through fork adoption — it carries no block_mined
+          event in this log; a still-present block is pinned directly, while a
+          rolled-away adopted block can only be fact-checked through the
+          transactions its rollback restored to the mempool.
+        """
+        payload_keys = ("height", "block_hash")
+        if kind == EVENT_BLOCK_ROLLED_BACK:
+            payload_keys = ("height", "block_hash", "transaction_ids")
+        LedgerStore._check_lifecycle_keys(
+            event, event_id, kind, payload_keys, path
+        )
+        height = event["height"]
+        block_hash = event["block_hash"]
+        if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) height must be a positive integer"
+            )
+        if not crypto.is_hex64(block_hash):
+            raise StateRecoveryError(
+                path, f"audit event {event_id} ({kind}) block_hash must be 64 lowercase hex characters"
+            )
+        ids: list[str] = []
+        if kind == EVENT_BLOCK_ROLLED_BACK:
+            ids = LedgerStore._check_sorted_hex64_list(
+                event["transaction_ids"],
+                event_id,
+                kind,
+                "transaction_ids",
+                path,
+            )
+        block = chain_by_hash.get(block_hash)
+        if block is not None and block.height != height:
+            raise StateRecoveryError(
+                path,
+                f"audit event {event_id} ({kind}) height disagrees with the "
+                "referenced block",
+            )
+        mined_ids = mined_blocks.get((height, block_hash))
+        if mined_ids is not None:
+            if not set(ids).issubset(set(mined_ids)):
+                raise StateRecoveryError(
+                    path,
+                    f"audit event {event_id} ({kind}) records transactions "
+                    "that were not in the mined block",
+                )
+            if block is not None:
+                block_ids = [tx.tx_id for tx in block.transactions]
+                if not set(ids).issubset(set(block_ids)):
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) transaction_ids "
+                        "disagree with the referenced block",
+                    )
+        else:
+            # No block_mined event: the block entered this node through fork
+            # adoption. A still-present block is fully pinned above; an
+            # adopted block already rolled back is gone from the chain, so its
+            # restored transactions must all exist as recoverable facts (in a
+            # surviving block or the mempool).
+            if block is None:
+                if kind != EVENT_BLOCK_ROLLED_BACK:
+                    raise StateRecoveryError(
+                        path,
+                        f"audit event {event_id} ({kind}) references block "
+                        f"{block_hash} that is neither mined nor present",
+                    )
+                for tx_id in ids:
+                    if tx_id not in tx_facts:
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} ({kind}) restored "
+                            f"transaction {tx_id} absent from chain and mempool",
+                        )
+        return height, block_hash, ids
 
     def _parse_persisted_syncs(
         self,

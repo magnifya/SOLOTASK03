@@ -110,7 +110,9 @@ class VerifySuccessTests(SnapshotFixture):
     def test_confirmed_blocks_pending_and_audit_verify(self) -> None:
         self._confirm_tx(10)
         # A mempool entry and an audit event (trust registration) exercise
-        # the pending uniqueness and audit-chain branches.
+        # the pending uniqueness and audit-chain branches. The core lifecycle
+        # (submit/mine/confirm + the second submit) appends four ledger events
+        # before the trust-registration event.
         self.svc.submit_transaction(signed_tx(self.kb, self.B, self.A, 3))
         self.assertEqual(
             self.svc.register_trust_source(
@@ -127,7 +129,17 @@ class VerifySuccessTests(SnapshotFixture):
             result["state_root"], self.store.state_root_for(self.store.chain, 1000)[0]
         )
         self.assertEqual(result["audit_checkpoint"], self.store.audit_checkpoint)
-        self.assertEqual(result["audit_checkpoint"]["event_id"], 1)
+        self.assertEqual(
+            [event["kind"] for event in doc["audit_events"]],
+            [
+                "transaction_submitted",
+                "block_mined",
+                "block_confirmed",
+                "transaction_submitted",
+                "source_registered",
+            ],
+        )
+        self.assertEqual(result["audit_checkpoint"]["event_id"], 5)
 
     def test_pending_tip_snapshot_verifies(self) -> None:
         self.svc.submit_transaction(signed_tx(self.ka, self.A, self.B, 5))
