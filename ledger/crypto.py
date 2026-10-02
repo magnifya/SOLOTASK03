@@ -554,3 +554,223 @@ def verify_account_proof(
         return True
     except (TypeError, ValueError):
         return False
+
+
+# Exact key shapes of the account-absence proof document and its parts.
+_ABSENCE_DOC_KEYS = ("account", "state", "lower", "upper")
+_ABSENCE_STATE_KEYS = (
+    "state_root",
+    "height",
+    "block_hash",
+    "account_count",
+)
+_ABSENCE_NEIGHBOR_KEYS = (
+    "account",
+    "balance",
+    "confirmed_transactions",
+    "index",
+    "state_root",
+    "height",
+    "block_hash",
+    "siblings",
+)
+
+
+def verify_account_absence_proof(
+    document: object, account: object, expected_state: object
+) -> bool:
+    """Verify an account-absence (non-membership) proof offline.
+
+    The document mirrors
+    ``GET /v1/accounts/{account}/absence-proof``::
+
+        {"account": A, "state": state-anchor-document,
+         "lower": neighbor-inclusion-proof | None,
+         "upper": neighbor-inclusion-proof | None}
+
+    ``account`` is the caller-pinned target (a non-empty string) and
+    ``expected_state`` is the caller-pinned full state-root document
+    (``state_root, height, block_hash, account_count``). The proof is valid
+    only when:
+
+    * every document/state/neighbor field is present exactly once with the
+      right type and format (booleans are never integers; neighbor sibling
+      items carry exactly ``direction``/``hash``);
+    * the document account equals the pinned account and the embedded state
+      anchor exactly equals ``expected_state`` (root, height, block hash and
+      account count);
+    * each non-null neighbor is a valid inclusion proof against the same
+      anchor, with its index in ``[0, account_count)``;
+    * the neighbors genuinely frame the target in ascending account order:
+      a present ``lower`` sits one slot below it (``lower.account < account``,
+      index ``i``), a present ``upper`` one slot above
+      (``account < upper.account``, index ``i + 1``), with both present
+      adjacent (``i, i + 1``); a boundary proof uses only index 0 (target
+      before the first account) or ``account_count - 1`` (target after the
+      last); an empty tree has ``account_count == 0`` and both sides null;
+    * the empty-tree root is the fixed empty Merkle root.
+
+    Returns False — never raises — for any malformed or tampered input,
+    including mixed anchors, non-adjacent neighbors, out-of-range indices and
+    phantom slots derived from odd-node self-pairing. Key order is
+    irrelevant (but missing/extra keys still fail).
+    """
+    try:
+        if not isinstance(document, dict):
+            return False
+        # Key order is irrelevant for the absence document, but the four
+        # keys must be present with none missing or extra.
+        if set(document.keys()) != set(_ABSENCE_DOC_KEYS):
+            return False
+        target = document["account"]
+        state = document["state"]
+        lower = document["lower"]
+        upper = document["upper"]
+
+        if not isinstance(account, str) or not account:
+            return False
+        if not isinstance(target, str) or not target or target != account:
+            return False
+
+        state = _validated_absence_state(state, expected_state)
+        if state is None:
+            return False
+        root = state["state_root"]
+        height = state["height"]
+        block_hash = state["block_hash"]
+        account_count = state["account_count"]
+
+        if account_count == 0:
+            if root != EMPTY_MERKLE_ROOT:
+                return False
+            return lower is None and upper is None
+
+        lower_result = None
+        upper_result = None
+        if lower is not None:
+            lower_result = _validated_absence_neighbor(
+                lower, root, height, block_hash, account_count
+            )
+            if lower_result is None:
+                return False
+            name, _index = lower_result
+            if not name < account:
+                return False
+        if upper is not None:
+            upper_result = _validated_absence_neighbor(
+                upper, root, height, block_hash, account_count
+            )
+            if upper_result is None:
+                return False
+            name, _index = upper_result
+            if not account < name:
+                return False
+
+        if lower_result is not None and upper_result is not None:
+            if lower_result[1] + 1 != upper_result[1]:
+                return False
+        elif lower_result is not None:
+            # Target past the last account: the only neighbor is the last row.
+            if lower_result[1] != account_count - 1:
+                return False
+        elif upper_result is not None:
+            # Target before the first account: the only neighbor is row zero.
+            if upper_result[1] != 0:
+                return False
+        else:
+            # A non-empty tree must name at least one framing neighbor.
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _validated_absence_state(state: object, expected_state: object) -> dict | None:
+    """Validate and return the embedded state anchor iff it exactly matches
+    the caller-pinned ``expected_state`` document (same four keys/types)."""
+    if not isinstance(state, dict):
+        return None
+    if set(state.keys()) != set(_ABSENCE_STATE_KEYS):
+        return None
+    if not isinstance(expected_state, dict):
+        return None
+    if set(expected_state.keys()) != set(_ABSENCE_STATE_KEYS):
+        return None
+    expected_root = expected_state["state_root"]
+    expected_height = expected_state["height"]
+    expected_hash = expected_state["block_hash"]
+    expected_count = expected_state["account_count"]
+    if not _is_hex64(expected_root) or not _is_hex64(expected_hash):
+        return None
+    if (
+        isinstance(expected_height, bool)
+        or not isinstance(expected_height, int)
+        or expected_height < 0
+    ):
+        return None
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count < 0
+    ):
+        return None
+    root = state["state_root"]
+    height = state["height"]
+    block_hash = state["block_hash"]
+    account_count = state["account_count"]
+    if not _is_hex64(root) or not _is_hex64(block_hash):
+        return None
+    if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+        return None
+    if (
+        isinstance(account_count, bool)
+        or not isinstance(account_count, int)
+        or account_count < 0
+    ):
+        return None
+    if root != expected_root:
+        return None
+    if height != expected_height:
+        return None
+    if block_hash != expected_hash:
+        return None
+    if account_count != expected_count:
+        return None
+    return {
+        "state_root": root,
+        "height": height,
+        "block_hash": block_hash,
+        "account_count": account_count,
+    }
+
+
+def _validated_absence_neighbor(
+    neighbor: object,
+    root: str,
+    height: int,
+    block_hash: str,
+    account_count: int,
+) -> tuple[str, int] | None:
+    """Validate one framing neighbor inclusion proof against the shared
+    anchor; return ``(account, index)`` on success."""
+    if not isinstance(neighbor, dict):
+        return None
+    if set(neighbor.keys()) != set(_ABSENCE_NEIGHBOR_KEYS):
+        return None
+    siblings = neighbor["siblings"]
+    if not isinstance(siblings, list):
+        return None
+    for item in siblings:
+        if not isinstance(item, dict) or set(item.keys()) != {"direction", "hash"}:
+            return None
+    name = neighbor["account"]
+    index = neighbor["index"]
+    if not isinstance(name, str) or not name:
+        return None
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None
+    if index < 0 or index >= account_count:
+        return None
+    if not verify_account_proof(neighbor, root, height, block_hash):
+        return None
+    return name, index

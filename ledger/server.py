@@ -924,6 +924,32 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     status, body = service.get_attested_account_proof(account, params)
                     self._send_json(status, body, sort_keys=False)
                     return
+                elif remainder.endswith("/absence-proof"):
+                    # GET /v1/accounts/{account}/absence-proof[?height=H] —
+                    # a non-membership proof in the account-state tree. The
+                    # account uses the same non-empty string semantics as the
+                    # single-account proof; height is its only optional,
+                    # single strict-decimal query parameter (malformed/
+                    # repeated/unknown 400). An unknown/pending anchor or a
+                    # pending chain tip is 404, a target already present in
+                    # the confirmed tree is 409. The success document keeps
+                    # the contract-fixed order account, state, lower, upper,
+                    # so it is serialized in insertion order.
+                    encoded_account = remainder[: -len("/absence-proof")]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    parsed = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) > 1 for values in parsed.values()):
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
+                        return
+                    params = {key: values[0] for key, values in parsed.items()}
+                    status, body = service.get_account_absence_proof(account, params)
+                    self._send_json(status, body, sort_keys=False)
+                    return
                 elif remainder.endswith("/proof"):
                     # GET /v1/accounts/{account}/proof[?height=H]
                     encoded_account = remainder[: -len("/proof")]
