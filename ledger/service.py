@@ -805,6 +805,88 @@ class LedgerService:
             receipt["nonce"] = tx.nonce
         return receipt
 
+    def get_transaction_receipts(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/transactions/receipts — a batch of plain receipts.
+
+        The body must be a JSON object containing exactly the ``tx_ids``
+        key: a list of one to two hundred distinct 64-lowercase-hex
+        strings. Every defect — an unparseable body (handled by the
+        server), a non-object, missing/extra keys, a non-array value, an
+        out-of-range count, a malformed element or a duplicate — is 400
+        ``{"error": "input"}`` and never touches state. Input validation
+        always precedes any transaction lookup, so a well-formed but
+        unknown id is not an input error.
+
+        A valid request always answers 200 with the fixed key order
+        ``items, total``: ``total`` is the requested id count and
+        ``items`` preserves the exact request order, each item in the
+        fixed key order ``tx_id, receipt, error``. A hit carries the
+        exact receipt document of :meth:`get_transaction` (a mempool
+        transaction keeps all three block-locator fields null, a
+        packed-but-unconfirmed one stays ``pending`` anchored at the
+        tip, a confirmed one is ``confirmed``; a sequenced transfer
+        keeps its ``nonce``, a legacy one gains no field) with ``error``
+        null; a miss carries ``receipt`` null and ``error``
+        ``not_found`` — even when every id misses. The lookup covers
+        the canonical chain and the mempool only; candidate forks are
+        never matches. The whole batch is resolved under one store
+        lock, so one response can never mix ledger states from before
+        and after a concurrent submission, confirmation, rollback or
+        adoption, and the query itself changes nothing.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"tx_ids"}:
+            return 400, {"error": "input"}
+        tx_ids_raw = payload["tx_ids"]
+        if (
+            not isinstance(tx_ids_raw, list)
+            or not 1 <= len(tx_ids_raw) <= 200
+            or any(not crypto.is_hex64(tx_id) for tx_id in tx_ids_raw)
+            or len(set(tx_ids_raw)) != len(tx_ids_raw)
+        ):
+            return 400, {"error": "input"}
+
+        with self.store.lock:
+            # One pass over the canonical chain (confirmed blocks plus
+            # the pending tip) locates every requested id at its first
+            # inclusion point; the mempool covers the rest. Candidate
+            # forks are never consulted.
+            located: dict[str, tuple[Block, int, Transaction]] = {}
+            wanted = set(tx_ids_raw)
+            for block in self.store.chain:
+                for index, tx in enumerate(block.transactions):
+                    if tx.tx_id in wanted and tx.tx_id not in located:
+                        located[tx.tx_id] = (block, index, tx)
+            items = []
+            for tx_id in tx_ids_raw:
+                receipt = None
+                match = located.get(tx_id)
+                if match is not None:
+                    block, index, tx = match
+                    if self._is_receipt_tx_well_typed(tx):
+                        receipt = self._transaction_receipt(
+                            tx,
+                            STATUS_CONFIRMED
+                            if block.status == STATUS_CONFIRMED
+                            else STATUS_PENDING,
+                            block.height,
+                            block.block_hash,
+                            index,
+                        )
+                else:
+                    tx = self.store.pending.get(tx_id)
+                    if tx is not None and self._is_receipt_tx_well_typed(tx):
+                        receipt = self._transaction_receipt(
+                            tx, STATUS_PENDING, None, None, None
+                        )
+                items.append(
+                    {
+                        "tx_id": tx_id,
+                        "receipt": receipt,
+                        "error": None if receipt is not None else "not_found",
+                    }
+                )
+            return 200, {"items": items, "total": len(tx_ids_raw)}
+
     def get_finalized_receipt(self, tx_id: object) -> tuple[int, dict]:
         """GET /v1/transactions/{tx_id}/finalized-receipt — an offline-verifiable
         finalized transaction receipt.

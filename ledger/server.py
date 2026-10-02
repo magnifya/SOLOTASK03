@@ -332,6 +332,29 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.audit_receipt_proofs(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions/receipts":
+                # POST /v1/transactions/receipts — a batch of plain
+                # transaction receipts. Read-only: no ledger/admin state
+                # changes, so it is not covered by uniform idempotency.
+                # The endpoint takes no query parameters: any query
+                # parameter (including a blank one) is 400
+                # {"error": "input"}; a bare trailing "?" carries none
+                # and is accepted like the other strict endpoints. The
+                # body is strictly {"tx_ids": [...]} and every defect —
+                # including an unparseable body — is 400
+                # {"error": "input"} before any state is read. The
+                # success document has the contract-fixed key order
+                # items,total, so it is serialized in insertion order
+                # rather than alphabetically.
+                if parse_qs(self.path.partition("?")[2], keep_blank_values=True):
+                    self._send_json(400, {"error": "input"})
+                    return
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                status, body = service.get_transaction_receipts(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions/finalized-receipts":
                 # POST /v1/transactions/finalized-receipts — a batch of
                 # finalized receipts sharing one signed chain snapshot. The
