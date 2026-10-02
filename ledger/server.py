@@ -828,11 +828,18 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.list_fork_syncs(params)
                 self._send_json(status, body)
             elif path == "/v1/index/transactions":
-                # GET /v1/index/transactions?tx_id=&account=&height=&limit=&cursor=
-                params = {
-                    key: values[0]
-                    for key, values in parse_qs(query, keep_blank_values=True).items()
-                }
+                # GET /v1/index/transactions?tx_id=&account=&height=&
+                # min_height=&max_height=&direction=&limit=&cursor= — the
+                # min_height/max_height/direction filters must not be
+                # repeated, even with identical values.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(
+                    len(parsed.get(key, ())) > 1
+                    for key in ("min_height", "max_height", "direction")
+                ):
+                    self._send_json(400, {"error": "input"})
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.list_transactions(params)
                 self._send_json(status, body)
             elif path.startswith("/v1/forks/") and path.endswith("/export"):

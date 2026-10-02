@@ -1004,13 +1004,24 @@ CLI 提供 `send-sequenced-batch --file PATH`：从 JSON 文件读取请求体�
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。
 查询参数 AND 组合：`tx_id`（64 位小写十六进制）、`account`（匹配 from 或 to）、
-`height`、`limit`、`cursor`；数值参数必须是首位非 0 的十进制（`0` 本身合法），
+`height`、`min_height`、`max_height`、`direction`、`limit`、`cursor`；数值参数必须
+是首位非 0 的十进制（`0` 本身合法），
 `limit` 默认 50、范围 1–200，`cursor` 默认 0，任何非法值返回 `400`。结果按
 `(height, index, tx_id)` 升序，`index` 是交易在块内从 0 起的位置，与 Merkle
 proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过滤后的总数，
 `cursor` 等于总数时返回空页、大于总数返回 `400`；`next_cursor` 是下一页偏移整数，
 没有更多结果时为 `null`。每个 item 含
 `{tx_id, height, block_hash, index, from, to, amount}`。
+
+`min_height`/`max_height` 是包含两端的高度区间，缺省的一端不设边界；与
+`height` 同时提供时取交集（高度不在区间内返回空页）。两者只接受 ASCII 非负
+十进制字符串（除 `0` 外禁止前导零；符号、小数、空白与非 ASCII 数字均非法）。
+`direction` 取 `all`（缺省；`account` 匹配发送方或接收方）、`out`（只匹配
+`from`）或 `in`（只匹配 `to`）；`in`/`out` 必须提供非空 `account`，`all`
+允许省略。自转账在任一匹配方向下只出现一次。新增参数的空值、非法格式、上下界
+倒置、非法 `direction`、`in`/`out` 缺少有效 `account` 或参数重复（即使重复值
+相同）均返回 `400` 与 `{"error":"input"}`；上界超过链尾不报错，整个区间位于
+链尾之后、未知账户或过滤交集为空时返回 `200` 空页。
 
 ## 交易回执
 
@@ -2130,8 +2141,9 @@ curl -s 'localhost:8080/v1/forks/sync/range/export?source=node-2&request_id=req-
 #         "anchor":{"height":2,"block_hash":"..."},"blocks":[{...}],"tip":{...},
 #         "attestation":null}
 
-# 确认链交易索引（tx_id/account/height/limit/cursor，AND 组合，非法 400）
-curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&limit=50&cursor=0'
+# 确认链交易索引（tx_id/account/height/min_height/max_height/direction/limit/cursor，
+# AND 组合，非法 400；新增参数校验失败返回 {"error":"input"}）
+curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&direction=out&min_height=1&max_height=9&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
 
 # 持久化来源信任（201 version=1 active；同内容 200；冲突 409；非法 400）
@@ -2248,7 +2260,7 @@ python -m ledger.cli adopt <tip-hash>
 
 # 导出候选分叉与确认链交易索引
 python -m ledger.cli export <tip-hash>
-python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--cursor N] [--limit N]
+python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--min-height N] [--max-height N] [--direction all|in|out] [--cursor N] [--limit N]
 
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'

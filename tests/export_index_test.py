@@ -310,6 +310,175 @@ class IndexServiceTests(unittest.TestCase):
             self.assertEqual(self.query(cursor=bad)[0], 400, bad)
 
 
+class IndexRangeDirectionTests(unittest.TestCase):
+    """min_height/max_height/direction filters on the transaction index."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.mkdtemp()
+        cls.svc = LedgerService(
+            LedgerStore(os.path.join(cls.tmp, "state.json"), initial_balance=1000),
+            initial_balance=1000,
+        )
+        cls.ka, cls.A = keypair()
+        cls.kb, cls.B = keypair()
+        # Block 1 (confirmed): A->B 10, A->A 7 (self-transfer).
+        # Block 2 (confirmed): B->A 5. Block 3 (pending tip): A->B 1.
+        for tx in (
+            signed_tx(cls.ka, cls.A, cls.B, 10),
+            signed_tx(cls.ka, cls.A, cls.A, 7),
+        ):
+            rc, _ = cls.svc.submit_transaction(tx)
+            assert rc == 202
+        assert cls.svc.mine_block()[0] == 201
+        assert cls.svc.confirm_block(1)[0] == 200
+        rc, _ = cls.svc.submit_transaction(signed_tx(cls.kb, cls.B, cls.A, 5))
+        assert rc == 202
+        assert cls.svc.mine_block()[0] == 201
+        assert cls.svc.confirm_block(2)[0] == 200
+        rc, _ = cls.svc.submit_transaction(signed_tx(cls.ka, cls.A, cls.B, 1))
+        assert rc == 202
+        assert cls.svc.mine_block()[0] == 201
+
+    def query(self, **params) -> tuple[int, dict]:
+        return self.svc.list_transactions(
+            {k: v for k, v in params.items() if v is not None}
+        )
+
+    def test_height_range_inclusive_bounds(self) -> None:
+        # Both bounds inclusive; either end may be omitted.
+        self.assertEqual(
+            self.query(min_height="1", max_height="2")[1]["total"], 3
+        )
+        self.assertEqual(self.query(min_height="2")[1]["total"], 1)
+        self.assertEqual(self.query(max_height="1")[1]["total"], 2)
+        status, body = self.query(min_height="1", max_height="1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 2)
+        self.assertTrue(all(it["height"] == 1 for it in body["items"]))
+        # Zero is a valid bound; genesis has no transactions.
+        self.assertEqual(self.query(min_height="0")[1]["total"], 3)
+        self.assertEqual(self.query(max_height="0")[1]["total"], 0)
+        # An upper bound past the chain tip is not an error.
+        self.assertEqual(self.query(max_height="99")[1]["total"], 3)
+        # A range entirely beyond the tip -> 200 empty page (the pending
+        # tip block 3 stays excluded).
+        for params in ({"min_height": "3"}, {"min_height": "3", "max_height": "9"}):
+            status, body = self.query(**params)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["items"], [])
+            self.assertEqual(body["total"], 0)
+            self.assertIsNone(body["next_cursor"])
+
+    def test_height_and_range_intersect(self) -> None:
+        # height combined with a range intersects; outside -> empty page.
+        self.assertEqual(
+            self.query(height="2", min_height="1", max_height="2")[1]["total"], 1
+        )
+        self.assertEqual(self.query(height="2", max_height="2")[1]["total"], 1)
+        for params in (
+            {"height": "1", "min_height": "2"},
+            {"height": "2", "max_height": "1"},
+        ):
+            status, body = self.query(**params)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["items"], [])
+            self.assertEqual(body["total"], 0)
+
+    def test_range_validation(self) -> None:
+        for key in ("min_height", "max_height"):
+            for bad in ("", "01", "00", "+1", "-1", "1.5", " 1", "1 ", "１２３", "abc"):
+                status, body = self.query(**{key: bad})
+                self.assertEqual(status, 400, (key, bad))
+                self.assertEqual(body, {"error": "input"}, (key, bad))
+        # Inverted bounds -> 400 input.
+        status, body = self.query(min_height="2", max_height="1")
+        self.assertEqual(status, 400)
+        self.assertEqual(body, {"error": "input"})
+
+    def test_direction_filter(self) -> None:
+        # Default / all: sender or recipient; the self-transfer A->A
+        # appears exactly once.
+        for direction in (None, "all"):
+            status, body = self.query(account=self.A, direction=direction)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["total"], 3)
+            ids = [it["tx_id"] for it in body["items"]]
+            self.assertEqual(len(ids), len(set(ids)))
+        # out: sender only; in: recipient only.
+        status, out = self.query(account=self.A, direction="out")
+        self.assertEqual(status, 200)
+        self.assertEqual(out["total"], 2)  # A->B and A->A
+        self.assertTrue(all(it["from"] == self.A for it in out["items"]))
+        status, inb = self.query(account=self.A, direction="in")
+        self.assertEqual(status, 200)
+        self.assertEqual(inb["total"], 2)  # A->A and B->A
+        self.assertTrue(all(it["to"] == self.A for it in inb["items"]))
+        # The self-transfer is the intersection of the two directions.
+        self_tx = next(
+            it["tx_id"]
+            for it in self.query()[1]["items"]
+            if it["from"] == it["to"]
+        )
+        self.assertEqual(
+            {it["tx_id"] for it in out["items"]}
+            & {it["tx_id"] for it in inb["items"]},
+            {self_tx},
+        )
+        status, body = self.query(account=self.B, direction="out")
+        self.assertEqual(body["total"], 1)  # B->A only
+        self.assertEqual(body["items"][0]["height"], 2)
+        status, body = self.query(account=self.B, direction="in")
+        self.assertEqual(body["total"], 1)  # A->B only
+        self.assertEqual(body["items"][0]["height"], 1)
+        # all (and only all) allows omitting the account.
+        self.assertEqual(self.query(direction="all")[1]["total"], 3)
+        # Direction combines with the other filters.
+        self.assertEqual(
+            self.query(account=self.A, direction="out", max_height="1")[1]["total"],
+            2,
+        )
+        self.assertEqual(
+            self.query(account=self.A, direction="in", height="2")[1]["total"], 1
+        )
+
+    def test_direction_validation(self) -> None:
+        for bad in ("", "bogus", "IN", "All", "inout"):
+            status, body = self.query(account=self.A, direction=bad)
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(body, {"error": "input"}, bad)
+        # in/out require a valid account: missing or empty -> 400 input.
+        for direction in ("in", "out"):
+            status, body = self.query(direction=direction)
+            self.assertEqual(status, 400)
+            self.assertEqual(body, {"error": "input"})
+            status, body = self.query(direction=direction, account="")
+            self.assertEqual(status, 400)
+            self.assertEqual(body, {"error": "input"})
+
+    def test_cursor_against_filtered_total(self) -> None:
+        # cursor == filtered total -> empty page; beyond -> 400.
+        status, body = self.query(account=self.A, direction="out", cursor="2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["items"], [])
+        self.assertEqual(body["total"], 2)
+        self.assertIsNone(body["next_cursor"])
+        self.assertEqual(
+            self.query(account=self.A, direction="out", cursor="3")[0], 400
+        )
+        status, body = self.query(min_height="2", cursor="1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["items"], [])
+        self.assertEqual(self.query(min_height="2", cursor="2")[0], 400)
+
+    def test_unknown_account_empty_page(self) -> None:
+        for direction in (None, "all", "in", "out"):
+            status, body = self.query(account="d" * 64, direction=direction)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["items"], [])
+            self.assertEqual(body["total"], 0)
+
+
 class ExportIndexHttpTests(unittest.TestCase):
     """Both endpoints over the real HTTP server."""
 
@@ -404,6 +573,49 @@ class ExportIndexHttpTests(unittest.TestCase):
             self.request("GET", "/v1/index/transactions?height=01")[0], 400
         )
 
+    def test_index_new_params_over_http(self) -> None:
+        # Repeated new parameters are rejected even with identical values.
+        for query in (
+            "min_height=1&min_height=1",
+            "max_height=1&max_height=2",
+            "direction=all&direction=all",
+        ):
+            status, body = self.request("GET", f"/v1/index/transactions?{query}")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "input"}, query)
+        # Repeated old parameters keep the existing first-value-wins behavior.
+        self.assertEqual(
+            self.request("GET", "/v1/index/transactions?height=1&height=2")[0], 200
+        )
+        # New-parameter validation failures report {"error": "input"}.
+        for query in (
+            "min_height=",
+            "min_height=%EF%BC%91",  # full-width digit
+            "max_height=+1",
+            "min_height=2&max_height=1",
+            "direction=sideways",
+            "direction=in",
+            "direction=out&account=",
+        ):
+            status, body = self.request("GET", f"/v1/index/transactions?{query}")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "input"}, query)
+        # The new filters apply over HTTP as well.
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?account={self.A}&direction=out"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 1)
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?account={self.A}&direction=in"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 0)
+        status, body = self.request("GET", "/v1/index/transactions?min_height=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["items"], [])
+
 
 class ExportIndexCliTests(unittest.TestCase):
     """The export and index CLI subcommands against a live server."""
@@ -478,6 +690,39 @@ class ExportIndexCliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("index", "--cursor", "99")[0], 1)
         self.assertEqual(self.run_cli("index", "--height", "01")[0], 1)
         self.assertEqual(self.run_cli("index", "--tx-id", "zz")[0], 1)
+
+    def test_index_cli_range_and_direction(self) -> None:
+        # The new options map to the query parameters and combine with the
+        # old ones; the fixture chain has one confirmed A->B tx at height 1.
+        rc, body = self.run_cli("index", "--min-height", "1", "--max-height", "1")
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body["total"], 1)
+        rc, body = self.run_cli("index", "--min-height", "2")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["items"], [])
+        rc, body = self.run_cli("index", "--account", self.A, "--direction", "out")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 1)
+        rc, body = self.run_cli("index", "--account", self.A, "--direction", "in")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 0)
+        rc, body = self.run_cli("index", "--direction", "all")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 1)
+        rc, body = self.run_cli(
+            "index", "--account", self.B, "--height", "1", "--direction", "in"
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 1)
+        # Server-side validation failures exit 1.
+        self.assertEqual(self.run_cli("index", "--min-height", "01")[0], 1)
+        self.assertEqual(self.run_cli("index", "--max-height", "１")[0], 1)
+        self.assertEqual(
+            self.run_cli("index", "--min-height", "2", "--max-height", "1")[0], 1
+        )
+        self.assertEqual(self.run_cli("index", "--direction", "bogus")[0], 1)
+        self.assertEqual(self.run_cli("index", "--direction", "in")[0], 1)
 
 
 if __name__ == "__main__":
