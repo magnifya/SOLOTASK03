@@ -4522,10 +4522,41 @@ class LedgerService:
         transaction's 0-based position inside its block, matching the Merkle
         proof index. A cursor beyond the filtered total returns 400, a cursor
         equal to it returns an empty page.
+
+        The optional anchor pair ``at_height``/``at_hash`` fixes the query
+        prefix to the confirmed main-chain blocks from genesis through the
+        anchor block inclusive. The parameters are all-or-nothing: exactly
+        one of them, an empty value, a malformed value (an ASCII
+        non-negative decimal without leading zeros; a 64-char lowercase hex
+        string) or a repeated occurrence returns the fixed
+        ``400 {"error": "input"}``. With both present, an unknown anchor
+        height (or one naming the pending tip) returns 404
+        ``anchor_not_found`` and a confirmed block with a different hash
+        returns 409 ``anchor_conflict``; candidate forks never satisfy an
+        anchor. Anchor errors take precedence over the cursor-out-of-range
+        check. With a valid prefix, the other filters still intersect it and
+        ``total``/``next_cursor`` count only the fixed prefix, so pages
+        taken under the same anchor stay identical as the chain tail grows
+        or is rolled back.
         """
         tx_id = params.get("tx_id")
         if tx_id is not None and not crypto.is_hex64(tx_id):
             return 400, {"error": "tx_id must be 64 lowercase hex characters"}
+
+        # Anchor pair: all-or-nothing with strict formats. Every violation
+        # maps to the contract-fixed {"error": "input"} and is answered
+        # before any state is read.
+        at_height_raw = params.get("at_height")
+        at_hash = params.get("at_hash")
+        anchor_present = at_height_raw is not None or at_hash is not None
+        if anchor_present:
+            if at_height_raw is None or at_hash is None:
+                return 400, {"error": "input"}
+            at_height = _parse_ascii_decimal(at_height_raw)
+            if at_height is None or not crypto.is_hex64(at_hash):
+                return 400, {"error": "input"}
+        else:
+            at_height = None
 
         # The range/direction parameters validate first so that every one of
         # their violations maps to the contract-fixed {"error": "input"} —
@@ -4580,10 +4611,25 @@ class LedgerService:
             cursor = parsed
 
         with self.store.lock:
+            # Resolve the anchor against the persisted main chain inside
+            # the same lock that builds the rows, so the anchor decision,
+            # the entries and the pagination share one chain snapshot;
+            # candidate forks are never consulted.
+            if anchor_present:
+                anchor_block = self.store.block_at(at_height)
+                if (
+                    anchor_block is None
+                    or anchor_block.status != STATUS_CONFIRMED
+                ):
+                    return 404, {"error": "anchor_not_found"}
+                if anchor_block.block_hash != at_hash:
+                    return 409, {"error": "anchor_conflict"}
             rows: list[dict] = []
             for block in self.store.chain:
                 if block.status != STATUS_CONFIRMED:
                     continue
+                if at_height is not None and block.height > at_height:
+                    break
                 if height is not None and block.height != height:
                     continue
                 if min_height is not None and block.height < min_height:

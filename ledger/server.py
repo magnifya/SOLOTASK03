@@ -829,14 +829,21 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 self._send_json(status, body)
             elif path == "/v1/index/transactions":
                 # GET /v1/index/transactions?tx_id=&account=&height=&
-                # min_height=&max_height=&direction=&limit=&cursor= — the
-                # range/direction parameters reject repeats (even identical
-                # values) with the fixed 400 {"error": "input"}; the legacy
-                # parameters keep their first-value-wins behaviour.
+                # min_height=&max_height=&direction=&at_height=&at_hash=&
+                # limit=&cursor= — the range/direction parameters and the
+                # anchor pair reject repeats (even identical values) with the
+                # fixed 400 {"error": "input"}; the legacy parameters keep
+                # their first-value-wins behaviour.
                 parsed = parse_qs(query, keep_blank_values=True)
                 if any(
                     len(parsed[name]) > 1
-                    for name in ("min_height", "max_height", "direction")
+                    for name in (
+                        "min_height",
+                        "max_height",
+                        "direction",
+                        "at_height",
+                        "at_hash",
+                    )
                     if name in parsed
                 ):
                     self._send_json(400, {"error": "input"})

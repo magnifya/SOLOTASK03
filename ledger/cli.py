@@ -636,6 +636,8 @@ def cmd_index(args: argparse.Namespace) -> int:
         "min_height": args.min_height,
         "max_height": args.max_height,
         "direction": args.direction,
+        "at_height": args.at_height,
+        "at_hash": args.at_hash,
         "cursor": args.cursor,
         "limit": args.limit,
     }
@@ -1485,6 +1487,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--direction",
         help="account flow direction: all (sender or recipient), "
         "out (sender only) or in (recipient only)",
+    )
+    p_index.add_argument(
+        "--at-height",
+        help="anchor block height fixing the query prefix (with --at-hash)",
+    )
+    p_index.add_argument(
+        "--at-hash",
+        help="anchor block hash, 64 lowercase hex characters (with --at-height)",
     )
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
