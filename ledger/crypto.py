@@ -554,3 +554,152 @@ def verify_account_proof(
         return True
     except (TypeError, ValueError):
         return False
+
+
+# Exact key sets of an account-absence-proof document (ignoring key order).
+_ABSENCE_TOP_KEYS = frozenset(("account", "state", "lower", "upper"))
+_ABSENCE_STATE_KEYS = frozenset(
+    ("state_root", "height", "block_hash", "account_count")
+)
+_ACCOUNT_PROOF_KEYS = frozenset(
+    (
+        "account",
+        "balance",
+        "confirmed_transactions",
+        "index",
+        "state_root",
+        "height",
+        "block_hash",
+        "siblings",
+    )
+)
+_SIBLING_KEYS = frozenset(("direction", "hash"))
+
+
+def _valid_state_anchor(state: object) -> bool:
+    """True iff ``state`` is a complete state-root document of the right types.
+
+    ``height`` / ``account_count`` must be non-negative ints (never bools) and
+    both hashes 64-char lowercase hex strings; missing or extra keys fail.
+    """
+    if not isinstance(state, dict) or frozenset(state) != _ABSENCE_STATE_KEYS:
+        return False
+    if not _is_hex64(state.get("state_root")):
+        return False
+    if not _is_hex64(state.get("block_hash")):
+        return False
+    height = state.get("height")
+    if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+        return False
+    count = state.get("account_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return False
+    return True
+
+
+def verify_account_absence_proof(
+    document: object, account: object, expected_state: object
+) -> bool:
+    """Verify an account-absence (non-membership) proof offline.
+
+    ``document`` is the ``{account, state, lower, upper}`` response: ``state``
+    is a complete state-root document and ``lower``/``upper`` are either
+    ``null`` or a full account inclusion proof of the immediate predecessor /
+    successor. The caller pins ``account`` (the claimed-missing target) and
+    ``expected_state`` (the exact state anchor). A proof returns True only
+    when every field is present with no extras and the correct type/format,
+    every neighbor leaf and Merkle path is valid under the pinned anchor, the
+    neighbors strictly bracket the target, and their indices are adjacent
+    (or the single neighbor sits on the zero/last-slot boundary). An empty
+    tree requires both sides null and the empty Merkle root. Every malformed
+    or tampered input returns False rather than raising; dict key order is
+    irrelevant.
+    """
+    try:
+        if not isinstance(account, str) or not account:
+            return False
+        if not isinstance(document, dict):
+            return False
+        if frozenset(document) != _ABSENCE_TOP_KEYS:
+            return False
+        if document.get("account") != account:
+            return False
+        state = document.get("state")
+        if not _valid_state_anchor(state):
+            return False
+        if not isinstance(expected_state, dict):
+            return False
+        if frozenset(expected_state) != _ABSENCE_STATE_KEYS:
+            return False
+        root = state["state_root"]
+        height = state["height"]
+        block_hash = state["block_hash"]
+        count = state["account_count"]
+        if root != expected_state.get("state_root"):
+            return False
+        if height != expected_state.get("height"):
+            return False
+        if block_hash != expected_state.get("block_hash"):
+            return False
+        if count != expected_state.get("account_count"):
+            return False
+        lower = document.get("lower")
+        upper = document.get("upper")
+        if lower is not None and not isinstance(lower, dict):
+            return False
+        if upper is not None and not isinstance(upper, dict):
+            return False
+
+        if count == 0:
+            # The empty set has no neighbors and the canonical empty root.
+            if lower is not None or upper is not None:
+                return False
+            return root == EMPTY_MERKLE_ROOT
+
+        # A non-empty tree claims at least one confirmed account, so exactly
+        # the bracketing side(s) of the missing target are present.
+        if lower is None and upper is None:
+            return False
+
+        def valid_neighbor(proof: object) -> bool:
+            if not isinstance(proof, dict):
+                return False
+            if frozenset(proof) != _ACCOUNT_PROOF_KEYS:
+                return False
+            siblings = proof.get("siblings")
+            if not isinstance(siblings, list):
+                return False
+            if any(
+                not isinstance(item, dict)
+                or frozenset(item) != _SIBLING_KEYS
+                for item in siblings
+            ):
+                return False
+            index = proof.get("index")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                or index >= count
+            ):
+                return False
+            return verify_account_proof(proof, root, height, block_hash)
+
+        if lower is not None and not valid_neighbor(lower):
+            return False
+        if upper is not None and not valid_neighbor(upper):
+            return False
+
+        if lower is not None:
+            if lower["account"] >= account:
+                return False
+            if lower["index"] != (upper["index"] - 1 if upper is not None else count - 1):
+                return False
+        if upper is not None:
+            if upper["account"] <= account:
+                return False
+            if upper["index"] != (lower["index"] + 1 if lower is not None else 0):
+                return False
+        return True
+    except (TypeError, ValueError):
+        return False

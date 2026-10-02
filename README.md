@@ -756,6 +756,43 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   `False` 而不抛异常；奇数层自我配对的幻像槽位（左兄弟等于当前节点）也判为
   非法。签名无需改变即可验证历史 proof——传入该高度的 root/height/block_hash
   即可。
+- **账户不存在证明**：`GET /v1/accounts/{account}/absence-proof` 证明目标
+  账户**未进入锚点对应的已确认账户集合**（仅此而已：不代表余额为零，也不
+  涉及任何 pending 收入）。账户沿用单账户证明的非空字符串语义；`height` 是
+  唯一可选的**单值**查询参数，严格十进制规则与 state-proof 完全相同：非法、
+  重复或未知参数返回 `400`；锚点未知/非 canonical/pending、未指定高度而链尾
+  pending 均返回 `404`；目标账户已在该（历史）已确认状态树中返回
+  `409 {"error": "account already exists"}`。只有账户缺失且锚点可用才返回
+  `200`。查询完全只读：不改变账本、generation、索引或审计事件。成功文档
+  顶层键序固定为 `account, state, lower, upper`：`state` 复用状态根文档
+  （`state_root, height, block_hash, account_count`）；`lower`/`upper`
+  分别携带紧邻目标的**前驱/后继完整账户包含证明**（字段与键序同
+  state-proof），缺失的一侧为 `null`。目标位于两账户之间时，两个邻居账户名
+  严格夹住目标（`lower.account < account < upper.account`）且索引相邻
+  （`upper.index == lower.index + 1`）；目标位于首账户之前时只有 `upper`
+  且其 `index == 0`；位于末账户之后时只有 `lower` 且其
+  `index == account_count - 1`；空树两侧均为 `null`，`account_count == 0`，
+  根为空树 Merkle 根。邻居沿用当前账户排序（原始字符串码位升序，不做大小写
+  折叠或 Unicode 归一化）与链上交易原序；响应中的状态锚、账户数和邻居证明
+  来自同一把锁内的同一份 canonical 已确认视图。
+- **账户不存在证明离线校验**：
+  `ledger.crypto.verify_account_absence_proof(document, account,
+  expected_state) -> bool` 为纯库入口：不读写文件、不抛异常，键序不影响
+  判断。调用方钉住目标账户 `account`（非空字符串）与**完整**状态根文档
+  `expected_state`。仅当以下全部成立才返回 `True`：文档恰含
+  `account, state, lower, upper`（缺失或额外字段均 `False`），文档账户
+  等于钉住账户；`state` 与 `expected_state` 恰含
+  `state_root, height, block_hash, account_count` 四字段（`height` 与
+  `account_count` 为非负整数，布尔值不当作数字，两个 hash 为 64 位小写
+  hex）且账户、根、高度、区块哈希和账户数五项逐一相等；空树要求两侧均为
+  `null` 且根为现有空树根；非空树至少一侧存在，每份非空邻居是键集合完整、
+  叶子与 Merkle 路径都对该锚点有效的账户包含证明，其 `index` 落在
+  `[0, account_count)` 内（越界、负数、布尔值、奇数节点自我复制产生的
+  幻像槽位一律 `False`），账户名严格夹住目标，且两侧索引相邻或唯一邻居
+  分别位于索引零 / `account_count - 1` 边界。篡改任一邻居叶子或路径、混用
+  其他锚点、非相邻邻居、类型或格式错误均返回 `False`。历史证明只依据指定
+  高度的已确认前缀；重启与分叉后重新查询对应当前 canonical；确认与查询并发
+  时同一文档内的锚点与邻居证明不会混入不同状态。
 - **快照与恢复**：每次原子快照在 `state.state_root` 记录已确认账户树根（与
   链、generation 同一文档）。恢复时只对**唯一胜出快照**在同代冲突判定之后
   按该快照记录的初始余额重算状态根；重算值与记录不符即抛
@@ -1862,7 +1899,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 
 | 文件 | 职责 |
 | --- | --- |
-| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof` 与批量束 `verify_merkle_proof_bundle`）、账户状态叶子/状态根与 `verify_account_proof` 离线验证 |
+| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof` 与批量束 `verify_merkle_proof_bundle`）、账户状态叶子/状态根、`verify_account_proof` 离线验证与 `verify_account_absence_proof` 账户不存在（非成员）证明离线验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
@@ -2039,6 +2076,15 @@ curl -s localhost:8080/v1/accounts/<pubkey-hex>/proof
 #     "state_root":"...","height":N,"block_hash":"...","siblings":[{direction,hash}...]}
 # 历史锚点（非法/重复 height -> 400；锚点不可用或账户当时不存在 -> 404）
 curl -s "localhost:8080/v1/accounts/<pubkey-hex>/proof?height=H"
+# 账户不存在证明（height 可选单值、规则同 state-proof；非法/重复/未知参数 -> 400；
+# 锚点未知/pending -> 404；目标已在已确认集 -> 409；只读不改账本/generation/索引/审计）
+curl -s "localhost:8080/v1/accounts/<target-account>/absence-proof"
+curl -s "localhost:8080/v1/accounts/<target-account>/absence-proof?height=H"
+# -> 200 {"account":"<target>","state":{"state_root":"...","height":N,
+#         "block_hash":"...","account_count":K},
+#         "lower":null|{<前驱完整 state-proof>},"upper":null|{<后继完整 state-proof>}}
+# 空树（如创世高度）两侧均为 null；离线用
+# ledger.crypto.verify_account_absence_proof(document, account, state) 校验
 # 签名状态证明（height 可选单值、规则同 state-proof；非法 400；缺失/pending 404；
 # 200 键序 state,proof,auth，auth.signature =
 # Ed25519(SHA256(UTF8("ledger-state-proof-v1") || canonical_json(去auth)))，
@@ -2381,6 +2427,7 @@ python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）�
 python tests/merkle_proof_bundle_test.py  # 批量 Merkle 证明（verify_merkle_proof_bundle 键序/类型/唯一性/index 映射/路径/根/区块哈希、严格 400、404/409、POST /v1/blocks/{height}/proofs、CLI proofs）
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
+python tests/account_absence_proof_test.py  # 账户不存在证明 GET /v1/accounts/{account}/absence-proof（非空账户语义、height 严格单值参数 400、未知/pending 锚点与链尾 pending 404、目标已存在 409；空树/内部/边界邻居、严格码位排序无折叠归一化；只读不改账本/generation/索引/审计；历史前缀、重启、分叉 canonical、并发一致；verify_account_absence_proof 纯库校验：精确键集合、bool≠数值、锚点五字段匹配、邻居叶子与路径、相邻/边界、越界与幻像槽位、篡改/混用锚点均 False 且不抛异常）与 HTTP 线序
 python tests/attested_state_proof_test.py  # 签名状态证明 GET /v1/accounts/{account}/attested-proof（height 可选单值规则同 state-proof；非法/重复/未知参数 400；未知/pending 锚点与缺失账户 404；200 固定键序 state,proof,auth，state/proof 复用 state-root/state-proof 字段键序，auth 键序 key_version,signature；ledger-state-proof-v1 域 SHA256+Ed25519、链状态签名者同锁；verify_state_proof input/auth/integrity 分类、账户/锚点/index 范围/Merkle 路径、轮换历史验签、不抛异常）与 HTTP 线序
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化

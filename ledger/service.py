@@ -28,6 +28,7 @@ transaction in an empty ledger could never be accepted.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import hmac
 import json
@@ -1464,6 +1465,91 @@ class LedgerService:
                 "height": anchor.height,
                 "block_hash": anchor.block_hash,
                 "siblings": siblings,
+            }
+
+    def get_account_absence_proof(
+        self, account: str, params: dict | None = None
+    ) -> tuple[int, dict]:
+        """GET /v1/accounts/{account}/absence-proof — a non-membership proof.
+
+        The query-parameter and anchor rules are identical to
+        :meth:`get_account_proof`: ``height`` is the only accepted (optional,
+        single) strict non-negative decimal parameter; malformed, repeated or
+        unknown parameters are 400 and an unknown/non-canonical/pending anchor
+        (including a pending default tip) is 404. A target already present in
+        the confirmed account set returns 409: absence only means the account
+        never entered the confirmed set, not that its balance is zero.
+
+        On success the body has the fixed key order ``account, state, lower,
+        upper``: ``state`` is the state-root document
+        (``state_root, height, block_hash, account_count``) and ``lower`` /
+        ``upper`` are the full inclusion proofs of the immediate predecessor /
+        successor in the ascending account order, or ``null`` on the missing
+        side. For a target between two accounts the neighbors strictly bracket
+        it at adjacent indices; before the first or after the last account the
+        single neighbor sits at index 0 or ``account_count - 1``; an empty tree
+        yields both null. The anchor, account count and neighbor proofs are all
+        snapshotted from one canonical confirmed view under the store lock. The
+        query is read-only: it never touches the ledger, generation, indexes
+        or audit events.
+        """
+        height_raw: object = None
+        if params is not None:
+            if any(key != "height" for key in params):
+                return 400, {"error": "unknown query parameter"}
+            height_raw = params.get("height")
+        anchor_height: int | None = None
+        if height_raw is not None:
+            anchor_height = _parse_decimal(height_raw)
+            if anchor_height is None:
+                return 400, {"error": "height must be a non-negative decimal"}
+        with self.store.lock:
+            if anchor_height is None:
+                anchor = self.store.tip()
+            else:
+                anchor = self.store.block_at(anchor_height)
+                if anchor is None:
+                    return 404, {"error": "anchor block not found"}
+            if anchor.status != STATUS_CONFIRMED:
+                return 404, {"error": "chain tip is pending confirmation"}
+            prefix = (
+                self.store.chain
+                if anchor_height is None
+                else self.store.chain[: anchor.height + 1]
+            )
+            rows, leaves, root = self._state_tree(prefix)
+            names = [name for name, _b, _t in rows]
+            position = bisect.bisect_left(names, account)
+            if position < len(names) and names[position] == account:
+                return 409, {"error": "account already exists"}
+
+            state = {
+                "state_root": root,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "account_count": len(rows),
+            }
+
+            def neighbor_proof(index: int) -> dict:
+                name, balance, transactions = rows[index]
+                return {
+                    "account": name,
+                    "balance": balance,
+                    "confirmed_transactions": transactions,
+                    "index": index,
+                    "state_root": root,
+                    "height": anchor.height,
+                    "block_hash": anchor.block_hash,
+                    "siblings": crypto.merkle_proof(leaves, index),
+                }
+
+            lower = neighbor_proof(position - 1) if position > 0 else None
+            upper = neighbor_proof(position) if position < len(rows) else None
+            return 200, {
+                "account": account,
+                "state": state,
+                "lower": lower,
+                "upper": upper,
             }
 
     def get_attested_account_proof(

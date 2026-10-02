@@ -900,6 +900,32 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     status, body = service.get_account_sequence(account)
                     self._send_json(status, body)
                     return
+                if remainder.endswith("/absence-proof"):
+                    # GET /v1/accounts/{account}/absence-proof[?height=H] —
+                    # a non-membership proof in the confirmed account-state
+                    # tree. The query parameter rules are identical to /proof
+                    # (height is the only optional single parameter;
+                    # malformed/unknown 400, repeated rejected here); an
+                    # unknown/pending anchor is 404 and a target already in
+                    # the confirmed set is 409. The success document has the
+                    # contract key order account, state, lower, upper, so it
+                    # is serialized in insertion order rather than
+                    # alphabetically.
+                    encoded_account = remainder[: -len("/absence-proof")]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    parsed = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) > 1 for values in parsed.values()):
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
+                        return
+                    params = {key: values[0] for key, values in parsed.items()}
+                    status, body = service.get_account_absence_proof(account, params)
+                    self._send_json(status, body, sort_keys=False)
+                    return
                 if remainder.endswith("/attested-proof"):
                     # GET /v1/accounts/{account}/attested-proof[?height=H] —
                     # a signed account-state inclusion proof. The query
