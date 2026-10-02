@@ -828,10 +828,21 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.list_fork_syncs(params)
                 self._send_json(status, body)
             elif path == "/v1/index/transactions":
-                # GET /v1/index/transactions?tx_id=&account=&height=&limit=&cursor=
+                # GET /v1/index/transactions?tx_id=&account=&height=&
+                # min_height=&max_height=&direction=&limit=&cursor= — the
+                # range/direction parameters reject repeats (even identical
+                # values) with the fixed 400 {"error": "input"}; the legacy
+                # parameters keep their first-value-wins behaviour.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(
+                    len(parsed[name]) > 1
+                    for name in ("min_height", "max_height", "direction")
+                    if name in parsed
+                ):
+                    self._send_json(400, {"error": "input"})
+                    return
                 params = {
-                    key: values[0]
-                    for key, values in parse_qs(query, keep_blank_values=True).items()
+                    key: values[0] for key, values in parsed.items()
                 }
                 status, body = service.list_transactions(params)
                 self._send_json(status, body)

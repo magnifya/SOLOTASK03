@@ -10,8 +10,12 @@ five-field document (summary re-verification failure -> 400, duplicate ->
 only, AND-combined tx_id/account/height filters, strict decimal
 height/limit/cursor validation, (height, index, tx_id) ordering matching
 the Merkle proof index, items/total/next_cursor pagination with
-cursor == total -> empty page and cursor > total -> 400), plus the CLI
-``export`` and ``index`` subcommands (non-2xx -> exit code 1).
+cursor == total -> empty page and cursor > total -> 400; the inclusive
+min_height/max_height range intersecting an exact height, and the
+direction filter — all/out/in with in/out requiring a non-empty account,
+self-transfers listed once under every matching direction — where every
+new-parameter violation, including repeats, is 400 {"error": "input"}),
+plus the CLI ``export`` and ``index`` subcommands (non-2xx -> exit code 1).
 
 Run: python3 tests/export_index_test.py
 """
@@ -309,6 +313,170 @@ class IndexServiceTests(unittest.TestCase):
         for bad in ("-1", "01", "abc", ""):
             self.assertEqual(self.query(cursor=bad)[0], 400, bad)
 
+    def test_min_max_height_range(self) -> None:
+        # Inclusive bounds on both ends.
+        status, body = self.query(min_height="1", max_height="1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 2)
+        self.assertTrue(all(it["height"] == 1 for it in body["items"]))
+        status, body = self.query(min_height="2")
+        self.assertEqual([it["height"] for it in body["items"]], [2])
+        status, body = self.query(max_height="1")
+        self.assertEqual([it["height"] for it in body["items"]], [1, 1])
+        # A bound of 0 simply includes the (transaction-less) genesis range.
+        self.assertEqual(self.query(min_height="0")[1]["total"], 3)
+        self.assertEqual(self.query(min_height="0", max_height="0")[1]["total"], 0)
+        # An upper bound beyond the chain tip is not an error.
+        self.assertEqual(self.query(max_height="99")[1]["total"], 3)
+        # A range entirely beyond the tip -> 200 empty page.
+        for params in ({"min_height": "3"}, {"min_height": "5", "max_height": "9"}):
+            status, body = self.query(**params)
+            self.assertEqual(status, 200, params)
+            self.assertEqual(body["total"], 0)
+            self.assertEqual(body["items"], [])
+            self.assertIsNone(body["next_cursor"])
+
+    def test_height_intersects_range(self) -> None:
+        # An exact height inside the range -> intersection.
+        status, body = self.query(height="1", min_height="1", max_height="2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 2)
+        # An exact height outside the range -> empty page, not an error.
+        for params in (
+            {"height": "1", "min_height": "2"},
+            {"height": "2", "max_height": "1"},
+            {"height": "1", "min_height": "2", "max_height": "3"},
+        ):
+            status, body = self.query(**params)
+            self.assertEqual(status, 200, params)
+            self.assertEqual(body["total"], 0)
+            self.assertEqual(body["items"], [])
+
+    def test_range_validation_input_error(self) -> None:
+        # Empty values, signs, decimals, whitespace, leading zeros and
+        # non-ASCII digits are all the fixed {"error": "input"}.
+        for bad in ("", "01", "00", "-1", "+1", "1.0", " 1", "1 ", "1_0",
+                    "abc", "１２", "٣", "²"):
+            for key in ("min_height", "max_height"):
+                status, body = self.query(**{key: bad})
+                self.assertEqual(status, 400, (key, bad))
+                self.assertEqual(body, {"error": "input"}, (key, bad))
+        # Inverted bounds.
+        status, body = self.query(min_height="2", max_height="1")
+        self.assertEqual(status, 400)
+        self.assertEqual(body, {"error": "input"})
+        # Equal bounds are a valid single-height range.
+        status, body = self.query(min_height="2", max_height="2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 1)
+
+    def test_direction_filter(self) -> None:
+        # Default and explicit "all" keep the sender-or-recipient semantics.
+        self.assertEqual(self.query(account=self.A)[1]["total"], 2)
+        self.assertEqual(self.query(account=self.A, direction="all")[1]["total"], 2)
+        # out matches the sender only, in the recipient only.
+        status, body = self.query(account=self.B, direction="out")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 1)  # B->C
+        self.assertTrue(all(it["from"] == self.B for it in body["items"]))
+        status, body = self.query(account=self.B, direction="in")
+        self.assertEqual(body["total"], 1)  # A->B
+        self.assertTrue(all(it["to"] == self.B for it in body["items"]))
+        status, body = self.query(account=self.C, direction="in")
+        self.assertEqual(body["total"], 2)  # A->C, B->C
+        status, body = self.query(account=self.C, direction="out")
+        self.assertEqual(body["total"], 0)  # C->A sits in the pending tip
+        # Unknown account with a direction -> 200 empty page.
+        status, body = self.query(account="d" * 64, direction="out")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 0)
+
+    def test_direction_validation_input_error(self) -> None:
+        for bad in ("", "IN", "Out", "both", "none", "1"):
+            status, body = self.query(account=self.A, direction=bad)
+            self.assertEqual(status, 400, bad)
+            self.assertEqual(body, {"error": "input"}, bad)
+        # in/out require a non-empty account; all does not.
+        for direction in ("in", "out"):
+            status, body = self.query(direction=direction)
+            self.assertEqual(status, 400)
+            self.assertEqual(body, {"error": "input"})
+            status, body = self.query(direction=direction, account="")
+            self.assertEqual(status, 400)
+            self.assertEqual(body, {"error": "input"})
+        self.assertEqual(self.query(direction="all")[0], 200)
+
+    def test_range_direction_and_legacy_filters_combine(self) -> None:
+        status, body = self.query(
+            account=self.A, direction="out", min_height="1", max_height="1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 2)
+        status, body = self.query(account=self.A, direction="out", min_height="2")
+        self.assertEqual(body["total"], 0)
+        # total counts the whole filtered set while the page is sliced.
+        status, body = self.query(
+            account=self.A, direction="all", min_height="1", limit="1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(len(body["items"]), 1)
+        self.assertEqual(body["next_cursor"], 1)
+        # cursor == filtered total -> empty page; beyond -> 400.
+        status, body = self.query(account=self.A, direction="out", cursor="2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["items"], [])
+        self.assertEqual(self.query(account=self.A, direction="out", cursor="3")[0], 400)
+
+
+class IndexSelfTransferTests(unittest.TestCase):
+    """Self-transfers appear exactly once under every matching direction."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.mkdtemp()
+        cls.svc = LedgerService(
+            LedgerStore(os.path.join(cls.tmp, "state.json"), initial_balance=1000),
+            initial_balance=1000,
+        )
+        cls.ka, cls.A = keypair()
+        cls.kb, cls.B = keypair()
+        # Block 1 (confirmed): A->A 7 (self-transfer), A->B 3.
+        for key, sender, to, amount in (
+            (cls.ka, cls.A, cls.A, 7),
+            (cls.ka, cls.A, cls.B, 3),
+        ):
+            rc, _ = cls.svc.submit_transaction(signed_tx(key, sender, to, amount))
+            assert rc == 202
+        assert cls.svc.mine_block()[0] == 201
+        assert cls.svc.confirm_block(1)[0] == 200
+
+    def query(self, **params) -> tuple[int, dict]:
+        return self.svc.list_transactions(
+            {k: v for k, v in params.items() if v is not None}
+        )
+
+    def test_self_transfer_listed_once_per_direction(self) -> None:
+        # A->A and A->B are confirmed; the self-transfer matches every
+        # direction while A->B matches only the sender side.
+        expected = {None: 2, "all": 2, "out": 2, "in": 1}
+        for direction, total in expected.items():
+            params: dict = {"account": self.A}
+            if direction is not None:
+                params["direction"] = direction
+            status, body = self.query(**params)
+            self.assertEqual(status, 200, (direction, body))
+            self.assertEqual(body["total"], total, direction)
+            self_ids = [
+                item["tx_id"]
+                for item in body["items"]
+                if item["from"] == item["to"] == self.A
+            ]
+            self.assertEqual(len(self_ids), 1, direction)
+        # The other account is unaffected by the self-transfer.
+        self.assertEqual(self.query(account=self.B, direction="in")[1]["total"], 1)
+        self.assertEqual(self.query(account=self.B, direction="out")[1]["total"], 0)
+
 
 class ExportIndexHttpTests(unittest.TestCase):
     """Both endpoints over the real HTTP server."""
@@ -404,6 +572,59 @@ class ExportIndexHttpTests(unittest.TestCase):
             self.request("GET", "/v1/index/transactions?height=01")[0], 400
         )
 
+    def test_index_range_direction_over_http(self) -> None:
+        status, body = self.request(
+            "GET", "/v1/index/transactions?min_height=1&max_height=1"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 1)
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?account={self.A}&direction=out"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 1)
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?account={self.A}&direction=in"
+        )
+        self.assertEqual(body["total"], 0)
+        # A range past the chain tip is an empty page, not an error.
+        status, body = self.request("GET", "/v1/index/transactions?min_height=7")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["items"], [])
+        # Repeated legacy parameters keep the first-value-wins behaviour.
+        status, body = self.request("GET", "/v1/index/transactions?height=1&height=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 1)
+
+    def test_index_new_parameter_violations_over_http(self) -> None:
+        # %D9%A3 is the Arabic-Indic digit three; %EF%BC%91%EF%BC%92 is
+        # full-width "12" — both must be rejected like any malformed height.
+        for query in (
+            "min_height=",
+            "max_height=",
+            "direction=",
+            "min_height=01",
+            "max_height=-1",
+            "min_height=+1",
+            "max_height=1.0",
+            "min_height=%201",
+            "max_height=%D9%A3",
+            "min_height=%EF%BC%91%EF%BC%92",
+            "min_height=2&max_height=1",
+            "direction=sideways",
+            "direction=IN",
+            "direction=in",
+            "direction=out",
+            "direction=in&account=",
+            "min_height=1&min_height=1",
+            "max_height=2&max_height=2",
+            "direction=all&direction=all",
+            "min_height=1&min_height=2",
+        ):
+            status, body = self.request("GET", f"/v1/index/transactions?{query}")
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "input"}, query)
+
 
 class ExportIndexCliTests(unittest.TestCase):
     """The export and index CLI subcommands against a live server."""
@@ -478,6 +699,37 @@ class ExportIndexCliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("index", "--cursor", "99")[0], 1)
         self.assertEqual(self.run_cli("index", "--height", "01")[0], 1)
         self.assertEqual(self.run_cli("index", "--tx-id", "zz")[0], 1)
+
+    def test_index_cli_range_direction(self) -> None:
+        rc, body = self.run_cli("index", "--min-height", "1", "--max-height", "1")
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body["total"], 1)
+        rc, body = self.run_cli("index", "--account", self.A, "--direction", "out")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 1)
+        rc, body = self.run_cli("index", "--account", self.A, "--direction", "in")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 0)
+        # The new options combine with the legacy ones.
+        rc, body = self.run_cli(
+            "index", "--account", self.A, "--direction", "out",
+            "--min-height", "1", "--height", "1", "--limit", "10",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["total"], 1)
+        # A range past the chain tip is a successful empty page.
+        rc, body = self.run_cli("index", "--min-height", "5")
+        self.assertEqual(rc, 0)
+        self.assertEqual(body["items"], [])
+        self.assertEqual(body["total"], 0)
+        # Server-side validation failures exit 1.
+        self.assertEqual(self.run_cli("index", "--min-height", "01")[0], 1)
+        self.assertEqual(self.run_cli("index", "--max-height", "1.5")[0], 1)
+        self.assertEqual(self.run_cli("index", "--direction", "sideways")[0], 1)
+        self.assertEqual(self.run_cli("index", "--direction", "in")[0], 1)
+        self.assertEqual(
+            self.run_cli("index", "--min-height", "2", "--max-height", "1")[0], 1
+        )
 
 
 if __name__ == "__main__":

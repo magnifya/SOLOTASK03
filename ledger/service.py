@@ -107,6 +107,18 @@ def _parse_decimal(value: object) -> int | None:
     return int(value)
 
 
+def _parse_ascii_decimal(value: object) -> int | None:
+    """Like ``_parse_decimal`` but restricted to ASCII digits.
+
+    ``str.isdigit`` also accepts non-ASCII digits (Arabic-Indic, superscripts
+    and the like) that ``int`` then converts; the transaction-index range
+    parameters reject those outright.
+    """
+    if not isinstance(value, str) or not value or not value.isascii():
+        return None
+    return _parse_decimal(value)
+
+
 class LedgerService:
     def __init__(
         self,
@@ -4495,9 +4507,17 @@ class LedgerService:
 
         Pending-tip transactions are excluded. Filters (AND-combined):
         ``tx_id`` (64 lowercase hex), ``account`` (matches sender or
-        recipient) and ``height``; ``limit`` (default 50, range 1-200) and
-        ``cursor`` (default 0) paginate. Numeric filters must be plain
-        decimals without leading zeros; any malformed value returns 400.
+        recipient), ``height``, the inclusive ``min_height``/``max_height``
+        range (an exact ``height`` intersects with the range) and
+        ``direction`` (``all`` keeps the sender-or-recipient account match,
+        ``out`` matches senders only, ``in`` recipients only; ``in``/``out``
+        require a non-empty ``account``); ``limit`` (default 50, range
+        1-200) and ``cursor`` (default 0) paginate. Numeric filters must be
+        plain decimals without leading zeros; any malformed value returns
+        400. The range/direction parameters accept ASCII digits only and
+        every violation of their rules — empty values, malformed heights,
+        inverted bounds, an unknown direction, a missing account for
+        ``in``/``out`` — returns the fixed ``400 {"error": "input"}``.
         Rows are ordered by (height, index, tx_id); ``index`` is the
         transaction's 0-based position inside its block, matching the Merkle
         proof index. A cursor beyond the filtered total returns 400, a cursor
@@ -4506,6 +4526,37 @@ class LedgerService:
         tx_id = params.get("tx_id")
         if tx_id is not None and not crypto.is_hex64(tx_id):
             return 400, {"error": "tx_id must be 64 lowercase hex characters"}
+
+        # The range/direction parameters validate first so that every one of
+        # their violations maps to the contract-fixed {"error": "input"} —
+        # including ``in``/``out`` with an empty account, which would
+        # otherwise fall into the legacy account message below.
+        min_height = None
+        if params.get("min_height") is not None:
+            min_height = _parse_ascii_decimal(params["min_height"])
+            if min_height is None:
+                return 400, {"error": "input"}
+        max_height = None
+        if params.get("max_height") is not None:
+            max_height = _parse_ascii_decimal(params["max_height"])
+            if max_height is None:
+                return 400, {"error": "input"}
+        if (
+            min_height is not None
+            and max_height is not None
+            and min_height > max_height
+        ):
+            return 400, {"error": "input"}
+        direction = params.get("direction")
+        if direction is None:
+            direction = "all"
+        elif direction not in ("all", "in", "out"):
+            return 400, {"error": "input"}
+        if direction in ("in", "out"):
+            required_account = params.get("account")
+            if not isinstance(required_account, str) or not required_account:
+                return 400, {"error": "input"}
+
         account = params.get("account")
         if account is not None and (not isinstance(account, str) or not account):
             return 400, {"error": "account must be a non-empty string"}
@@ -4535,11 +4586,24 @@ class LedgerService:
                     continue
                 if height is not None and block.height != height:
                     continue
+                if min_height is not None and block.height < min_height:
+                    continue
+                if max_height is not None and block.height > max_height:
+                    continue
                 for index, tx in enumerate(block.transactions):
                     if tx_id is not None and tx.tx_id != tx_id:
                         continue
-                    if account is not None and account not in (tx.sender, tx.recipient):
-                        continue
+                    if account is not None:
+                        # A self-transfer matches every direction and is
+                        # listed once, since each transaction is tested once.
+                        if direction == "out":
+                            if tx.sender != account:
+                                continue
+                        elif direction == "in":
+                            if tx.recipient != account:
+                                continue
+                        elif account not in (tx.sender, tx.recipient):
+                            continue
                     rows.append(
                         {
                             "tx_id": tx.tx_id,

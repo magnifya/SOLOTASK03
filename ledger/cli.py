@@ -633,6 +633,9 @@ def cmd_index(args: argparse.Namespace) -> int:
         "tx_id": args.tx_id,
         "account": args.account,
         "height": args.height,
+        "min_height": args.min_height,
+        "max_height": args.max_height,
+        "direction": args.direction,
         "cursor": args.cursor,
         "limit": args.limit,
     }
@@ -1472,6 +1475,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--tx-id", help="filter by transaction id (64-char hex)")
     p_index.add_argument("--account", help="filter by sender or recipient account")
     p_index.add_argument("--height", help="filter by block height (decimal)")
+    p_index.add_argument(
+        "--min-height", help="filter by minimum block height (inclusive decimal)"
+    )
+    p_index.add_argument(
+        "--max-height", help="filter by maximum block height (inclusive decimal)"
+    )
+    p_index.add_argument(
+        "--direction",
+        help="account flow direction: all (sender or recipient), "
+        "out (sender only) or in (recipient only)",
+    )
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_index.set_defaults(func=cmd_index)
