@@ -1,4 +1,4 @@
-"""Command line interface: send, send-sequenced, send-sequenced-batch, sequence, tx, mine, block, account, proof, proofs,
+"""Command line interface: send, send-sequenced, send-sequenced-batch, sequence, tx, txs, mine, block, account, proof, proofs,
 state-root,
 state-proof, state-proofs, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
@@ -210,6 +210,33 @@ def cmd_tx(args: argparse.Namespace) -> int:
         "GET", f"{args.base_url}/v1/transactions/{quoted}", None
     )
     return _emit(status, body)
+
+
+def cmd_txs(args: argparse.Namespace) -> int:
+    # Batch ordinary receipts. The count, the 64-lowercase-hex shape and
+    # distinctness are checked locally first: any defect prints the ordered
+    # {"error": "input"} body and exits 1 without contacting the server,
+    # matching the service-side rules (1-200 distinct ids). The success
+    # document has a contract-fixed key order, so it is printed in insertion
+    # order rather than alphabetically; a 200 carrying not_found items is
+    # still success (exit 0).
+    tx_ids = args.tx_ids
+    if (
+        not tx_ids
+        or len(tx_ids) > 200
+        or any(not crypto.is_hex64(tx_id) for tx_id in tx_ids)
+        or len(set(tx_ids)) != len(tx_ids)
+    ):
+        print(json.dumps({"error": "input"}, sort_keys=False))
+        return 1
+    payload = {"tx_ids": list(tx_ids)}
+    status, body = _request(
+        "POST",
+        f"{args.base_url}/v1/transactions/receipts",
+        payload,
+        sort_keys=False,
+    )
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_account(args: argparse.Namespace) -> int:
@@ -1187,6 +1214,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_tx = sub.add_parser("tx", help="fetch a transaction receipt by tx_id")
     p_tx.add_argument("tx_id", help="transaction id (64 lowercase hex characters)")
     p_tx.set_defaults(func=cmd_tx)
+
+    p_txs = sub.add_parser(
+        "txs", help="fetch several transaction receipts in one batch query"
+    )
+    p_txs.add_argument(
+        "tx_ids",
+        metavar="tx_id",
+        nargs="*",
+        help="one to 200 distinct transaction ids "
+        "(64 lowercase hex characters); request order is preserved",
+    )
+    p_txs.set_defaults(func=cmd_txs)
 
     p_account = sub.add_parser("account", help="fetch an account")
     p_account.add_argument("account", help="account id (public key hex)")

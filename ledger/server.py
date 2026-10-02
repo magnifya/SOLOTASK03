@@ -332,6 +332,36 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.audit_receipt_proofs(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/transactions/receipts":
+                # POST /v1/transactions/receipts — a batch of ordinary
+                # transaction receipts resolved against one persisted ledger
+                # snapshot. The endpoint takes no query parameters: any
+                # parameter (including a blank one) is 400 {"error":
+                # "input"}; a bare trailing "?" carries none and is accepted.
+                # The body is strictly {"tx_ids": [...]} with 1-200 distinct
+                # 64-lowercase-hex ids; every parse/shape/type/range defect
+                # is the same 400 body. A legal batch answers 200 even when
+                # ids are unknown (receipt null, error "not_found"). The
+                # query is read-only (no idempotency wrapper, no state
+                # touched) and the success body has a contract-fixed key
+                # order (items, total; each item tx_id, receipt, error), so
+                # it is serialized in insertion order rather than
+                # alphabetically.
+                _route, _has_query, query_string = self.path.partition("?")
+                if _has_query and parse_qs(
+                    query_string, keep_blank_values=True
+                ):
+                    # The body is deliberately unread: close the connection
+                    # so it cannot desync the next pipelined request.
+                    self.close_connection = True
+                    self._send_json(400, {"error": "input"})
+                    return
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                status, body = service.get_transaction_receipts(payload)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/transactions/finalized-receipts":
                 # POST /v1/transactions/finalized-receipts — a batch of
                 # finalized receipts sharing one signed chain snapshot. The

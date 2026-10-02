@@ -805,6 +805,100 @@ class LedgerService:
             receipt["nonce"] = tx.nonce
         return receipt
 
+    # At most this many distinct ids are accepted by one batch receipt query.
+    RECEIPTS_MAX_TX_IDS = 200
+
+    def get_transaction_receipts(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/transactions/receipts — a batch of ordinary transaction
+        receipts against one persisted ledger state.
+
+        The body must be a JSON object containing exactly the ``tx_ids``
+        key: an array of between one and ``RECEIPTS_MAX_TX_IDS`` distinct
+        strings, each exactly 64 lowercase hex characters. Every other
+        shape — a non-object body, a missing or extra key, a non-array or
+        out-of-range array, a malformed element, or a duplicate — is 400
+        ``{"error": "input"}`` and never reaches the lookup; a well-formed
+        but unknown id is not an input error.
+
+        A legal batch is always answered 200 with the fixed key order
+        ``items, total``: ``total`` equals the number of requested ids and
+        ``items`` keeps the request order exactly. Each item has the fixed
+        key order ``tx_id, receipt, error``: a hit carries the exact
+        :meth:`get_transaction` receipt (same fields, types and meaning)
+        with ``error`` null; a miss carries a null ``receipt`` and
+        ``not_found`` — an id held only by a candidate fork, or retired by a
+        rollback or fork adoption, is a miss. The whole batch is resolved
+        under one store lock, so concurrent commits, confirms, rollbacks or
+        fork adoptions can never make one response straddle two ledger
+        states; the query is read-only.
+        """
+        bad_input = 400, {"error": "input"}
+        if not isinstance(payload, dict) or set(payload) != {"tx_ids"}:
+            return bad_input
+        tx_ids = payload["tx_ids"]
+        if not isinstance(tx_ids, list) or not (
+            1 <= len(tx_ids) <= self.RECEIPTS_MAX_TX_IDS
+        ):
+            return bad_input
+        if any(not crypto.is_hex64(tx_id) for tx_id in tx_ids):
+            return bad_input
+        if len(set(tx_ids)) != len(tx_ids):
+            return bad_input
+
+        with self.store.lock:
+            # Resolve every id against one persisted-state snapshot: the
+            # canonical chain first (confirmed blocks, then at most one
+            # pending tip), then the mempool. Candidate forks are never
+            # iterated, and receipts are rebuilt from the stored signed
+            # transactions exactly as for the single-receipt endpoint.
+            requested = set(tx_ids)
+            located: dict[str, tuple[str, int, str, int, Transaction]] = {}
+            for block in self.store.chain:
+                status = (
+                    STATUS_CONFIRMED
+                    if block.status == STATUS_CONFIRMED
+                    else STATUS_PENDING
+                )
+                for index, tx in enumerate(block.transactions):
+                    if tx.tx_id in requested and tx.tx_id not in located:
+                        located[tx.tx_id] = (
+                            status,
+                            block.height,
+                            block.block_hash,
+                            index,
+                            tx,
+                        )
+            items: list[dict] = []
+            for tx_id in tx_ids:
+                match = located.get(tx_id)
+                if match is None:
+                    tx = self.store.pending.get(tx_id)
+                    if tx is None:
+                        items.append(
+                            {"tx_id": tx_id, "receipt": None, "error": "not_found"}
+                        )
+                        continue
+                    match = (STATUS_PENDING, None, None, None, tx)
+                status, height, block_hash, index, tx = match
+                if not self._is_receipt_tx_well_typed(tx):
+                    # A stored value violating the receipt contract is
+                    # treated as absent rather than serialized, exactly as
+                    # the single-receipt endpoint's 404.
+                    items.append(
+                        {"tx_id": tx_id, "receipt": None, "error": "not_found"}
+                    )
+                    continue
+                items.append(
+                    {
+                        "tx_id": tx_id,
+                        "receipt": self._transaction_receipt(
+                            tx, status, height, block_hash, index
+                        ),
+                        "error": None,
+                    }
+                )
+            return 200, {"items": items, "total": len(items)}
+
     def get_finalized_receipt(self, tx_id: object) -> tuple[int, dict]:
         """GET /v1/transactions/{tx_id}/finalized-receipt — an offline-verifiable
         finalized transaction receipt.

@@ -1097,6 +1097,38 @@ pending 集合与待定尾块重建，快照损坏或冲突仍按既有规则抛
 `StateRecoveryError`。查询与提交、打包、确认、回滚、采用、清理共用同一把锁，
 只反映已持久化的状态。
 
+### 批量普通交易回执
+
+`POST /v1/transactions/receipts` 在单笔回执之外，一次查询一至多笔**普通**交易
+回执（内存池、待定末块、已确认均覆盖；与批量最终化回执不同，本接口只读、不带
+证明、不做最终化限制）。
+
+- **请求**：请求体必须是可解析为 UTF-8 JSON 的对象且**只含** `tx_ids` 一个
+  键；`tx_ids` 为数组，长度 **1 至 200**，元素两两互异，每个元素都是恰好 64
+  位**小写**十六进制字符串。请求体无法解析、不是对象、键缺失或多余、数组类型
+  错误、数量越界（0 或超过 200）、元素格式错误或重复，以及携带**任意查询
+  参数**（裸 `?` 不带参数不算），一律返回 `400` 与 `{"error":"input"}`，整批
+  不返回任何查询条目。输入检查先于交易查找；**合法但未知的 ID 不是输入错误**。
+- **响应**：请求合法时统一返回 `200`，即使全部未命中。顶层键序固定为
+  `items, total`：`total` 等于请求的 ID 数量；`items` **严格保持请求顺序**，
+  每项键序固定为 `tx_id, receipt, error`。
+  - **命中**：`receipt` 完整沿用单笔回执的字段、类型与含义（九字段；序列转账
+    追加 `nonce`，旧式交易不增加该字段；回执中的交易 ID 与签名交易相符），
+    `error` 为 `null`；
+  - **未命中**：`receipt` 为 `null`，`error` 为 `"not_found"`——只存在于候选
+    分叉、或已被回滚/分叉采用退役的旧位置交易均算未命中。
+- **状态一致性**：整批在**同一把锁**内对应同一个已持久化账本状态解析，并发
+  提交、确认、回滚或分叉采用不可能使一次响应混入变化前后的数据；回滚或分叉
+  采用后，每项结果与同一状态下的单笔查询一致，不继续暴露已退役交易的旧区块
+  位置。查询只读：不改变内存池、账户序列、generation、幂等记录或审计历史，
+  不创建文件；相同账本状态在重启前后返回相同结果。
+- **CLI**：`txs TX_ID...`（1 至 200 个参数，沿用现有服务地址配置）按**参数
+  顺序**发起批量查询并打印单行 JSON（键序 `items, total`）。参数数量、格式
+  或重复检查失败时，本地直接打印 `{"error":"input"}` 并以退出码 **1** 结束、
+  不发送请求；HTTP 200 时退出码为 **0**（包含未命中项也如此）；其他响应或
+  连接失败沿用既有错误输出并以 1 退出。现有 `tx` 命令、单笔回执、批量最终化
+  回执与确认链交易索引行为不变。
+
 ### 可离线验证的最终化回执
 
 `GET /v1/transactions/{tx_id}/finalized-receipt` 在普通回执之外给出一份
@@ -2048,6 +2080,13 @@ curl -s localhost:8080/v1/accounts/<pubkey-hex>
 curl -s localhost:8080/v1/transactions/<tx-id-hex>
 # -> 200 {"tx_id":"...","from":"...","to":"...","amount":N,"signature":"...",
 #         "status":"pending|confirmed","height":H|null,"block_hash":"...|null","index":I|null}
+# 批量普通交易回执（体只含 tx_ids：1-200 个互异 64 位小写 hex；任何形状/数量/重复/查询参数错误
+# 400 {"error":"input"} 且整批无条目；合法即 200，未命中项 receipt=null、error="not_found"）
+curl -s -X POST localhost:8080/v1/transactions/receipts \
+  -H 'Content-Type: application/json' \
+  -d '{"tx_ids":["<tx-id-hex-1>","<tx-id-hex-2>"]}'
+# -> 200 {"items":[{"tx_id":"...","receipt":{...同单笔回执...},"error":null},
+#                  {"tx_id":"...","receipt":null,"error":"not_found"}],"total":2}
 # 可离线验证的最终化回执（非法/不存在 404，未确认 409；200 键序 receipt,proof,headers,finality；
 # 离线用 verify_finalized_receipt(document, expected_tx_id, trust) 校验）
 curl -s localhost:8080/v1/transactions/<tx-id-hex>/finalized-receipt
@@ -2286,6 +2325,7 @@ python -m ledger.cli send --signing-key @alice.pem --to <recipient-pubkey-hex> -
 python -m ledger.cli mine
 python -m ledger.cli block 1
 python -m ledger.cli tx <tx-id-hex>
+python -m ledger.cli txs <tx-id-hex-1> <tx-id-hex-2>  # 批量普通回执（1-200 个互异 id；顺序保留；本地校验失败不发请求退出 1；200 含未命中仍退出 0）
 python -m ledger.cli account <pubkey-hex>
 python -m ledger.cli proof 1 <tx-id-hex>
 python -m ledger.cli proofs 1 <tx-id-hex-1> <tx-id-hex-2>  # 批量；非 2xx 退出 1
@@ -2431,6 +2471,7 @@ python tests/light_client_verify_finality_pages_test.py  # 最终化分页历史
 python tests/finality_locator_test.py   # 最终化分叉定位 POST /v1/chain/finalities/locate（体仅含顺序键 locators,limit；locators 1–64 项 height,block_hash 严格降序非布尔非负整数/64hex；limit 1–500 默认100、拒布尔；非法 400 无副作用；顺序取首个 canonical 同高同哈希 confirmed 命中否则 409；200 完全复用 GET /v1/chain/finalities 键序 anchor,finalities,next,head 仅 anchor 取命中项；verify_finality_locator_pages 成功 ok,anchor,head,matched_index,pages,verified_block_hashes 索引从0、locators 非法 input、首锚不在列表 integrity、不抛异常）与 HTTP
 python tests/light_client_apply_finality_locator_pages_test.py  # 定位最终化分页原子落盘 apply_finality_locator_pages（后四项沿用 verify_finality_locator_pages；仅接受已有检查点、缺文件 io；共锁依次结构 input→存量 state/io→认证 auth→完整性 integrity：命中锚与凭证逐高匹配 confirmed 分支、各页 head 相同且 head.tip 等于本地 tip 并钉住 tip_hash、分页/连续性/链描述符 S/末页到达 head.finalized；末目标不低于 finalized、同高不异 hash；全批通过才 v3 原子写 generation+1，目标相同幂等不改字节、空页锚高 confirmed 块推进一次；成功键序 ok,generation,finalized,matched_index,pages,applied、matched_index 0 基；失败仅 ok,error 不抛异常不改字节或代数）
 python tests/finalized_receipt_test.py  # 可离线验证最终化回执 GET /v1/transactions/{tx_id}/finalized-receipt（非法/不存在 404、内存池与 pending 尾块 409；200 固定键序 receipt,proof,headers,finality：九字段 receipt 且 status=confirmed、单笔 Merkle 证明六字段、头序列从交易块到最高 confirmed 块升序五字段全 confirmed、finality 沿用 /v1/chain/finality 且 finalized=末头；链与签名者同锁快照，pending 链尾止于上一 confirmed 块）与 verify_finalized_receipt（成功键序 ok,tx_id,height,block_hash,finalized；形状/类型/hex/expected_tx_id/trust 错 input、未知版本或 ledger-finality-v1 坏签名 auth、交易签名/重算 tx_id、receipt-proof-头绑定、Merkle 路径、头哈希与链接、末头/finality/tip 绑定 integrity；失败仅 ok,error、不抛异常）与 HTTP 线序
+python tests/transaction_receipts_test.py  # 批量普通回执 POST /v1/transactions/receipts（体仅 tx_ids：1-200 个互异 64 位小写 hex；非对象/缺多键/类型错/越界/格式错/重复/任意查询参数/非UTF-8 JSON 400 {"error":"input"} 且整批无条目，输入检查先于查找、合法未知不算错；200 固定键序 items,total，total=请求数，items 严格保序、每项 tx_id,receipt,error，命中沿用单笔回执（序列转账带 nonce），未命中 receipt=null/error=not_found 含全未命中；候选分叉不可见、回滚/分叉采用后与单笔一致不暴露旧位置；同锁单快照并发不混入、只读不改内存池/序列/generation/幂等/审计/文件、重启一致）与 HTTP 线序、CLI txs（本地数量/格式/重复校验失败打印 input 体退出 1 不发请求，200 含未命中退出 0，其他响应/连接失败退出 1，tx 不变）
 python tests/receipt_proofs_audit_http_test.py  # 回执证明批量审计 POST /v1/transactions/receipt-proofs/audit 与 CLI receipt-proofs-audit（体按序仅 documents,expected_root；空体/非UTF-8/JSON错/缺多乱序键/空数组/根非法 400 且键序 ok,error、不改状态；200 键序 ok,root,total,succeeded,errors,entries,digest，逐项不短路、tx_id 先占后同 ID 判 integrity、digest 可重算；并发与重启结果一致；CLI 文件/stdin、读取/JSON/参数错不请求服务输出 input 体退出 1、ok 真退出 0）
 python tests/attested_range_sync_test.py  # 签名增量区间 POST /v1/forks/sync/range/attested（domain=ledger-sync-range-v1 的 canonical SHA-256+Ed25519；400→403→410→403→409→400→409 优先级；冻结公钥/版本/签名/指纹；重试冻结公钥验签 403/重验 400/不同 409/相同 200；独立幂等命名空间；mode=attested 采用/过期事件、原子落盘回滚、重启重验与静默丢弃；syncs/history 纳入 attested/all）与 HTTP/CLI
 python tests/sync_history_test.py     # 同步生命周期历史 GET /v1/forks/sync/history（冻结摘要、过滤/严格数值/重复参数 400、排序分页、采用/过期不改写、重启兼容）与 HTTP/CLI
