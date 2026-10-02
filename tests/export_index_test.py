@@ -478,6 +478,307 @@ class IndexSelfTransferTests(unittest.TestCase):
         self.assertEqual(self.query(account=self.B, direction="out")[1]["total"], 0)
 
 
+class IndexAnchorTests(unittest.TestCase):
+    """at_height/at_hash block anchors for the transaction index."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.mkdtemp()
+        cls.state_path = os.path.join(cls.tmp, "anchor.json")
+        cls.svc = LedgerService(
+            LedgerStore(cls.state_path, initial_balance=1000),
+            initial_balance=1000,
+        )
+        cls.ka, cls.A = keypair()
+        cls.kb, cls.B = keypair()
+        cls.kc, cls.C = keypair()
+        # Confirmed block 1: A->B 10, A->C 20. Confirmed block 2: B->C 5.
+        for key, sender, to, amount in (
+            (cls.ka, cls.A, cls.B, 10),
+            (cls.ka, cls.A, cls.C, 20),
+        ):
+            rc, _ = cls.svc.submit_transaction(signed_tx(key, sender, to, amount))
+            assert rc == 202
+        assert cls.svc.mine_block()[0] == 201
+        assert cls.svc.confirm_block(1)[0] == 200
+        rc, _ = cls.svc.submit_transaction(signed_tx(cls.kb, cls.B, cls.C, 5))
+        assert rc == 202
+        assert cls.svc.mine_block()[0] == 201
+        assert cls.svc.confirm_block(2)[0] == 200
+        cls.genesis_hash = cls.svc.store.chain[0].block_hash
+        cls.hash1 = cls.svc.store.chain[1].block_hash
+        cls.hash2 = cls.svc.store.chain[2].block_hash
+        # A stored candidate fork at height 1 never satisfies an anchor.
+        fork_block = Block.create(
+            1, cls.genesis_hash, [tx_obj(cls.kc, cls.C, cls.A, 9)], "confirmed"
+        )
+        rc, body = cls.svc.submit_fork_candidate(
+            {"blocks": [cls.svc.store.chain[0].to_dict(), fork_block.to_dict()]}
+        )
+        assert rc == 201, body
+        cls.fork_block_hash = fork_block.block_hash
+
+    def query(self, **params) -> tuple[int, dict]:
+        return self.svc.list_transactions(
+            {k: v for k, v in params.items() if v is not None}
+        )
+
+    def anchor(self, anchor_height, block_hash, **extra) -> tuple[int, dict]:
+        return self.query(
+            at_height=str(anchor_height), at_hash=block_hash, **extra
+        )
+
+    def test_anchor_prefix_inclusive_and_paginated(self) -> None:
+        # Anchor at block 1: only the two block-1 transactions.
+        status, page1 = self.anchor(1, self.hash1, limit="1")
+        self.assertEqual(status, 200, page1)
+        self.assertEqual(page1["total"], 2)
+        self.assertEqual([it["height"] for it in page1["items"]], [1])
+        self.assertEqual(page1["next_cursor"], 1)
+        status, page2 = self.anchor(1, self.hash1, limit="1", cursor="1")
+        self.assertEqual(status, 200, page2)
+        self.assertEqual(page2["total"], 2)
+        self.assertEqual([it["height"] for it in page2["items"]], [1])
+        self.assertIsNone(page2["next_cursor"])
+        # The two pages concatenate to the full fixed-prefix set.
+        self.assertEqual(
+            [it["tx_id"] for it in page1["items"] + page2["items"]],
+            sorted(it["tx_id"] for it in page1["items"] + page2["items"]),
+        )
+        # Anchor at block 2 includes both confirmed blocks.
+        status, body = self.anchor(2, self.hash2)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 3)
+        self.assertEqual([it["height"] for it in body["items"]], [1, 1, 2])
+
+    def test_genesis_anchor_is_empty_set(self) -> None:
+        status, body = self.anchor(0, self.genesis_hash)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body, {"items": [], "total": 0, "next_cursor": None})
+
+    def test_anchor_pages_stable_when_tail_grows(self) -> None:
+        # Isolated store so growing the tail cannot perturb class-shared state.
+        path = os.path.join(self.tmp, "growth.json")
+        svc = LedgerService(
+            LedgerStore(path, initial_balance=1000), initial_balance=1000
+        )
+        for key, sender, to, amount in (
+            (self.ka, self.A, self.B, 10),
+            (self.ka, self.A, self.C, 20),
+        ):
+            assert svc.submit_transaction(signed_tx(key, sender, to, amount))[0] == 202
+        assert svc.mine_block()[0] == 201
+        assert svc.confirm_block(1)[0] == 200
+        hash1 = svc.store.chain[1].block_hash
+
+        def anchored():
+            return svc.list_transactions(
+                {"at_height": "1", "at_hash": hash1, "limit": "10"}
+            )
+
+        status, before = anchored()
+        self.assertEqual(status, 200)
+        self.assertEqual(before["total"], 2)
+        # Grow the confirmed tail by two more blocks; the fixed prefix and
+        # its multi-page set stay identical.
+        for key, sender, to, amount in (
+            (self.kb, self.B, self.C, 5),
+            (self.kc, self.C, self.A, 2),
+        ):
+            assert svc.submit_transaction(signed_tx(key, sender, to, amount))[0] == 202
+            assert svc.mine_block()[0] == 201
+            assert svc.confirm_block(svc.store.tip().height)[0] == 200
+        status, after = anchored()
+        self.assertEqual(status, 200, after)
+        self.assertEqual(after["total"], before["total"])
+        self.assertEqual(
+            [it["tx_id"] for it in after["items"]],
+            [it["tx_id"] for it in before["items"]],
+        )
+        # A height filter past the anchor is a normal empty page even though
+        # the chain now extends well beyond it.
+        status, body = svc.list_transactions(
+            {"at_height": "1", "at_hash": hash1, "min_height": "3"}
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["items"], [])
+        self.assertEqual(body["total"], 0)
+        self.assertIsNone(body["next_cursor"])
+
+    def test_anchor_intersects_other_filters(self) -> None:
+        # tx_id filter inside the prefix.
+        tx_id = self.svc.store.chain[1].transactions[0].tx_id
+        status, body = self.anchor(2, self.hash2, tx_id=tx_id)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 1)
+        # Account + direction intersect the prefix as usual.
+        status, body = self.anchor(
+            2, self.hash2, account=self.B, direction="out"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 1)
+        # An exact height above the anchor matches nothing.
+        status, body = self.anchor(1, self.hash1, height="2")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 0)
+
+    def test_anchor_cursor_rules(self) -> None:
+        # cursor == total is an empty page even with a limit.
+        status, body = self.anchor(1, self.hash1, cursor="2", limit="1")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["items"], [])
+        self.assertIsNone(body["next_cursor"])
+        # cursor > total keeps the legacy 400.
+        status, body = self.anchor(1, self.hash1, cursor="3")
+        self.assertEqual(status, 400, body)
+
+    def test_anchor_errors_take_precedence_over_cursor(self) -> None:
+        # Unknown anchor height with an out-of-range cursor: 404 wins.
+        status, body = self.query(
+            at_height="99", at_hash="a" * 64, cursor="999"
+        )
+        self.assertEqual(status, 404, body)
+        self.assertEqual(body, {"error": "anchor_not_found"})
+        # Hash conflict with an out-of-range cursor: 409 wins.
+        status, body = self.query(
+            at_height="1", at_hash="a" * 64, cursor="999"
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body, {"error": "anchor_conflict"})
+
+    def test_pending_anchor_is_not_found(self) -> None:
+        # Mine a pending tip without confirming it.
+        rc, _ = self.svc.submit_transaction(signed_tx(self.kb, self.B, self.A, 1))
+        assert rc == 202
+        assert self.svc.mine_block()[0] == 201
+        pending_height = self.svc.store.tip().height
+        pending_hash = self.svc.store.tip().block_hash
+        try:
+            status, body = self.anchor(pending_height, pending_hash)
+            self.assertEqual(status, 404, body)
+            self.assertEqual(body, {"error": "anchor_not_found"})
+            # The correct hash of a pending block is still not found.
+        finally:
+            assert self.svc.rollback_block(pending_height)[0] == 200
+
+    def test_candidate_fork_cannot_satisfy_anchor(self) -> None:
+        # The stored candidate's height-1 hash must be a conflict against the
+        # confirmed block, never a valid anchor.
+        status, body = self.query(
+            at_height="1", at_hash=self.fork_block_hash
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body, {"error": "anchor_conflict"})
+
+    def test_anchor_input_violations(self) -> None:
+        bad_cases = (
+            {"at_height": "1"},
+            {"at_hash": self.hash1},
+            {"at_height": "", "at_hash": self.hash1},
+            {"at_height": "1", "at_hash": ""},
+            {"at_height": "01", "at_hash": self.hash1},
+            {"at_height": "-1", "at_hash": self.hash1},
+            {"at_height": "1.0", "at_hash": self.hash1},
+            {"at_height": "x", "at_hash": self.hash1},
+            {"at_height": "1", "at_hash": "A" * 64},
+            {"at_height": "1", "at_hash": "a" * 63},
+            {"at_height": "1", "at_hash": "g" * 64},
+            {"at_height": "1", "at_hash": "xyz"},
+        )
+        for params in bad_cases:
+            status, body = self.query(**params)
+            self.assertEqual(status, 400, params)
+            self.assertEqual(body, {"error": "input"}, params)
+
+    def test_anchor_restart_stable(self) -> None:
+        status, first = self.anchor(2, self.hash2, limit="1")
+        self.assertEqual(status, 200, first)
+        reloaded = LedgerService(
+            LedgerStore(self.state_path, initial_balance=1000),
+            initial_balance=1000,
+        )
+        status, second = reloaded.list_transactions(
+            {"at_height": "2", "at_hash": self.hash2, "limit": "1"}
+        )
+        self.assertEqual(status, 200, second)
+        self.assertEqual(second, first)
+
+
+class IndexAnchorForkAdoptionTests(unittest.TestCase):
+    """Anchor behaviour across an atomic fork adoption."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+        self.state_path = os.path.join(self.tmp, "adopt.json")
+        self.svc = LedgerService(
+            LedgerStore(self.state_path, initial_balance=1000),
+            initial_balance=1000,
+        )
+        self.store = self.svc.store
+        self.ka, self.A = keypair()
+        self.kb, self.B = keypair()
+        self.kc, self.C = keypair()
+        genesis = self.store.chain[0]
+        # Canonical: one confirmed block 1 A->B 10 (chain length 2).
+        canon1 = Block.create(
+            1, genesis.block_hash, [tx_obj(self.ka, self.A, self.B, 10)],
+            "confirmed",
+        )
+        self.store.chain.append(canon1)
+        self.store.rebuild_derived()
+        self.store.save()
+        self.canon_hash1 = canon1.block_hash
+        # A strictly longer fork: f1 A->C 20, f2 C->A 1, both confirmed.
+        f1 = Block.create(
+            1, genesis.block_hash, [tx_obj(self.ka, self.A, self.C, 20)],
+            "confirmed",
+        )
+        f2 = Block.create(
+            2, f1.block_hash, [tx_obj(self.kc, self.C, self.A, 1)], "confirmed"
+        )
+        status, body = self.svc.submit_fork_candidate(
+            {"blocks": [genesis.to_dict(), f1.to_dict(), f2.to_dict()]}
+        )
+        assert status == 201, body
+        self.fork_tip = body["tip_hash"]
+        self.fork_hash1 = f1.block_hash
+
+    def anchor_query(self, service, height, block_hash):
+        return service.list_transactions(
+            {"at_height": str(height), "at_hash": block_hash}
+        )
+
+    def test_genesis_anchor_survives_adoption(self) -> None:
+        status, before = self.anchor_query(self.svc, 0, self.store.chain[0].block_hash)
+        self.assertEqual(status, 200)
+        self.assertEqual(before["total"], 0)
+        status, adopted = self.svc.adopt_fork(self.fork_tip)
+        self.assertEqual(status, 200, adopted)
+        # The genesis hash is unchanged; the anchor still reads the same.
+        status, after = self.anchor_query(
+            self.svc, 0, self.store.chain[0].block_hash
+        )
+        self.assertEqual(status, 200, after)
+        self.assertEqual(after, before)
+
+    def test_conflicting_anchor_rejected_after_adoption(self) -> None:
+        # Valid before adoption on the old canonical block 1.
+        status, before = self.anchor_query(self.svc, 1, self.canon_hash1)
+        self.assertEqual(status, 200, before)
+        self.assertEqual(before["total"], 1)
+        status, _ = self.svc.adopt_fork(self.fork_tip)
+        self.assertEqual(status, 200)
+        # Same height now carries a different confirmed hash: 409.
+        status, after = self.anchor_query(self.svc, 1, self.canon_hash1)
+        self.assertEqual(status, 409, after)
+        self.assertEqual(after, {"error": "anchor_conflict"})
+        # The new chain's block 1 hash anchors cleanly with its tx set.
+        status, body = self.anchor_query(self.svc, 1, self.fork_hash1)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["block_hash"], self.fork_hash1)
+
+
 class ExportIndexHttpTests(unittest.TestCase):
     """Both endpoints over the real HTTP server."""
 
@@ -625,6 +926,59 @@ class ExportIndexHttpTests(unittest.TestCase):
             self.assertEqual(status, 400, query)
             self.assertEqual(body, {"error": "input"}, query)
 
+    def test_index_anchor_over_http(self) -> None:
+        genesis_hash = self.service.store.chain[0].block_hash
+        block_hash = self.service.store.chain[1].block_hash
+        # Valid genesis anchor: empty set.
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?at_height=0&at_hash={genesis_hash}"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["items"], [])
+        # Valid block-1 anchor: the single confirmed transaction.
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?at_height=1&at_hash={block_hash}"
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["tx_id"], self.tx_id)
+        # Unknown height -> 404, hash mismatch on confirmed block -> 409.
+        self.assertEqual(
+            self.request(
+                "GET",
+                f"/v1/index/transactions?at_height=9&at_hash={'a' * 64}",
+            )[0],
+            404,
+        )
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?at_height=1&at_hash={'a' * 64}"
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body, {"error": "anchor_conflict"})
+        # A stored candidate fork never satisfies the anchor.
+        fork_hash = self.service.store.forks[self.fork_tip][-1].block_hash
+        status, body = self.request(
+            "GET", f"/v1/index/transactions?at_height=1&at_hash={fork_hash}"
+        )
+        self.assertEqual(status, 409, body)
+        # Pairing, format and repeat violations are the fixed input error.
+        for query in (
+            "at_height=1",
+            f"at_hash={block_hash}",
+            f"at_height=&at_hash={block_hash}",
+            "at_height=1&at_hash=",
+            f"at_height=01&at_hash={block_hash}",
+            f"at_height=1&at_hash={'A' * 64}",
+            f"at_height=1&at_height=1&at_hash={block_hash}",
+            f"at_height=1&at_hash={block_hash}&at_hash={block_hash}",
+        ):
+            status, body = self.request(
+                "GET", f"/v1/index/transactions?{query}"
+            )
+            self.assertEqual(status, 400, query)
+            self.assertEqual(body, {"error": "input"}, query)
+
 
 class ExportIndexCliTests(unittest.TestCase):
     """The export and index CLI subcommands against a live server."""
@@ -729,6 +1083,44 @@ class ExportIndexCliTests(unittest.TestCase):
         self.assertEqual(self.run_cli("index", "--direction", "in")[0], 1)
         self.assertEqual(
             self.run_cli("index", "--min-height", "2", "--max-height", "1")[0], 1
+        )
+
+    def test_index_cli_anchor(self) -> None:
+        genesis_hash = self.service.store.chain[0].block_hash
+        block_hash = self.service.store.chain[1].block_hash
+        # Inputs are forwarded verbatim; a valid anchor exits 0 with the
+        # fixed-prefix set.
+        rc, body = self.run_cli(
+            "index", "--at-height", "1", "--at-hash", block_hash
+        )
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["items"][0]["tx_id"], body["items"][0]["tx_id"])
+        # Genesis anchor is a valid empty set.
+        rc, body = self.run_cli(
+            "index", "--at-height", "0", "--at-hash", genesis_hash
+        )
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body["total"], 0)
+        # 404/409/400 anchor responses exit 1 while still printing JSON.
+        rc, body = self.run_cli(
+            "index", "--at-height", "9", "--at-hash", "a" * 64
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(body, {"error": "anchor_not_found"})
+        rc, body = self.run_cli(
+            "index", "--at-height", "1", "--at-hash", "a" * 64
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(body, {"error": "anchor_conflict"})
+        self.assertEqual(
+            self.run_cli("index", "--at-height", "01",
+                         "--at-hash", block_hash)[0],
+            1,
+        )
+        # An unpaired anchor is rejected by the server.
+        self.assertEqual(
+            self.run_cli("index", "--at-height", "1")[0], 1
         )
 
 

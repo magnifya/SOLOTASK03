@@ -1023,6 +1023,19 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 相同）均返回 `400` 与 `{"error":"input"}`。上界超过链尾不报错；整个区间位于链尾
 之后、未知账户或过滤交集为空时返回 `200` 空页。
 
+区块锚点：可选的 `at_height`/`at_hash` 成对提供，把查询固定到**创世块到锚点块
+（含）**的已确认前缀；二者必须同时出现（缺任一或空值均非法），`at_height` 只接受
+ASCII 非负十进制（除 `0` 外禁止前导零），`at_hash` 只接受 64 位小写十六进制，
+任一参数重复（即使重复值相同）返回 `400` 与 `{"error":"input"}`。格式通过后，
+锚点高度不存在或对应 pending 块为 `404 {"error":"anchor_not_found"}`；高度为已确认
+块但哈希不同为 `409 {"error":"anchor_conflict"}`（候选分叉不能满足锚点）；这些锚点
+错误优先于 `cursor` 越界。锚点有效时其他过滤条件继续取交集，条目字段与排序不变，
+`total` 与 `next_cursor` 只统计固定前缀内的过滤结果；过滤高度超出锚点为正常空页，
+`cursor` 等于 `total` 为空页、大于 `total` 沿用 `400`。同一锚点下的多页结果在链尾
+继续增长（确认新块或回滚 pending 尾块）后仍拼成同一份交易集合；分叉采用后锚点仍是
+同一已确认块且哈希相同则结果不变，否则按上述错误拒绝。创世锚点有效并返回空集合。
+锚点判断、条目与分页信息取自同一份已持久化主链状态；二者都省略时保留原有行为。
+
 ## 交易回执
 
 `GET /v1/transactions/{tx_id}` 返回单笔交易的回执。`tx_id` 必须恰好是 64 位
@@ -2145,6 +2158,10 @@ curl -s 'localhost:8080/v1/forks/sync/range/export?source=node-2&request_id=req-
 # AND 组合，非法 400；新参数违规一律 {"error":"input"}）
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&min_height=1&max_height=9&direction=out&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
+# at_height/at_hash 成对提供时把结果固定在创世块..锚点块（含）的已确认前缀
+# （缺对/空/非法/重复 400 input；锚点不存在或 pending 404 anchor_not_found；
+# 哈希不符 409 anchor_conflict）
+curl -s 'localhost:8080/v1/index/transactions?at_height=9&at_hash=<64-hex>&limit=50&cursor=0'
 
 # 持久化来源信任（201 version=1 active；同内容 200；冲突 409；非法 400）
 curl -s -X POST localhost:8080/v1/trust/sources \

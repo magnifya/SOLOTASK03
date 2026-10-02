@@ -4518,6 +4518,19 @@ class LedgerService:
         every violation of their rules — empty values, malformed heights,
         inverted bounds, an unknown direction, a missing account for
         ``in``/``out`` — returns the fixed ``400 {"error": "input"}``.
+        The optional ``at_height``/``at_hash`` pair pins the query to the
+        immutable confirmed prefix from genesis through the anchor block
+        (inclusive); both must be provided together, ``at_height`` an ASCII
+        non-negative decimal without leading zeros and ``at_hash`` 64
+        lowercase hex characters — every pairing/format violation returns
+        the fixed ``400 {"error": "input"}``. A well-formed anchor naming a
+        height that does not exist or is a pending block is 404, and a hash
+        differing from the confirmed block at that height is 409; these
+        anchor errors take precedence over a cursor past the result set.
+        Candidate forks never satisfy an anchor. With a valid anchor the
+        other filters still intersect and ``total``/``next_cursor`` count
+        only the rows inside the fixed prefix; omitting the pair keeps the
+        original growing-chain behaviour.
         Rows are ordered by (height, index, tx_id); ``index`` is the
         transaction's 0-based position inside its block, matching the Merkle
         proof index. A cursor beyond the filtered total returns 400, a cursor
@@ -4579,9 +4592,41 @@ class LedgerService:
                 return 400, {"error": "cursor must be a non-negative decimal"}
             cursor = parsed
 
+        # The anchor pair pins the result to the fixed confirmed prefix
+        # genesis..at_height (inclusive). The two parameters must appear
+        # together and obey the strict ASCII-decimal / lowercase-hex rules;
+        # every pairing or format violation is the fixed input error.
+        at_height_raw = params.get("at_height")
+        at_hash = params.get("at_hash")
+        if (at_height_raw is None) != (at_hash is None):
+            return 400, {"error": "input"}
+        at_height = None
+        if at_height_raw is not None:
+            at_height = _parse_ascii_decimal(at_height_raw)
+            if at_height is None or not crypto.is_hex64(at_hash):
+                return 400, {"error": "input"}
+
         with self.store.lock:
+            if at_height is not None:
+                # Resolve the anchor before pagination so a missing,
+                # pending or hash-conflicting anchor outranks a cursor past
+                # the result set. Only the persisted canonical chain is
+                # consulted; stored fork candidates never anchor a query.
+                anchor_block = self.store.block_at(at_height)
+                if (
+                    anchor_block is None
+                    or anchor_block.status != STATUS_CONFIRMED
+                ):
+                    return 404, {"error": "anchor_not_found"}
+                if at_hash != anchor_block.block_hash:
+                    return 409, {"error": "anchor_conflict"}
             rows: list[dict] = []
-            for block in self.store.chain:
+            prefix = (
+                self.store.chain[: at_height + 1]
+                if at_height is not None
+                else self.store.chain
+            )
+            for block in prefix:
                 if block.status != STATUS_CONFIRMED:
                     continue
                 if height is not None and block.height != height:

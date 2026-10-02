@@ -833,10 +833,18 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 # range/direction parameters reject repeats (even identical
                 # values) with the fixed 400 {"error": "input"}; the legacy
                 # parameters keep their first-value-wins behaviour.
+                # The at_height/at_hash anchor pair follows the same strict
+                # no-repeat rule.
                 parsed = parse_qs(query, keep_blank_values=True)
                 if any(
                     len(parsed[name]) > 1
-                    for name in ("min_height", "max_height", "direction")
+                    for name in (
+                        "min_height",
+                        "max_height",
+                        "direction",
+                        "at_height",
+                        "at_hash",
+                    )
                     if name in parsed
                 ):
                     self._send_json(400, {"error": "input"})
