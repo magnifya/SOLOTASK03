@@ -12130,6 +12130,16 @@ AUDIT_REPORT_ARCHIVE_VERSION = 1
 AUDIT_REPORT_ARCHIVE_KEYS = ("v", "generation", "reports", "hash")
 RECORD_AUDIT_REPORT_RESULT_KEYS = ("ok", "digest", "generation")
 READ_AUDIT_REPORT_RESULT_KEYS = ("ok", "report", "generation")
+LIST_AUDIT_REPORTS_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "items",
+    "total",
+    "next_cursor",
+)
+LIST_AUDIT_REPORTS_ITEM_KEYS = ("generation", "report")
+LIST_AUDIT_REPORTS_DEFAULT_LIMIT = 50
+LIST_AUDIT_REPORTS_MAX_LIMIT = 200
 
 _audit_report_locks: dict[str, threading.RLock] = {}
 _audit_report_locks_guard = threading.Lock()
@@ -12458,5 +12468,104 @@ def read_state_anchors_audit_report(path: object, digest: object) -> dict:
                         "generation": position,
                     }
             return {"ok": False, "error": ERR_NOT_FOUND}
+    except _CheckpointError as failure:
+        return {"ok": False, "error": failure.category}
+
+
+def list_state_anchors_audit_reports(
+    path: object,
+    public_key: object = None,
+    limit: object = LIST_AUDIT_REPORTS_DEFAULT_LIMIT,
+    cursor: object = 0,
+) -> dict:
+    """Page through the recorded audit reports, optionally filtered by key.
+
+    ``path`` is the archive maintained by
+    :func:`record_state_anchors_audit_report`. ``public_key`` is ``None``
+    (the default) to keep every report, otherwise a 64-lowercase-hex
+    Ed25519 key and only reports sealed by exactly that key are kept.
+    ``limit`` is the page size (default 50, accepted range 1-200) and
+    ``cursor`` the zero-based offset into the filtered sequence (default
+    0); both must be plain non-boolean integers and ``cursor`` must not be
+    negative. Filtering never renumbers: each item keeps the fixed
+    1-based generation the report was first recorded at, and an idempotent
+    same-digest resubmission occupies exactly one item.
+
+    Success returns ``{"ok": True, "generation", "items", "total",
+    "next_cursor"}`` in that key order: ``generation`` is the archive's
+    current total generation, ``total`` the number of reports surviving
+    the filter and ``items`` the page in ascending first-recording
+    generation, each entry ``{"generation", "report"}`` with the original
+    report document (still accepted by
+    :func:`verify_state_anchors_audit_report`). A ``cursor`` equal to
+    ``total`` yields an empty page; when further entries follow,
+    ``next_cursor`` is the current offset plus this page's size, otherwise
+    it is ``None``. A legal filter with no matches yields ``total`` 0, an
+    empty page and a ``None`` cursor.
+
+    Failure returns only ``{"ok": False, "error": category}``: ``input``
+    for a bad path, key, limit or cursor (including a cursor beyond
+    ``total``), ``not_found`` for a missing archive, ``state`` for archive
+    parse/digest/ordering/replay corruption anywhere in the file (paging
+    and filtering never hide it) and ``io`` for a read failure. The query
+    validates solely from the archive's self-contained evidence — it never
+    re-reads the reports' source files — and it never writes, rewrites or
+    advances the archive. Same-path reads share the recorder's
+    cross-process lock, so one call's items, total and generation all come
+    from a single complete archive (the full old or the full new
+    generation under a concurrent append); nothing is raised and identical
+    file bytes with identical arguments yield identical results across
+    restarts.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if public_key is not None and (
+        not isinstance(public_key, str)
+        or not crypto.is_hex64(public_key)
+    ):
+        return {"ok": False, "error": ERR_INPUT}
+    if not _is_int(limit) or not 1 <= limit <= LIST_AUDIT_REPORTS_MAX_LIMIT:
+        return {"ok": False, "error": ERR_INPUT}
+    if not _is_int(cursor) or cursor < 0:
+        return {"ok": False, "error": ERR_INPUT}
+
+    try:
+        with _AuditReportArchiveLock(path, create=False):
+            try:
+                stored = _load_audit_report_archive(path)
+            except _CheckpointError as failure:
+                return {"ok": False, "error": failure.category}
+            except Exception:
+                return {"ok": False, "error": ERR_STATE}
+            if stored is None:
+                return {"ok": False, "error": ERR_NOT_FOUND}
+
+            matches = [
+                (position, report)
+                for position, report in enumerate(
+                    stored["reports"], start=1
+                )
+                if public_key is None
+                or report["public_key"] == public_key
+            ]
+            total = len(matches)
+            if cursor > total:
+                return {"ok": False, "error": ERR_INPUT}
+            page = matches[cursor : cursor + limit]
+            items = [
+                {
+                    "generation": position,
+                    "report": copy.deepcopy(report),
+                }
+                for position, report in page
+            ]
+            consumed = cursor + len(page)
+            return {
+                "ok": True,
+                "generation": stored["generation"],
+                "items": items,
+                "total": total,
+                "next_cursor": consumed if consumed < total else None,
+            }
     except _CheckpointError as failure:
         return {"ok": False, "error": failure.category}
