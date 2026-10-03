@@ -287,8 +287,17 @@ def cmd_state_proofs(args: argparse.Namespace) -> int:
     ):
         return _emit(400, {"ok": False, "error": "input"}, sort_keys=False)
     if args.height is not None:
+        # Strict non-negative ASCII decimal, same form as the server accepts:
+        # "0" or a string starting with 1-9 followed by 0-9 only. The empty
+        # string, leading zeros, signs, whitespace, decimal/scientific forms
+        # and non-ASCII digits (full-width, Arabic-Indic, superscript, mixed)
+        # are rejected locally without normalization or truncation. Any
+        # well-formed string (even an over-long one) is forwarded verbatim;
+        # an unknown height is answered 404 by the server.
         if args.height != "0" and (
-            not args.height.isdigit() or args.height[0] == "0"
+            not args.height.isascii()
+            or not args.height.isdigit()
+            or args.height[0] == "0"
         ):
             return _emit(400, {"ok": False, "error": "input"}, sort_keys=False)
         payload: dict = {"accounts": list(accounts), "height": args.height}

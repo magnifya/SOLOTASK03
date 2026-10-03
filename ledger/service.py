@@ -120,6 +120,44 @@ def _parse_ascii_decimal(value: object) -> int | None:
     return _parse_decimal(value)
 
 
+# Heights only ever index the canonical chain list, whose length never
+# approaches this value; a well-formed height string with more digits folds
+# to it instead of being converted to a giant integer. This keeps parsing
+# independent of the interpreter's integer-string digit cap, so an
+# over-long but well-formed request-body height stays a benign unknown
+# height rather than raising.
+_HEIGHT_BEYOND_CHAIN = 10**18
+_HEIGHT_MAX_DIGITS = len(str(_HEIGHT_BEYOND_CHAIN)) - 1  # 18
+
+
+def _parse_height_decimal(value: object) -> int | None:
+    """Parse a height as a strict non-negative ASCII decimal string.
+
+    Only the literal ``"0"`` or a string whose first character is an ASCII
+    digit ``1``-``9`` and whose remaining characters are all ASCII digits
+    ``0``-``9`` is accepted. The empty string, leading zeros, signs,
+    surrounding or interior whitespace, decimal points, scientific notation
+    and any non-ASCII digits (full-width, Arabic-Indic, superscript or mixed
+    scripts — which ``str.isdigit``/``int`` would otherwise accept) are all
+    rejected outright, with no normalization or truncation. Non-string
+    values (numbers, booleans, null) are rejected as well.
+
+    A well-formed string with more than
+    ``_HEIGHT_MAX_DIGITS`` digits folds to ``_HEIGHT_BEYOND_CHAIN`` rather
+    than undergoing an arbitrarily large (and possibly digit-capped)
+    conversion: it can only name an unknown height.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if not value.isascii() or not value.isdigit():
+        return None
+    if len(value) > 1 and value[0] == "0":
+        return None
+    if len(value) > _HEIGHT_MAX_DIGITS:
+        return _HEIGHT_BEYOND_CHAIN
+    return int(value)
+
+
 class LedgerService:
     def __init__(
         self,
@@ -1472,9 +1510,10 @@ class LedgerService:
         tip is confirmed.
 
         With a path height the state is replayed only from genesis through
-        that block: the height must be an unsigned decimal without leading
-        zeros (malformed heights are treated like any unknown path), the block
-        must exist on the canonical chain and be confirmed — an unknown,
+        that block: the height must be an unsigned ASCII decimal without
+        leading zeros (the empty string, signs, whitespace, decimal/scientific
+        forms and non-ASCII digits are treated like any unknown path), the
+        block must exist on the canonical chain and be confirmed — an unknown,
         non-canonical or pending height returns 404. The success body has
         exactly the same four fields as the unanchored endpoint.
         """
@@ -1482,9 +1521,10 @@ class LedgerService:
             if height is None:
                 anchor = self.store.tip()
             else:
-                # Strict unsigned decimal with no leading zeros, signs or
-                # whitespace; every malformed value is an unknown path (404).
-                height_int = _parse_decimal(height)
+                # Strict ASCII unsigned decimal with no leading zeros, signs
+                # or whitespace; every malformed value is an unknown path
+                # (404).
+                height_int = _parse_height_decimal(height)
                 if height_int is None:
                     return 404, {"error": "block not found"}
                 anchor = self.store.block_at(height_int)
@@ -1510,8 +1550,10 @@ class LedgerService:
         Without ``height`` the proof is anchored to the highest (confirmed)
         block. With ``height=H`` the state is deterministically replayed from
         the canonical confirmed prefix through that block only: the value must
-        be a plain non-negative decimal without leading zeros (a malformed or
-        repeated query parameter is 400), and an unknown/non-canonical/pending
+        be a plain non-negative ASCII decimal string without leading zeros
+        (no signs, whitespace, decimal/scientific forms or non-ASCII digits;
+        a malformed or repeated query parameter is 400), and an
+        unknown/non-canonical/pending
         anchor height is 404. ``height`` is the only accepted query parameter;
         any unknown parameter is 400. Returns 404 while a pending tip anchors
         the default view, or for an account absent from the (historical)
@@ -1524,7 +1566,7 @@ class LedgerService:
             height_raw = params.get("height")
         anchor_height: int | None = None
         if height_raw is not None:
-            anchor_height = _parse_decimal(height_raw)
+            anchor_height = _parse_height_decimal(height_raw)
             if anchor_height is None:
                 return 400, {"error": "height must be a non-negative decimal"}
         with self.store.lock:
@@ -1595,7 +1637,7 @@ class LedgerService:
             height_raw = params.get("height")
         anchor_height: int | None = None
         if height_raw is not None:
-            anchor_height = _parse_decimal(height_raw)
+            anchor_height = _parse_height_decimal(height_raw)
             if anchor_height is None:
                 return 400, {"error": "height must be a non-negative decimal"}
         with self.store.lock:
@@ -1695,7 +1737,7 @@ class LedgerService:
             height_raw = params.get("height")
         anchor_height: int | None = None
         if height_raw is not None:
-            anchor_height = _parse_decimal(height_raw)
+            anchor_height = _parse_height_decimal(height_raw)
             if anchor_height is None:
                 return 400, {"error": "height must be a non-negative decimal"}
         from . import light_client
@@ -1752,7 +1794,7 @@ class LedgerService:
             height_raw = params.get("height")
         anchor_height: int | None = None
         if height_raw is not None:
-            anchor_height = _parse_decimal(height_raw)
+            anchor_height = _parse_height_decimal(height_raw)
             if anchor_height is None:
                 return 400, {"error": "height must be a non-negative decimal"}
         from . import light_client
@@ -1853,7 +1895,7 @@ class LedgerService:
             return 400, {"error": "accounts must be distinct"}
         anchor_height: int | None = None
         if "height" in payload:
-            anchor_height = _parse_decimal(payload["height"])
+            anchor_height = _parse_height_decimal(payload["height"])
             if anchor_height is None:
                 return 400, {"error": "height must be a non-negative decimal"}
         from . import light_client
