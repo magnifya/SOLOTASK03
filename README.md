@@ -822,6 +822,34 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   状态根（任一绑定或证明错误为 `integrity`）。成功键序固定为
   `ok, account, height, block_hash, state_root`；失败仅返回
   `{"ok": false, "error"}`，`error` 仅取 `input`/`auth`/`integrity`。
+- **带审计签名的账户不存在证明**：`GET
+  /v1/accounts/{account}/attested-absence-proof` 在账户不存在证明之外给出
+  一份带审计签名的文档。账户沿用非空字符串语义（空账户路径 `404`）；
+  `height` 是唯一可选单值查询参数，沿用严格十进制格式，非法、重复或未知
+  参数返回 `400`；锚点未知/非 canonical/pending、未指定高度而链尾 pending
+  均返回 `404`；目标账户已在该高度的已确认集合中返回 `409`。不存在仍只
+  表示账户未进入**已确认集合**，不表示余额为零。成功 `200` 在原不存在证明
+  文档末尾追加 `auth`（顶层键序 `account, state, lower, upper, auth`），
+  其余字段语义不变；`auth` 键序为 `key_version, signature`，签名为当前
+  审计签名者对 `SHA256(UTF8("ledger-state-absence-proof-v1") ‖
+  canonical_json(去掉 auth 的文档))` 的 Ed25519 签名，轮换后旧证明仍可按
+  其 `key_version` 的历史公钥验证。状态锚、账户数、邻居证明与签名者来自
+  同一把锁内的同一份 canonical 视图；查询是纯读，重复查询与重启结果一致。
+- **签名不存在证明离线校验**：`ledger.light_client.
+  verify_state_absence_proof(document, account, trust) -> dict`（纯库
+  API，不读本地状态、**不抛异常**）。`document` 即上述 200 响应，
+  `account` 为调用方钉住的非空字符串目标账户，`trust` 须携带
+  `audit_signers`（格式同 `verify_state_proof`）。依次核对：各对象的
+  **键集/类型**（缺失或额外键、类型或编码错误、畸形账户与信任材料均为
+  `input`，布尔值不得当数值；对象字段换序不影响验证）；按 `key_version`
+  取审计公钥并按 `ledger-state-absence-proof-v1` 域验 Ed25519 签名（未知
+  版本或坏签名为 `auth`）；文档必须命名钉住账户，两邻居必须绑定内嵌状态
+  锚（不得混用锚点）、索引落在 `account_count` 范围内且 Merkle 路径重算
+  有效，邻居必须严格夹住目标且索引相邻，边界证明只能在索引 0 或
+  `account_count-1`，空树（`account_count == 0`、固定空树根、两侧 null）
+  边界必须成立（任一不符为 `integrity`）。成功键序固定为
+  `ok, account, height, block_hash, state_root`；失败仅返回
+  `{"ok": false, "error"}`，`error` 仅取 `input`/`auth`/`integrity`。
 - **CLI**：`state-root [--height H]` 与 `state-proof <account> [--height H]`
   两个子命令，`--height` 缺省时行为与输出完全不变；提供时逐字转发对应历史
   高度接口的单行 JSON 响应（含非 2xx 错误体）。`receipt-proofs-audit`
@@ -2457,6 +2485,7 @@ python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（ca
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
 python tests/absence_proof_test.py  # 账户不存在证明 GET /v1/accounts/{account}/absence-proof（height 可选单值严格十进制；非法/重复/未知 400、未知/pending 锚点 404、已存在 409；200 固定键序 account,state,lower,upper，前驱/后继完整包含证明与边界 null、空树根；纯读不改账本/索引/审计；verify_account_absence_proof 严格字段/类型/布尔、锚点绑定、邻居有效性/相邻/边界、幻像槽位/篡改/混用锚点不抛异常；HTTP/重启/分叉/并发一致性）
 python tests/attested_state_proof_test.py  # 签名状态证明 GET /v1/accounts/{account}/attested-proof（height 可选单值规则同 state-proof；非法/重复/未知参数 400；未知/pending 锚点与缺失账户 404；200 固定键序 state,proof,auth，state/proof 复用 state-root/state-proof 字段键序，auth 键序 key_version,signature；ledger-state-proof-v1 域 SHA256+Ed25519、链状态签名者同锁；verify_state_proof input/auth/integrity 分类、账户/锚点/index 范围/Merkle 路径、轮换历史验签、不抛异常）与 HTTP 线序
+python tests/attested_absence_proof_test.py  # 带审计签名的账户不存在证明 GET /v1/accounts/{account}/attested-absence-proof（账户非空字符串语义、空 404；height 可选单值严格十进制，非法/重复/未知 400；未知/pending 锚点与 pending 链尾 404、已存在 409；200 在不存在证明末尾追加 auth，键序 account,state,lower,upper,auth；ledger-state-absence-proof-v1 域 SHA256+Ed25519、状态与签名者同锁、轮换历史验签；verify_state_absence_proof input/auth/integrity 分类、键序无关、布尔非整数、目标/锚点/相邻/索引/Merkle/空树边界、不抛异常；纯读、重启一致）与 HTTP 线序
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验

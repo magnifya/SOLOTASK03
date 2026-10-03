@@ -930,6 +930,34 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     status, body = service.get_account_sequence(account)
                     self._send_json(status, body)
                     return
+                if remainder.endswith("/attested-absence-proof"):
+                    # GET /v1/accounts/{account}/attested-absence-proof[?height=H]
+                    # — a signed non-membership proof in the account-state
+                    # tree. The account and query-parameter rules are
+                    # identical to /absence-proof (non-empty account;
+                    # height is the only optional single strict-decimal
+                    # parameter; malformed/repeated/unknown 400; unknown or
+                    # pending anchor and pending tip 404; existing target
+                    # 409). The success document appends auth to the plain
+                    # absence-proof document (account, state, lower, upper,
+                    # auth), so it is serialized in insertion order.
+                    encoded_account = remainder[: -len("/attested-absence-proof")]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    parsed = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) > 1 for values in parsed.values()):
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
+                        return
+                    params = {key: values[0] for key, values in parsed.items()}
+                    status, body = service.get_attested_account_absence_proof(
+                        account, params
+                    )
+                    self._send_json(status, body, sort_keys=False)
+                    return
                 if remainder.endswith("/attested-proof"):
                     # GET /v1/accounts/{account}/attested-proof[?height=H] —
                     # a signed account-state inclusion proof. The query
