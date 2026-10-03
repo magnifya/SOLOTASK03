@@ -3748,6 +3748,246 @@ def verify_state_proofs(
     }
 
 
+# -- attested account-absence (non-membership) proofs -----------------------
+#
+# A GET /v1/accounts/{account}/attested-absence-proof response is the plain
+# absence document (account, state, lower, upper) with an ``auth`` envelope
+# appended, signed on its own domain (distinct from ledger-state-proof-v1 so
+# an inclusion proof can never verify as an absence proof and vice versa).
+
+STATE_ABSENCE_PROOF_DOMAIN = "ledger-state-absence-proof-v1"
+
+# The exact contract wire key order of an attested absence proof: the plain
+# absence document keys with ``auth`` appended.
+ATTESTED_STATE_ABSENCE_KEYS = (
+    "account",
+    "state",
+    "lower",
+    "upper",
+    "auth",
+)
+ABSENCE_DOC_KEY_SET = frozenset(("account", "state", "lower", "upper"))
+ABSENCE_STATE_KEY_SET = frozenset(STATE_ROOT_DOC_KEYS)
+ABSENCE_NEIGHBOR_KEY_SET = frozenset(STATE_PROOF_DOC_KEYS)
+
+# Fixed success key order returned by :func:`verify_state_absence_proof`.
+STATE_ABSENCE_RESULT_KEYS = (
+    "ok",
+    "account",
+    "height",
+    "block_hash",
+    "state_root",
+)
+
+
+def _state_absence_bytes(unsigned: dict) -> bytes:
+    """The signed bytes of an attested absence proof without its ``auth``
+    envelope:
+    ``UTF8("ledger-state-absence-proof-v1") || canonical_json({account, state,
+    lower, upper})``.
+    """
+    return STATE_ABSENCE_PROOF_DOMAIN.encode("utf-8") + _canonical_json_bytes(
+        unsigned
+    )
+
+
+def sign_state_absence_proof(
+    private_key_hex: str,
+    key_version: int,
+    account: str,
+    state: dict,
+    lower: dict | None,
+    upper: dict | None,
+) -> dict | None:
+    """Build the ``{key_version, signature}`` envelope of an attested absence
+    proof.
+
+    The signature is an Ed25519 signature over
+    ``SHA256(UTF8("ledger-state-absence-proof-v1") || canonical_json({account,
+    state, lower, upper}))``. Returns None when the private key is malformed.
+    """
+    unsigned = {
+        "account": account,
+        "state": state,
+        "lower": lower,
+        "upper": upper,
+    }
+    digest = hashlib.sha256(_state_absence_bytes(unsigned)).digest()
+    signature = crypto.sign_message(private_key_hex, digest)
+    if signature is None:
+        return None
+    return {"key_version": key_version, "signature": signature}
+
+
+def _parse_absence_state_document(raw: object) -> dict:
+    """Exact key set and raw types of the absence state anchor (key order is
+    irrelevant for absence-document verification)."""
+    if not isinstance(raw, dict) or set(raw.keys()) != ABSENCE_STATE_KEY_SET:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["state_root"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["height"]) or raw["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["block_hash"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["account_count"]) or raw["account_count"] < 0:
+        raise _Failure(ERR_INPUT)
+    return {key: raw[key] for key in STATE_ROOT_DOC_KEYS}
+
+
+def _parse_absence_neighbor(raw: object) -> dict:
+    """Exact key set and raw types of one framing neighbor inclusion proof.
+
+    Unlike :func:`_parse_state_proof_document`, key order is irrelevant and the
+    account is any non-empty string (the absence endpoints accept arbitrary
+    non-empty target names, not only 64-hex ids).
+    """
+    if not isinstance(raw, dict) or set(raw.keys()) != ABSENCE_NEIGHBOR_KEY_SET:
+        raise _Failure(ERR_INPUT)
+    account = raw["account"]
+    if not isinstance(account, str) or not account:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["balance"]) or raw["balance"] < 0:
+        raise _Failure(ERR_INPUT)
+    transactions = raw["confirmed_transactions"]
+    if not isinstance(transactions, list) or any(
+        not crypto.is_hex64(tx_id) for tx_id in transactions
+    ):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["index"]) or raw["index"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["state_root"]):
+        raise _Failure(ERR_INPUT)
+    if not _is_int(raw["height"]) or raw["height"] < 0:
+        raise _Failure(ERR_INPUT)
+    if not crypto.is_hex64(raw["block_hash"]):
+        raise _Failure(ERR_INPUT)
+    siblings = raw["siblings"]
+    if not isinstance(siblings, list) or len(siblings) > crypto.MAX_MERKLE_DEPTH:
+        raise _Failure(ERR_INPUT)
+    for item in siblings:
+        if not isinstance(item, dict) or set(item.keys()) != set(
+            STATE_PROOF_SIBLING_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        direction = item["direction"]
+        if not isinstance(direction, str) or direction not in ("left", "right"):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(item["hash"]):
+            raise _Failure(ERR_INPUT)
+    return {key: raw[key] for key in STATE_PROOF_DOC_KEYS}
+
+
+def verify_state_absence_proof(
+    document: object, account: object, trust: object
+) -> dict:
+    """Offline-verify one
+    ``GET /v1/accounts/{account}/attested-absence-proof`` document.
+
+    ``document`` is the decoded response: the plain absence document
+    ``account, state, lower, upper`` with ``auth`` appended (the five keys may
+    appear in any order, but the set must be exact). ``state`` is the
+    state-root document (``state_root, height, block_hash, account_count``),
+    ``lower``/``upper`` are full account-state inclusion proofs of the framing
+    confirmed neighbors or ``null``, and ``auth`` is
+    ``{key_version, signature}``. ``account`` is the caller-pinned target (any
+    non-empty string); ``trust`` must carry an ``audit_signers`` list exactly
+    as for :func:`verify_state_proof`.
+
+    Verification, in order:
+
+    1. **input** — the pinned account (a non-empty string), exact key sets and
+       raw types of every (sub-)document, 64/128-lowercase-hex encodings and
+       the ``trust.audit_signers`` list (booleans are never integers);
+    2. **auth** — the envelope's ``key_version`` must resolve in
+       ``audit_signers`` and the Ed25519 signature must verify over
+       ``SHA256(UTF8("ledger-state-absence-proof-v1") ||
+       canonical_json(document without auth))`` (an unknown version or a bad
+       signature is ``auth``; a document signed by a since-rotated key still
+       verifies under its historical public key);
+    3. **integrity** — the document must name the pinned account, the embedded
+       state anchor and both neighbors must be one consistent view, the
+       neighbors must frame the target adjacently (boundary and empty-tree
+       cases included) and their Merkle paths must recompute the state root.
+
+    Success returns ``{"ok": True, "account", "height", "block_hash",
+    "state_root"}`` in that key order; failure returns only
+    ``{"ok": False, "error": "input"|"auth"|"integrity"}``. Never raises for
+    malformed input and never reads any local state; reordering object fields
+    does not affect the result.
+    """
+    try:
+        # Stage 1 (input): exact key sets, types, hex encodings and trust.
+        if not isinstance(account, str) or not account:
+            raise _Failure(ERR_INPUT)
+        if not isinstance(document, dict) or set(document.keys()) != set(
+            ATTESTED_STATE_ABSENCE_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        target = document["account"]
+        if not isinstance(target, str) or not target:
+            raise _Failure(ERR_INPUT)
+        state = _parse_absence_state_document(document["state"])
+        lower = None
+        upper = None
+        if document["lower"] is not None:
+            lower = _parse_absence_neighbor(document["lower"])
+        if document["upper"] is not None:
+            upper = _parse_absence_neighbor(document["upper"])
+        raw_auth = document["auth"]
+        if not isinstance(raw_auth, dict) or tuple(raw_auth.keys()) != (
+            STATE_PROOF_AUTH_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        key_version = raw_auth["key_version"]
+        signature = raw_auth["signature"]
+        if not _is_int(key_version) or key_version < 1:
+            raise _Failure(ERR_INPUT)
+        if not isinstance(signature, str) or not crypto.is_hex128(signature):
+            raise _Failure(ERR_INPUT)
+        signers = _validate_header_trust(trust)
+
+        # Stage 2 (auth): signer lookup by key version and the Ed25519
+        # signature over the domain-prefixed canonical bytes of the document
+        # without auth. Canonical JSON sorts keys, so field reordering on the
+        # wire does not change the signed bytes.
+        public_key = signers.get(key_version)
+        if public_key is None:
+            raise _Failure(ERR_AUTH)
+        unsigned = {
+            "account": target,
+            "state": state,
+            "lower": lower,
+            "upper": upper,
+        }
+        digest = hashlib.sha256(_state_absence_bytes(unsigned)).digest()
+        if not crypto.verify_signature(public_key, digest, signature):
+            raise _Failure(ERR_AUTH)
+
+        # Stage 3 (integrity): account binding plus the full plain-absence
+        # checks: one shared anchor, adjacent framing neighbors, boundary and
+        # empty-tree rules, index ranges and the recomputed Merkle paths.
+        if target != account:
+            raise _Failure(ERR_INTEGRITY)
+        if not crypto.verify_account_absence_proof(
+            unsigned, account, state
+        ):
+            raise _Failure(ERR_INTEGRITY)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather than
+        # crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "account": account,
+        "height": state["height"],
+        "block_hash": state["block_hash"],
+        "state_root": state["state_root"],
+    }
+
+
 def verify_header_page(
     document: object,
     anchor: object,

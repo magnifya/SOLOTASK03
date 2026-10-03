@@ -1648,6 +1648,120 @@ class LedgerService:
                 "upper": neighbor(upper_index),
             }
 
+    def get_attested_account_absence_proof(
+        self, account: str, params: dict | None = None
+    ) -> tuple[int, dict]:
+        """GET /v1/accounts/{account}/attested-absence-proof — a signed
+        non-membership proof in the account-state tree.
+
+        The query-parameter and status rules are identical to
+        :meth:`get_account_absence_proof`: ``height`` is the only accepted
+        (optional, single) strict non-negative decimal parameter; a malformed,
+        repeated or unknown parameter is 400; an unknown/non-canonical/pending
+        anchor height or a pending default tip is 404; an empty account is 404;
+        and a target already in the (historical) confirmed set is 409.
+        Absence still means only "never entered the confirmed set" — never a
+        zero balance.
+
+        On success the chain, the state tree (anchor, account count and both
+        neighbor proofs) and the current audit signer are snapshotted together
+        under one store lock and the body has the fixed key order
+        ``account, state, lower, upper, auth``: the first four fields reuse the
+        plain absence-proof document unchanged and ``auth`` is
+        ``{key_version, signature}`` — an Ed25519 signature made with the
+        current audit signer over
+        ``SHA256(UTF8("ledger-state-absence-proof-v1") ||
+        canonical_json({account, state, lower, upper}))``. A document signed
+        before a rotation stays verifiable with the corresponding historical
+        public key. The read is pure: it changes no ledger, generation, index
+        or audit state, and repeated queries (including after restart) return
+        identical bytes for the same state view and signer version.
+        """
+        if not isinstance(account, str) or not account:
+            return 404, {"error": "account not found"}
+        height_raw: object = None
+        if params is not None:
+            if any(key != "height" for key in params):
+                return 400, {"error": "unknown query parameter"}
+            height_raw = params.get("height")
+        anchor_height: int | None = None
+        if height_raw is not None:
+            anchor_height = _parse_decimal(height_raw)
+            if anchor_height is None:
+                return 400, {"error": "height must be a non-negative decimal"}
+        from . import light_client
+
+        with self.store.lock:
+            if anchor_height is None:
+                anchor = self.store.tip()
+            else:
+                anchor = self.store.block_at(anchor_height)
+                if anchor is None:
+                    return 404, {"error": "anchor block not found"}
+            if anchor.status != STATUS_CONFIRMED:
+                return 404, {"error": "chain tip is pending confirmation"}
+            prefix = (
+                self.store.chain
+                if anchor_height is None
+                else self.store.chain[: anchor.height + 1]
+            )
+            rows, leaves, root = self._state_tree(prefix)
+            names = [name for name, _b, _t in rows]
+            position = bisect_left(names, account)
+            if position < len(names) and names[position] == account:
+                return 409, {"error": "account exists in state tree"}
+            state = {
+                "state_root": root,
+                "height": anchor.height,
+                "block_hash": anchor.block_hash,
+                "account_count": len(rows),
+            }
+
+            def neighbor(index: int | None) -> dict | None:
+                if index is None:
+                    return None
+                name, balance, transactions = rows[index]
+                return {
+                    "account": name,
+                    "balance": balance,
+                    "confirmed_transactions": transactions,
+                    "index": index,
+                    "state_root": root,
+                    "height": anchor.height,
+                    "block_hash": anchor.block_hash,
+                    "siblings": crypto.merkle_proof(leaves, index),
+                }
+
+            lower_index = position - 1 if position > 0 else None
+            upper_index = position if position < len(rows) else None
+            lower = neighbor(lower_index)
+            upper = neighbor(upper_index)
+            signer = self.store.audit_signer
+            if signer is None:
+                # Every snapshot (including migrated legacy ones) carries a
+                # current audit signer after recovery; reaching here is a
+                # programming error rather than a client-visible condition.
+                raise RuntimeError(
+                    "no audit signer available for state absence proof"
+                )
+            auth = light_client.sign_state_absence_proof(
+                signer["private_key"],
+                signer["version"],
+                account,
+                state,
+                lower,
+                upper,
+            )
+            if auth is None:
+                raise RuntimeError("current audit signer key is invalid")
+            return 200, {
+                "account": account,
+                "state": state,
+                "lower": lower,
+                "upper": upper,
+                "auth": auth,
+            }
+
     def get_attested_account_proof(
         self, account: str, params: dict | None = None
     ) -> tuple[int, dict]:

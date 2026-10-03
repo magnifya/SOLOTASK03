@@ -954,6 +954,37 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     status, body = service.get_attested_account_proof(account, params)
                     self._send_json(status, body, sort_keys=False)
                     return
+                if remainder.endswith("/attested-absence-proof"):
+                    # GET /v1/accounts/{account}/attested-absence-proof
+                    # [?height=H] — an audit-signed non-membership proof in the
+                    # account-state tree. The account uses the same non-empty
+                    # string semantics and the query parameter rules are
+                    # identical to /absence-proof (height is the only optional
+                    # single strict-decimal parameter; malformed/repeated/
+                    # unknown 400; unknown/non-canonical/pending anchor and
+                    # pending tip 404; a confirmed target 409). The success
+                    # document keeps the contract-fixed order account, state,
+                    # lower, upper, auth, so it is serialized in insertion
+                    # order.
+                    encoded_account = remainder[
+                        : -len("/attested-absence-proof")
+                    ]
+                    account = unquote(encoded_account)
+                    if not encoded_account or not account:
+                        self._send_json(404, {"error": "account not found"})
+                        return
+                    parsed = parse_qs(query, keep_blank_values=True)
+                    if any(len(values) > 1 for values in parsed.values()):
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
+                        return
+                    params = {key: values[0] for key, values in parsed.items()}
+                    status, body = service.get_attested_account_absence_proof(
+                        account, params
+                    )
+                    self._send_json(status, body, sort_keys=False)
+                    return
                 elif remainder.endswith("/absence-proof"):
                     # GET /v1/accounts/{account}/absence-proof[?height=H] —
                     # a non-membership proof in the account-state tree. The

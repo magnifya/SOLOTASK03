@@ -780,6 +780,31 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   篡改、混用锚点、非相邻邻居、越界索引、邻居字段缺失/额外、类型或格式错误
   均返回 `False`。历史证明只依据指定高度的已确认前缀，调用方传入该高度的
   state 文档即可。
+- **带审计签名的账户不存在证明**：
+  `GET /v1/accounts/{account}/attested-absence-proof` 在普通不存在证明之外
+  给出一份带审计签名的版本。账户沿用非空字符串语义，空账户路径返回 `404`；
+  `height` 是唯一可选单值查询参数，沿用严格十进制格式，参数非法、重复或
+  未知均返回 `400`；锚点未知/非 canonical/pending、默认 pending 链尾均
+  返回 `404`；目标账户已在该高度的已确认集合返回 `409`。不存在仍只表示
+  未进入已确认集合，不能解释成余额为零。成功 `200` 在原不存在证明文档
+  （固定键序 `account, state, lower, upper`，字段语义完全不变）末尾追加
+  `auth`（键序 `key_version, signature`，格式沿用签名状态证明）。链、状态
+  锚、账户数、邻居证明与当前审计签名者在**同一把锁**内取自同一份 canonical
+  视图；签名为对
+  `SHA256(UTF8("ledger-state-absence-proof-v1") ‖ canonical_json(去掉 auth
+  的文档))` 的 Ed25519 签名，轮换后旧证明仍可用对应历史公钥验证；并发
+  确认、回滚、采用分叉或轮换都不会混用状态，相同状态与签名者下重复查询、
+  重启结果一致。查询为纯读，不改文件、generation、索引或审计。
+- **带审计签名的不存在证明离线校验**：
+  `ledger.light_client.verify_state_absence_proof(document, account, trust)
+  -> dict` 为纯库 API（不读本地状态、**不抛异常**）。`account` 为调用方
+  钉住的非空字符串目标，`trust` 须携带 `audit_signers`（格式同签名状态
+  证明）。依次判定 **input → auth → integrity**：字段缺失或额外、类型或
+  编码错误（布尔值不视为整数）、畸形账户及信任材料归 `input`（对象字段
+  换序不影响验证）；未知签名版本或坏签名归 `auth`；目标不符、锚点混用、
+  邻居不相邻、索引越界、Merkle 路径或空树边界错误归 `integrity`。成功
+  固定返回 `ok, account, height, block_hash, state_root`；失败只返回
+  `{"ok": false, "error"}`，`error` 取 `input`/`auth`/`integrity`。
 - **离线验证**：`ledger.crypto.verify_account_proof(proof, expected_root,
   expected_height, expected_hash) -> bool` 从 proof 的账户三元组**重算
   leaf**，沿 siblings 重算到根，并核对：重算根同时等于 proof 的
@@ -2122,6 +2147,15 @@ curl -s "localhost:8080/v1/accounts/<pubkey-hex>/attested-proof?height=H"
 #         "proof":{"account":"...","balance":...,"confirmed_transactions":[...],"index":I,
 #                  "state_root":"...","height":N,"block_hash":"...","siblings":[...]},
 #         "auth":{"key_version":1,"signature":"..."}}
+# 带审计签名的账户不存在证明（账户非空字符串，空账户 404；height 可选单值严格十进制，
+# 非法/重复/未知参数 400；未知/非 canonical/pending 锚点与默认 pending 链尾 404；
+# 目标已在该高度已确认集 409；不存在不等于余额为零）
+# 200 键序 account,state,lower,upper,auth，lower/upper 为前驱/后继完整包含证明或 null，
+# auth.signature = Ed25519(SHA256(UTF8("ledger-state-absence-proof-v1") ||
+#                               canonical_json(去auth)))，
+# 离线用 verify_state_absence_proof(document, account, trust) 校验（input/auth/integrity）
+curl -s "localhost:8080/v1/accounts/<account>/attested-absence-proof"
+curl -s "localhost:8080/v1/accounts/<account>/attested-absence-proof?height=H"
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
 # 批量 Merkle 证明（tx_ids 须非空、互异、各为 64 位小写 hex；畸形请求体 -> 400；
@@ -2457,6 +2491,7 @@ python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（ca
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
 python tests/absence_proof_test.py  # 账户不存在证明 GET /v1/accounts/{account}/absence-proof（height 可选单值严格十进制；非法/重复/未知 400、未知/pending 锚点 404、已存在 409；200 固定键序 account,state,lower,upper，前驱/后继完整包含证明与边界 null、空树根；纯读不改账本/索引/审计；verify_account_absence_proof 严格字段/类型/布尔、锚点绑定、邻居有效性/相邻/边界、幻像槽位/篡改/混用锚点不抛异常；HTTP/重启/分叉/并发一致性）
 python tests/attested_state_proof_test.py  # 签名状态证明 GET /v1/accounts/{account}/attested-proof（height 可选单值规则同 state-proof；非法/重复/未知参数 400；未知/pending 锚点与缺失账户 404；200 固定键序 state,proof,auth，state/proof 复用 state-root/state-proof 字段键序，auth 键序 key_version,signature；ledger-state-proof-v1 域 SHA256+Ed25519、链状态签名者同锁；verify_state_proof input/auth/integrity 分类、账户/锚点/index 范围/Merkle 路径、轮换历史验签、不抛异常）与 HTTP 线序
+python tests/attested_absence_proof_test.py  # 带审计签名的账户不存在证明 GET /v1/accounts/{account}/attested-absence-proof（空账户 404；height 可选单值严格十进制，非法/重复/未知 400；未知/非 canonical/pending 锚点与默认 pending 链尾 404；已在确认集 409；200 固定键序 account,state,lower,upper,auth，原不存在字段不变，ledger-state-absence-proof-v1 域 SHA256+Ed25519，链/锚/邻居/签名者同一 canonical 视图；verify_state_absence_proof 字段换序可验、input/auth/integrity 分类、目标/锚点混用/邻居相邻/越界/Merkle/空树边界、轮换历史验签、重启/分叉/并发一致、不抛异常）与 HTTP 线序
 python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/CLI/重启重建）
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
