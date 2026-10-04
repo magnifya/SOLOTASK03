@@ -674,6 +674,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         "direction": args.direction,
         "at_height": args.at_height,
         "at_hash": args.at_hash,
+        "include_summary": "true" if args.include_summary else None,
         "cursor": args.cursor,
         "limit": args.limit,
     }
@@ -1543,6 +1544,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument(
         "--at-hash",
         help="anchor block hash, 64 lowercase hex characters (with --at-height)",
+    )
+    p_index.add_argument(
+        "--include-summary",
+        action="store_true",
+        help="include the per-account income/expense summary over the full "
+        "filtered set (requires --account); sends include_summary=true",
     )
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")

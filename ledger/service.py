@@ -4835,10 +4835,38 @@ class LedgerService:
         ``total``/``next_cursor`` count only the fixed prefix, so pages
         taken under the same anchor stay identical as the chain tail grows
         or is rolled back.
+
+        The optional ``include_summary`` accepts a single occurrence of
+        ``true``/``false``; omitted or ``false`` the response is unchanged.
+        An empty value, any other token (or a repeat, rejected at the HTTP
+        layer) returns the fixed ``400 {"error": "input"}``. When ``true``
+        a non-empty ``account`` is required (else the same fixed input
+        error, answered before the anchor lookup) and the response adds
+        ``summary`` with ``incoming_count``/``outgoing_count`` (the number
+        of filtered transactions received/sent by the account),
+        ``incoming_amount``/``outgoing_amount`` (the matching integer
+        sums) and ``net_amount`` (incoming minus outgoing, may be
+        negative). The summary spans the whole filtered confirmed set, not
+        just the current page; a self-transfer occupies one row but adds
+        one to both counts/amounts and zero to the net. An empty page at
+        ``cursor == total`` still carries the full summary. All figures
+        are integers.
         """
         tx_id = params.get("tx_id")
         if tx_id is not None and not crypto.is_hex64(tx_id):
             return 400, {"error": "tx_id must be 64 lowercase hex characters"}
+
+        # include_summary is a strict single-occurrence true/false flag (the
+        # repeat check lives in the HTTP layer). Every violation — empty
+        # value, unknown token — maps to the contract-fixed
+        # {"error": "input"} and is answered before the anchor is looked up.
+        include_summary_raw = params.get("include_summary")
+        if include_summary_raw is not None and include_summary_raw not in (
+            "true",
+            "false",
+        ):
+            return 400, {"error": "input"}
+        include_summary = include_summary_raw == "true"
 
         # Anchor pair: all-or-nothing with strict formats. Every violation
         # maps to the contract-fixed {"error": "input"} and is answered
@@ -4886,6 +4914,13 @@ class LedgerService:
                 return 400, {"error": "input"}
 
         account = params.get("account")
+        # The summary is computed per account, so enabling it without a valid
+        # account is the fixed input error; check it before the legacy account
+        # message (which uses a different error body).
+        if include_summary and not (
+            isinstance(account, str) and account
+        ):
+            return 400, {"error": "input"}
         if account is not None and (not isinstance(account, str) or not account):
             return 400, {"error": "account must be a non-empty string"}
 
@@ -4965,7 +5000,33 @@ class LedgerService:
             return 400, {"error": "cursor is beyond the result set"}
         items = rows[cursor : cursor + limit]
         next_cursor = cursor + limit if cursor + limit < total else None
-        return 200, {"items": items, "total": total, "next_cursor": next_cursor}
+        body: dict = {"items": items, "total": total, "next_cursor": next_cursor}
+        if include_summary:
+            # The summary covers the WHOLE filtered set (all confirmed rows
+            # collected above), never just the current page. Direction filters
+            # transactions first; each surviving row is then re-classified by
+            # the account independently, so a self-transfer counts once as
+            # incoming and once as outgoing while occupying a single total.
+            # All arithmetic stays on Python integers.
+            incoming_count = 0
+            outgoing_count = 0
+            incoming_amount = 0
+            outgoing_amount = 0
+            for row in rows:
+                if row["to"] == account:
+                    incoming_count += 1
+                    incoming_amount += row["amount"]
+                if row["from"] == account:
+                    outgoing_count += 1
+                    outgoing_amount += row["amount"]
+            body["summary"] = {
+                "incoming_count": incoming_count,
+                "outgoing_count": outgoing_count,
+                "incoming_amount": incoming_amount,
+                "outgoing_amount": outgoing_amount,
+                "net_amount": incoming_amount - outgoing_amount,
+            }
+        return 200, body
 
     # -- source trust registry ------------------------------------------------
 

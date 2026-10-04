@@ -1097,6 +1097,35 @@ proof 的 index 一致。返回 `{items, total, next_cursor}`：`total` 是过�
 在链尾继续增长或回滚 pending 末块后仍拼成同一份交易集合；分叉采用后若锚点仍是
 哈希相同的已确认块，结果不变，否则按上述错误拒绝读取。创世锚点有效并返回空集合。
 
+按账户收支汇总：可选参数 `include_summary` 只接受**单次出现**的 `true` 或
+`false`；省略与 `false` 的响应与原有完全一致（无 `summary` 键）。空值、任何
+其他取值（如 `1`、`yes`、大小写变体、带空白）或重复出现（即使值相同）一律
+`400` 与 `{"error":"input"}`；启用（`true`）时 `account` 必须为非空字符串，
+缺失或为空同样 `400 {"error":"input"}`，该输入校验**先于锚点查找**（锚点
+`404`/`409` 与 `cursor > total` 的 `400` 都让位于它），其余参数校验与错误响应
+沿用既有约定。启用时响应在 `items`、`total`、`next_cursor` 之外附 `summary`：
+
+- `incoming_count`、`outgoing_count` 分别为账户作为收款方（to）、付款方
+  （from）的交易数；`incoming_amount`、`outgoing_amount` 为对应金额之和；
+  `net_amount = incoming_amount - outgoing_amount`，允许为负。所有值均为
+  整数，金额全程整数精度。
+- 汇总覆盖**所有过滤条件共同命中的完整集合**（含锚点前缀与全部其他过滤器），
+  不是当前页；`total` 仍是该集合的唯一交易数（自转账占一个 total，同时各计
+  一次收入与一次支出、两边金额各加一次、净额贡献为零）。`direction` 先筛选
+  交易，再以 `account` 独立判断收支：例如 `direction=out` 命中的自转账仍计入
+  一次收入。旧式与序列转账采用相同规则，**不按 nonce 去重**。
+- 未知账户、过滤交集为空或创世锚点均返回 `200`，汇总各值为零；`cursor`
+  等于 `total` 的空页仍附完整汇总，`cursor` 超过 `total` 沿用现有 `400`
+  （无 `summary`）。内存池、pending 末块与候选分叉不参与统计。
+- 条目、总数与汇总来自**同一把锁内同一份已持久化主链视图**，确认或分叉采用
+  与查询并发时不会混合不同状态；固定锚点下翻页及链尾增长不改变汇总，重启后
+  结果一致。查询为纯读：不改变 generation、账本、索引、审计事件或快照。
+
+CLI 的 `index` 命令新增 `--include-summary` 开关：启用时发送
+`include_summary=true`（须与 `--account` 同用，可与 `--direction`、
+`--at-height/--at-hash` 等其他选项组合），原样打印服务端单行 JSON，2xx
+退出 0，HTTP 错误或连接失败退出 1；不启用时行为完全不变。
+
 ## 交易回执
 
 `GET /v1/transactions/{tx_id}` 返回单笔交易的回执。`tx_id` 必须恰好是 64 位
@@ -2260,6 +2289,13 @@ curl -s 'localhost:8080/v1/forks/sync/range/export?source=node-2&request_id=req-
 curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&min_height=1&max_height=9&direction=out&limit=50&cursor=0'
 # -> 200 {"items":[{tx_id,height,block_hash,index,from,to,amount}...],"total":N,"next_cursor":null}
 
+# 按账户收支汇总（include_summary 仅接受单次 true/false；true 须带非空 account；
+# 汇总覆盖全部过滤命中集合而非当前页；空值/非法值/重复/缺账户 400 input）
+curl -s 'localhost:8080/v1/index/transactions?account=<pubkey-hex>&include_summary=true'
+# -> 200 {"items":[...],"total":N,"next_cursor":null,
+#         "summary":{"incoming_count":N,"outgoing_count":N,
+#                    "incoming_amount":N,"outgoing_amount":N,"net_amount":N}}
+
 # 持久化来源信任（201 version=1 active；同内容 200；冲突 409；非法 400）
 curl -s -X POST localhost:8080/v1/trust/sources \
   -H 'Content-Type: application/json' \
@@ -2376,6 +2412,7 @@ python -m ledger.cli adopt <tip-hash>
 # 导出候选分叉与确认链交易索引
 python -m ledger.cli export <tip-hash>
 python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--cursor N] [--limit N]
+python -m ledger.cli index --account <pubkey-hex> --include-summary  # 发送 include_summary=true 并附收支汇总；非 2xx 退出 1
 
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
