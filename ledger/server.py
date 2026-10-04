@@ -860,10 +860,11 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
             elif path == "/v1/index/transactions":
                 # GET /v1/index/transactions?tx_id=&account=&height=&
                 # min_height=&max_height=&direction=&at_height=&at_hash=&
-                # limit=&cursor= — the range/direction parameters and the
-                # anchor pair reject repeats (even identical values) with the
-                # fixed 400 {"error": "input"}; the legacy parameters keep
-                # their first-value-wins behaviour.
+                # include_summary=&limit=&cursor= — the range/direction
+                # parameters, the anchor pair and the summary flag reject
+                # repeats (even identical values) with the fixed
+                # 400 {"error": "input"}; the legacy parameters keep their
+                # first-value-wins behaviour.
                 parsed = parse_qs(query, keep_blank_values=True)
                 if any(
                     len(parsed[name]) > 1
@@ -873,6 +874,7 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                         "direction",
                         "at_height",
                         "at_hash",
+                        "include_summary",
                     )
                     if name in parsed
                 ):

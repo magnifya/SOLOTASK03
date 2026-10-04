@@ -4835,10 +4835,45 @@ class LedgerService:
         ``total``/``next_cursor`` count only the fixed prefix, so pages
         taken under the same anchor stay identical as the chain tail grows
         or is rolled back.
+
+        The optional ``include_summary`` flag accepts exactly ``true`` or
+        ``false`` (a single occurrence; omitted and ``false`` keep the plain
+        items/total/next_cursor response). An empty value, any other value
+        or a repeated occurrence returns the fixed ``400 {"error": "input"}``,
+        as does enabling it without a non-empty ``account`` — all of these
+        are answered before the anchor is looked up. When enabled, the
+        response additionally carries ``summary`` with the account's
+        ``incoming_count``/``outgoing_count`` and
+        ``incoming_amount``/``outgoing_amount`` totals plus ``net_amount``
+        (incoming minus outgoing, possibly negative), all integers computed
+        over the entire filtered set — every page of the same query,
+        including the empty page at ``cursor == total``, reports the same
+        summary. ``direction`` filters the transactions first and the
+        account then decides the flow direction of each survivor, so a
+        self-transfer counts once towards ``total`` yet adds one incoming
+        and one outgoing movement (net zero). Legacy and sequenced
+        transfers follow the same rules with no nonce de-duplication. An
+        unknown account, an empty filter intersection or a genesis anchor
+        simply yields a zero summary.
         """
         tx_id = params.get("tx_id")
         if tx_id is not None and not crypto.is_hex64(tx_id):
             return 400, {"error": "tx_id must be 64 lowercase hex characters"}
+
+        # include_summary: strict single-occurrence "true"/"false" flag
+        # (repeats are rejected by the HTTP layer). Every violation maps to
+        # the contract-fixed {"error": "input"} and is answered before the
+        # anchor is looked up.
+        include_summary_raw = params.get("include_summary")
+        include_summary = False
+        if include_summary_raw is not None:
+            if include_summary_raw not in ("true", "false"):
+                return 400, {"error": "input"}
+            include_summary = include_summary_raw == "true"
+        if include_summary:
+            summary_account = params.get("account")
+            if not isinstance(summary_account, str) or not summary_account:
+                return 400, {"error": "input"}
 
         # Anchor pair: all-or-nothing with strict formats. Every violation
         # maps to the contract-fixed {"error": "input"} and is answered
@@ -4965,7 +5000,31 @@ class LedgerService:
             return 400, {"error": "cursor is beyond the result set"}
         items = rows[cursor : cursor + limit]
         next_cursor = cursor + limit if cursor + limit < total else None
-        return 200, {"items": items, "total": total, "next_cursor": next_cursor}
+        body = {"items": items, "total": total, "next_cursor": next_cursor}
+        if include_summary:
+            # The summary aggregates the whole filtered set captured under
+            # the lock above — the same persisted main-chain snapshot the
+            # items and total came from — never just the current page. A
+            # self-transfer appears once in rows yet moves funds both ways.
+            incoming_count = 0
+            outgoing_count = 0
+            incoming_amount = 0
+            outgoing_amount = 0
+            for row in rows:
+                if row["to"] == account:
+                    incoming_count += 1
+                    incoming_amount += row["amount"]
+                if row["from"] == account:
+                    outgoing_count += 1
+                    outgoing_amount += row["amount"]
+            body["summary"] = {
+                "incoming_count": incoming_count,
+                "outgoing_count": outgoing_count,
+                "incoming_amount": incoming_amount,
+                "outgoing_amount": outgoing_amount,
+                "net_amount": incoming_amount - outgoing_amount,
+            }
+        return 200, body
 
     # -- source trust registry ------------------------------------------------
 
