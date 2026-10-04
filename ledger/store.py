@@ -138,11 +138,17 @@ EVENT_TRANSACTION_SUBMITTED = "transaction_submitted"
 EVENT_BLOCK_MINED = "block_mined"
 EVENT_BLOCK_CONFIRMED = "block_confirmed"
 EVENT_BLOCK_ROLLED_BACK = "block_rolled_back"
+# A successful sender-signed cancellation of a mempool transaction
+# (POST /v1/transactions/{tx_id}/cancel). Like the other four core events it is
+# appended in the same atomic write as the change it describes and strictly
+# replayed during recovery.
+EVENT_TRANSACTION_CANCELLED = "transaction_cancelled"
 LEDGER_EVENT_KINDS = (
     EVENT_TRANSACTION_SUBMITTED,
     EVENT_BLOCK_MINED,
     EVENT_BLOCK_CONFIRMED,
     EVENT_BLOCK_ROLLED_BACK,
+    EVENT_TRANSACTION_CANCELLED,
 )
 
 # Prefix of durable snapshot temp files ("<state>.ledger-<...>") living next to
@@ -2512,9 +2518,19 @@ class LedgerStore:
                 "block_hash",
                 "transaction_ids",
             ),
+            EVENT_TRANSACTION_CANCELLED: (
+                "tx_id",
+                "from",
+                "to",
+                "amount",
+                # The cancellation signature (128 lowercase hex), never the
+                # original transfer signature.
+                "signature",
+            ),
         }
         ledger_event_optional_payload = {
             EVENT_TRANSACTION_SUBMITTED: ("nonce",),
+            EVENT_TRANSACTION_CANCELLED: ("nonce",),
         }
         ledger_event_kinds = set(ledger_event_payload_keys)
         events: list[dict] = []
@@ -2716,6 +2732,57 @@ class LedgerStore:
                             f"audit event {event_id} (transaction_submitted) "
                             "nonce must be a non-negative integer",
                         )
+                elif kind == EVENT_TRANSACTION_CANCELLED:
+                    tx_id = event["tx_id"]
+                    sender = event["from"]
+                    recipient = event["to"]
+                    amount = event["amount"]
+                    signature = event["signature"]
+                    nonce = event.get("nonce")
+                    if not crypto.is_hex64(tx_id):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_cancelled) "
+                            "tx_id must be 64 lowercase hex characters",
+                        )
+                    if not isinstance(sender, str) or not sender:
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_cancelled) "
+                            "'from' must be a non-empty string",
+                        )
+                    if not isinstance(recipient, str) or not recipient:
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_cancelled) "
+                            "'to' must be a non-empty string",
+                        )
+                    if (
+                        isinstance(amount, bool)
+                        or not isinstance(amount, int)
+                        or amount <= 0
+                    ):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_cancelled) "
+                            "amount must be a positive integer",
+                        )
+                    if not crypto.is_hex128(signature):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_cancelled) "
+                            "signature must be 128 lowercase hex characters",
+                        )
+                    if nonce is not None and (
+                        isinstance(nonce, bool)
+                        or not isinstance(nonce, int)
+                        or nonce < 0
+                    ):
+                        raise StateRecoveryError(
+                            path,
+                            f"audit event {event_id} (transaction_cancelled) "
+                            "nonce must be a non-negative integer",
+                        )
                 else:
                     height = event["height"]
                     block_hash = event["block_hash"]
@@ -2821,14 +2888,35 @@ class LedgerStore:
         for fact_chain in [chain, *forks.values()]:
             for block in fact_chain:
                 block_facts.setdefault(block.height, {})[block.block_hash] = block
+        # Verified transaction metadata (sender, recipient, amount, nonce)
+        # keyed by tx_id, seeded here from every independently verified
+        # transaction in the recovered canonical chain, candidate forks and
+        # mempool, then extended by transaction_submitted events as the log
+        # replays. A transaction_cancelled event must describe exactly this
+        # transaction.
+        tx_meta: dict[str, tuple[str, str, int, int | None]] = {}
         # Transaction facts: the recovered mempool plus every transaction in
         # the canonical chain and surviving forks, all independently
         # signature/tx_id verified by their own parsers.
         tx_facts: set[str] = set(pending)
+        for fact_tx in pending.values():
+            tx_meta.setdefault(
+                fact_tx.tx_id,
+                (fact_tx.sender, fact_tx.recipient, fact_tx.amount, fact_tx.nonce),
+            )
         for fact_chain in [chain, *forks.values()]:
             for block in fact_chain:
                 for fact_tx in block.transactions:
                     tx_facts.add(fact_tx.tx_id)
+                    tx_meta.setdefault(
+                        fact_tx.tx_id,
+                        (
+                            fact_tx.sender,
+                            fact_tx.recipient,
+                            fact_tx.amount,
+                            fact_tx.nonce,
+                        ),
+                    )
 
         # Block-lifecycle events (mined/confirmed/rolled back). A snapshot
         # written before this feature carries none: its blocks are all legacy
@@ -2901,6 +2989,23 @@ class LedgerStore:
         phases: dict[int, list[tuple[str, str, list[str] | None]]] = {}
         # The currently open pending tip: (height, hash, tx_ids).
         open_tip: tuple[int, str, list[str] | None] | None = None
+        # Event-replay location of each transaction named by the log:
+        # "mempool" (submitted/unpacked), "tip" (packed in the open pending
+        # block), "confirmed", "gone" (cancelled and not resubmitted) or
+        # "unknown" (a fork adoption rearranged locations the log does not
+        # fully encode). Cancellation is only strictly location-checked while
+        # the location is known; the final recovered state is then reconciled
+        # against the end state of every tracked transaction.
+        tx_live: dict[str, str] = {}
+        # Per-sender unconfirmed sequenced nonces while their locations are
+        # event-tracked: reservations in the mempool plus the open pending
+        # tip, exactly the range a cancellation's highest-nonce rule ranges
+        # over. A fork adoption makes per-sender reservation history
+        # unprovable from the log, after which the gate is skipped (the
+        # recovered sequences section still proves the resulting dense
+        # partitions independently).
+        reserved_nonces: dict[str, set[int]] = {}
+        reservations_doubted = False
 
         for index, event in enumerate(audit_events):
             kind = event.get("kind")
@@ -2917,6 +3022,16 @@ class LedgerStore:
                     and ad_height >= 0
                     and crypto.is_hex64(tip_hash)
                 ):
+                    # An adoption rearranges transactions between the old
+                    # chain, the adopted chain and the mempool in ways the
+                    # ledger-event log does not fully encode; per-transaction
+                    # locations and per-sender reservation tails are only
+                    # approximated afterwards, so the strict gates degrade to
+                    # signature/payload checks and the independently validated
+                    # sequences section proves the resulting nonce state.
+                    reservations_doubted = True
+                    for tracked_id in tx_live:
+                        tx_live[tracked_id] = "unknown"
                     if ad_status == STATUS_PENDING:
                         tx_list: list[str] | None = None
                         adopted_block = block_facts.get(ad_height, {}).get(tip_hash)
@@ -2935,21 +3050,25 @@ class LedgerStore:
             height = event.get("height")
             if kind == EVENT_TRANSACTION_SUBMITTED:
                 tx_id = event["tx_id"]
+                sender = event["from"]
+                recipient = event["to"]
                 amount = event["amount"]
                 nonce = event.get("nonce")
                 if nonce is None:
-                    message = crypto.canonical_message(
-                        event["from"], event["to"], amount
-                    )
+                    message = crypto.canonical_message(sender, recipient, amount)
                 else:
                     message = crypto.sequenced_message(
-                        event["from"], event["to"], amount, nonce
+                        sender, recipient, amount, nonce
                     )
                 if crypto.compute_tx_id(message) != tx_id:
                     fail(
                         f"audit event {event_id} (transaction_submitted) tx_id "
                         "does not recompute from its payload"
                     )
+                # Record/refresh the verified metadata; the tx_id hash binds
+                # the (from, to, amount, nonce) tuple, so every copy is
+                # identical.
+                tx_meta[tx_id] = (sender, recipient, amount, nonce)
                 # A second submission event for one tx_id is only reachable
                 # after fork adoption dropped the old pending tip carrying it
                 # (the tx left both the chain and the mempool, so a fresh
@@ -2957,6 +3076,72 @@ class LedgerStore:
                 # only ever answers 409. This is not itself corruption, so it
                 # is not rejected — the recomputed tx_id binds every copy.
                 tx_facts.add(tx_id)
+                if tx_live.get(tx_id) in (None, "gone", "unknown"):
+                    tx_live[tx_id] = "mempool"
+                    if nonce is not None and not reservations_doubted:
+                        reserved_nonces.setdefault(sender, set()).add(nonce)
+                continue
+
+            if kind == EVENT_TRANSACTION_CANCELLED:
+                tx_id = event["tx_id"]
+                sender = event["from"]
+                recipient = event["to"]
+                amount = event["amount"]
+                cancel_signature = event["signature"]
+                nonce = event.get("nonce")
+                # The id must recompute from the event's own payload ...
+                if nonce is None:
+                    message = crypto.canonical_message(sender, recipient, amount)
+                else:
+                    message = crypto.sequenced_message(
+                        sender, recipient, amount, nonce
+                    )
+                if crypto.compute_tx_id(message) != tx_id:
+                    fail(
+                        f"audit event {event_id} (transaction_cancelled) tx_id "
+                        "does not recompute from its payload"
+                    )
+                # ... the payload must describe the actual verified
+                # transaction (the hash id alone binds the tuple, this also
+                # pins the event to the chain/mempool facts) ...
+                meta = tx_meta.get(tx_id)
+                if meta is None or meta != (sender, recipient, amount, nonce):
+                    fail(
+                        f"audit event {event_id} (transaction_cancelled) "
+                        "payload does not match the verified transaction"
+                    )
+                # ... and the cancellation signature must verify under the
+                # sender's key over ledger-cancel-v1\n<tx_id>.
+                if not crypto.verify_signature(
+                    sender, crypto.cancel_message(tx_id), cancel_signature
+                ):
+                    fail(
+                        f"audit event {event_id} (transaction_cancelled) "
+                        "signature does not verify"
+                    )
+                # The mempool/highest-nonce gates are only provable while the
+                # log fully encodes the transaction's location (no adoption
+                # rearranged it); after an adoption the independently
+                # validated chain, mempool and sequences sections vouch for
+                # the resulting state instead.
+                location = tx_live.get(tx_id)
+                if not reservations_doubted and location is not None:
+                    if location != "mempool":
+                        fail(
+                            f"audit event {event_id} (transaction_cancelled) "
+                            "cancels a transaction that was not in the mempool"
+                        )
+                    if nonce is not None:
+                        reserved = reserved_nonces.get(sender, set())
+                        if reserved and nonce != max(reserved):
+                            fail(
+                                f"audit event {event_id} (transaction_cancelled) "
+                                "cancels a sequenced nonce that is not the "
+                                "sender's highest reservation"
+                            )
+                if nonce is not None and not reservations_doubted:
+                    reserved_nonces.get(sender, set()).discard(nonce)
+                tx_live[tx_id] = "gone"
                 continue
 
             assert isinstance(height, int)
@@ -3029,7 +3214,43 @@ class LedgerStore:
                 mined_hashes.setdefault(height, set()).add(block_hash)
                 history.append(("mined", block_hash, tx_ids))
                 open_tip = (height, block_hash, tx_ids)
+                for packed_id in tx_ids:
+                    location = tx_live.get(packed_id)
+                    if location == "gone":
+                        # A cancelled transaction can return to the pool only
+                        # through a fork adoption the ledger log does not
+                        # record (a direct-candidate adoption); after one the
+                        # per-transaction gates degrade to payload/signature
+                        # checks.
+                        reservations_doubted = True
+                        tx_live[packed_id] = "unknown"
+                    elif location == "mempool":
+                        tx_live[packed_id] = "tip"
+                    elif location == "confirmed":
+                        # A re-mined previously-confirmed transaction is
+                        # likewise only reachable after an unlogged adoption.
+                        reservations_doubted = True
+                        tx_live[packed_id] = "unknown"
+                    # Reservations are unchanged by mining: the pending tip
+                    # keeps the nonce reserved alongside the mempool.
             elif kind == EVENT_BLOCK_CONFIRMED:
+                # Capture the confirmed block's transactions for the location
+                # replay: the open-tip id list when this event closes the
+                # tracked tip, otherwise the surviving verified block at the
+                # named hash (an untracked adopted/legacy tip).
+                confirmed_tx_ids: list[str] | None = None
+                if (
+                    open_tip is not None
+                    and open_tip[0] == height
+                    and open_tip[1] == block_hash
+                ):
+                    confirmed_tx_ids = open_tip[2]
+                else:
+                    confirmed_block = block_facts.get(height, {}).get(block_hash)
+                    if confirmed_block is not None:
+                        confirmed_tx_ids = [
+                            tx.tx_id for tx in confirmed_block.transactions
+                        ]
                 if (
                     open_tip is None
                     or open_tip[0] != height
@@ -3060,6 +3281,15 @@ class LedgerStore:
                             "mined"
                         )
                 history.append(("confirmed", block_hash, None))
+                # The block just confirmed closes the open tip: its
+                # transactions become confirmed and their sequenced nonces
+                # leave the pending-tip/mempool reservation view.
+                if not reservations_doubted and confirmed_tx_ids is not None:
+                    for confirmed_id in confirmed_tx_ids:
+                        tx_live[confirmed_id] = "confirmed"
+                        meta = tx_meta.get(confirmed_id)
+                        if meta is not None and meta[3] is not None:
+                            reserved_nonces.get(meta[0], set()).discard(meta[3])
                 open_tip = None
             else:  # EVENT_BLOCK_ROLLED_BACK
                 tx_ids = list(event["transaction_ids"])
@@ -3120,55 +3350,142 @@ class LedgerStore:
                             "transaction_ids are not in the block's order"
                         )
                 history.append(("rolled_back", block_hash, None))
+                # The rolled-back transactions return to the mempool, so a
+                # tracked location reverts to "mempool" (nonces stay reserved,
+                # nothing changes in the reservation view).
+                if not reservations_doubted and opening_ids is not None:
+                    for restored_id in tx_ids:
+                        if tx_live.get(restored_id) == "tip":
+                            tx_live[restored_id] = "mempool"
                 open_tip = None
 
-        if cutoff_height is None:
-            # A pre-feature event log: the events' own hash chain is the only
-            # lifecycle evidence; nothing to reconcile against blocks.
-            return
-
-        # Forward reconciliation limited to what is provable after a chain
-        # switch. Fork adoption (a synced tip proven by sync_adopted, or a
-        # directly submitted candidate whose adoption leaves no durable event
-        # by design) is the one operation that legitimately replaces blocks
-        # without lifecycle events, so a recovered block that does not match
-        # the replay's final hash cannot on its own be called corruption:
-        # the chain parser has already recomputed every hash and signature.
-        # What IS provable:
-        for block in chain[1:]:
-            height = block.height
-            if height < cutoff_height or height in adopted_away:
-                continue
-            history = phases.get(height)
-            if not history:
-                continue
-            final_phase = history[-1]
-            if final_phase[1] != block.block_hash:
-                # A different valid block at this height can only be the
-                # result of an (possibly unrecorded direct-candidate)
-                # adoption; its own hashes were independently verified.
-                continue
-            # Same hash: its recorded lifecycle phase must agree with the
-            # recovered status — a confirmed event may not sit on a pending
-            # block nor an open/rolled-back phase on a confirmed one.
-            if block.status == STATUS_CONFIRMED:
-                if final_phase[0] != "confirmed":
+        # When the log predates every block lifecycle event, the per-height
+        # reconciliation below has no boundary to apply; transaction-level
+        # reconciliation still runs so a transaction_cancelled event in such
+        # a log is checked against the recovered chain/mempool.
+        skip_block_reconciliation = cutoff_height is None
+        chain_explained = not reservations_doubted
+        if not skip_block_reconciliation:
+            for block in chain[1:]:
+                height = block.height
+                if height < cutoff_height or height in adopted_away:
+                    continue
+                history = phases.get(height)
+                if not history:
+                    # A block above the feature boundary with no lifecycle
+                    # event can only arrive through an unrecorded direct
+                    # adoption: it may also have rearranged mempool
+                    # transactions, so the transaction-level final
+                    # reconciliation below is skipped.
+                    chain_explained = False
+                    continue
+                final_phase = history[-1]
+                if final_phase[1] != block.block_hash:
+                    # A different valid block at this height can only be the
+                    # result of an (possibly unrecorded direct-candidate)
+                    # adoption; its own hashes were independently verified.
+                    chain_explained = False
+                    continue
+                # Same hash: its recorded lifecycle phase must agree with the
+                # recovered status — a confirmed event may not sit on a pending
+                # block nor an open/rolled-back phase on a confirmed one.
+                if block.status == STATUS_CONFIRMED:
+                    if final_phase[0] != "confirmed":
+                        fail(
+                            f"recovered confirmed block at height {height} does "
+                            "not match its block lifecycle audit events"
+                        )
+                elif final_phase[0] == "confirmed":
                     fail(
-                        f"recovered confirmed block at height {height} does "
-                        "not match its block lifecycle audit events"
+                        f"recovered pending block at height {height} has a "
+                        "block_confirmed audit event"
                     )
-            elif final_phase[0] == "confirmed":
-                fail(
-                    f"recovered pending block at height {height} has a "
-                    "block_confirmed audit event"
-                )
-            # A block carrying the exact hash of a block_rolled_back event
-            # returned without an adoption explaining it is corruption.
-            if final_phase[0] == "rolled_back":
-                fail(
-                    f"block at height {height} is present after a "
-                    "block_rolled_back event naming its exact hash"
-                )
+                # A block carrying the exact hash of a block_rolled_back event
+                # returned without an adoption explaining it is corruption.
+                if final_phase[0] == "rolled_back":
+                    fail(
+                        f"block at height {height} is present after a "
+                        "block_rolled_back event naming its exact hash"
+                    )
+            # The recovered pending tip must be exactly the tip the replay
+            # left open; otherwise an adoption moved blocks (and possibly
+            # mempool transactions) without a lifecycle event.
+            recovered_tip = chain[-1]
+            if recovered_tip.status == STATUS_PENDING:
+                if (
+                    open_tip is None
+                    or open_tip[0] != recovered_tip.height
+                    or open_tip[1] != recovered_tip.block_hash
+                ):
+                    chain_explained = False
+            elif open_tip is not None:
+                chain_explained = False
+        else:
+            recovered_tip = chain[-1]
+
+        # When the recovered chain/mempool are fully explained by the ledger
+        # event replay alone, reconcile every event-tracked transaction's
+        # final location. This is what makes a forged transaction_cancelled
+        # event fatal: a cancelled transaction must be absent from both the
+        # canonical chain and the mempool, while a non-cancelled transaction
+        # must still sit exactly where the replay put it. Logs written before
+        # the cancel feature contain no cancel events; their blocks are
+        # already vouched for by the per-height replay (or accepted outright
+        # when no block lifecycle events exist), so this transaction-level
+        # reconciliation only runs when a cancel event is present — older
+        # snapshots recover exactly as before.
+        has_cancel_event = any(
+            event.get("kind") == EVENT_TRANSACTION_CANCELLED
+            for event in audit_events
+        )
+        if chain_explained and has_cancel_event:
+            recovered_chain_ids = {
+                tx.tx_id: block
+                for block in chain
+                for tx in block.transactions
+            }
+            for tracked_id, end_location in tx_live.items():
+                if end_location == "unknown":
+                    continue
+                fact_block = recovered_chain_ids.get(tracked_id)
+                in_mempool = tracked_id in pending
+                if end_location == "gone":
+                    if fact_block is not None or in_mempool:
+                        fail(
+                            "transaction_cancelled event names "
+                            f"{tracked_id} but the transaction is still held "
+                            "by the recovered chain or mempool"
+                        )
+                elif end_location == "mempool":
+                    if not in_mempool or fact_block is not None:
+                        fail(
+                            f"transaction {tracked_id} should be in the "
+                            "mempool according to the lifecycle events but is "
+                            "not held there in the recovered state"
+                        )
+                elif end_location == "tip":
+                    if (
+                        fact_block is None
+                        or fact_block is not recovered_tip
+                        or fact_block.status != STATUS_PENDING
+                        or in_mempool
+                    ):
+                        fail(
+                            f"transaction {tracked_id} should be packed in "
+                            "the pending tip according to the lifecycle "
+                            "events but the recovered state disagrees"
+                        )
+                elif end_location == "confirmed":
+                    if (
+                        fact_block is None
+                        or fact_block.status != STATUS_CONFIRMED
+                        or in_mempool
+                    ):
+                        fail(
+                            f"transaction {tracked_id} should be confirmed "
+                            "according to the lifecycle events but the "
+                            "recovered state disagrees"
+                        )
 
     def _parse_persisted_syncs(
         self,

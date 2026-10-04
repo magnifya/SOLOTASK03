@@ -82,6 +82,7 @@ EVENT_TRANSACTION_SUBMITTED = "transaction_submitted"
 EVENT_BLOCK_MINED = "block_mined"
 EVENT_BLOCK_CONFIRMED = "block_confirmed"
 EVENT_BLOCK_ROLLED_BACK = "block_rolled_back"
+EVENT_TRANSACTION_CANCELLED = "transaction_cancelled"
 
 
 def _parse_height(height: object) -> int | None:
@@ -704,6 +705,129 @@ class LedgerService:
         if tx_id in self.store.pending:
             return STATUS_PENDING
         return None
+
+    def cancel_transaction(
+        self, tx_id: object, payload: object
+    ) -> tuple[int, dict]:
+        """POST /v1/transactions/{tx_id}/cancel — cancel a mempool transaction.
+
+        The sender signs the UTF-8 bytes of
+        ``ledger-cancel-v1\\n<tx_id>`` with the same Ed25519 key that owns the
+        transaction. Returns ``(status, body)``:
+
+        * the ``tx_id`` path component must be exactly 64 lowercase hex
+          characters and the body exactly ``{"signature": S}`` with S a
+          128-lowercase-hex Ed25519 signature; every shape/format defect is
+          ``400 {"error": "input"}`` answered before any state is read;
+        * only the canonical chain (confirmed blocks plus at most one pending
+          tip block) and the mempool are searched — candidate forks never
+          participate; a well-formed id nothing holds is
+          ``404 {"error": "not_found"}``;
+        * a signature that does not verify under the located transaction's
+          sender is ``403 {"error": "unauthorized"}``;
+        * a valid signature for a transaction already packed into the pending
+          tip or a confirmed block is
+          ``409 {"error": "not_cancellable"}`` — only an unpacked mempool
+          transaction can be cancelled;
+        * a sequenced transfer is cancellable only while it holds the sender's
+          highest reserved nonce (the tail of the dense reservation range
+          covering the mempool and the pending chain tip); cancelling a lower
+          reservation is ``409 {"error": "sequence_conflict"}``.
+
+        A successful cancellation removes the transaction from the mempool,
+        releases its spend reservation (a sequenced cancellation also releases
+        the nonce, decrementing ``next_sequence``), leaves every other
+        transaction and all confirmed balances untouched, and appends exactly
+        one ``transaction_cancelled`` audit event (payload
+        ``tx_id, from, to, amount, signature`` plus ``nonce`` for a sequenced
+        transfer) in the same atomic write. Afterwards the transaction reads
+        as not found from every receipt endpoint; the identical original
+        transfer may be resubmitted and the released nonce reused. Cancelling
+        never bans the transaction id from a later legal fork.
+        """
+        bad_input = 400, {"error": "input"}
+        if not crypto.is_hex64(tx_id):
+            return bad_input
+        if not isinstance(payload, dict) or set(payload) != {"signature"}:
+            return bad_input
+        signature = payload["signature"]
+        if not crypto.is_hex128(signature):
+            return bad_input
+
+        with self.store.lock:
+            # Search the canonical chain first (confirmed blocks, then the at
+            # most-one pending tip), then the mempool. Candidate forks are not
+            # searched and never affect the answer.
+            located: Transaction | None = None
+            located_block: Block | None = None
+            for block in self.store.chain:
+                for candidate in block.transactions:
+                    if candidate.tx_id == tx_id:
+                        located = candidate
+                        located_block = block
+                        break
+                if located is not None:
+                    break
+            in_mempool = located is None
+            if in_mempool:
+                located = self.store.pending.get(tx_id)
+            if located is None:
+                return 404, {"error": "not_found"}
+
+            # The cancellation signature is checked against the located
+            # transaction's sender, so a well-formed id held on the canonical
+            # chain or in the mempool but signed by anyone else is 403 rather
+            # than 404/not_cancellable.
+            message = crypto.cancel_message(tx_id)
+            if not crypto.verify_signature(located.sender, message, signature):
+                return 403, {"error": "unauthorized"}
+
+            if not in_mempool:
+                # Packed into the pending tip or already confirmed.
+                return 409, {"error": "not_cancellable"}
+
+            assert located_block is None
+            tx = located
+            if tx.nonce is not None:
+                # Only the sender's highest reserved nonce — the tail of the
+                # dense confirmed/pending reservation range — may be released;
+                # cancelling an interior reservation would leave a gap.
+                state = self.store.sequences.get(tx.sender)
+                highest = self.store.sequence_next(state) - 1
+                if tx.nonce != highest:
+                    return 409, {"error": "sequence_conflict"}
+                if state is None or state["pending"].get(tx.nonce) != tx.tx_id:
+                    # Structural guard: the mempool transaction's nonce slot
+                    # must name exactly this transaction; any disagreement is
+                    # an invariant violation rather than a client conflict.
+                    return 409, {"error": "sequence_conflict"}
+
+            pending_before = dict(self.store.pending)
+            self.store.pending.pop(tx.tx_id, None)
+            event_payload = {
+                "tx_id": tx.tx_id,
+                "from": tx.sender,
+                "to": tx.recipient,
+                "amount": tx.amount,
+                "signature": signature,
+            }
+            if tx.nonce is not None:
+                event_payload["nonce"] = tx.nonce
+            self.store.append_audit_event(
+                EVENT_TRANSACTION_CANCELLED, event_payload
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Persistence failed: restore the mempool in its exact prior
+                # insertion order and drop the event so the in-memory state
+                # (including the derived sequence view, which save() publishes
+                # only after a successful promotion) keeps matching the last
+                # durably committed snapshot.
+                self.store.pending = pending_before
+                self.store.truncate_audit_events(1)
+                return 500, {"error": "persistence failed"}
+            return 200, {"tx_id": tx.tx_id, "status": "cancelled"}
 
     def get_account_sequence(self, account: object) -> tuple[int, dict]:
         """GET /v1/accounts/{account}/sequence — the account's nonce stream.

@@ -1061,6 +1061,68 @@ CLI 提供 `send-sequenced-batch --file PATH`：从 JSON 文件读取请求体�
 读标准输入，原样输出服务端 JSON；2xx 退出码 0，其余为 1。本地文件读取或 JSON
 解析失败时直接输出 `{"error":"input"}` 并以 1 退出，不请求服务。
 
+## 签名取消交易
+
+在转账、序列转账与既有审计能力之外，发送方可凭签名取消仍在内存池中的交易：
+
+`POST /v1/transactions/{tx_id}/cancel`。
+
+### 请求与状态码
+
+- 入口沿用统一 `Idempotency-Key` 规则。不接受任何查询参数（含空值或重复参数
+  一律 `400`；裸结尾 `?` 无参数照常接受）。
+- `tx_id` 路径段必须恰为 64 位小写十六进制；请求体必须是只含 `signature` 一个
+  键的 JSON 对象，`signature` 恰为 128 位小写十六进制 Ed25519 签名。任何格式
+  错误、JSON 解析错误、缺/多键或类型错误都返回 `400 {"error": "input"}`，且在
+  读状态前作答、无副作用。
+- 查找范围**仅限主链与内存池**（主链含已确认块与至多一个 pending 链尾），候选
+  分叉不参与；主链与内存池都查不到时返回 `404 {"error": "not_found"}`。
+- 取消签名消息固定为 UTF-8 字节
+  `ledger-cancel-v1` 加一个换行再加 `tx_id` 的 UTF-8 字节
+  （即 `ledger-cancel-v1\n<tx_id>`，无 JSON、无额外分隔符）；用交易发送方公钥
+  做 Ed25519 验签。验签失败返回 `403 {"error": "unauthorized"}`（先验签、后判定
+  可取消性：已打包/已确认交易的错误签名仍是 403）。
+- 签名有效但交易已在 pending 末块或已确认区块中时，返回
+  `409 {"error": "not_cancellable"}`。
+- 序列交易只允许取消该发送方**当前最高预留 nonce**（预留范围覆盖内存池与 pending
+  链尾，即连续待处理区间的最后一个 nonce）；取消更低的预留 nonce 返回
+  `409 {"error": "sequence_conflict"}`。
+- 成功返回 `200`，JSON 固定为 `{"tx_id": ..., "status": "cancelled"}`。
+
+### 成功语义
+
+- 交易从内存池移除，其**支出预留**立即释放（其他交易与已确认余额不变）；序列
+  交易还释放其 nonce，`next_sequence` 减一。被取消交易随后在单笔回执
+  （`GET /v1/transactions/{tx_id}`）与批量回执
+  （`POST /v1/transactions/receipts`）中一律按未找到处理（`404`，批量项
+  `error="not_found"`）。
+- 可按原规则重新提交**完全相同的交易**，也可复用释放的 nonce；取消不禁止以后的
+  合法分叉包含该交易（候选链校验与分叉同步语义不变）。
+- 成功取消与恰好一条 `transaction_cancelled` 审计事件在同一次原子写入落盘，
+  载荷固定为 `tx_id, from, to, amount, signature`（取消签名，不是原转账签名），
+  序列交易另带 `nonce`。`generation` 仅推进一次；失败与幂等重放不追加事件。
+- 写入失败返回 `500 {"error": "persistence failed"}`，内存池及其顺序、序列、幂等
+  记录与审计链整体回到请求前。并发取消与打包共用同一把锁、按先后生效。
+- 重启保留取消结果与幂等重放结果；中断恢复只能得到完整的取消前或取消后状态。
+
+### 恢复校验
+
+快照恢复时严格校验每条 `transaction_cancelled` 事件：字段类型与 64/128 位小写
+十六进制格式、由 `from/to/amount`（序列交易加 `nonce`）重算的 `tx_id` 必须与
+载荷一致、取消签名必须在 `ledger-cancel-v1` 域下经发送方公钥验签；事件还须与
+提交/出块/确认/回滚状态机重放一致——被取消交易在恢复出的主链与内存池中都不得
+再存在，取消时交易必须处于内存池（已打包/已确认不可取消），序列取消必须落在
+当时发送方的最高预留 nonce。任一项不符（含事件字段非法、ID 重算不符或验签失
+败）都判快照无效；无可恢复快照时抛
+`ledger.store.StateRecoveryError(path, reason)`，绝不静默新建链。分叉采用可能
+重排链上/内存池交易，经分叉采用之后的历史仅做签名与载荷校验，最终 nonce 状态
+仍由独立严格校验的 `sequences` 区段保证。写于本特性之前的旧快照仍可恢复；CLI、
+区块哈希、证明、确认/回滚与分叉同步语义保持不变。
+
+CLI 提供 `cancel TX_ID (--signing-key HEX|@FILE | --signature HEX)
+[--idempotency-key K]`，对 `ledger-cancel-v1\nTX_ID` 本地签名后发送；非 2xx 退出
+码为 1。
+
 ## 交易索引
 
 `GET /v1/index/transactions` 在**已确认链**上提供交易索引（不含 pending 末块）。

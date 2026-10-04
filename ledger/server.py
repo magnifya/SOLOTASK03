@@ -391,6 +391,41 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     return
                 status, body = service.get_attested_account_proofs(payload)
                 self._send_json(status, body, sort_keys=False)
+            elif path.startswith("/v1/transactions/") and path.endswith("/cancel"):
+                # POST /v1/transactions/{tx_id}/cancel — sender-signed
+                # cancellation of a mempool transaction. The endpoint takes no
+                # query parameters (any parameter, including a blank one, is
+                # 400 {"error": "input"}; a bare trailing "?" carries none and
+                # is accepted). The body is strictly {"signature": S} with S a
+                # 128-lowercase-hex Ed25519 signature over
+                # ledger-cancel-v1\n<tx_id>; every parse/shape defect is the
+                # same 400 body. Lookup covers the canonical chain and mempool
+                # only (404 not_found), a bad signature is 403 unauthorized, a
+                # packed/confirmed transaction is 409 not_cancellable and a
+                # non-tail sequenced reservation is 409 sequence_conflict.
+                # The route follows the uniform Idempotency-Key rules.
+                _route, _has_query, query_string = self.path.partition("?")
+                if _has_query and parse_qs(
+                    query_string, keep_blank_values=True
+                ):
+                    # The body is deliberately unread: close the connection
+                    # so it cannot desync the next pipelined request.
+                    self.close_connection = True
+                    self._send_json(400, {"error": "input"})
+                    return
+                tx_id = unquote(
+                    path[len("/v1/transactions/") : -len("/cancel")]
+                )
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                self._json_mutation(
+                    "POST",
+                    lambda: service.cancel_transaction(tx_id, payload),
+                    payload,
+                    sort_keys=False,
+                )
             elif path == "/v1/transactions/sequenced":
                 # POST /v1/transactions/sequenced — a retryable, nonce-ordered
                 # sequenced transfer. The first valid request returns 202 with

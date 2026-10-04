@@ -1,4 +1,4 @@
-"""Command line interface: send, send-sequenced, send-sequenced-batch, sequence, tx, txs, mine, block, account, proof, proofs,
+"""Command line interface: send, send-sequenced, send-sequenced-batch, cancel, sequence, tx, txs, mine, block, account, proof, proofs,
 state-root,
 state-proof, state-proofs, confirm, rollback, status, candidates, chain, adopt, export,
 index, sync, sync-range, sync-attested, sync-range-attested, syncs,
@@ -210,6 +210,59 @@ def cmd_tx(args: argparse.Namespace) -> int:
         "GET", f"{args.base_url}/v1/transactions/{quoted}", None
     )
     return _emit(status, body)
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    # Cancel a mempool transaction. The cancel signature covers
+    # ledger-cancel-v1\n<tx_id>; unlike a transfer it binds no sender field,
+    # so --signing-key is enough on its own (an explicit --signature is also
+    # accepted). Malformed tx_id/signature inputs fail locally with the same
+    # {"error": "input"} body and exit code 1 as the server-side rules.
+    if not crypto.is_hex64(args.tx_id):
+        print(json.dumps({"error": "input"}, sort_keys=False))
+        return 1
+    if args.signing_key:
+        try:
+            key = _load_signing_key(args.signing_key)
+        except (ValueError, OSError, TypeError) as exc:
+            return _emit(400, {"error": f"invalid signing key: {exc}"})
+        signature = key.sign(crypto.cancel_message(args.tx_id)).hex()
+    elif args.signature:
+        signature = args.signature
+    else:
+        return _emit(
+            400,
+            {"error": "provide either --signing-key or --signature"},
+        )
+    if not crypto.is_hex128(signature):
+        print(json.dumps({"error": "input"}, sort_keys=False))
+        return 1
+    quoted = urllib.parse.quote(args.tx_id, safe="")
+    payload = {"signature": signature}
+    headers = {"Accept": "application/json"}
+    if args.idempotency_key is not None:
+        headers["Idempotency-Key"] = args.idempotency_key
+    data = json.dumps(payload).encode("utf-8")
+    headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        f"{args.base_url}/v1/transactions/{quoted}/cancel",
+        data=data,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            status = response.status
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            body = {"error": exc.reason}
+        status = exc.code
+    except (urllib.error.URLError, OSError) as exc:
+        return _emit(0, {"error": f"cannot reach ledger server: {exc}"})
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_txs(args: argparse.Namespace) -> int:
@@ -1224,6 +1277,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_tx = sub.add_parser("tx", help="fetch a transaction receipt by tx_id")
     p_tx.add_argument("tx_id", help="transaction id (64 lowercase hex characters)")
     p_tx.set_defaults(func=cmd_tx)
+
+    p_cancel = sub.add_parser(
+        "cancel", help="cancel a mempool transaction by tx_id"
+    )
+    p_cancel.add_argument(
+        "tx_id", help="transaction id (64 lowercase hex characters)"
+    )
+    p_cancel.add_argument(
+        "--signing-key",
+        help="sender Ed25519 private key: hex or @file (PEM/hex); signs "
+        "ledger-cancel-v1 newline tx_id",
+    )
+    p_cancel.add_argument(
+        "--signature", help="raw Ed25519 cancel signature hex (128 hex chars)"
+    )
+    p_cancel.add_argument(
+        "--idempotency-key",
+        help="optional Idempotency-Key header for the cancel request",
+    )
+    p_cancel.set_defaults(func=cmd_cancel)
 
     p_txs = sub.add_parser(
         "txs", help="fetch several transaction receipts in one batch query"
