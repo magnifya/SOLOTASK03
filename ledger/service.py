@@ -76,9 +76,10 @@ EVENT_ALLOWLIST_REMOVED = "allowlist_removed"
 EVENT_HISTORY_ACCESS = "history_access"
 EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
 # Core ledger lifecycle events mirroring ledger.store's literal values:
-# one event per successful submit/mine/confirm/rollback transition, appended
-# in the same atomic write as the change it describes.
+# one event per successful submit/cancel/mine/confirm/rollback transition,
+# appended in the same atomic write as the change it describes.
 EVENT_TRANSACTION_SUBMITTED = "transaction_submitted"
+EVENT_TRANSACTION_CANCELLED = "transaction_cancelled"
 EVENT_BLOCK_MINED = "block_mined"
 EVENT_BLOCK_CONFIRMED = "block_confirmed"
 EVENT_BLOCK_ROLLED_BACK = "block_rolled_back"
@@ -353,6 +354,107 @@ class LedgerService:
                 self.store.truncate_audit_events(1)
                 raise
         return 202, {"tx_id": tx.tx_id}
+
+    # -- transaction cancellation --------------------------------------------
+
+    def cancel_transaction(
+        self, tx_id: object, payload: object
+    ) -> tuple[int, dict]:
+        """POST /v1/transactions/{tx_id}/cancel — sender-signed mempool cancel.
+
+        The path ``tx_id`` must be exactly 64 lowercase hex characters and
+        the body exactly ``{"signature": "<128 lowercase hex>"}``; every
+        format, shape or JSON defect is ``400 {"error": "input"}``. The
+        lookup covers only the canonical chain and the mempool (candidate
+        forks never participate): an id nothing holds is
+        ``404 {"error": "not_found"}``. The signature must be the sender's
+        Ed25519 signature over ``ledger-cancel-v1\\n<tx_id>``; a mismatch is
+        ``403 {"error": "unauthorized"}``. A transaction already packed into
+        the pending tip or a confirmed block is
+        ``409 {"error": "not_cancellable"}``. A sequenced transfer may only
+        be cancelled while its nonce is the sender's highest reserved nonce
+        (reservations span the mempool and the pending tip); anything else is
+        ``409 {"error": "sequence_conflict"}``.
+
+        A successful cancel removes the transaction from the mempool,
+        releasing its spend reservation (and, for a sequenced transfer, its
+        nonce, moving ``next_sequence`` back by one), appends exactly one
+        ``transaction_cancelled`` audit event and persists both in the same
+        atomic write; a failed write rolls mempool (and its order), the
+        event and the generation back and raises for the caller's
+        persistence-failed answer. Confirmed balances and every other
+        transaction are untouched, and nothing forbids resubmitting the same
+        transaction, reusing the freed nonce or a later fork containing it.
+        """
+        if not crypto.is_hex64(tx_id):
+            return 400, {"error": "input"}
+        if not isinstance(payload, dict) or set(payload) != {"signature"}:
+            return 400, {"error": "input"}
+        signature = payload["signature"]
+        if not crypto.is_hex128(signature):
+            return 400, {"error": "input"}
+        with self.store.lock:
+            # Canonical chain (confirmed blocks and the pending tip) first;
+            # candidate forks are deliberately never searched.
+            block_tx = None
+            for block in self.store.chain:
+                for candidate in block.transactions:
+                    if candidate.tx_id == tx_id:
+                        block_tx = candidate
+                        break
+                if block_tx is not None:
+                    break
+            tx = self.store.pending.get(tx_id)
+            located = tx if tx is not None else block_tx
+            if located is None:
+                return 404, {"error": "not_found"}
+            # The cancellation must be signed by the transaction's sender
+            # over the fixed cancel message naming this tx_id.
+            if not crypto.verify_signature(
+                located.sender, crypto.cancel_message(tx_id), signature
+            ):
+                return 403, {"error": "unauthorized"}
+            if block_tx is not None:
+                return 409, {"error": "not_cancellable"}
+            if tx.nonce is not None:
+                # Only the sender's highest reserved nonce may leave the
+                # pending set; reservations are a dense prefix spanning the
+                # mempool and the pending tip, so releasing the top one moves
+                # next_sequence back by exactly one.
+                state = self.store.sequences.get(tx.sender)
+                reserved = state["pending"] if state is not None else {}
+                highest = max(reserved) if reserved else None
+                if highest is None or tx.nonce != highest:
+                    return 409, {"error": "sequence_conflict"}
+            # Keep the mempool (and its insertion order) for the rollback
+            # path so a failed write restores the exact pre-request state.
+            pending_before = dict(self.store.pending)
+            del self.store.pending[tx_id]
+            event_payload = {
+                "tx_id": tx.tx_id,
+                "from": tx.sender,
+                "to": tx.recipient,
+                "amount": tx.amount,
+                "signature": signature,
+            }
+            if tx.nonce is not None:
+                event_payload["nonce"] = tx.nonce
+            # One transaction_cancelled event, persisted in the same atomic
+            # write as the mempool removal.
+            self.store.append_audit_event(
+                EVENT_TRANSACTION_CANCELLED, event_payload
+            )
+            try:
+                self.store.save()
+            except BaseException:
+                # Persistence failed: restore the mempool with its original
+                # order and drop the event so memory keeps matching the last
+                # durably committed state.
+                self.store.pending.clear()
+                self.store.pending.update(pending_before)
+                self.store.truncate_audit_events(1)
+                raise
+        return 200, {"tx_id": tx_id, "status": "cancelled"}
 
     # -- sequenced (retryable, nonce-ordered) transactions ------------------
 

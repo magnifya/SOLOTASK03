@@ -54,6 +54,23 @@ def sequenced_message(
     return (SEQUENCED_MESSAGE_PREFIX + body).encode("utf-8")
 
 
+# Domain prefix of a transaction-cancel signature message: the UTF-8 prefix
+# line (including its trailing LF) followed by the bare tx_id. It binds a
+# cancellation to this protocol and keeps it disjoint from the transfer
+# signature domains (canonical and sequenced).
+CANCEL_MESSAGE_PREFIX = "ledger-cancel-v1\n"
+
+
+def cancel_message(tx_id: str) -> bytes:
+    """Deterministic byte representation of a transaction-cancel request.
+
+    The message is the UTF-8 text ``ledger-cancel-v1`` followed by a single
+    LF and the target transaction id (64 lowercase hex characters), so the
+    same tx_id always yields identical bytes on every client.
+    """
+    return (CANCEL_MESSAGE_PREFIX + tx_id).encode("utf-8")
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

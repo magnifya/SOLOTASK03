@@ -129,17 +129,20 @@ EVENT_HISTORY_ACCESS = "history_access"
 # service.EVENT_HISTORY_CREDENTIAL_CHANGED mirrors this literal value.
 EVENT_HISTORY_CREDENTIAL_CHANGED = "history_credential_changed"
 # Core ledger lifecycle events, one per successful state transition:
-# transaction_submitted (first mempool enqueue), block_mined (first pending
+# transaction_submitted (first mempool enqueue), transaction_cancelled
+# (sender-signed removal of a mempool transaction), block_mined (first pending
 # block creation at a height), block_confirmed (first confirmation of the
 # pending tip) and block_rolled_back (successful pending-tip rollback). The
 # service layer appends them in the same atomic write as the change they
 # describe; recovery strictly re-validates their payloads and lifecycle.
 EVENT_TRANSACTION_SUBMITTED = "transaction_submitted"
+EVENT_TRANSACTION_CANCELLED = "transaction_cancelled"
 EVENT_BLOCK_MINED = "block_mined"
 EVENT_BLOCK_CONFIRMED = "block_confirmed"
 EVENT_BLOCK_ROLLED_BACK = "block_rolled_back"
 LEDGER_EVENT_KINDS = (
     EVENT_TRANSACTION_SUBMITTED,
+    EVENT_TRANSACTION_CANCELLED,
     EVENT_BLOCK_MINED,
     EVENT_BLOCK_CONFIRMED,
     EVENT_BLOCK_ROLLED_BACK,
@@ -2487,18 +2490,29 @@ class LedgerStore:
         # events carrying the action and the heads the two external files had
         # at access time (64-hex, or null when the file did not exist yet).
         history_access_kinds = {EVENT_HISTORY_ACCESS}
-        # The four core ledger lifecycle events carry strictly typed payloads;
+        # The core ledger lifecycle events carry strictly typed payloads;
         # their inter-event state machine and the facts they reference are
         # cross-checked separately by _validate_ledger_lifecycle_events once
         # the whole chain is parsed. A transaction_submitted event may
         # additionally carry a non-negative nonce, marking it as a sequenced
-        # transfer whose tx_id recomputes from the sequenced message.
+        # transfer whose tx_id recomputes from the sequenced message. A
+        # transaction_cancelled event records the sender-signed removal of a
+        # mempool transaction: its signature is the sender's Ed25519
+        # cancellation signature over crypto.cancel_message(tx_id), and it
+        # likewise carries nonce when the cancelled transfer was sequenced.
         ledger_event_payload_keys = {
             EVENT_TRANSACTION_SUBMITTED: (
                 "tx_id",
                 "from",
                 "to",
                 "amount",
+            ),
+            EVENT_TRANSACTION_CANCELLED: (
+                "tx_id",
+                "from",
+                "to",
+                "amount",
+                "signature",
             ),
             EVENT_BLOCK_MINED: (
                 "height",
@@ -2515,6 +2529,7 @@ class LedgerStore:
         }
         ledger_event_optional_payload = {
             EVENT_TRANSACTION_SUBMITTED: ("nonce",),
+            EVENT_TRANSACTION_CANCELLED: ("nonce",),
         }
         ledger_event_kinds = set(ledger_event_payload_keys)
         events: list[dict] = []
@@ -2672,7 +2687,10 @@ class LedgerStore:
                             else ""
                         ),
                     )
-                if kind == EVENT_TRANSACTION_SUBMITTED:
+                if kind in (
+                    EVENT_TRANSACTION_SUBMITTED,
+                    EVENT_TRANSACTION_CANCELLED,
+                ):
                     tx_id = event["tx_id"]
                     sender = event["from"]
                     recipient = event["to"]
@@ -2681,19 +2699,19 @@ class LedgerStore:
                     if not crypto.is_hex64(tx_id):
                         raise StateRecoveryError(
                             path,
-                            f"audit event {event_id} (transaction_submitted) "
+                            f"audit event {event_id} ({kind}) "
                             "tx_id must be 64 lowercase hex characters",
                         )
                     if not isinstance(sender, str) or not sender:
                         raise StateRecoveryError(
                             path,
-                            f"audit event {event_id} (transaction_submitted) "
+                            f"audit event {event_id} ({kind}) "
                             "'from' must be a non-empty string",
                         )
                     if not isinstance(recipient, str) or not recipient:
                         raise StateRecoveryError(
                             path,
-                            f"audit event {event_id} (transaction_submitted) "
+                            f"audit event {event_id} ({kind}) "
                             "'to' must be a non-empty string",
                         )
                     if (
@@ -2703,7 +2721,7 @@ class LedgerStore:
                     ):
                         raise StateRecoveryError(
                             path,
-                            f"audit event {event_id} (transaction_submitted) "
+                            f"audit event {event_id} ({kind}) "
                             "amount must be a positive integer",
                         )
                     if nonce is not None and (
@@ -2713,9 +2731,18 @@ class LedgerStore:
                     ):
                         raise StateRecoveryError(
                             path,
-                            f"audit event {event_id} (transaction_submitted) "
+                            f"audit event {event_id} ({kind}) "
                             "nonce must be a non-negative integer",
                         )
+                    if kind == EVENT_TRANSACTION_CANCELLED:
+                        signature = event["signature"]
+                        if not crypto.is_hex128(signature):
+                            raise StateRecoveryError(
+                                path,
+                                f"audit event {event_id} ({kind}) "
+                                "signature must be 128 lowercase hex "
+                                "characters",
+                            )
                 else:
                     height = event["height"]
                     block_hash = event["block_hash"]
@@ -2792,6 +2819,9 @@ class LedgerStore:
 
         * a ``transaction_submitted`` tx_id must recompute from its
           from/to/amount and the same tx_id is submitted at most once;
+        * a ``transaction_cancelled`` tx_id must likewise recompute from its
+          payload and its cancellation signature must verify under the
+          sender's key over the fixed ``ledger-cancel-v1`` message;
         * a ``block_mined`` event must carry the recomputed Merkle root, its
           transaction_ids must be ascending distinct facts (a prior
           submission, the recovered mempool, or a cryptographically verified
@@ -2957,6 +2987,40 @@ class LedgerStore:
                 # only ever answers 409. This is not itself corruption, so it
                 # is not rejected — the recomputed tx_id binds every copy.
                 tx_facts.add(tx_id)
+                continue
+            if kind == EVENT_TRANSACTION_CANCELLED:
+                tx_id = event["tx_id"]
+                amount = event["amount"]
+                nonce = event.get("nonce")
+                if nonce is None:
+                    message = crypto.canonical_message(
+                        event["from"], event["to"], amount
+                    )
+                else:
+                    message = crypto.sequenced_message(
+                        event["from"], event["to"], amount, nonce
+                    )
+                if crypto.compute_tx_id(message) != tx_id:
+                    fail(
+                        f"audit event {event_id} (transaction_cancelled) tx_id "
+                        "does not recompute from its payload"
+                    )
+                # The cancellation signature must verify under the sender's
+                # key over the fixed ledger-cancel-v1 message naming the
+                # cancelled transaction.
+                if not crypto.verify_signature(
+                    event["from"],
+                    crypto.cancel_message(tx_id),
+                    event["signature"],
+                ):
+                    fail(
+                        f"audit event {event_id} (transaction_cancelled) "
+                        "signature does not verify for its sender"
+                    )
+                # The cancelled transaction stays a known fact (its own
+                # submission event and any fork block still reference it);
+                # nothing here forbids a later resubmission or a fork that
+                # packs it again.
                 continue
 
             assert isinstance(height, int)

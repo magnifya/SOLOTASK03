@@ -663,7 +663,10 @@ JSON 解析失败或任何键/值非法一律返回 `400` 及**有序**
   pending tip** 记录 `block_confirmed`（字段 `height,block_hash`，幂等重复
   确认不再追加）；**成功回滚 pending tip** 记录 `block_rolled_back`（字段
   `height,block_hash,transaction_ids`，`transaction_ids` 为实际回到
-  mempool 的交易，保持区块内顺序、为区块交易的子集）。四条事件与业务状态、
+  mempool 的交易，保持区块内顺序、为区块交易的子集）；**成功取消内存池
+  交易**记录 `transaction_cancelled`（字段 `tx_id,from,to,amount,signature`，
+  `signature` 为取消签名、序列交易另带 `nonce`，`tx_id` 必须由载荷重算一致
+  且取消签名必须通过发送方验签）。五条事件与业务状态、
   幂等记录在**同一原子持久化**内提交，落盘失败时状态、generation、审计链头
   与内存数据整体回到调用前；带 `Idempotency-Key` 的首次成功写入只追加一条，
   同键重放、同键冲突与非成功结果均不追加。事件一旦写入永不删除：候选
@@ -674,10 +677,10 @@ JSON 解析失败或任何键/值非法一律返回 `400` 及**有序**
   必须从 1 起连续无重复；每条 `prev_hash`/`event_hash` 必须重算一致，
   `audit_checkpoint` 必须钉住真实链头，`allowlist_added`/`allowlist_removed`
   事件也必须携带非空 `source` 与整数 `expires_at`；
-  `transaction_submitted`/`block_mined`/`block_confirmed`/
+  `transaction_submitted`/`transaction_cancelled`/`block_mined`/`block_confirmed`/
   `block_rolled_back` 严格校验字段类型、64 位小写十六进制格式、
   `transaction_ids` 的升序与区块内顺序，并按事件重放
-  提交→出块→确认/回滚状态机、核对被引用区块与交易事实及父区块哈希——
+  提交→取消/出块→确认/回滚状态机、核对被引用区块与交易事实及父区块哈希——
   只有分叉采用（`sync_adopted` 或直接采用候选）允许在无账本事件的情况下
   替换区块）。任一项损坏，或同代
   快照内容冲突，都抛 `StateRecoveryError`，绝不静默新建。来源公钥历史同样
@@ -1060,6 +1063,41 @@ nonce 与审计链；并发提交与同 `Idempotency-Key` 重试下只有一个�
 CLI 提供 `send-sequenced-batch --file PATH`：从 JSON 文件读取请求体，`--file -`
 读标准输入，原样输出服务端 JSON；2xx 退出码 0，其余为 1。本地文件读取或 JSON
 解析失败时直接输出 `{"error":"input"}` 并以 1 退出，不请求服务。
+
+## 签名取消交易
+
+`POST /v1/transactions/{tx_id}/cancel` 由发送方签名取消一笔仍在内存池中的交易。
+入口沿用统一 `Idempotency-Key` 规则；不新增 CLI 子命令，既有 CLI、区块哈希、
+证明、确认回滚与分叉同步语义完全不变。
+
+- **请求**：路径 `tx_id` 必须恰好是 64 位小写十六进制；请求体只含
+  `{"signature": "<128 位小写十六进制>"}` 一个键；不接受任何查询参数（裸 `?`
+  不带参数不算）。格式、键缺失/多余或 JSON 解析错误一律返回
+  `400 {"error":"input"}`。
+- **查找**：只查 canonical 主链与内存池，候选分叉不参与；查不到返回
+  `404 {"error":"not_found"}`。
+- **验签**：签名消息固定为 UTF-8 文本 `ledger-cancel-v1` 加一个换行再接
+  `tx_id`（即 `crypto.cancel_message(tx_id)`），用交易 `from` 对应的公钥做
+  Ed25519 验签；验签失败返回 `403 {"error":"unauthorized"}`。
+- **状态机**：签名有效但交易已在待定（pending 末块）或已确认区块中时返回
+  `409 {"error":"not_cancellable"}`。序列交易仅允许取消发送方**最高预留
+  nonce**（预留范围包含内存池与待定链尾），否则返回
+  `409 {"error":"sequence_conflict"}`。
+- **成功**：返回 `200 {"tx_id","status":"cancelled"}`。交易从内存池移除并释放
+  支出预留；序列交易同时释放 nonce 并使 `next_sequence` 减一；其他交易与已确认
+  余额不变。取消后单笔与批量回执均按未找到处理；可按原规则重提相同交易或复用
+  nonce，取消也不禁止合法分叉以后包含该交易。
+- **审计与原子性**：成功取消与恰好一条 `transaction_cancelled` 审计事件在同一
+  次原子写入中落盘，`generation` 仅推进一次；事件载荷为
+  `tx_id, from, to, amount, signature`（取消签名），序列交易另带 `nonce`。
+  失败与幂等重放不追加事件。落盘失败返回
+  `500 {"error":"persistence failed"}`，内存池及其顺序、序列、幂等记录与审计链
+  整体回到请求前。并发取消与打包在同一把锁内按先后生效；重启保留取消结果与
+  幂等重放，中断恢复只会得到完整的取消前或取消后状态。
+- **恢复校验**：`transaction_cancelled` 事件随审计链严格校验——字段类型与
+  hex 格式非法、`tx_id` 无法由 `from/to/amount`（及 `nonce`）重算一致、或取消
+  签名无法通过发送方验签的快照一律无效；没有任何可恢复快照时抛
+  `StateRecoveryError`。不含取消事件的旧快照仍可正常恢复。
 
 ## 交易索引
 
@@ -1984,12 +2022,12 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 
 | 文件 | 职责 |
 | --- | --- |
-| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof` 与批量束 `verify_merkle_proof_bundle`）、账户状态叶子/状态根、`verify_account_proof` 包含验证与 `verify_account_absence_proof` 不存在（非包含）验证 |
+| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息（含序列转账与 `ledger-cancel-v1` 取消消息）、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof` 与批量束 `verify_merkle_proof_bundle`）、账户状态叶子/状态根、`verify_account_proof` 包含验证与 `verify_account_absence_proof` 不存在（非包含）验证 |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |
 | `ledger/store.py` | 链（含候选分叉）、状态、待打包集合、索引、账户、持久化来源信任注册表、allowlist、可轮换审计检查点 Ed25519 签名者（含历史公钥）与带哈希链/检查点的只增审计事件流（含 `history_access` 绑定）的 JSON 原子持久化（fsync 快照 + 原子改名）、generation、创世区块、候选分叉整链校验、采用时原子换链、启动快照扫描、旧快照补链/签名者迁移与崩溃恢复、节点托管检查点历史文件的启动重验与末条同类事件绑定、持久分权历史凭据（`history_credential` 快照区段与 `history_credential_changed` 事件重放校验） |
-| `ledger/service.py` | 提交校验（签名、金额、余额）、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记、令牌保护的 `/v1/history/trust`
+| `ledger/service.py` | 提交校验（签名、金额、余额）、签名取消内存池交易、打包、确认/回滚状态机、查询，候选分叉的提交校验、链比较与原子采用，来源信任注册/轮换/撤销、keyless allowlist 新增/幂等/删除、审计签名者轮换、信任文档、审计分页、哈希锚定导出（含检查点认证）与同步事件登记、令牌保护的 `/v1/history/trust`
 读取/追加（201/200 幂等）与 `/v1/history/export` 签名分页及其
 `history_access` 审计事件，以及持久分权凭据 `/v1/history/access`
 的 rotate/revoke（201 首创/200 更新，仅存 SHA-256 哈希，分权 Bearer 闸门
@@ -2033,7 +2071,7 @@ read/update/export，401/403 无副作用）与 `history_credential_changed` 事
 ## 统一请求幂等保护（Idempotency-Key）
 
 所有**改变账本或管理状态**的 POST 与 DELETE 入口（旧式交易提交、序列
-转账提交、打包、确认/
+转账提交、签名取消交易、打包、确认/
 回滚、候选分叉提交/采用、整链与增量（含签名）同步、来源信任注册/轮换/
 撤销、allowlist 新增/删除、审计签名者轮换、历史签名者日志追加、历史分
 页导出与持久分权历史凭据管理）都支持统一的请求幂等保护。只读 POST
@@ -2121,6 +2159,14 @@ curl -s -X POST localhost:8080/v1/transactions/sequenced \
 # -> 202 {"tx_id":"...","nonce":0}（相同请求重试 -> 200 同结果）
 # 字段/类型/签名/余额不合格 -> 400 {"error":"input"}
 # nonce 落后/跳号/同 nonce 冲突 -> 409 {"error":"sequence_conflict","next_sequence":N}
+# 签名取消内存池交易（signature 为发送方对 "ledger-cancel-v1\n"+tx_id 的 Ed25519 签名；
+# 体只含 signature、不接受查询参数；沿用 Idempotency-Key 规则）
+curl -s -X POST localhost:8080/v1/transactions/<tx-id-hex>/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"signature":"<sig-hex-128>"}'
+# -> 200 {"status":"cancelled","tx_id":"..."}；格式/JSON 错 400 {"error":"input"}；
+# 查不到 404 {"error":"not_found"}；验签失败 403 {"error":"unauthorized"}；
+# 已入块 409 {"error":"not_cancellable"}；非最高预留 nonce 409 {"error":"sequence_conflict"}
 # 账户序列（陌生账户也返回 200：next_sequence=0、两个空数组；不接受查询参数）
 curl -s localhost:8080/v1/accounts/<pubkey-hex>/sequence
 # -> 200 {"account":"...","next_sequence":N,"pending_sequences":[{"nonce","tx_id"}...],

@@ -440,6 +440,43 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     lambda: service.submit_transaction(payload),
                     payload,
                 )
+            elif path.startswith("/v1/transactions/") and path.endswith(
+                "/cancel"
+            ):
+                # POST /v1/transactions/{tx_id}/cancel — sender-signed
+                # cancellation of a mempool transaction. The endpoint takes
+                # no query parameters: any parameter (including a blank one)
+                # is 400 {"error": "input"}; a bare trailing "?" carries
+                # none and is accepted. The tx_id must be 64 lowercase hex
+                # and the body exactly {"signature": "<128 lowercase hex>"};
+                # every format or JSON defect is 400 {"error": "input"}.
+                # Unknown ids are 404 {"error": "not_found"}, a bad sender
+                # signature 403 {"error": "unauthorized"}, a packed or
+                # confirmed transaction 409 {"error": "not_cancellable"} and
+                # a non-top reserved sequenced nonce 409 {"error":
+                # "sequence_conflict"}. The route is state-changing, so the
+                # uniform Idempotency-Key rules apply.
+                _route, _has_query, query_string = self.path.partition("?")
+                if _has_query and parse_qs(
+                    query_string, keep_blank_values=True
+                ):
+                    # The body is deliberately unread: close the connection
+                    # so it cannot desync the next pipelined request.
+                    self.close_connection = True
+                    self._send_json(400, {"error": "input"})
+                    return
+                tx_id = unquote(
+                    path[len("/v1/transactions/") : -len("/cancel")]
+                )
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                self._json_mutation(
+                    "POST",
+                    lambda: service.cancel_transaction(tx_id, payload),
+                    payload,
+                )
             elif path == "/v1/forks/candidates":
                 ok, payload = self._read_json()
                 if not ok:
