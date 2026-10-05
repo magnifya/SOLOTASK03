@@ -13,8 +13,10 @@ serving node or holding any chain state:
                                       block_hash, siblings}},
             ...
         ],
-        # Optional account-state extension: all four fields are either present
-        # together or absent together, and state_proofs is a non-empty list.
+        # Optional account-state extension: all four anchor fields are either
+        # present together or absent together, and the bundle carries at
+        # least one kind of state proof (state_proofs and the optional
+        # state_absence_proofs may not both be empty).
         "state_root": str,            # 64 lowercase hex, anchored state root
         "state_height": int,          # confirmed anchor block height
         "state_block_hash": str,      # 64 lowercase hex anchor block hash
@@ -23,6 +25,14 @@ serving node or holding any chain state:
                                       confirmed_transactions, index,
                                       state_root, height, block_hash,
                                       siblings}},
+            ...
+        ],
+        # Optional non-inclusion extension: only valid together with the
+        # four anchor fields above. Every item carries exactly
+        # {"height", "proof"} where proof is the plain four-field
+        # account-absence document {account, state, lower, upper}.
+        "state_absence_proofs": [
+            {"height": int, "proof": {account, state, lower, upper}},
             ...
         ],
         "signature": str,             # optional Ed25519 signature hex
@@ -64,13 +74,21 @@ Verification, in order:
    the anchor hash; each account must sit at its ``index`` in the ascending
    account set of the anchor height's confirmed transactions, ``height`` +
    ``account`` pairs must be unique, and every proof must pass
-   ``crypto.verify_account_proof`` against the bundle's anchors.
+   ``crypto.verify_account_proof`` against the bundle's anchors. Every
+   ``state_absence_proofs`` item must bind to the same anchor (its own
+   ``height`` and the embedded state document's root/height/hash), its target
+   account must be unique, absent from the anchor height's rebuilt account
+   set (and hence from every inclusion proof), and the document must pass
+   ``crypto.verify_account_absence_proof`` against the anchor extended by
+   the rebuilt account count — predecessor/successor framing, adjacent
+   indices, boundary and empty-tree rules included.
 
 On success :func:`verify_bundle` returns
 ``{"ok": True, "source", "S", "verified_tx_ids"}`` — plus
-``"verified_accounts"`` (ascending) when the state extension was verified —
-on failure ``{"ok": False, "error": category}`` with category one of
-``input/auth/expired/integrity/proof``.
+``"verified_accounts"`` (ascending) when the state extension was verified
+and ``"verified_absent_accounts"`` (ascending) when the bundle carried
+``state_absence_proofs`` — on failure ``{"ok": False, "error": category}``
+with category one of ``input/auth/expired/integrity/proof``.
 
 :func:`verify_range_export` verifies one exported incremental range delivery
 (the ``GET /v1/forks/sync/range/export`` document, top-level key order
@@ -604,7 +622,8 @@ ERR_IO = "io"
 DESCRIPTOR_FIELDS = ("tip_hash", "height", "length", "status")
 
 # The optional account-state extension: these four bundle fields are either
-# all present or all absent.
+# all present or all absent. ``state_absence_proofs`` is only ever valid
+# alongside them.
 STATE_FIELDS = ("state_root", "state_height", "state_block_hash", "state_proofs")
 
 # The exact key set of one state-proof document (mirrors the server's
@@ -621,6 +640,10 @@ _STATE_PROOF_KEYS = frozenset(
         "siblings",
     )
 )
+
+# The exact key set of one bundled account-absence proof document (mirrors
+# the server's plain GET /v1/accounts/{account}/absence-proof response).
+_STATE_ABSENCE_PROOF_KEYS = frozenset(("account", "state", "lower", "upper"))
 
 # An Ed25519 public key rendered as 64 lowercase hexadecimal characters.
 _HEX32_RE = re.compile(r"[0-9a-f]{64}")
@@ -662,9 +685,11 @@ def verify_bundle(bundle: object, trust: object, now: float | None = None) -> di
     """Verify an offline proof bundle against the local trust document.
 
     Returns ``{"ok": True, "source": ..., "S": ..., "verified_tx_ids": [...]}``
-    on success — extended bundles also carry ``"verified_accounts"`` — or
-    ``{"ok": False, "error": category}`` on failure. Never raises for
-    malformed input: every defect maps to one of the five categories.
+    on success — extended bundles also carry ``"verified_accounts"``, and
+    bundles with ``state_absence_proofs`` additionally carry
+    ``"verified_absent_accounts"`` — or ``{"ok": False, "error": category}``
+    on failure. Never raises for malformed input: every defect maps to one
+    of the five categories.
     """
     current = time.time() if now is None else now
     try:
@@ -682,6 +707,11 @@ def verify_bundle(bundle: object, trust: object, now: float | None = None) -> di
         verified_accounts = (
             _verify_state_proofs(bundle, blocks) if has_state else None
         )
+        verified_absent = (
+            _verify_state_absence_proofs(bundle, blocks)
+            if has_state and "state_absence_proofs" in bundle
+            else None
+        )
     except _Failure as failure:
         return {"ok": False, "error": failure.category}
     except Exception:
@@ -696,6 +726,8 @@ def verify_bundle(bundle: object, trust: object, now: float | None = None) -> di
     }
     if verified_accounts is not None:
         result["verified_accounts"] = verified_accounts
+    if verified_absent is not None:
+        result["verified_absent_accounts"] = verified_absent
     return result
 
 
@@ -762,16 +794,24 @@ def _validate_inputs(bundle: object, trust: object) -> tuple[str, object]:
 def _validate_state_fields(bundle: dict) -> None:
     """Structural validation of the optional account-state extension.
 
-    The four state fields are all-or-nothing; when present, ``state_root`` and
-    ``state_block_hash`` must be 64-char lowercase hex, ``state_height`` a
-    non-boolean non-negative integer and ``state_proofs`` a non-empty list.
-    Every item must carry exactly ``{height, proof}`` and every proof document
-    exactly the eight documented keys with the right JSON types. Only shape
-    and type are judged here — domain defects (bad hex, negative balances,
-    illegal directions) are reported later as integrity/proof failures.
+    The four anchor fields are all-or-nothing; ``state_absence_proofs`` is
+    only valid alongside them (supplying it alone, or with any anchor field
+    missing, is an input error). When the extension is present, ``state_root``
+    and ``state_block_hash`` must be 64-char lowercase hex, ``state_height``
+    a non-boolean non-negative integer and ``state_proofs`` a list; the
+    optional ``state_absence_proofs`` must be a list too, and at least one
+    of the two lists must be non-empty — the bundle has to carry at least
+    one kind of state proof. Every inclusion item must carry exactly
+    ``{height, proof}`` with the eight documented proof keys, and every
+    absence item exactly ``{height, proof}`` with the four-field absence
+    document ``{account, state, lower, upper}``, all with the right JSON
+    types. Only shape and type are judged here — domain defects (bad hex
+    inside inclusion proofs, negative balances, illegal directions) are
+    reported later as integrity/proof failures.
     """
     present = [field for field in STATE_FIELDS if field in bundle]
-    if not present:
+    has_absence = "state_absence_proofs" in bundle
+    if not present and not has_absence:
         return
     if len(present) != len(STATE_FIELDS):
         raise _Failure(ERR_INPUT)
@@ -782,7 +822,7 @@ def _validate_state_fields(bundle: dict) -> None:
     if not crypto.is_hex64(bundle["state_block_hash"]):
         raise _Failure(ERR_INPUT)
     state_proofs = bundle["state_proofs"]
-    if not isinstance(state_proofs, list) or not state_proofs:
+    if not isinstance(state_proofs, list):
         raise _Failure(ERR_INPUT)
     for item in state_proofs:
         if not isinstance(item, dict) or set(item) != {"height", "proof"}:
@@ -811,6 +851,38 @@ def _validate_state_fields(bundle: dict) -> None:
             raise _Failure(ERR_INPUT)
         if not isinstance(proof["siblings"], list):
             raise _Failure(ERR_INPUT)
+    absence_proofs = bundle.get("state_absence_proofs")
+    if has_absence:
+        if not isinstance(absence_proofs, list):
+            raise _Failure(ERR_INPUT)
+        for item in absence_proofs:
+            _validate_state_absence_item(item)
+    # The bundle must carry at least one kind of state proof.
+    if not state_proofs and not absence_proofs:
+        raise _Failure(ERR_INPUT)
+
+
+def _validate_state_absence_item(item: object) -> None:
+    """Structural validation of one ``state_absence_proofs`` item.
+
+    The item carries exactly ``{height, proof}``; the proof is the plain
+    four-field absence document ``{account, state, lower, upper}`` whose
+    target account is a non-empty string and whose nested state-root and
+    neighbor documents obey the same key-set, type and hex rules as the
+    standalone attested absence proof. Every defect is an input error.
+    """
+    if not isinstance(item, dict) or set(item) != {"height", "proof"}:
+        raise _Failure(ERR_INPUT)
+    if not _is_int(item["height"]):
+        raise _Failure(ERR_INPUT)
+    proof = item["proof"]
+    if not isinstance(proof, dict) or set(proof) != _STATE_ABSENCE_PROOF_KEYS:
+        raise _Failure(ERR_INPUT)
+    if not isinstance(proof["account"], str) or not proof["account"]:
+        raise _Failure(ERR_INPUT)
+    _parse_absence_state_document(proof["state"])
+    _parse_absence_neighbor_document(proof["lower"])
+    _parse_absence_neighbor_document(proof["upper"])
 
 
 # -- stage 2/3: trust, expiry and signature -----------------------------------
@@ -1094,6 +1166,19 @@ def _verify_proofs(proofs_raw: list, blocks: list[Block]) -> list[str]:
     return sorted(verified)
 
 
+def _anchor_account_set(blocks: list[Block], height: int) -> set[str]:
+    """The account set of the anchor height: every account touched by a
+    confirmed transaction up to and including the anchor block."""
+    accounts: set[str] = set()
+    for block in blocks[: height + 1]:
+        if block.status != STATUS_CONFIRMED:
+            continue
+        for tx in block.transactions:
+            accounts.add(tx.sender)
+            accounts.add(tx.recipient)
+    return accounts
+
+
 def _verify_state_proofs(bundle: dict, blocks: list[Block]) -> list[str]:
     """Verify every account-state proof against the bundle's state anchor.
 
@@ -1108,15 +1193,7 @@ def _verify_state_proofs(bundle: dict, blocks: list[Block]) -> list[str]:
     ascending.
     """
     height = bundle["state_height"]
-    # The account set of the anchor height: every account touched by a
-    # confirmed transaction up to and including the anchor block, ascending.
-    accounts: set[str] = set()
-    for block in blocks[: height + 1]:
-        if block.status != STATUS_CONFIRMED:
-            continue
-        for tx in block.transactions:
-            accounts.add(tx.sender)
-            accounts.add(tx.recipient)
+    accounts = _anchor_account_set(blocks, height)
     position = {account: index for index, account in enumerate(sorted(accounts))}
 
     verified: list[str] = []
@@ -1140,6 +1217,47 @@ def _verify_state_proofs(bundle: dict, blocks: list[Block]) -> list[str]:
             height,
             bundle["state_block_hash"],
         ):
+            raise _Failure(ERR_PROOF)
+        verified.append(account)
+    return sorted(verified)
+
+
+def _verify_state_absence_proofs(bundle: dict, blocks: list[Block]) -> list[str]:
+    """Verify every bundled account-absence proof against the state anchor.
+
+    Every item's ``height`` and the embedded state document's root, height
+    and block hash must bind to the bundle's confirmed anchor; any
+    disagreement is a proof failure. The anchor height's confirmed
+    transactions rebuild the account set: the target must not belong to it
+    (which also keeps it disjoint from every inclusion proof's account) and
+    targets must be unique within the anchor. Each document is then checked
+    with :func:`crypto.verify_account_absence_proof` against the anchor
+    extended by the rebuilt account count — the predecessor/successor
+    framing, adjacent-index, boundary and empty-tree rules included; any
+    failure is a proof failure. Returns the verified absent accounts sorted
+    ascending.
+    """
+    height = bundle["state_height"]
+    accounts = _anchor_account_set(blocks, height)
+    expected_state = {
+        "state_root": bundle["state_root"],
+        "height": height,
+        "block_hash": bundle["state_block_hash"],
+        "account_count": len(accounts),
+    }
+    verified: list[str] = []
+    seen: set[str] = set()
+    for item in bundle["state_absence_proofs"]:
+        if item["height"] != height:
+            raise _Failure(ERR_PROOF)
+        proof = item["proof"]
+        account = proof["account"]
+        # The target must genuinely be absent from the anchor's account set
+        # — and therefore from every inclusion proof the bundle carries.
+        if account in accounts or account in seen:
+            raise _Failure(ERR_PROOF)
+        seen.add(account)
+        if not crypto.verify_account_absence_proof(proof, account, expected_state):
             raise _Failure(ERR_PROOF)
         verified.append(account)
     return sorted(verified)
