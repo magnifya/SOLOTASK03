@@ -978,6 +978,24 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 }
                 status, body = service.list_transactions(params)
                 self._send_json(status, body)
+            elif path == "/v1/index/pending":
+                # GET /v1/index/pending?account=&direction=&limit=&cursor=&
+                # generation= — the mempool + pending-tip transaction index.
+                # Every parameter is strict: a repeat (even of an identical
+                # value), an unknown name, an empty value or a malformed
+                # value is the fixed 400 {"error": "input"}. The success
+                # document has a contract-fixed key order (generation,
+                # items, total, next_cursor), so it is serialized in
+                # insertion order rather than alphabetically.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(400, {"error": "input"})
+                    return
+                params = {
+                    key: values[0] for key, values in parsed.items()
+                }
+                status, body = service.list_pending_transactions(params)
+                self._send_json(status, body, sort_keys=False)
             elif path.startswith("/v1/forks/") and path.endswith("/export"):
                 # GET /v1/forks/{tip_hash}/export
                 tip_hash = unquote(path[len("/v1/forks/") : -len("/export")])

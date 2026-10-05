@@ -5359,6 +5359,152 @@ class LedgerService:
             }
         return 200, body
 
+    # -- pending transaction index --------------------------------------------
+
+    PENDING_INDEX_PARAMS = ("account", "direction", "limit", "cursor", "generation")
+
+    def list_pending_transactions(self, params: dict) -> tuple[int, dict]:
+        """GET /v1/index/pending — paginated mempool + pending-tip index.
+
+        The read-set is exactly the transactions that can still be packed or
+        rolled back: the persisted mempool plus the unconfirmed pending tip
+        block of the canonical chain. Confirmed transactions and candidate
+        forks are never included. Only the five contract parameters are
+        accepted (``account``, ``direction``, ``limit``, ``cursor``,
+        ``generation``); an unknown name, an empty value or any malformed
+        value returns the fixed ``400 {"error": "input"}`` (a repeated
+        parameter is rejected at the HTTP layer with the same body).
+        ``account`` absent disables the account filter; ``direction``
+        defaults to ``all`` (sender or recipient), ``out`` matches senders
+        only and ``in`` recipients only, and ``in``/``out`` require a
+        non-empty ``account``. ``limit`` (default 50, range 1-200) and
+        ``cursor`` (default 0) paginate; ``generation`` is an optional
+        non-negative ASCII decimal without leading zeros. All numeric
+        parameters accept ASCII digits only.
+
+        The merged set is filtered and returned in ``tx_id`` ascending
+        order with the fixed key order ``generation, items, total,
+        next_cursor``. Every item carries the fixed keys ``tx_id, from, to,
+        amount, signature, status, height, block_hash, index, location,
+        nonce``: ``status`` is always ``pending``; ``location`` is
+        ``mempool`` (``height``/``block_hash``/``index`` null) or
+        ``pending_block`` (the real tip-block position); ``nonce`` is null
+        for legacy transfers. A cursor beyond the filtered total returns
+        the fixed 400 input body, a cursor equal to it returns an empty
+        page. When ``generation`` is given it must equal the persisted
+        generation of the snapshot being read, otherwise the answer is
+        ``409 {"error": "stale_snapshot"}`` with no partial data. The
+        whole response is built inside the store lock from one persisted
+        snapshot; the query is pure read — it creates no files, advances
+        no generation and appends no audit events.
+        """
+        for key in params:
+            if key not in self.PENDING_INDEX_PARAMS:
+                return 400, {"error": "input"}
+        account = params.get("account")
+        if account is not None and (
+            not isinstance(account, str) or not account
+        ):
+            return 400, {"error": "input"}
+        direction = params.get("direction")
+        if direction is None:
+            direction = "all"
+        elif direction not in ("all", "in", "out"):
+            return 400, {"error": "input"}
+        if direction in ("in", "out") and not (
+            isinstance(account, str) and account
+        ):
+            return 400, {"error": "input"}
+        limit = self.INDEX_DEFAULT_LIMIT
+        if params.get("limit") is not None:
+            parsed = _parse_ascii_decimal(params["limit"])
+            if parsed is None or not 1 <= parsed <= self.INDEX_MAX_LIMIT:
+                return 400, {"error": "input"}
+            limit = parsed
+        cursor = 0
+        if params.get("cursor") is not None:
+            parsed = _parse_ascii_decimal(params["cursor"])
+            if parsed is None:
+                return 400, {"error": "input"}
+            cursor = parsed
+        generation = None
+        if params.get("generation") is not None:
+            generation = _parse_ascii_decimal(params["generation"])
+            if generation is None:
+                return 400, {"error": "input"}
+
+        with self.store.lock:
+            # The generation check, the merged read-set and the pagination
+            # all observe the same persisted snapshot under one lock, so a
+            # concurrent submit/cancel/mine/confirm/rollback/adoption can
+            # never blend two states into one response.
+            current_generation = self.store.generation
+            if generation is not None and generation != current_generation:
+                return 409, {"error": "stale_snapshot"}
+            rows: list[dict] = []
+            for tx in self.store.pending.values():
+                rows.append(self._pending_index_item(tx, "mempool", None, None, None))
+            tip = self.store.chain[-1] if self.store.chain else None
+            if tip is not None and tip.status == STATUS_PENDING:
+                for index, tx in enumerate(tip.transactions):
+                    rows.append(
+                        self._pending_index_item(
+                            tx, "pending_block", tip.height, tip.block_hash, index
+                        )
+                    )
+            if account is not None:
+                if direction == "out":
+                    rows = [row for row in rows if row["from"] == account]
+                elif direction == "in":
+                    rows = [row for row in rows if row["to"] == account]
+                else:
+                    rows = [
+                        row
+                        for row in rows
+                        if account in (row["from"], row["to"])
+                    ]
+            rows.sort(key=lambda row: row["tx_id"])
+            total = len(rows)
+            if cursor > total:
+                return 400, {"error": "input"}
+            items = rows[cursor : cursor + limit]
+            next_cursor = cursor + limit if cursor + limit < total else None
+            return 200, {
+                "generation": current_generation,
+                "items": items,
+                "total": total,
+                "next_cursor": next_cursor,
+            }
+
+    @staticmethod
+    def _pending_index_item(
+        tx: Transaction,
+        location: str,
+        height: int | None,
+        block_hash: str | None,
+        index: int | None,
+    ) -> dict:
+        """The fixed eleven-field pending-index item shape.
+
+        ``nonce`` is always present: the sequence number for a sequenced
+        transfer, null for a legacy one. Mempool rows pass null
+        height/block_hash/index; pending-tip rows anchor at the real
+        in-block position.
+        """
+        return {
+            "tx_id": tx.tx_id,
+            "from": tx.sender,
+            "to": tx.recipient,
+            "amount": tx.amount,
+            "signature": tx.signature,
+            "status": STATUS_PENDING,
+            "height": height,
+            "block_hash": block_hash,
+            "index": index,
+            "location": location,
+            "nonce": tx.nonce,
+        }
+
     # -- source trust registry ------------------------------------------------
 
     @staticmethod
