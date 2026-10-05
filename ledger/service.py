@@ -456,6 +456,171 @@ class LedgerService:
                 raise
         return 200, {"tx_id": tx_id, "status": "cancelled"}
 
+    # -- atomic batch transaction cancellation -------------------------------
+
+    BATCH_CANCEL_LIMIT = 200
+
+    def cancel_transactions_batch(
+        self, payload: object
+    ) -> tuple[int, dict]:
+        """POST /v1/transactions/cancel/batch — atomically cancel a batch of
+        sender-signed mempool transactions. Returns ``(status, body)``.
+
+        Validation runs in fixed phases and only the first error of a phase
+        is returned:
+
+        * Envelope: body is exactly ``{"cancellations": [item, ...]}`` with a
+          list of 1-200 items; each item is exactly
+          ``{"tx_id": "<64 lowercase hex>", "signature": "<128 lowercase
+          hex>"}`` and batch tx_ids are pairwise distinct. Envelope defects
+          (bad JSON is rejected by the HTTP layer, non-UTF-8, query
+          parameters, wrong top-level shape or count) are
+          ``400 {"error": "input"}`` without an index; item shape/format
+          defects and duplicate tx_ids are
+          ``400 {"error": "input", "index": I}`` at the first offending item,
+          a duplicate naming the position of its second occurrence.
+        * Per item in input order: the lookup covers only the canonical chain
+          and the mempool (candidate forks never participate). Unknown ids are
+          ``404 {"error": "not_found", "index": I}``; a signature that is not
+          the sender's Ed25519 signature over ``ledger-cancel-v1\\n<tx_id>``
+          is ``403 {"error": "unauthorized", "index": I}``; a transaction
+          packed into the pending tip or a confirmed block is
+          ``409 {"error": "not_cancellable", "index": I}``.
+        * Suffix: for every sender with selected sequenced transactions, the
+          selected nonces must be a contiguous suffix of that sender's full
+          reserved nonce range (mempool plus pending tip), in any input order;
+          otherwise ``409 {"error": "sequence_conflict", "index": I}`` naming
+          the earliest selected sequence entry of the earliest violating
+          sender. Legacy transactions impose no sequence constraint.
+
+        A successful batch removes every selected transaction from the
+        mempool in input order (releasing spend reservations and, per sender,
+        as many nonces so next_sequence steps back by the number of that
+        sender's cancelled sequenced transactions), appends one
+        ``transaction_cancelled`` event per transaction and persists the whole
+        batch in one atomic write (generation advances once); other mempool
+        transactions keep their order and confirmed balances never change.
+        A failing write answers ``500 {"error": "persistence failed"}`` and
+        leaves mempool order, sequences, the audit chain and idempotency
+        records exactly as before. Success answers 200 with contract-ordered
+        ``items`` (each ``{"tx_id", "status": "cancelled"}`` in input order)
+        and ``total``.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"cancellations"}:
+            return 400, {"error": "input"}
+        items = payload["cancellations"]
+        if not isinstance(items, list) or not (
+            1 <= len(items) <= self.BATCH_CANCEL_LIMIT
+        ):
+            return 400, {"error": "input"}
+        parsed: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or set(item) != {"tx_id", "signature"}:
+                return 400, {"error": "input", "index": index}
+            tx_id = item["tx_id"]
+            signature = item["signature"]
+            if not crypto.is_hex64(tx_id) or not crypto.is_hex128(signature):
+                return 400, {"error": "input", "index": index}
+            # A duplicate names the position of its second (or later)
+            # occurrence; the scan in input order already guarantees any
+            # earlier format defect would have been reported first.
+            if tx_id in seen:
+                return 400, {"error": "input", "index": index}
+            seen.add(tx_id)
+            parsed.append((tx_id, signature))
+
+        with self.store.lock:
+            # Canonical chain (confirmed blocks and the pending tip) indexed
+            # once; candidate forks are deliberately never searched.
+            chain_txs: dict[str, Transaction] = {}
+            for block in self.store.chain:
+                for candidate in block.transactions:
+                    chain_txs.setdefault(candidate.tx_id, candidate)
+
+            # Per-item phase: lookup, signature verification and packed/
+            # confirmed status for each item in input order.
+            selected: list[tuple[int, Transaction, str]] = []
+            for index, (tx_id, signature) in enumerate(parsed):
+                mempool_tx = self.store.pending.get(tx_id)
+                located = (
+                    mempool_tx
+                    if mempool_tx is not None
+                    else chain_txs.get(tx_id)
+                )
+                if located is None:
+                    return 404, {"error": "not_found", "index": index}
+                if not crypto.verify_signature(
+                    located.sender, crypto.cancel_message(tx_id), signature
+                ):
+                    return 403, {"error": "unauthorized", "index": index}
+                if mempool_tx is None:
+                    return 409, {"error": "not_cancellable", "index": index}
+                selected.append((index, located, signature))
+
+            # Suffix phase: per sender (visited by first appearance in input
+            # order) the selected nonces must equal the top k slots of that
+            # sender's dense reserved range — mempool plus pending tip.
+            per_sender: dict[str, list[tuple[int, int]]] = {}
+            sender_order: list[str] = []
+            for index, tx, _signature in selected:
+                if tx.nonce is None:
+                    continue
+                if tx.sender not in per_sender:
+                    per_sender[tx.sender] = []
+                    sender_order.append(tx.sender)
+                per_sender[tx.sender].append((index, tx.nonce))
+            for sender in sender_order:
+                entries = per_sender[sender]
+                selected_nonces = {nonce for _index, nonce in entries}
+                state = self.store.sequences.get(sender)
+                confirmed_count = len(state["confirmed"]) if state is not None else 0
+                reserved = state["pending"] if state is not None else {}
+                upper = confirmed_count + len(reserved)  # one past highest slot
+                required = set(range(upper - len(selected_nonces), upper))
+                if selected_nonces != required:
+                    return 409, {
+                        "error": "sequence_conflict",
+                        "index": entries[0][0],
+                    }
+
+            # Commit phase: keep the mempool (and its insertion order) for the
+            # rollback path so a failed write restores the exact pre-request
+            # state.
+            pending_before = dict(self.store.pending)
+            for _index, tx, signature in selected:
+                del self.store.pending[tx.tx_id]
+                event_payload = {
+                    "tx_id": tx.tx_id,
+                    "from": tx.sender,
+                    "to": tx.recipient,
+                    "amount": tx.amount,
+                    "signature": signature,
+                }
+                if tx.nonce is not None:
+                    event_payload["nonce"] = tx.nonce
+                # One transaction_cancelled event per cancelled transaction,
+                # appended in input order and persisted together with the
+                # mempool removals in the single atomic write below.
+                self.store.append_audit_event(
+                    EVENT_TRANSACTION_CANCELLED, event_payload
+                )
+            try:
+                self.store.save()
+            except BaseException:
+                # Persistence failed: restore the mempool with its original
+                # order and drop every appended event so memory keeps matching
+                # the last durably committed state.
+                self.store.pending.clear()
+                self.store.pending.update(pending_before)
+                self.store.truncate_audit_events(len(selected))
+                return 500, {"error": "persistence failed"}
+            items_out = [
+                {"tx_id": tx.tx_id, "status": "cancelled"}
+                for _index, tx, _signature in selected
+            ]
+            return 200, {"items": items_out, "total": len(items_out)}
+
     # -- sequenced (retryable, nonce-ordered) transactions ------------------
 
     def submit_sequenced_transaction(
