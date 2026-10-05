@@ -1482,10 +1482,15 @@ expected_root)`（本身不变）同时暴露为 HTTP 接口与 CLI 子命令：
   siblings}` 文档；`signature` 可选，为 Ed25519 签名的十六进制。
   可选的**账户状态扩展**再带四个字段——`state_root`、`state_height`、
   `state_block_hash`、`state_proofs`——要么全部省略（历史格式），要么全部
-  提供；`state_proofs` 为非空列表，每项仅含 `{height, proof}`，`proof` 即
+  提供；`state_proofs` 为列表，每项仅含 `{height, proof}`，`proof` 即
   `/v1/accounts/{account}/proof` 返回的 `{account, balance,
   confirmed_transactions, index, state_root, height, block_hash, siblings}`
-  八字段文档（缺失、额外或类型错误都判 `input`）。
+  八字段文档（缺失、额外或类型错误都判 `input`）。扩展存在时还可选带
+  `state_absence_proofs`（不允许脱离四个锚点字段单独出现），每项仅含
+  `{height, proof}`，`proof` 即 `/v1/accounts/{account}/absence-proof`
+  返回的 `{account, state, lower, upper}` 四字段不存在证明；束中至少
+  要有一种状态证明（非空的 `state_proofs` 和/或非空的
+  `state_absence_proofs`）。
 - **trust**：`{genesis_hash, sources, allowlist}`（`GET /v1/trust` 还会带
   `audit_signers` 与 `source_key_history`，轻客户端束验证忽略这两个额外
   字段）。`genesis_hash` 锚定创世块；
@@ -1511,11 +1516,18 @@ expected_root)`（本身不变）同时暴露为 HTTP 接口与 CLI 子命令：
   `account` 与 `index`（不在集合或位置不符判 `proof`），`height`+`account`
   不得重复，最后逐条交给 `crypto.verify_account_proof` 以束上的
   `state_root/state_height/state_block_hash` 为锚验证（非法方向/哈希、伪造
-  leaf、非法自配对、siblings 畸形均判 `proof`）。
+  leaf、非法自配对、siblings 畸形均判 `proof`）。存在 `state_absence_proofs`
+  时，每项的 `height` 与内嵌 `state` 文档（含按锚点重建账户集合得到的
+  `account_count`）都必须绑定同一已确认锚点，目标账户在数组内唯一、不得与
+  包含证明重复、且确实不在锚点账户集合中，再逐条交给
+  `crypto.verify_account_absence_proof` 完整核验前驱/后继、相邻索引、边界
+  与空树规则（锚点不一致、目标已存在、邻居路径或集合关系不成立均判
+  `proof`）。
 
 成功返回 `{ok: true, source, S, verified_tx_ids}`（`verified_tx_ids` 为按
 tx_id 升序的已验证交易列表）；带状态扩展的束成功时另含按 account 升序的
-`verified_accounts`，不带扩展的束返回形状与历史完全一致。失败返回
+`verified_accounts`，带非包含证明的束再追加按 account 升序的
+`verified_absent_accounts`，不带扩展的束返回形状与历史完全一致。失败返回
 `{ok: false, error}`，`error` 仅取
 `input` / `auth` / `expired` / `integrity` / `proof` 五类：
 
@@ -2639,6 +2651,7 @@ python tests/range_export_verify_test.py  # 区间导出离线核验 verify_rang
 python tests/range_export_batch_verify_test.py  # 多页增量区间离线连续核验 verify_range_exports（非空数组、逐页复验、首锚=expected_anchor 后锚=前页 tip{height,block_hash}、断锚/跳高/重叠 integrity、tx_id 跨页唯一、pending 只许末页、成功键序 ok,anchor,tip,pages,verified_tx_ids 升序、input/auth/expired/integrity 分类、CLI verify-range-batch 文件/stdin/退出码）
 python tests/source_key_history_test.py  # 来源公钥历史 source_key_history（注册写版本1及事件号、轮换递增记新事件、撤销保留历史、原子落盘回滚；GET /v1/trust 固定键序 genesis_hash,sources,allowlist,audit_signers,source_key_history 与项键序 version,public_key,activated_event_id；重启逐字节保留、旧快照内存重建不强制写盘、历史结构/事件不符 StateRecoveryError；verify_range_export 按 attestation.version 取历史公钥并匹配 attestation.public_key，未知项 auth、签名错 integrity、无历史旧规、畸形 input；HTTP 线序）
 python tests/light_client_state_proof_test.py  # 轻客户端账户状态扩展（state_root/state_height/state_block_hash/state_proofs 全有或全无与严格形状 input、锚点 integrity、账户升序集合/index/唯一性/verify_account_proof proof、verified_accounts、账户 proof 未知/重复参数 400、CLI）
+python tests/light_client_state_absence_proof_test.py  # 轻客户端账户不存在证明扩展（state_absence_proofs 仅随四锚点字段出现、至少一种状态证明、严格形状 input、锚点绑定/目标唯一/与包含证明不重叠/重建集合不存在/前驱后继相邻边界空树 proof、verified_absent_accounts 升序、签名覆盖新字段、CLI 退出码）
 python tests/trust_audit_test.py       # 持久化来源信任（注册201/幂等200/冲突409、轮换404/409、撤销404/409/幂等）、审计分页与过滤、同步接收/采用/过期事件、原子落盘与回滚、重启持久化、损坏与同代冲突恢复拒绝、HTTP/CLI
 python tests/audit_chain_test.py       # 审计哈希链向量、检查点、追加失败回滚与恢复补链（旧快照一次补链/错配拒绝）、同代检查点冲突、GET /v1/audit/export 锚点与分页、重复参数 400、CLI audit-export/audit-verify（ok+checkpoint 或 input/integrity、退出码 0/1）
 python tests/audit_signer_test.py      # 可轮换 Ed25519 检查点认证：首版密钥生成、POST /v1/audit/signer/rotate（400/409/200、audit_signer_rotated 事件、历史公钥保留）、导出 checkpoint_auth、离线 --trust 核验（创世锚/密钥版本/签名/跨页一致，失败新增 auth）、写盘失败回滚、签名者严格恢复（错配拒绝/无签名旧快照唯一胜者一次性迁移/同代签名者冲突）、HTTP/CLI
