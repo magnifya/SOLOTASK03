@@ -950,6 +950,24 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.list_fork_syncs(params)
                 self._send_json(status, body)
+            elif path == "/v1/index/pending":
+                # GET /v1/index/pending?account=&direction=&limit=&cursor=&
+                # generation= — the read-only mempool + pending-tip index.
+                # Only the five documented parameters are accepted, each at
+                # most once and never blank; every violation (and any
+                # malformed value, checked by the service) is the fixed
+                # 400 {"error": "input"}. A generation pinning a different
+                # persisted snapshot is 409 {"error": "stale_snapshot"}.
+                # The success document has the contract-fixed key order
+                # generation, items, total, next_cursor, so it is serialized
+                # in insertion order rather than alphabetically.
+                parsed = parse_qs(query, keep_blank_values=True)
+                if any(len(values) > 1 for values in parsed.values()):
+                    self._send_json(400, {"error": "input"})
+                    return
+                params = {key: values[0] for key, values in parsed.items()}
+                status, body = service.list_pending_transactions(params)
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/index/transactions":
                 # GET /v1/index/transactions?tx_id=&account=&height=&
                 # min_height=&max_height=&direction=&at_height=&at_hash=&

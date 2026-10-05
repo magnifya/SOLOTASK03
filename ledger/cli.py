@@ -1,7 +1,7 @@
 """Command line interface: send, send-sequenced, send-sequenced-batch, sequence, tx, txs, mine, block, account, proof, proofs,
 state-root,
 state-proof, state-proofs, confirm, rollback, status, candidates, chain, adopt, export,
-index, sync, sync-range, sync-attested, sync-range-attested, syncs,
+index, pending, sync, sync-range, sync-attested, sync-range-attested, syncs,
 sync-history, sync-export, sync-range-export, chain-range,
 sync-state-audit, sync-plan,
 audit, audit-export, trust
@@ -686,6 +686,27 @@ def cmd_index(args: argparse.Namespace) -> int:
         url = f"{url}?{query}"
     status, body = _request("GET", url, None)
     return _emit(status, body)
+
+
+def cmd_pending(args: argparse.Namespace) -> int:
+    # GET /v1/index/pending — the mempool + pending-tip index. The response
+    # is printed verbatim (contract key order generation, items, total,
+    # next_cursor); a non-2xx status or an unreachable server exits 1.
+    filters = {
+        "account": args.account,
+        "direction": args.direction,
+        "limit": args.limit,
+        "cursor": args.cursor,
+        "generation": args.generation,
+    }
+    query = urllib.parse.urlencode(
+        {key: value for key, value in filters.items() if value is not None}
+    )
+    url = f"{args.base_url}/v1/index/pending"
+    if query:
+        url = f"{url}?{query}"
+    status, body = _request("GET", url, None)
+    return _emit(status, body, sort_keys=False)
 
 
 def cmd_trust_add(args: argparse.Namespace) -> int:
@@ -1554,6 +1575,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--cursor", help="pagination offset (decimal, default 0)")
     p_index.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
     p_index.set_defaults(func=cmd_index)
+
+    p_pending = sub.add_parser(
+        "pending",
+        help="query the mempool + pending-tip transaction index",
+    )
+    p_pending.add_argument(
+        "--account", help="filter by sender or recipient account"
+    )
+    p_pending.add_argument(
+        "--direction",
+        help="account flow direction: all (sender or recipient), "
+        "out (sender only) or in (recipient only); in/out require --account",
+    )
+    p_pending.add_argument("--limit", help="page size (decimal, 1-200, default 50)")
+    p_pending.add_argument("--cursor", help="pagination offset (decimal, default 0)")
+    p_pending.add_argument(
+        "--generation",
+        help="pin the read to a persisted snapshot generation (decimal); "
+        "a mismatch answers 409 stale_snapshot",
+    )
+    p_pending.set_defaults(func=cmd_pending)
 
     p_verify = sub.add_parser(
         "verify",

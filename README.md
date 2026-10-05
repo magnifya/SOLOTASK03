@@ -1164,6 +1164,33 @@ CLI 的 `index` 命令新增 `--include-summary` 开关：启用时发送
 `--at-height/--at-hash` 等其他选项组合），原样打印服务端单行 JSON，2xx
 退出 0，HTTP 错误或连接失败退出 1；不启用时行为完全不变。
 
+### 待确认交易索引
+
+`GET /v1/index/pending` 提供**内存池与 pending 末块**的合并索引视图——即仍可
+被打包、取消、确认或回滚的交易集合；已确认交易与候选分叉始终排除。查询参数
+仅接受 `account`、`direction`、`limit`、`cursor`、`generation` 五个：任一参数
+重复（即使值相同）、未知、带空值或格式不合法都返回 `400` 与
+`{"error":"input"}`。`account` 缺省时不过滤，提供时 `all`（默认）匹配 from
+或 to；`direction` 只能为 `all`/`in`/`out`，`in`/`out` 必须搭配非空
+`account`。`limit` 为 1–200 的 ASCII 十进制（默认 50），`cursor` 默认 0、
+大于过滤后总数时报 `400`、等于总数时返回空页。结果按 `tx_id` 升序应用过滤
+并分页，返回固定键序 `generation, items, total, next_cursor`。每项固定包含
+`tx_id, from, to, amount, signature, status, height, block_hash, index,
+location, nonce`：`status` 恒为 `pending`；`location` 为 `mempool`（内存池，
+`height`/`block_hash`/`index` 均为 `null`）或 `pending_block`（待定末块，携带
+真实的 `height`/`block_hash` 与块内从 0 起的 `index`）；旧式交易 `nonce` 为
+`null`，序列转账为其序号。
+
+可选参数 `generation` 把读取钉在**当前已持久化快照代际**上（无前导零的非负
+ASCII 十进制）：与当前代际不符时返回 `409 {"error":"stale_snapshot"}` 且不
+返回任何部分数据。代际检查与行构造在同一把锁内完成，提交、取消、打包、
+确认、回滚、分叉采用、同步及恢复期间的响应始终对应单一完整快照。查询为纯读：
+不创建文件、不推进代际、不写审计；重启后从 canonical 链的 pending 末块与
+持久化内存池重建相同结果。
+
+CLI 新增 `pending` 子命令（`--account`、`--direction`、`--limit`、`--cursor`、
+`--generation`），原样输出服务端单行 JSON，非 2xx 或连接失败退出 1。
+
 ## 交易回执
 
 `GET /v1/transactions/{tx_id}` 返回单笔交易的回执。`tx_id` 必须恰好是 64 位
@@ -2512,6 +2539,7 @@ python -m ledger.cli adopt <tip-hash>
 python -m ledger.cli export <tip-hash>
 python -m ledger.cli index [--tx-id <hex>] [--account <pubkey-hex>] [--height N] [--cursor N] [--limit N]
 python -m ledger.cli index --account <pubkey-hex> --include-summary  # 发送 include_summary=true 并附收支汇总；非 2xx 退出 1
+python -m ledger.cli pending [--account <pubkey-hex>] [--direction all|in|out] [--limit N] [--cursor N] [--generation N]  # 内存池+pending 末块索引；非 2xx 退出 1
 
 # 节点间候选链同步与审计查询
 python -m ledger.cli sync --source node-2 --request-id req-7 --expires-at 1800000000 '<export 文档或块数组 JSON>'
@@ -2627,6 +2655,7 @@ python tests/confirm_rollback_test.py  # 确认/回滚状态机（service/HTTP/C
 python tests/recovery_test.py         # generation、多区块一致性、快照恢复、损坏拒绝、并发串行化
 python tests/fork_test.py             # 候选分叉校验、链比较、原子采用、内存池去重、重启重校验
 python tests/export_index_test.py     # 分叉导出、导出格式候选重验、确认链交易索引与 CLI
+python tests/pending_index_test.py    # 待确认索引 GET /v1/index/pending 与 CLI pending（内存池+pending 末块合并、tx_id 升序、固定键序 generation,items,total,next_cursor 与十一字段项、严格参数 400、generation 钉快照 409、打包/确认/回滚/取消/重启、纯读）
 python tests/fork_sync_test.py        # 节点间候选链同步（201/200/400/409/410、幂等、审计分页、过期、采用、重启）与 HTTP/CLI
 python tests/range_sync_test.py       # 增量区间协议（GET /v1/chain/range 分页/严格参数/404/409/pending 尾块；POST /v1/forks/sync/range 状态优先级、拼接整链重验、201五字段、脱离 canonical 的200重试、最长链采用、失败回滚、重启指纹核验）与 HTTP/CLI
 python tests/header_page_test.py      # 签名区块头分页 GET /v1/chain/headers（after_height/after_hash 必填、limit 1–500 默认 100、400/404/409；固定键序 anchor,headers,tip,auth 与头项 height,prev_hash,merkle_root,block_hash,status；anchor=tip 时空 headers；pending 仅链尾；domain=ledger-headers-v1 的 SHA-256+Ed25519 签名；verify_header_page input/auth/integrity、锚点/tip 钉住、重算哈希与链接、分页串联、轮换历史验签）与 HTTP
