@@ -1571,6 +1571,65 @@ class LedgerService:
                 "proofs": proofs,
             }
 
+    def get_multiproof(self, height: object, payload: object) -> tuple[int, dict]:
+        """Return a compact multi-leaf Merkle inclusion proof at one height.
+
+        POST /v1/blocks/{height}/multiproof with ``{"tx_ids": [...]}``. The
+        body rules are identical to :meth:`get_proofs`: a JSON object holding
+        exactly the ``tx_ids`` key with a non-empty list of distinct
+        64-lowercase-hex strings; any parse/shape/format violation is 400
+        before the height is even inspected. A malformed (non-negative ASCII
+        decimal without leading zeros) or unknown height is 404; a pending
+        block is 409; any one requested transaction missing from a confirmed
+        block makes the whole batch 404 — partial proofs are never returned.
+
+        On success the document contains only ``height``, ``block_hash``,
+        ``merkle_root``, ``leaf_count``, ``leaves`` and ``nodes``:
+        ``leaf_count`` is the block's real leaf count, ``leaves`` lists just
+        the requested transactions as ``{tx_id, index}`` ascending by block
+        index, and ``nodes`` is the minimal set of sibling subtree roots
+        immediately outside the union of the selected root paths as
+        ``{level, index, hash}`` sorted by level then index. Selecting every
+        leaf (or a single-leaf block) yields an empty node list; request
+        order never changes the response. Like the other proof endpoints,
+        this is a pure read of the current canonical main-chain view.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"tx_ids"}:
+            return 400, {"error": "request body must be a JSON object with only 'tx_ids'"}
+        tx_ids_raw = payload["tx_ids"]
+        if not isinstance(tx_ids_raw, list) or not tx_ids_raw:
+            return 400, {"error": "field 'tx_ids' must be a non-empty array"}
+        if any(not crypto.is_hex64(tx_id) for tx_id in tx_ids_raw):
+            return 400, {
+                "error": "every tx_id must be a string of 64 lowercase hex characters"
+            }
+        if len(set(tx_ids_raw)) != len(tx_ids_raw):
+            return 400, {"error": "tx_ids must be distinct"}
+
+        height_int = _parse_height_decimal(height)
+        if height_int is None:
+            return 404, {"error": "block not found"}
+        with self.store.lock:
+            block = self.store.block_at(height_int)
+            if block is None:
+                return 404, {"error": "block not found"}
+            if block.status != STATUS_CONFIRMED:
+                return 409, {"error": "block is pending confirmation"}
+            tx_ids = [tx.tx_id for tx in block.transactions]
+            present = set(tx_ids)
+            if any(tx_id not in present for tx_id in tx_ids_raw):
+                return 404, {"error": "transaction not found"}
+            indices = sorted(tx_ids.index(tx_id) for tx_id in set(tx_ids_raw))
+            leaves, nodes = crypto.merkle_multiproof(tx_ids, indices)
+            return 200, {
+                "height": block.height,
+                "block_hash": block.block_hash,
+                "merkle_root": block.merkle_root,
+                "leaf_count": len(tx_ids),
+                "leaves": leaves,
+                "nodes": nodes,
+            }
+
     # -- accounts -----------------------------------------------------------
 
     def get_account(self, account: str) -> tuple[int, dict]:

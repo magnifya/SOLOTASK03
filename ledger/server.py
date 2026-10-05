@@ -621,6 +621,24 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                         return
                     status, body = service.get_proofs(height, payload)
                     self._send_json(status, body, sort_keys=False)
+                elif remainder.endswith("/multiproof"):
+                    # POST /v1/blocks/{height}/multiproof — compact
+                    # multi-leaf Merkle inclusion proof. Read-only like
+                    # /proofs. The body is {"tx_ids": [...]} and is strictly
+                    # validated by the service (400) before the height is
+                    # parsed; a malformed/unknown height is 404, a pending
+                    # block 409 and a missing leaf a whole-batch 404. The
+                    # success document has a contract-fixed key order
+                    # (height, block_hash, merkle_root, leaf_count, leaves,
+                    # nodes), so it is serialized in insertion order rather
+                    # than alphabetically.
+                    height = unquote(remainder[: -len("/multiproof")])
+                    ok, payload = self._read_json()
+                    if not ok:
+                        self._send_json(400, payload)  # type: ignore[arg-type]
+                        return
+                    status, body = service.get_multiproof(height, payload)
+                    self._send_json(status, body, sort_keys=False)
                 else:
                     # POST /v1/blocks/{height}/confirm | /v1/blocks/{height}/rollback
                     key = self._idempotency_key()

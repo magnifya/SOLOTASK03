@@ -432,6 +432,318 @@ def verify_merkle_proof_bundle(
         return False
 
 
+# -- compact multi-leaf inclusion proofs ------------------------------------
+
+# Exact key sets of a compact Merkle multiproof response document. Unlike the
+# batch bundle, object key order is not semantically significant to the
+# verifier, but the sets themselves are fixed.
+_MULTIPROOF_TOP_KEYS = frozenset(
+    ("height", "block_hash", "merkle_root", "leaf_count", "leaves", "nodes")
+)
+_MULTIPROOF_LEAF_KEYS = frozenset(("tx_id", "index"))
+_MULTIPROOF_NODE_KEYS = frozenset(("level", "index", "hash"))
+
+
+def _merkle_levels(tx_ids: list[str]) -> list[list[str]]:
+    """Every level of the block Merkle tree, level 0 being the leaves.
+
+    Mirrors :func:`merkle_root`: levels hash ``sha256(left + right)`` hex
+    pairs and a lone odd node is paired with itself; the duplicated copy is a
+    phantom slot and is never stored as its own node.
+    """
+    levels = [list(tx_ids)]
+    while len(levels[-1]) > 1:
+        level = levels[-1]
+        if len(level) % 2 == 1:
+            level = level + [level[-1]]
+        levels.append([
+            sha256_hex((level[i] + level[i + 1]).encode("ascii"))
+            for i in range(0, len(level), 2)
+        ])
+    return levels
+
+
+def _merkle_multiproof_coordinates(
+    leaf_count: int, selected: list[int]
+) -> set[tuple[int, int]]:
+    """Coordinates of the minimal sibling set for ``selected`` leaf indices.
+
+    A coordinate is required iff it sits immediately outside the union of the
+    selected leaves' root paths: walking the frontier upward level by level,
+    every known subtree whose paired neighbour is a real position (below the
+    level's real size, which excludes the odd-node phantom self-pair slot)
+    that is not itself on the frontier contributes exactly that neighbour.
+    The coordinate set is fully determined by ``leaf_count`` and the selected
+    indices, so a verifier can recompute it and demand an exact match.
+    """
+    needed: set[tuple[int, int]] = set()
+    frontier = set(selected)
+    size = leaf_count
+    level = 0
+    while size > 1:
+        for position in frontier:
+            sibling = position ^ 1
+            if sibling < size and sibling not in frontier:
+                needed.add((level, sibling))
+        frontier = {position // 2 for position in frontier}
+        size = (size + 1) // 2
+        level += 1
+    return needed
+
+
+def merkle_multiproof(
+    tx_ids: list[str], indices: list[int]
+) -> tuple[list[dict], list[dict]]:
+    """Build a compact multi-leaf inclusion proof.
+
+    Returns ``(leaves, nodes)`` where ``leaves`` is one ``{tx_id, index}``
+    item per selected leaf (ascending index) and ``nodes`` is the minimal set
+    of sibling subtree roots just outside the union of the selected leaves'
+    root paths, each ``{level, index, hash}`` sorted by level then index
+    (level 0 is the leaf layer, index the real zero-based position on that
+    level). Nodes derivable from the selected leaves and the other nodes are
+    omitted, as is the root itself; a phantom self-pair sibling is never
+    emitted. Selecting every leaf (the only possibility for a single-leaf
+    block) yields an empty node list. Raises ValueError for an empty tree, a
+    non-integer/out-of-range index or an empty selection.
+    """
+    if not tx_ids:
+        raise ValueError("cannot build a Merkle multiproof for an empty tree")
+    for index in indices:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError("indices must be integers")
+        if index < 0 or index >= len(tx_ids):
+            raise ValueError("transaction index out of range")
+    selected = sorted(set(indices))
+    if not selected:
+        raise ValueError("a multiproof must select at least one leaf")
+
+    levels = _merkle_levels(tx_ids)
+    leaves = [{"tx_id": tx_ids[index], "index": index} for index in selected]
+    needed = _merkle_multiproof_coordinates(len(tx_ids), selected)
+    nodes = [
+        {"level": level, "index": index, "hash": levels[level][index]}
+        for level, index in sorted(needed)
+    ]
+    return leaves, nodes
+
+
+def verify_merkle_multiproof(
+    document: object,
+    expected_block_hash: object,
+    expected_merkle_root: object,
+    expected_leaf_count: object,
+) -> bool:
+    """Strictly verify a compact Merkle multiproof offline.
+
+    The document mirrors POST /v1/blocks/{height}/multiproof::
+
+        {"height": H, "block_hash": B, "merkle_root": R,
+         "leaf_count": N,                    # the block's real leaf count
+         "leaves": [{"tx_id", "index"}, ...],   # selected leaves only
+         "nodes": [{"level", "index", "hash"}, ...]}  # minimal sibling set
+
+    Validation succeeds only when every field is present with the right type
+    (booleans are never integers; ``leaf_count`` positive, all other integers
+    non-negative; every hash and tx_id a 64-char lowercase hex string),
+    ``leaves`` is non-empty with strictly ascending indices *and* tx_ids in
+    range of ``leaf_count``, ``nodes`` has strictly ascending (level, index)
+    coordinates that are all real positions on the tree, no coordinate is
+    repeated or shared with a leaf and the node set is exactly the minimal
+    sibling set determined by ``leaf_count`` and the selected indices (so a
+    missing node, a redundant/derivable node or an unrelated extra subtree
+    all fail), the root recomputed with the block pairing rules
+    (``sha256(left + right)`` hex pairs, a lone odd node paired with itself,
+    no phantom sibling) equals both the document's ``merkle_root`` and
+    ``expected_merkle_root``, ``leaf_count`` equals
+    ``expected_leaf_count`` and ``block_hash`` equals
+    ``expected_block_hash``.
+
+    Every defect — missing/extra/repeated fields or coordinates, a wrong
+    type or sort order, out-of-range indices, missing or redundant nodes,
+    any hash/anchor mismatch — returns False rather than raising. Object key
+    order does not affect verification.
+    """
+    try:
+        if not isinstance(document, dict):
+            return False
+        if set(document.keys()) != set(_MULTIPROOF_TOP_KEYS):
+            return False
+        if not _is_hex64(expected_block_hash) or not _is_hex64(expected_merkle_root):
+            return False
+        if (
+            isinstance(expected_leaf_count, bool)
+            or not isinstance(expected_leaf_count, int)
+            or not 0 < expected_leaf_count <= 1 << MAX_MERKLE_DEPTH
+        ):
+            return False
+
+        height = document["height"]
+        block_hash = document["block_hash"]
+        document_root = document["merkle_root"]
+        leaf_count = document["leaf_count"]
+        leaves = document["leaves"]
+        nodes = document["nodes"]
+
+        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+            return False
+        if not _is_hex64(block_hash):
+            return False
+        if not _is_hex64(document_root):
+            return False
+        if (
+            isinstance(leaf_count, bool)
+            or not isinstance(leaf_count, int)
+            or leaf_count != expected_leaf_count
+        ):
+            return False
+        if not isinstance(leaves, list) or not leaves:
+            return False
+        if not isinstance(nodes, list):
+            return False
+
+        # Real level sizes of the claimed tree (phantom slots excluded).
+        sizes: list[int] = []
+        size = leaf_count
+        while True:
+            sizes.append(size)
+            if size == 1:
+                break
+            size = (size + 1) // 2
+        tree_depth = len(sizes) - 1
+        if tree_depth > MAX_MERKLE_DEPTH:
+            return False
+
+        # Selected leaves: strictly ascending index and strictly ascending
+        # tx_id, every coordinate a real leaf position.
+        leaf_hashes: dict[int, str] = {}
+        previous_index = -1
+        previous_tx_id: str | None = None
+        for leaf in leaves:
+            if not isinstance(leaf, dict) or set(leaf.keys()) != set(
+                _MULTIPROOF_LEAF_KEYS
+            ):
+                return False
+            tx_id = leaf["tx_id"]
+            index = leaf["index"]
+            if not _is_hex64(tx_id):
+                return False
+            if isinstance(index, bool) or not isinstance(index, int):
+                return False
+            if index <= previous_index or not 0 <= index < leaf_count:
+                return False
+            if previous_tx_id is not None and tx_id <= previous_tx_id:
+                return False
+            leaf_hashes[index] = tx_id
+            previous_index = index
+            previous_tx_id = tx_id
+
+        # Nodes: strictly ascending (level, index), coordinates real and
+        # unique, never sharing a selected-leaf coordinate.
+        node_hashes: dict[tuple[int, int], str] = {}
+        previous_coord: tuple[int, int] | None = None
+        for node in nodes:
+            if not isinstance(node, dict) or set(node.keys()) != set(
+                _MULTIPROOF_NODE_KEYS
+            ):
+                return False
+            level = node["level"]
+            index = node["index"]
+            node_hash = node["hash"]
+            if isinstance(level, bool) or not isinstance(level, int) or level < 0:
+                return False
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                return False
+            if not _is_hex64(node_hash):
+                return False
+            if level >= len(sizes) or index >= sizes[level]:
+                return False
+            coord = (level, index)
+            if previous_coord is not None and coord <= previous_coord:
+                return False
+            if level == 0 and index in leaf_hashes:
+                return False
+            node_hashes[coord] = node_hash
+            previous_coord = coord
+
+        # The minimal sibling coordinate set is fully determined by the leaf
+        # count and the selected indices; an exact match rules out missing,
+        # redundant, derivable and wholly unrelated nodes in one step.
+        expected_nodes = _merkle_multiproof_coordinates(
+            leaf_count, sorted(leaf_hashes)
+        )
+        if set(node_hashes) != expected_nodes:
+            return False
+
+        def nodes_at(level: int) -> dict[int, str]:
+            return {
+                index: value
+                for (node_level, index), value in node_hashes.items()
+                if node_level == level
+            }
+
+        # Recompute the root level by level: hash every coordinate pair whose
+        # both members are available, self-pair an odd level's lone last node,
+        # and bridge uncovered subtrees with the supplied nodes of the next
+        # level. Every supplied coordinate must be consumed in exactly one
+        # pairing; the frontier must converge on the single root coordinate.
+        available: dict[int, str] = dict(leaf_hashes)
+        available.update(nodes_at(0))
+        known_coordinates = {(0, i) for i in leaf_hashes} | set(node_hashes)
+        consumed: set[tuple[int, int]] = set()
+        for level, level_size in enumerate(sizes[:-1]):
+            parents: dict[int, str] = {}
+            pair_count = (level_size + 1) // 2
+            for pair in range(pair_count):
+                left = 2 * pair
+                right = left + 1
+                if right < level_size:
+                    if left in available and right in available:
+                        parents[pair] = sha256_hex(
+                            (available[left] + available[right]).encode("ascii")
+                        )
+                        # Only coordinates originally supplied (a selected
+                        # leaf or a proof node) count as consumed; parents
+                        # computed this round are intermediate values.
+                        if (level, left) in known_coordinates:
+                            consumed.add((level, left))
+                        if (level, right) in known_coordinates:
+                            consumed.add((level, right))
+                elif left in available:
+                    # Odd level's lone last node pairs with itself; the
+                    # phantom sibling carries no node.
+                    value = available[left]
+                    parents[pair] = sha256_hex((value + value).encode("ascii"))
+                    if (level, left) in known_coordinates:
+                        consumed.add((level, left))
+            for index, value in nodes_at(level + 1).items():
+                if index in parents:
+                    # A node that the leaves already derive is redundant.
+                    return False
+                parents[index] = value
+            available = parents
+
+        if set(available) != {0}:
+            return False
+        if tree_depth == 0:
+            # A single-leaf block: the one selected leaf is itself the root,
+            # so it is trivially "consumed" with no pairing.
+            consumed = set(known_coordinates)
+        if consumed != known_coordinates:
+            return False
+        recomputed_root = available[0]
+
+        if not hmac.compare_digest(recomputed_root, document_root):
+            return False
+        if not hmac.compare_digest(document_root, expected_merkle_root):
+            return False
+        if not hmac.compare_digest(block_hash, expected_block_hash):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 # -- account state Merkle tree ----------------------------------------------
 
 

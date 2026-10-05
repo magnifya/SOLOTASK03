@@ -1,6 +1,6 @@
 # SOLOTASK03 可验证账本后端
 
-要实现一个可验证账本后端，用 Python 标准库加 hashlib 与 cryptography，同时提供 HTTP 服务和命令行入口。交易提交走 POST /v1/transactions，请求体是 JSON，含 from、to、amount 与 signature，amount 是整数；签名与余额校验通过才进入待打包集合，返回 202 与 tx_id，签名不合法或余额不足返回 400 并说明原因。打包走 POST /v1/blocks，仅当链尾已确认且有待打包交易时，把待打包交易按 tx_id 升序封成待定区块，算出前块哈希、Merkle 根与区块哈希后持久化，返回 201 与 height、block_hash、merkle_root、status=pending，链尾待定或没有待打包交易都返回 409。查询走 GET /v1/blocks/{height} 与 GET /v1/accounts/{account}，分别返回 block_hash、prev_hash、merkle_root、status、transaction_ids 与 balance、confirmed_transactions，查不到都返回 404。已确认交易还可通过 GET /v1/blocks/{height}/proof/{tx_id} 获取 Merkle 包含证明，返回 height、tx_id、index、merkle_root、block_hash 与 siblings；siblings 自叶向根排列，每项含 direction（sibling 位于当前节点的 left/right）与 64 位小写十六进制 hash，区块不存在、交易不在该高度或 tx_id 格式不符均返回 404，区块仍为待定时返回 409。批量接口 POST /v1/blocks/{height}/proofs 请求体为 {"tx_ids":[...]}，须为非空、元素互异且各为 64 位小写十六进制的数组；解析失败、键缺失/额外、类型错误、空数组/重复/格式错均 400 且不改状态，未知高度或缺交易 404，待定块 409。成功返回顶层键序固定为 height,block_hash,merkle_root,transaction_ids,proofs：transaction_ids 为该块全部叶子（按 tx_id 升序），proofs 按 tx_id 字典序排列，每项键序 tx_id,index,siblings。离线可用 ledger.crypto.verify_merkle_proof_bundle(bundle, expected_block_hash, expected_merkle_root) -> bool 严格校验键序、类型、唯一 tx_id、index 映射、自叶到根路径、重算根与区块哈希，任何畸形或篡改均返回 False 而不抛异常。命令行提供 send、mine、block、account、proof、proofs、confirm、rollback、status 等子命令，与接口一一对应，打印单行 JSON；proofs HEIGHT TX_ID... 在非 2xx 时退出码为 1。创世区块高度为零，逐块加一。同一批交易按相同顺序打包必须得到相同的 merkle_root 与 block_hash。
+要实现一个可验证账本后端，用 Python 标准库加 hashlib 与 cryptography，同时提供 HTTP 服务和命令行入口。交易提交走 POST /v1/transactions，请求体是 JSON，含 from、to、amount 与 signature，amount 是整数；签名与余额校验通过才进入待打包集合，返回 202 与 tx_id，签名不合法或余额不足返回 400 并说明原因。打包走 POST /v1/blocks，仅当链尾已确认且有待打包交易时，把待打包交易按 tx_id 升序封成待定区块，算出前块哈希、Merkle 根与区块哈希后持久化，返回 201 与 height、block_hash、merkle_root、status=pending，链尾待定或没有待打包交易都返回 409。查询走 GET /v1/blocks/{height} 与 GET /v1/accounts/{account}，分别返回 block_hash、prev_hash、merkle_root、status、transaction_ids 与 balance、confirmed_transactions，查不到都返回 404。已确认交易还可通过 GET /v1/blocks/{height}/proof/{tx_id} 获取 Merkle 包含证明，返回 height、tx_id、index、merkle_root、block_hash 与 siblings；siblings 自叶向根排列，每项含 direction（sibling 位于当前节点的 left/right）与 64 位小写十六进制 hash，区块不存在、交易不在该高度或 tx_id 格式不符均返回 404，区块仍为待定时返回 409。批量接口 POST /v1/blocks/{height}/proofs 请求体为 {"tx_ids":[...]}，须为非空、元素互异且各为 64 位小写十六进制的数组；解析失败、键缺失/额外、类型错误、空数组/重复/格式错均 400 且不改状态，未知高度或缺交易 404，待定块 409。成功返回顶层键序固定为 height,block_hash,merkle_root,transaction_ids,proofs：transaction_ids 为该块全部叶子（按 tx_id 升序），proofs 按 tx_id 字典序排列，每项键序 tx_id,index,siblings。离线可用 ledger.crypto.verify_merkle_proof_bundle(bundle, expected_block_hash, expected_merkle_root) -> bool 严格校验键序、类型、唯一 tx_id、index 映射、自叶到根路径、重算根与区块哈希，任何畸形或篡改均返回 False 而不抛异常。另有紧凑多笔包含证明 POST /v1/blocks/{height}/multiproof，请求体验证规则与 /proofs 相同（违反或解析失败先 400），高度格式错或不存在 404、待定块 409、已确认块缺任一交易整批 404；成功文档仅含 height、block_hash、merkle_root、leaf_count、leaves、nodes，leaf_count 为全块真实叶子数，leaves 仅含请求交易且每项只有 tx_id、index 并按块内 index 升序，nodes 每项只有 level、index、hash 并按 level 再 index 升序，恰好是所选叶子根路径并集外紧邻的兄弟子树根（不含可推导节点、不传虚拟兄弟、坐标唯一；选中全部叶子或单叶区块时为空，重排请求不改变响应）；离线用 ledger.crypto.verify_merkle_multiproof(document, expected_block_hash, expected_merkle_root, expected_leaf_count) -> bool 严格校验字段、类型、排序、坐标与最小节点集合、叶子数及重算根和区块哈希，任何不符返回 False 不抛异常，键序不影响验证。命令行提供 send、mine、block、account、proof、proofs、confirm、rollback、status 等子命令，与接口一一对应，打印单行 JSON；proofs HEIGHT TX_ID... 在非 2xx 时退出码为 1。创世区块高度为零，逐块加一。同一批交易按相同顺序打包必须得到相同的 merkle_root 与 block_hash。
 
 ## 确认 / 回滚状态机
 
@@ -1437,6 +1437,46 @@ expected_root)`（本身不变）同时暴露为 HTTP 接口与 CLI 子命令：
   `{"tx_ids":[...]}`，输出与接口字段、键序一致的单行 JSON；任何非 2xx
   响应（含连接失败）退出码为 1。
 
+## 紧凑多笔 Merkle 包含证明（multiproof）
+
+批量 `/proofs` 返回全块叶子与逐笔路径；紧凑多笔证明只返回所选叶子与它们
+根路径并集外紧邻的必要兄弟子树根：
+
+- **请求**：`POST /v1/blocks/{height}/multiproof`，请求体规则与
+  `/proofs` 完全相同：JSON 对象且**只含** `tx_ids` 一个键，非空数组、元素
+  两两互异、每个元素都是恰好 64 位**小写**十六进制字符串。解析失败或违反
+  任一规则先返回 `400`，且不触碰任何状态。
+- **状态码**：`height` 只接受无前导零的非负 ASCII 十进制（`0` 合法，拒绝
+  正负号、空白、小数点、科学计数法、前导零与非 ASCII 数字）；高度格式错或
+  不存在返回 `404`；区块仍为 pending 返回 `409`；已确认块缺任一请求交易
+  返回 `404`——整批要么全部成功，要么不返回任何部分证明。成功返回 `200`。
+- **响应**：文档**只含**六个字段，顶层键序固定为
+  `{height, block_hash, merkle_root, leaf_count, leaves, nodes}`。
+  `leaf_count` 是该块**真实叶子总数**（不是所选叶子数）。`leaves` 只含请求
+  的交易，每项仅有 `{tx_id, index}`，按其在原块中的 index 升序排列，
+  `index` 为 0-based 真实位置。`nodes` 每项仅有 `{level, index, hash}`，
+  按 `level` 再 `index` 升序排列；`level = 0` 为叶子层，`index` 是该层
+  0-based 的真实位置（奇数层末节点自配产生的幻像槽位不算真实位置）。
+  `nodes` 恰好包含所选叶子到根路径**并集外紧邻的兄弟子树根**：同一坐标只
+  出现一次，不含可由所选叶子与其他节点推导的节点，也不含根本身。哈希配对
+  沿用 `sha256(left_hex + right_hex)` 与奇数层末节点自配，且不传虚拟兄弟。
+  选中全部叶子（单叶区块的唯一情形）时 `nodes` 为空；重排请求不改变响应。
+- **离线校验**：`ledger.crypto.verify_merkle_multiproof(document,
+  expected_block_hash, expected_merkle_root, expected_leaf_count) -> bool`，
+  依次接收文档、可信区块哈希、可信 Merkle 根与可信叶子数。严格校验：
+  叶子非空且 `index` 与 `tx_id` 均**严格升序**、index 不越界；所有整数拒绝
+  布尔值，`leaf_count` 为正、其余非负；哈希与交易 ID 均为 64 位小写 hex；
+  节点 `(level, index)` 坐标严格升序、真实存在、不与叶子或彼此重合；节点
+  集合与由叶子数和所选 index 确定的最小集合**完全相等**（缺失、冗余/可
+  推导、越界或无关节点即 False）；随后逐层重算根（奇数层末节点自配、无
+  虚拟兄弟），重算根同时等于文档 `merkle_root` 与 `expected_merkle_root`，
+  `leaf_count == expected_leaf_count`，`block_hash == expected_block_hash`。
+  缺失/额外/重复字段或坐标、排序错、类型错、缺节点、冗余节点或任何校验
+  不符都返回 `False`，全程不抛异常；对象键序不影响验证。
+- 与 `/proofs` 一样，该接口是当前一致主链视图上的纯读：不改快照、
+  generation、审计或幂等记录；同一主链重启前后结果一致。现有 HTTP、CLI
+  与离线校验行为保持不变（本接口无独立 CLI 子命令）。
+
 ## 离线轻客户端验证
 
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
@@ -2564,6 +2604,7 @@ python -m compileall -q ledger   # 编译检查
 python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
 python tests/merkle_proof_bundle_test.py  # 批量 Merkle 证明（verify_merkle_proof_bundle 键序/类型/唯一性/index 映射/路径/根/区块哈希、严格 400、404/409、POST /v1/blocks/{height}/proofs、CLI proofs）
+python tests/merkle_multiproof_test.py  # 紧凑多笔 Merkle 包含证明（merkle_multiproof 最小节点集、verify_merkle_multiproof 字段/类型/严格排序/坐标/最小集合/奇数自配/根·叶子数·区块哈希绑定且不抛异常、严格 400 先于高度、404/409/整批 404、全选空 nodes、请求重排不变、纯读不改状态、重启一致、POST /v1/blocks/{height}/multiproof）
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
 python tests/absence_proof_test.py  # 账户不存在证明 GET /v1/accounts/{account}/absence-proof（height 可选单值严格十进制；非法/重复/未知 400、未知/pending 锚点 404、已存在 409；200 固定键序 account,state,lower,upper，前驱/后继完整包含证明与边界 null、空树根；纯读不改账本/索引/审计；verify_account_absence_proof 严格字段/类型/布尔、锚点绑定、邻居有效性/相邻/边界、幻像槽位/篡改/混用锚点不抛异常；HTTP/重启/分叉/并发一致性）
