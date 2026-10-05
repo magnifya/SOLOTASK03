@@ -456,6 +456,177 @@ class LedgerService:
                 raise
         return 200, {"tx_id": tx_id, "status": "cancelled"}
 
+    # At most this many cancellations are accepted by one batch request.
+    CANCEL_BATCH_MAX_ITEMS = 200
+
+    def cancel_transactions_batch(self, payload: object) -> tuple[int, dict]:
+        """POST /v1/transactions/cancel/batch — an atomic batch of
+        sender-signed mempool cancellations. Returns ``(status, body)``.
+
+        The body is exactly ``{"cancellations": [item, ...]}`` with 1 to
+        ``CANCEL_BATCH_MAX_ITEMS`` items; each item is exactly
+        ``{"tx_id": "<64 lowercase hex>", "signature": "<128 lowercase
+        hex>"}`` and the tx_ids are pairwise distinct. Legacy, sequenced
+        and different-sender transactions may mix freely; every signature
+        follows the single-cancel rule (the sender's Ed25519 signature over
+        ``ledger-cancel-v1\\n<tx_id>``).
+
+        Validation runs in phases and reports only the first error:
+
+        * envelope defects (non-object body, missing/extra keys, a
+          non-array or out-of-range cancellations array) are
+          ``400 {"error": "input"}`` with no index;
+        * item format defects and a repeated tx_id are
+          ``400 {"error": "input", "index": I}`` at the first offending
+          item (a duplicate names its later occurrence);
+        * then, in input order, each item is looked up (canonical chain
+          and mempool only), its signature verified and its packing state
+          checked: an unknown id is ``404 {"error": "not_found",
+          "index": I}``, a bad sender signature ``403 {"error":
+          "unauthorized", "index": I}`` and a transaction already packed
+          into the pending tip or a confirmed block ``409 {"error":
+          "not_cancellable", "index": I}``;
+        * finally, per sender, the sequenced nonces selected for
+          cancellation must form a contiguous suffix of all the sender's
+          reserved nonces (reservations span the mempool and the pending
+          tip), in any order. The first violating sender (in order of
+          first appearance) is reported as ``409 {"error":
+          "sequence_conflict", "index": I}`` naming its earliest
+          sequenced batch item.
+
+        Any failure leaves the whole batch untouched. A successful batch
+        removes every transaction from the mempool, releasing each spend
+        reservation and (for sequenced transfers) each nonce so a
+        sender's ``next_sequence`` steps back by the number of its
+        cancelled sequenced transfers; every other mempool transaction
+        (and its order) and all confirmed balances are untouched. One
+        ``transaction_cancelled`` event per item is appended in input
+        order and the whole batch persists in a single atomic write (the
+        generation advances once); a failed write restores the mempool
+        (and its order), the events and the generation and answers
+        ``500 {"error": "persistence failed"}``. Cancelled transactions
+        read as not found, and nothing forbids resubmitting them or
+        reusing the freed nonces.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"cancellations"}:
+            return 400, {"error": "input"}
+        items = payload["cancellations"]
+        if (
+            not isinstance(items, list)
+            or not items
+            or len(items) > self.CANCEL_BATCH_MAX_ITEMS
+        ):
+            return 400, {"error": "input"}
+        # Item format and duplicate check in one input-order pass: the
+        # first offending item names the index, and a repeated tx_id names
+        # its later occurrence.
+        seen: set[str] = set()
+        entries: list[tuple[str, str]] = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or set(item) != {"tx_id", "signature"}:
+                return 400, {"error": "input", "index": index}
+            tx_id = item["tx_id"]
+            signature = item["signature"]
+            if not crypto.is_hex64(tx_id) or not crypto.is_hex128(signature):
+                return 400, {"error": "input", "index": index}
+            if tx_id in seen:
+                return 400, {"error": "input", "index": index}
+            seen.add(tx_id)
+            entries.append((tx_id, signature))
+
+        with self.store.lock:
+            # Per-item lookup, signature and packing checks in input
+            # order. The lookup covers the canonical chain (confirmed
+            # blocks and the pending tip) and the mempool only; candidate
+            # forks are deliberately never searched.
+            resolved: list[Transaction] = []
+            for index, (tx_id, signature) in enumerate(entries):
+                block_tx = None
+                for block in self.store.chain:
+                    for candidate in block.transactions:
+                        if candidate.tx_id == tx_id:
+                            block_tx = candidate
+                            break
+                    if block_tx is not None:
+                        break
+                tx = self.store.pending.get(tx_id)
+                located = tx if tx is not None else block_tx
+                if located is None:
+                    return 404, {"error": "not_found", "index": index}
+                # The cancellation must be signed by the transaction's
+                # sender over the fixed cancel message naming this tx_id.
+                if not crypto.verify_signature(
+                    located.sender, crypto.cancel_message(tx_id), signature
+                ):
+                    return 403, {"error": "unauthorized", "index": index}
+                if block_tx is not None:
+                    return 409, {"error": "not_cancellable", "index": index}
+                resolved.append(tx)
+
+            # Suffix rule, checked only after every item resolved: per
+            # sender, the sequenced nonces selected for cancellation must
+            # be exactly the top-k of the sender's reserved nonces
+            # (mempool plus pending tip), in any order. Senders are
+            # visited in order of their first sequenced batch item; the
+            # first violator names that item's index.
+            selected: dict[str, set[int]] = {}
+            first_item: dict[str, int] = {}
+            for index, tx in enumerate(resolved):
+                if tx.nonce is None:
+                    continue
+                selected.setdefault(tx.sender, set()).add(tx.nonce)
+                first_item.setdefault(tx.sender, index)
+            for sender, nonces in selected.items():
+                state = self.store.sequences.get(sender)
+                reserved = state["pending"] if state is not None else {}
+                highest = max(reserved) if reserved else None
+                expected = (
+                    set(range(highest - len(nonces) + 1, highest + 1))
+                    if highest is not None
+                    else set()
+                )
+                if highest is None or nonces != expected:
+                    return 409, {
+                        "error": "sequence_conflict",
+                        "index": first_item[sender],
+                    }
+
+            # Keep the mempool (and its insertion order) for the rollback
+            # path so a failed write restores the exact pre-request state.
+            pending_before = dict(self.store.pending)
+            for tx in resolved:
+                del self.store.pending[tx.tx_id]
+            # One transaction_cancelled event per item, in input order,
+            # persisted with the mempool removals in a single atomic
+            # write (the generation advances exactly once).
+            for (tx_id, signature), tx in zip(entries, resolved):
+                event_payload = {
+                    "tx_id": tx.tx_id,
+                    "from": tx.sender,
+                    "to": tx.recipient,
+                    "amount": tx.amount,
+                    "signature": signature,
+                }
+                if tx.nonce is not None:
+                    event_payload["nonce"] = tx.nonce
+                self.store.append_audit_event(
+                    EVENT_TRANSACTION_CANCELLED, event_payload
+                )
+            try:
+                self.store.save()
+            except BaseException:
+                # Persistence failed: restore the mempool with its
+                # original order and drop the events so memory keeps
+                # matching the last durably committed state.
+                self.store.pending.clear()
+                self.store.pending.update(pending_before)
+                self.store.truncate_audit_events(len(resolved))
+                return 500, {"error": "persistence failed"}
+        cancelled = [
+            {"tx_id": tx.tx_id, "status": "cancelled"} for tx in resolved
+        ]
+        return 200, {"items": cancelled, "total": len(cancelled)}
+
     # -- sequenced (retryable, nonce-ordered) transactions ------------------
 
     def submit_sequenced_transaction(

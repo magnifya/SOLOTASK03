@@ -440,6 +440,44 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                     lambda: service.submit_transaction(payload),
                     payload,
                 )
+            elif path == "/v1/transactions/cancel/batch":
+                # POST /v1/transactions/cancel/batch — an atomic batch of
+                # sender-signed mempool cancellations. The endpoint takes
+                # no query parameters: any parameter (including a blank
+                # one) is 400 {"error": "input"}; a bare trailing "?"
+                # carries none and is accepted. The body is strictly
+                # {"cancellations": [{"tx_id", "signature"}, ...]} with
+                # 1-200 distinct ids; envelope defects are 400 {"error":
+                # "input"} without an index, item format and duplicate
+                # defects carry the first offending zero-based index.
+                # Unknown ids are 404 not_found, a bad sender signature
+                # 403 unauthorized, a packed or confirmed transaction 409
+                # not_cancellable and a non-suffix sequenced-nonce
+                # selection 409 sequence_conflict — each naming the first
+                # offending item. The route is state-changing, so the
+                # uniform Idempotency-Key rules apply. The success body
+                # has the contract key order items,total, so it is
+                # serialized in insertion order rather than
+                # alphabetically.
+                _route, _has_query, query_string = self.path.partition("?")
+                if _has_query and parse_qs(
+                    query_string, keep_blank_values=True
+                ):
+                    # The body is deliberately unread: close the connection
+                    # so it cannot desync the next pipelined request.
+                    self.close_connection = True
+                    self._send_json(400, {"error": "input"})
+                    return
+                ok, payload = self._read_json()
+                if not ok:
+                    self._send_json(400, {"error": "input"})
+                    return
+                self._json_mutation(
+                    "POST",
+                    lambda: service.cancel_transactions_batch(payload),
+                    payload,
+                    sort_keys=False,
+                )
             elif path.startswith("/v1/transactions/") and path.endswith(
                 "/cancel"
             ):
