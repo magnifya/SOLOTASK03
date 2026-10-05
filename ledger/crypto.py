@@ -432,6 +432,252 @@ def verify_merkle_proof_bundle(
         return False
 
 
+def merkle_multiproof(tx_ids: list[str], indices: list[int]) -> list[dict]:
+    """Compact multi-leaf inclusion proof: the sibling subtree roots that
+    together with the selected leaves determine the Merkle root.
+
+    Mirrors :func:`merkle_root`: levels hash ``sha256(left + right)`` hex
+    pairs and a lone odd node at a level is paired with itself (never sent as
+    a node). The result holds exactly the nodes adjacent to the union of the
+    selected leaves' root paths — one entry per coordinate, nothing derivable
+    from the selected leaves themselves. Each item is
+    ``{"level", "index", "hash"}`` where level 0 is the leaf level and index
+    is the node's real zero-based position within that level; items are
+    ordered by level, then index. Selecting every leaf (or a single-leaf
+    block) yields an empty list. Raises ValueError for an empty list or an
+    out-of-range/non-integer index.
+    """
+    if not tx_ids:
+        raise ValueError("cannot build a Merkle multiproof for an empty tree")
+    known: set[int] = set()
+    for index in indices:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise ValueError("index must be an integer")
+        if index < 0 or index >= len(tx_ids):
+            raise ValueError("transaction index out of range")
+        known.add(index)
+
+    nodes: list[dict] = []
+    level = list(tx_ids)
+    level_no = 0
+    while len(level) > 1:
+        width = len(level)
+        for position in sorted(known):
+            sibling = position ^ 1
+            # sibling == width is the odd-level self-pair: no node is sent.
+            if sibling < width and sibling not in known:
+                nodes.append({
+                    "level": level_no,
+                    "index": sibling,
+                    "hash": level[sibling],
+                })
+        if width % 2 == 1:
+            level.append(level[-1])
+        level = [
+            sha256_hex((level[i] + level[i + 1]).encode("ascii"))
+            for i in range(0, len(level), 2)
+        ]
+        known = {position // 2 for position in known}
+        level_no += 1
+    return nodes
+
+
+def _multiproof_coordinates(leaf_count: int, indices) -> list[tuple[int, int]]:
+    """The exact ``(level, index)`` coordinates a multiproof for ``indices``
+    must carry in a tree of ``leaf_count`` leaves (same rules as
+    :func:`merkle_multiproof`, hashes omitted)."""
+    known = set(indices)
+    coordinates: list[tuple[int, int]] = []
+    width = leaf_count
+    level = 0
+    while width > 1:
+        for position in sorted(known):
+            sibling = position ^ 1
+            if sibling < width and sibling not in known:
+                coordinates.append((level, sibling))
+        known = {position // 2 for position in known}
+        width = (width + 1) // 2
+        level += 1
+    return coordinates
+
+
+def _multiproof_root(
+    leaf_count: int, leaf_map: dict[int, str], node_map: dict[tuple[int, int], str]
+) -> str | None:
+    """Recompute the Merkle root from selected leaves and proof nodes.
+
+    ``leaf_map`` maps level-0 positions to leaf hashes, ``node_map`` maps
+    ``(level, index)`` coordinates to sibling-subtree hashes. Returns None
+    when a required hash is missing or the maps do not converge to one root.
+    """
+    known = dict(leaf_map)
+    width = leaf_count
+    level = 0
+    while width > 1:
+        parents: dict[int, str] = {}
+        for position in sorted(known):
+            parent = position // 2
+            if parent in parents:
+                continue
+            left = known.get(2 * parent, node_map.get((level, 2 * parent)))
+            if left is None:
+                return None
+            right_position = 2 * parent + 1
+            if right_position < width:
+                right = known.get(
+                    right_position, node_map.get((level, right_position))
+                )
+                if right is None:
+                    return None
+            else:
+                # Lone odd node pairs with itself; no virtual sibling exists.
+                right = left
+            parents[parent] = sha256_hex((left + right).encode("ascii"))
+        known = parents
+        width = (width + 1) // 2
+        level += 1
+    if len(known) != 1:
+        return None
+    return next(iter(known.values()))
+
+
+# Key sets of a multiproof document. Verification is order-insensitive: only
+# the exact key *sets* must match, never their insertion order.
+_MULTIPROOF_TOP_KEYS = frozenset(
+    {"height", "block_hash", "merkle_root", "leaf_count", "leaves", "nodes"}
+)
+_MULTIPROOF_LEAF_KEYS = frozenset({"tx_id", "index"})
+_MULTIPROOF_NODE_KEYS = frozenset({"level", "index", "hash"})
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def verify_merkle_multiproof(
+    document: object,
+    trusted_block_hash: object,
+    trusted_merkle_root: object,
+    trusted_leaf_count: object,
+) -> bool:
+    """Strictly verify a compact multi-leaf Merkle inclusion proof offline.
+
+    The document mirrors POST /v1/blocks/{height}/multiproof::
+
+        {"height": H, "block_hash": B, "merkle_root": R, "leaf_count": N,
+         "leaves": [{"tx_id", "index"}, ...],   # requested leaves only
+         "nodes": [{"level", "index", "hash"}, ...]}
+
+    ``leaf_count`` is the block's true leaf count (positive) and must equal
+    ``trusted_leaf_count``. ``leaves`` is non-empty with ``index`` and
+    ``tx_id`` both strictly ascending; ``nodes`` is sorted by ``(level,
+    index)`` and must be *exactly* the sibling-subtree roots adjacent to the
+    union of the selected leaves' root paths — a missing, extra, duplicated
+    or out-of-range coordinate is invalid. The root is recomputed from the
+    leaves and nodes with the same pairing rules as :func:`merkle_root`
+    (``sha256(left + right)`` hex pairs, a lone odd node paired with itself)
+    and must equal both the document's ``merkle_root`` and
+    ``trusted_merkle_root``, while ``block_hash`` must equal
+    ``trusted_block_hash``. Key order inside any object is irrelevant.
+
+    Every defect — a missing/extra key, a wrong type, a boolean where an
+    integer belongs, a non-positive ``leaf_count``, a malformed hash or
+    tx_id, an unsorted/duplicated leaf or node, an out-of-range index, a
+    missing or redundant node, or any anchor mismatch — returns False rather
+    than raising.
+    """
+    try:
+        if not _is_hex64(trusted_block_hash) or not _is_hex64(trusted_merkle_root):
+            return False
+        if (
+            isinstance(trusted_leaf_count, bool)
+            or not isinstance(trusted_leaf_count, int)
+            or trusted_leaf_count < 1
+        ):
+            return False
+        if not isinstance(document, dict) or set(document) != _MULTIPROOF_TOP_KEYS:
+            return False
+
+        height = document["height"]
+        block_hash = document["block_hash"]
+        document_root = document["merkle_root"]
+        leaf_count = document["leaf_count"]
+        leaves = document["leaves"]
+        nodes = document["nodes"]
+
+        if not _is_nonnegative_int(height):
+            return False
+        if not _is_hex64(block_hash) or not _is_hex64(document_root):
+            return False
+        if (
+            isinstance(leaf_count, bool)
+            or not isinstance(leaf_count, int)
+            or leaf_count < 1
+        ):
+            return False
+        if not isinstance(leaves, list) or not leaves:
+            return False
+        if not isinstance(nodes, list):
+            return False
+
+        leaf_map: dict[int, str] = {}
+        previous_index = -1
+        previous_tx_id = ""
+        for leaf in leaves:
+            if not isinstance(leaf, dict) or set(leaf) != _MULTIPROOF_LEAF_KEYS:
+                return False
+            tx_id = leaf["tx_id"]
+            index = leaf["index"]
+            if not _is_hex64(tx_id):
+                return False
+            if not _is_nonnegative_int(index) or index >= leaf_count:
+                return False
+            # Both orderings are strict: duplicates violate them too.
+            if index <= previous_index or tx_id <= previous_tx_id:
+                return False
+            previous_index = index
+            previous_tx_id = tx_id
+            leaf_map[index] = tx_id
+
+        node_map: dict[tuple[int, int], str] = {}
+        previous_coordinate: tuple[int, int] | None = None
+        for node in nodes:
+            if not isinstance(node, dict) or set(node) != _MULTIPROOF_NODE_KEYS:
+                return False
+            level = node["level"]
+            index = node["index"]
+            node_hash = node["hash"]
+            if not _is_nonnegative_int(level) or not _is_nonnegative_int(index):
+                return False
+            if not _is_hex64(node_hash):
+                return False
+            coordinate = (level, index)
+            if previous_coordinate is not None and coordinate <= previous_coordinate:
+                return False
+            previous_coordinate = coordinate
+            node_map[coordinate] = node_hash
+
+        if leaf_count != trusted_leaf_count:
+            return False
+        # The node set must be exactly the required sibling coordinates:
+        # nothing missing, nothing derivable or otherwise redundant.
+        if set(node_map) != set(_multiproof_coordinates(leaf_count, leaf_map)):
+            return False
+
+        recomputed = _multiproof_root(leaf_count, leaf_map, node_map)
+        if recomputed is None:
+            return False
+        if not hmac.compare_digest(recomputed, document_root):
+            return False
+        if not hmac.compare_digest(document_root, trusted_merkle_root):
+            return False
+        if not hmac.compare_digest(block_hash, trusted_block_hash):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 # -- account state Merkle tree ----------------------------------------------
 
 

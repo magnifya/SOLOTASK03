@@ -604,7 +604,25 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 )
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
-                if remainder.endswith("/proofs"):
+                if remainder.endswith("/multiproof"):
+                    # POST /v1/blocks/{height}/multiproof — compact multi-leaf
+                    # Merkle proof. Read-only like /proofs: no ledger/admin
+                    # state changes, so it is not covered by uniform
+                    # idempotency. The body is {"tx_ids": [...]} and is
+                    # strictly validated by the service (400) before any
+                    # state is read. The success document has a
+                    # contract-fixed key order (height, block_hash,
+                    # merkle_root, leaf_count, leaves, nodes), so it is
+                    # serialized in insertion order rather than
+                    # alphabetically.
+                    height = unquote(remainder[: -len("/multiproof")])
+                    ok, payload = self._read_json()
+                    if not ok:
+                        self._send_json(400, payload)  # type: ignore[arg-type]
+                        return
+                    status, body = service.get_multiproof(height, payload)
+                    self._send_json(status, body, sort_keys=False)
+                elif remainder.endswith("/proofs"):
                     # POST /v1/blocks/{height}/proofs — batch Merkle proofs.
                     # Read-only: no ledger/admin state changes, so it is not
                     # covered by uniform idempotency. The body is
