@@ -941,6 +941,32 @@ separators=(",", ":"))` 序列化（三个键固定按字母序、紧凑分隔�
   越出钉住集合、或重算的 verified/missing/conflicts 与报告不符为
   `integrity`。成功固定返回 `ok, verified, missing, conflicts`（均按高度
   再账户稳定升序）；任何失败只返回 `{"ok": false, "error"}`、不抛异常。
+- **单条报告的归档包含证明**：
+  `ledger.light_client.audit_report_proof(path, digest) -> dict` 在
+  record 的同一把跨进程锁下严格重载并校验整档（结构、排序、摘要与证据
+  重放），以报告首次记录顺序中的 digest 为叶子、按账本既有 Merkle 规则
+  （`sha256(left+right)` 十六进制对、奇数末节点自配对）计算
+  `archive_root`；只读不写。成功固定返回 `ok, generation, archive_root,
+  digest, index, total, report, siblings`：`generation` 为首次记录的
+  1 基代数，`index` 为 0 基叶位，`total` 为叶子总数，`report` 为完整
+  报告文档，`siblings` 自叶到根排列且每项含 `direction`（sibling 位于
+  路径节点的 left/right）与 64 位小写 hex `hash`。路径或 digest 非法为
+  `input`，归档不存在或 digest 未命中为 `not_found`，归档损坏为
+  `state`，读失败为 `io`；任何失败不改文件。重复读取、并发追加与重启
+  后同一归档版本得到相同根与路径。
+  `ledger.light_client.verify_audit_report_proof(document,
+  expected_root, expected_digest, expected_pairs, public_key) -> dict`
+  离线核验：不读写任何文件、不抛异常，先按既有报告规则复核内嵌报告
+  （形状、正文摘要、证据重放、分组与钉住公钥下的 Ed25519 验签），再复算
+  叶子（报告 digest）、路径与根并与钉住根比对。结构、键序、类型、hex
+  或参数错误为 `input`；报告公钥不符或验签失败为 `auth`；摘要、顺序、
+  路径、根或与路径深度不符的 total 不一致为 `integrity`。成功固定返回
+  `ok, archive_root, digest, index`。命令行 `ledger audit-report-proof
+  ARCHIVE DIGEST` 打印单行 JSON 证明文档，`ledger audit-report-verify
+  PROOF --expected-root ROOT --expected-digest DIGEST --pairs FILE
+  --public-key KEY`（`PROOF` 与 `FILE` 均可用 `-` 读标准输入）离线复核，
+  两者成功退出 0、其他错误退出 1。既有状态锚、报告导出/校验与归档文件
+  格式、HTTP 接口、其余 CLI、追加幂等与旧文件兼容行为全部不变。
 
 ## 可重试的序列转账
 

@@ -1184,6 +1184,70 @@ def cmd_receipt_proofs_audit(args: argparse.Namespace) -> int:
     return 0 if 200 <= status < 300 and body.get("ok") is True else 1
 
 
+def cmd_audit_report_proof(args: argparse.Namespace) -> int:
+    """Prove one recorded audit report's inclusion in the archive Merkle root.
+
+    Reads the local archive maintained by ``record_state_anchors_audit_report``
+    (no server contact) and prints the inclusion proof as one JSON line in the
+    contract key order (``ok, generation, archive_root, digest, index, total,
+    report, siblings``); a missing argument, unknown digest or corrupt archive
+    prints the ``{"ok": false, "error"}`` body and exits 1.
+    """
+    from .light_client import audit_report_proof
+
+    if not args.archive or not args.digest:
+        return _input_failure()
+    body = audit_report_proof(args.archive, args.digest)
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
+def cmd_audit_report_verify(args: argparse.Namespace) -> int:
+    """Offline-verify an audit-report inclusion proof against a pinned root.
+
+    ``PROOF`` (or standard input when ``-``) supplies the document printed by
+    ``audit-report-proof``; ``--pairs FILE`` (``-`` for standard input) the
+    pinned ``{"height", "account"}`` JSON list. No server contact is made and
+    no file is written. Prints the verifier's single JSON line
+    (``ok, archive_root, digest, index`` on success) and exits 0 on success,
+    1 on any failure; a missing argument, unreadable file or non-JSON input
+    reports ``{"ok": false, "error": "input"}``.
+    """
+    from .light_client import verify_audit_report_proof
+
+    if (
+        not args.proof_file
+        or args.expected_root is None
+        or args.expected_digest is None
+        or args.pairs is None
+        or args.public_key is None
+    ):
+        return _input_failure()
+    try:
+        if args.proof_file == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.proof_file, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+        if args.pairs == "-":
+            pairs = json.loads(sys.stdin.read())
+        else:
+            with open(args.pairs, "r", encoding="utf-8") as fh:
+                pairs = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        # Unreadable or non-JSON input is an input error.
+        return _input_failure()
+    body = verify_audit_report_proof(
+        document,
+        args.expected_root,
+        args.expected_digest,
+        pairs,
+        args.public_key,
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if body.get("ok") is True else 1
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -1881,6 +1945,55 @@ def build_parser() -> argparse.ArgumentParser:
         "default 100)",
     )
     p_header_locators.set_defaults(func=cmd_header_locators)
+
+    p_audit_report_proof = sub.add_parser(
+        "audit-report-proof",
+        help="prove one recorded audit report's inclusion in the local "
+        "archive's Merkle root (offline, read-only)",
+    )
+    p_audit_report_proof.add_argument(
+        "archive",
+        nargs="?",
+        help="audit report archive path (read only)",
+    )
+    p_audit_report_proof.add_argument(
+        "digest",
+        nargs="?",
+        help="report digest (64 lowercase hex characters)",
+    )
+    p_audit_report_proof.set_defaults(func=cmd_audit_report_proof)
+
+    p_audit_report_verify = sub.add_parser(
+        "audit-report-verify",
+        help="offline-verify an audit-report inclusion proof against a "
+        "pinned archive root",
+    )
+    p_audit_report_verify.add_argument(
+        "proof_file",
+        metavar="PROOF|-",
+        nargs="?",
+        help="proof JSON document printed by audit-report-proof, or - to "
+        "read it from standard input",
+    )
+    p_audit_report_verify.add_argument(
+        "--expected-root",
+        help="pinned archive Merkle root (64 lowercase hex characters)",
+    )
+    p_audit_report_verify.add_argument(
+        "--expected-digest",
+        help="pinned report digest (64 lowercase hex characters)",
+    )
+    p_audit_report_verify.add_argument(
+        "--pairs",
+        metavar="FILE|-",
+        help='JSON file with the pinned {"height","account"} list, or - to '
+        "read it from standard input",
+    )
+    p_audit_report_verify.add_argument(
+        "--public-key",
+        help="pinned Ed25519 public key (64 lowercase hex characters)",
+    )
+    p_audit_report_verify.set_defaults(func=cmd_audit_report_verify)
 
     return parser
 
