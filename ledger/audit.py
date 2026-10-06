@@ -472,17 +472,10 @@ def _verify_checkpoint_auth(
     signer = signers.get(first["key_version"])
     if signer is None:
         raise _VerifyError(ERR_AUTH)
-    # A trust document may not describe signer activations that lie beyond the
-    # checkpoint head it is meant to authenticate. The *selected* key's own
-    # activation beyond the head is reported as auth (an unactivated key
-    # version, matching the signed-envelope failure category); any other
-    # history entry beyond the head makes the document itself inconsistent
-    # with the verified checkpoint and is an input error.
-    for other_version, entry in signers.items():
-        if other_version == first["key_version"]:
-            continue
-        if entry["activated_event_id"] > checkpoint["event_id"]:
-            raise _VerifyError(ERR_INPUT)
+    # Signer history entries beyond the verified checkpoint are not a defect:
+    # an export pinned to an older checkpoint is routinely verified against a
+    # trust document that already lists later rotations. Only the *selected*
+    # key's activation is constrained by the checkpoint (below).
     # A signer can only authenticate a checkpoint taken at or after the event
     # that activated its key.
     if checkpoint["event_id"] < signer["activated_event_id"]:

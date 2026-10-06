@@ -426,14 +426,14 @@ class ExportAuthOfflineTests(unittest.TestCase):
                 audit.verify_export(page, trust)["error"], "input", activated
             )
 
-    def test_unselected_signer_beyond_checkpoint_is_input(self) -> None:
+    def test_unselected_signer_beyond_checkpoint_is_accepted(self) -> None:
         # Rotate to v2 (activation event 1), then advance the log one more
         # event without rotating the signer: exports stay signed by v2 at a
         # checkpoint of event 2. A trust document that additionally lists a
-        # legitimate-looking v3 activated beyond that checkpoint is internally
-        # inconsistent with the verified head and is an input error — even
-        # though the selected v2 key itself is active and the signature is
-        # valid.
+        # legitimate-looking v3 activated beyond that checkpoint is accepted —
+        # an export pinned to an older checkpoint is routinely verified
+        # against a trust document that already lists later rotations. Only
+        # the *selected* key's activation is constrained by the checkpoint.
         self.svc.rotate_audit_signer(
             {"private_key": PRIV_B, "expected_version": 1}
         )
@@ -447,7 +447,7 @@ class ExportAuthOfflineTests(unittest.TestCase):
         trust["audit_signers"].append(
             {"version": 3, "public_key": "c" * 64, "activated_event_id": 50}
         )
-        self.assertEqual(audit.verify_export(page, trust)["error"], "input")
+        self.assertTrue(audit.verify_export(page, trust)["ok"])
 
     def test_selected_key_activated_after_checkpoint_stays_auth(self) -> None:
         # Contrast with the case above: when the *selected* envelope key is

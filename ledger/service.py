@@ -5932,6 +5932,10 @@ class LedgerService:
                 "activated_event_id": event["event_id"],
             }
             self.store.audit_signer = new_signer
+            # Retain the new seed alongside every retired one: checkpoints
+            # pinned before this rotation stay signable under their
+            # contemporaneous key.
+            self.store.audit_signer_keys[new_version] = private_key
             self.store.audit_signer_history.append(
                 {
                     "version": new_version,
@@ -5946,6 +5950,7 @@ class LedgerService:
                 # together so a failed write never leaves a rotated key
                 # without its event.
                 self.store.audit_signer = old_signer
+                self.store.audit_signer_keys.pop(new_version, None)
                 del self.store.audit_signer_history[history_length:]
                 self.store.truncate_audit_events(1)
                 raise
@@ -6019,6 +6024,22 @@ class LedgerService:
         ``cursor == total`` returns an empty last page (its anchor is the log
         head so the final page matches the checkpoint); ``cursor > total`` is
         400.
+
+        The optional paired parameters ``checkpoint_event_id`` (a
+        non-negative ASCII decimal without leading zeros) and
+        ``checkpoint_hash`` (64 lowercase hex) pin the export to an explicit
+        audit-chain prefix instead of the moving head. Both must appear
+        together; a lone, repeated or malformed parameter is 400
+        ``{"error": "input"}``. The pinned event id must already exist on the
+        persisted chain with exactly that hash — event id 0 pins the empty
+        prefix, whose hash is 64 zeroes — otherwise 409
+        ``{"error": "checkpoint_conflict"}`` and nothing is persisted. A
+        pinned export pages only the prefix: ``total`` is the pinned event
+        id, ``checkpoint`` is exactly the requested
+        ``{event_id, event_hash}`` and ``checkpoint_auth`` is signed by the
+        newest signer activated at or before the checkpoint, so later
+        appends, ledger changes and key rotations never alter the pinned
+        pages.
         """
         limit = self.AUDIT_DEFAULT_LIMIT
         if params.get("limit") is not None:
@@ -6032,19 +6053,56 @@ class LedgerService:
             if parsed is None:
                 return 400, {"error": "cursor must be a non-negative decimal"}
             cursor = parsed
+        raw_checkpoint_id = params.get("checkpoint_event_id")
+        raw_checkpoint_hash = params.get("checkpoint_hash")
+        if (raw_checkpoint_id is None) != (raw_checkpoint_hash is None):
+            # The pin is a pair: one half without the other is an input error.
+            return 400, {"error": "input"}
+        pinned = None
+        if raw_checkpoint_id is not None:
+            pinned_id = _parse_ascii_decimal(raw_checkpoint_id)
+            if pinned_id is None or not crypto.is_hex64(raw_checkpoint_hash):
+                return 400, {"error": "input"}
+            pinned = {"event_id": pinned_id, "event_hash": raw_checkpoint_hash}
 
         with self.store.lock:
             # Sweep due expiries first, exactly like /v1/audit/events, so the
             # exported checkpoint and log never lag a durable expiry.
             self._prune_expired_syncs()
             events = self.store.audit_events
-            total = len(events)
+            if pinned is not None:
+                # Validate the pin against the persisted chain: the event id
+                # must have been reached and its recorded hash must match
+                # exactly. A conflict changes nothing — no event, no write.
+                target = pinned["event_id"]
+                if target > len(events):
+                    return 409, {"error": "checkpoint_conflict"}
+                head_hash = (
+                    events[target - 1]["event_hash"] if target else audit.ZERO_HASH
+                )
+                if head_hash != pinned["event_hash"]:
+                    return 409, {"error": "checkpoint_conflict"}
+                total = target
+                checkpoint = pinned
+                checkpoint_auth = self.store.sign_checkpoint_for(pinned)
+            else:
+                total = len(events)
+                checkpoint = dict(self.store.audit_checkpoint)
+                # One fresh signature over the current head on every request;
+                # every page fetched in the same export binds the identical
+                # checkpoint and therefore the same verifiable envelope.
+                checkpoint_auth = self.store.sign_checkpoint()
             if cursor > total:
                 return 400, {"error": "cursor is beyond the result set"}
-            page = [dict(event) for event in events[cursor : cursor + limit]]
+            # Bound the slice by the (possibly pinned) total, not just the
+            # log length: a pinned page never returns events past its prefix.
+            page = [
+                dict(event)
+                for event in events[cursor : min(cursor + limit, total)]
+            ]
             # The anchor is the predecessor hash of the page's first event;
-            # for an empty terminal page it is the current log head, which the
-            # offline verifier requires the last page to meet.
+            # for an empty terminal page it is the (possibly pinned) log
+            # head, which the offline verifier requires the last page to meet.
             if cursor == 0:
                 anchor_hash = audit.ZERO_HASH
             else:
@@ -6055,11 +6113,8 @@ class LedgerService:
                 "total": total,
                 "next_cursor": next_cursor,
                 "anchor_hash": anchor_hash,
-                "checkpoint": dict(self.store.audit_checkpoint),
-                # One fresh signature over the current head on every request;
-                # every page fetched in the same export binds the identical
-                # checkpoint and therefore the same verifiable envelope.
-                "checkpoint_auth": self.store.sign_checkpoint(),
+                "checkpoint": checkpoint,
+                "checkpoint_auth": checkpoint_auth,
             }
         return 200, body
 

@@ -635,6 +635,17 @@ JSON 解析失败或任何键/值非法一律返回 `400` 及**有序**
   `{genesis_hash, checkpoint, key_version}` 序列化为 key 排序、紧凑分隔符的
   UTF-8 JSON，取其 SHA-256 32 字节摘要，再用**当前审计签名私钥**做 Ed25519
   签名。同一份导出的各页钉住同一检查点、携带同一 `checkpoint_auth`。
+  可选的成对参数 `checkpoint_event_id`（无前导零的非负 ASCII 十进制）与
+  `checkpoint_hash`（64 位小写十六进制）把一次导出钉在明确的审计链前缀：
+  两者须同时出现且各出现一次，缺配对、重复或格式错误返回
+  `400 {"error":"input"}`；钉住的事件号必须已存在于当前持久化审计链且
+  `event_hash` 完全一致（事件号 `0` 钉空前缀，其哈希为 64 个 `0`），否则
+  `409 {"error":"checkpoint_conflict"}` 且不改变账本、代际或审计事件。
+  钉住后分页上限为该事件号：`total` 固定为 `checkpoint_event_id`，
+  `cursor` 等于该值返回空页、超过返回 `400`，每页只含前缀内事件，
+  `checkpoint` 逐字等于请求的检查点，`checkpoint_auth` 由不晚于该检查点
+  激活的最新签名版本签署，因此之后追加的事件与密钥轮换都不会改变已钉住
+  的页，且钉住页仍可被 `ledger.audit.verify_export` 离线核验。
 - **检查点签名密钥轮换**：节点首次创建时生成版本 1 的 Ed25519 审计检查点
   密钥（首版在事件 `0` 激活）。`POST /v1/audit/signer/rotate` 请求体
   `{"private_key", "expected_version"}`，其中 `private_key` 为 64 位小写
@@ -642,7 +653,9 @@ JSON 解析失败或任何键/值非法一律返回 `400` 及**有序**
   `expected_version` 与当前版本不符 `409`；成功 `200` 返回
   `{"version","public_key"}`，在同一原子落盘内追加一条
   `audit_signer_rotated` 事件（携带新版本号与新公钥）、切到新密钥，并永久
-  保留历史公钥。此后每次审计变化都以当前私钥签名当前检查点。
+  保留历史公钥。此后每次审计变化都以当前私钥签名当前检查点。轮换淘汰的
+  私钥种子随快照持久保留（`audit_signer.retired_keys`），因此钉在轮换之前
+  的检查点导出仍由当时的密钥版本签署，重启后结果一致。
 - **事件覆盖**：信任变更记录 `source_registered` / `source_rotated` /
   `source_revoked`；节点间同步记录 `sync_received`（接收）、
   `sync_adopted`（候选被采用，按来源同步记录逐条登记）与 `sync_expired`
@@ -2574,6 +2587,9 @@ python -m ledger.cli audit-signer-rotate --private-key <64-hex-seed> --expected-
 
 # 哈希锚定审计导出与离线校验（audit-verify 不连接服务端；- 从标准输入读取页或多页数组）
 python -m ledger.cli audit-export [--cursor N] [--limit N] > audit-page.json
+# 可选 --checkpoint-event-id N 与 --checkpoint-hash <64-hex> 成对把导出钉在
+# 明确的审计链前缀（只给一个或格式非法本地即单行 {"error":"input"} 退出 1）
+python -m ledger.cli audit-export --checkpoint-event-id N --checkpoint-hash <64-hex>
 python -m ledger.cli audit-verify audit-page.json
 cat audit-page.json | python -m ledger.cli audit-verify -
 # -> 成功单行 {"ok":true,"checkpoint":{"event_id":N,"event_hash":"..."}} 退出 0；

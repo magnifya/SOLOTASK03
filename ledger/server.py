@@ -783,18 +783,31 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.list_audit_events(params)
                 self._send_json(status, body)
             elif path == "/v1/audit/export":
-                # GET /v1/audit/export?cursor=&limit= — hash-anchored export
-                # pages for offline audit verification. Repeated query
-                # parameters are rejected 400 like the other strict endpoints.
+                # GET /v1/audit/export?cursor=&limit=&checkpoint_event_id=&checkpoint_hash=
+                # — hash-anchored export pages for offline audit verification,
+                # optionally pinned to an explicit checkpoint prefix. Repeated
+                # query parameters are rejected 400 like the other strict
+                # endpoints; a repeated checkpoint pin is an input error just
+                # like a lone or malformed one.
                 parsed = parse_qs(query, keep_blank_values=True)
-                if any(len(values) > 1 for values in parsed.values()):
-                    self._send_json(
-                        400, {"error": "query parameters must not be repeated"}
-                    )
+                repeated = {
+                    key for key, values in parsed.items() if len(values) > 1
+                }
+                if repeated:
+                    if repeated & {"checkpoint_event_id", "checkpoint_hash"}:
+                        self._send_json(400, {"error": "input"})
+                    else:
+                        self._send_json(
+                            400, {"error": "query parameters must not be repeated"}
+                        )
                     return
                 params = {key: values[0] for key, values in parsed.items()}
                 status, body = service.export_audit_events(params)
-                self._send_json(status, body)
+                # The success document has a contract-fixed key order (items,
+                # total, next_cursor, anchor_hash, checkpoint,
+                # checkpoint_auth), so it is serialized in insertion order
+                # rather than alphabetically.
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/chain/range":
                 # GET /v1/chain/range?after_height=&after_hash=&limit=
                 # Incremental canonical-chain page after an anchor. Repeated

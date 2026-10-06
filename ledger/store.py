@@ -454,6 +454,13 @@ class LedgerStore:
         # audit_signer_rotated event id. Public keys are retained forever so
         # historical checkpoints stay verifiable offline.
         self.audit_signer_history: list[dict] = []
+        # Retained signing seeds {version: private_key} for every signer
+        # version this node can still sign with — always including the
+        # current one. Rotation keeps the retired seeds so a checkpoint
+        # pinned before the rotation stays signable (and therefore
+        # exportable) afterwards; the retired entries are persisted as
+        # audit_signer.retired_keys in every snapshot.
+        self.audit_signer_keys: dict[int, str] = {}
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
@@ -531,6 +538,7 @@ class LedgerStore:
                 # first signer is activated at event 0 (the empty log).
                 self.audit_signer = self._make_audit_signer(1, 0)
                 self.audit_signer_history = [self._public_signer_entry(self.audit_signer)]
+                self.audit_signer_keys = {1: self.audit_signer["private_key"]}
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
@@ -734,10 +742,11 @@ class LedgerStore:
             # durable candidates, exactly as for the hash-chain repair). The
             # new key is persisted atomically together with the (possibly
             # relinked) log and checkpoint in the single save() below.
-            audit_signer, signer_history, signer_migration = signer_state
+            audit_signer, signer_history, signer_keys, signer_migration = signer_state
             if signer_migration:
                 audit_signer = self._make_audit_signer(1, 0)
                 signer_history = [self._public_signer_entry(audit_signer)]
+                signer_keys = {1: audit_signer["private_key"]}
 
             self.chain = chain
             self.pending = pending
@@ -751,6 +760,7 @@ class LedgerStore:
             self.audit_checkpoint = audit_checkpoint
             self.audit_signer = audit_signer
             self.audit_signer_history = signer_history
+            self.audit_signer_keys = signer_keys
             self.history_credential = history_credential
             self.idempotency = idempotency
             self.generation = generation
@@ -1437,10 +1447,15 @@ class LedgerStore:
         audit_checkpoint: dict,
         path: str,
         state_version: int | None,
-    ) -> tuple[dict | None, list[dict], bool]:
+    ) -> tuple[dict | None, list[dict], dict[int, str], bool]:
         """Strictly validate the persisted Ed25519 audit checkpoint signer.
 
-        Returns ``(current_signer, history, needs_migration)``. The one-time
+        Returns ``(current_signer, history, signer_keys, needs_migration)``.
+        ``signer_keys`` maps every signable version to its retained private
+        key: the optional ``audit_signer.retired_keys`` section supplies the
+        seeds of rotated-out versions (absent on snapshots written before
+        pinned-checkpoint exports, which can only re-sign the current head)
+        and the current record contributes its own seed. The one-time
         migration that mints a version 1 key is allowed *only* for a snapshot
         whose ``state.version`` explicitly predates 9 and which carries neither
         an ``audit_signer`` nor an ``audit_signer_history`` section. When the
@@ -1474,7 +1489,7 @@ class LedgerStore:
             if history_raw is None and raw is not None:
                 fail("audit_signer present without an audit_signer_history")
             if state_version is not None and state_version < STATE_VERSION:
-                return None, [], True
+                return None, [], {}, True
             if state_version is None:
                 fail(
                     "snapshot without a state.version is missing both "
@@ -1548,6 +1563,46 @@ class LedgerStore:
         if activated > audit_checkpoint["event_id"]:
             fail("audit signer activated beyond the checkpoint")
 
+        # Retired signing seeds keep checkpoints pinned before a rotation
+        # signable after it. The section is optional — snapshots written
+        # before pinned-checkpoint exports record none — but a present
+        # section is strictly verified: versions are decimal strings naming
+        # a historical (never the current) signer version and each seed must
+        # derive that version's recorded public key.
+        retired_keys: dict[int, str] = {}
+        retired_raw = raw.get("retired_keys")
+        if retired_raw is not None:
+            if not isinstance(retired_raw, dict):
+                fail("audit_signer.retired_keys must be an object")
+            for version_text, retired_key in retired_raw.items():
+                if not isinstance(version_text, str):
+                    fail("audit_signer.retired_keys versions must be strings")
+                try:
+                    retired_version = int(version_text)
+                except ValueError:
+                    fail("audit_signer.retired_keys versions must be decimals")
+                if str(retired_version) != version_text:
+                    fail("audit_signer.retired_keys versions must be plain decimals")
+                if retired_version < 1 or retired_version >= version:
+                    fail(
+                        "audit_signer.retired_keys names a version outside the "
+                        "retired signer history"
+                    )
+                if not crypto.is_hex64(retired_key):
+                    fail(
+                        "audit_signer.retired_keys keys must be 64 lowercase "
+                        "hex chars"
+                    )
+                if (
+                    crypto.derive_public_key(retired_key)
+                    != history[retired_version - 1]["public_key"]
+                ):
+                    fail(
+                        "audit_signer.retired_keys key does not derive the "
+                        "recorded public key"
+                    )
+                retired_keys[retired_version] = retired_key
+
         # Every version past 1 must be explained by an audit_signer_rotated
         # event at its activation id, carrying the same version and public
         # key; every such event must in turn match a history entry.
@@ -1598,7 +1653,9 @@ class LedgerStore:
             "public_key": public_key,
             "activated_event_id": activated,
         }
-        return current, history, False
+        signer_keys = dict(retired_keys)
+        signer_keys[version] = private_key
+        return current, history, signer_keys, False
 
     @staticmethod
     def _backfill_expired_events(
@@ -4152,6 +4209,7 @@ class LedgerStore:
         "history_credential",
         "audit_signer",
         "audit_signer_history",
+        "audit_signer_keys",
         "idempotency",
         "generation",
         "tx_index",
@@ -4245,6 +4303,14 @@ class LedgerStore:
                 "private_key": self.audit_signer["private_key"],
                 "public_key": self.audit_signer["public_key"],
                 "activated_event_id": self.audit_signer["activated_event_id"],
+                # Retired seeds (every retained version but the current one)
+                # keep checkpoints pinned before a rotation signable — and
+                # therefore exportable — after it and across restarts.
+                "retired_keys": {
+                    str(key_version): key
+                    for key_version, key in sorted(self.audit_signer_keys.items())
+                    if key_version != self.audit_signer["version"]
+                },
             }
         data = {
             "state": {
@@ -4909,6 +4975,39 @@ class LedgerStore:
             "key_version": self.audit_signer["version"],
             "signature": signature,
         }
+
+    def sign_checkpoint_for(self, checkpoint: dict) -> dict | None:
+        """Return ``{key_version, signature}`` for an arbitrary pinned checkpoint.
+
+        The signing key is the latest signer version activated at or before
+        the checkpoint whose seed is retained, so a checkpoint pinned before
+        a key rotation still authenticates under the key that was active then
+        and ``verify_export`` accepts the page against the current trust
+        document. Returns None on a legacy unsigned snapshot that has not yet
+        been migrated. Caller must hold the lock.
+        """
+        if self.audit_signer is None:
+            return None
+        version = self.audit_signer["version"]
+        private_key = self.audit_signer["private_key"]
+        for entry in self.audit_signer_history:
+            if entry["activated_event_id"] > checkpoint["event_id"]:
+                break
+            key = self.audit_signer_keys.get(entry["version"])
+            if key is not None:
+                version = entry["version"]
+                private_key = key
+        signature = audit.sign_checkpoint_auth(
+            private_key,
+            self.chain[0].block_hash,
+            checkpoint,
+            version,
+        )
+        # A locally generated/validated key cannot fail; treat it as a
+        # programming error rather than emitting an unsigned export.
+        if signature is None:
+            raise RuntimeError("retained audit signer key is invalid")
+        return {"key_version": version, "signature": signature}
 
     def append_audit_event(self, kind: str, payload: dict, at: float | None = None) -> dict:
         """Append an audit event in memory with the next monotonic event_id.

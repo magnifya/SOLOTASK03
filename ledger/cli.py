@@ -69,6 +69,22 @@ def _emit(status: int, body: dict, sort_keys: bool = True) -> int:
     return 0 if 200 <= status < 300 else 1
 
 
+def _is_plain_decimal(value: object) -> bool:
+    """True iff ``value`` is a non-negative ASCII decimal without leading zeros.
+
+    Mirrors the server's strict query-parameter rule: ``0`` or a digit string
+    whose first digit is non-zero; signs, whitespace, leading zeros and
+    non-ASCII digits are all rejected.
+    """
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value.isascii()
+        and value.isdigit()
+        and (value == "0" or not value.startswith("0"))
+    )
+
+
 # -- signing key handling ----------------------------------------------------
 
 
@@ -804,6 +820,23 @@ def cmd_audit_export(args: argparse.Namespace) -> int:
         "cursor": args.cursor,
         "limit": args.limit,
     }
+    checkpoint_id = args.checkpoint_event_id
+    checkpoint_hash = args.checkpoint_hash
+    if (checkpoint_id is None) != (checkpoint_hash is None) or (
+        checkpoint_id is not None
+        and not (
+            _is_plain_decimal(checkpoint_id) and crypto.is_hex64(checkpoint_hash)
+        )
+    ):
+        # The pin is a pair of well-formed values; a lone or malformed one
+        # fails locally with the same input error the server would return.
+        print(json.dumps({"error": "input"}))
+        return 1
+    if checkpoint_id is not None:
+        # Forward the pin verbatim; the server re-validates it against the
+        # persisted chain.
+        filters["checkpoint_event_id"] = checkpoint_id
+        filters["checkpoint_hash"] = checkpoint_hash
     query = urllib.parse.urlencode(
         {key: value for key, value in filters.items() if value is not None}
     )
@@ -1875,6 +1908,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_audit_export.add_argument(
         "--limit", help="page size (decimal, 1-200, default 50)"
+    )
+    p_audit_export.add_argument(
+        "--checkpoint-event-id",
+        help="pin the export at this audit event id (decimal; requires "
+        "--checkpoint-hash)",
+    )
+    p_audit_export.add_argument(
+        "--checkpoint-hash",
+        help="pin the export at this 64-char lowercase hex event hash "
+        "(requires --checkpoint-event-id)",
     )
     p_audit_export.set_defaults(func=cmd_audit_export)
 
