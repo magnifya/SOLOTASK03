@@ -121,6 +121,32 @@ def _parse_ascii_decimal(value: object) -> int | None:
     return _parse_decimal(value)
 
 
+# Audit event ids only ever index the persisted audit log, whose length never
+# approaches this value; a well-formed id with more digits folds to it instead
+# of being converted to a giant integer. This keeps checkpoint pinning
+# independent of the interpreter's integer-string digit cap: an over-long but
+# well-formed ``checkpoint_event_id`` is simply an event the log has not
+# reached (409 checkpoint_conflict) rather than a raised conversion error.
+_EVENT_ID_BEYOND_LOG = 10**18
+_EVENT_ID_MAX_DIGITS = len(str(_EVENT_ID_BEYOND_LOG)) - 1  # 18
+
+
+def _parse_event_id_decimal(value: object) -> int | None:
+    """Strict non-negative ASCII decimal audit event id, or None if malformed.
+
+    Same acceptance rules as ``_parse_ascii_decimal``; a well-formed string
+    with more than ``_EVENT_ID_MAX_DIGITS`` digits folds to
+    ``_EVENT_ID_BEYOND_LOG``.
+    """
+    if not isinstance(value, str) or not value or not value.isascii():
+        return None
+    if not value.isdigit() or (value[0] == "0" and value != "0"):
+        return None
+    if len(value) > _EVENT_ID_MAX_DIGITS:
+        return _EVENT_ID_BEYOND_LOG
+    return int(value)
+
+
 # Heights only ever index the canonical chain list, whose length never
 # approaches this value; a well-formed height string with more digits folds
 # to it instead of being converted to a giant integer. This keeps parsing
@@ -5932,6 +5958,9 @@ class LedgerService:
                 "activated_event_id": event["event_id"],
             }
             self.store.audit_signer = new_signer
+            # Retain the new seed alongside every previous one so checkpoints
+            # pinned to any historical prefix stay exportable and verifiable.
+            self.store.audit_signer_keys[new_version] = private_key
             self.store.audit_signer_history.append(
                 {
                     "version": new_version,
@@ -5946,6 +5975,7 @@ class LedgerService:
                 # together so a failed write never leaves a rotated key
                 # without its event.
                 self.store.audit_signer = old_signer
+                self.store.audit_signer_keys.pop(new_version, None)
                 del self.store.audit_signer_history[history_length:]
                 self.store.truncate_audit_events(1)
                 raise
@@ -6010,15 +6040,29 @@ class LedgerService:
 
         * ``anchor_hash`` — the hash immediately preceding the page's first
           event (64 zeroes at cursor 0; the head at cursor == total);
-        * ``checkpoint`` — the current ``{event_id, event_hash}`` log head
-          (``{0, "0"*64}`` for an empty log), included on every page;
+        * ``checkpoint`` — the ``{event_id, event_hash}`` this export pins,
+          included verbatim on every page;
         * ``checkpoint_auth`` — ``{key_version, signature}`` binding that
-          checkpoint (and the genesis anchor) under the current audit signer;
-          the same envelope is returned on every page of one export.
+          checkpoint (and the genesis anchor) under the audit signer active
+          at the checkpoint; the same envelope is returned on every page of
+          one export.
 
-        ``cursor == total`` returns an empty last page (its anchor is the log
-        head so the final page matches the checkpoint); ``cursor > total`` is
-        400.
+        Without the optional ``checkpoint_event_id``/``checkpoint_hash`` pair
+        the export pins the current log head (``{0, "0"*64}`` for an empty
+        log) and ``total`` is the current log length. The pair must appear
+        together (a lone value is 400 ``input``); ``checkpoint_event_id`` is
+        a non-negative ASCII decimal without leading zeros and
+        ``checkpoint_hash`` 64 lowercase hex characters. The pair is validated
+        against the persisted chain: an event id the log has not reached yet,
+        or a hash that does not match the recorded event, is 409
+        ``checkpoint_conflict`` and touches no state. A valid pair pins the
+        export to that prefix: ``total`` is exactly ``checkpoint_event_id``,
+        only events inside the prefix are paged, ``anchor_hash`` is computed
+        over the prefix and ``checkpoint`` echoes the request verbatim, so
+        later appends (or a restart) cannot change any page of the pinned
+        export. ``cursor == total`` returns an empty last page (its anchor is
+        the pinned head so the final page meets the checkpoint);
+        ``cursor > total`` is 400.
         """
         limit = self.AUDIT_DEFAULT_LIMIT
         if params.get("limit") is not None:
@@ -6033,18 +6077,63 @@ class LedgerService:
                 return 400, {"error": "cursor must be a non-negative decimal"}
             cursor = parsed
 
+        # The optional checkpoint pair pins the export to an explicit
+        # audit-chain prefix. Both values must appear together (the HTTP layer
+        # rejects repeated parameters); a lone or malformed value is 400.
+        raw_checkpoint_id = params.get("checkpoint_event_id")
+        raw_checkpoint_hash = params.get("checkpoint_hash")
+        if (raw_checkpoint_id is None) != (raw_checkpoint_hash is None):
+            return 400, {"error": "input"}
+        pinned_id: int | None = None
+        pinned_hash: str | None = None
+        if raw_checkpoint_id is not None:
+            pinned_id = _parse_event_id_decimal(raw_checkpoint_id)
+            if pinned_id is None or not crypto.is_hex64(raw_checkpoint_hash):
+                return 400, {"error": "input"}
+            pinned_hash = raw_checkpoint_hash
+
         with self.store.lock:
-            # Sweep due expiries first, exactly like /v1/audit/events, so the
-            # exported checkpoint and log never lag a durable expiry.
-            self._prune_expired_syncs()
-            events = self.store.audit_events
-            total = len(events)
+            if pinned_id is None:
+                # Sweep due expiries first, exactly like /v1/audit/events, so
+                # the exported checkpoint and log never lag a durable expiry.
+                self._prune_expired_syncs()
+                events = self.store.audit_events
+                total = len(events)
+                checkpoint = dict(self.store.audit_checkpoint)
+                # One fresh signature over the current head on every request;
+                # every page fetched in the same export binds the identical
+                # checkpoint and therefore the same verifiable envelope.
+                checkpoint_auth = self.store.sign_checkpoint()
+            else:
+                # A pinned export is a pure read of one durable prefix — no
+                # expiry sweep, no append, no generation change — so the same
+                # pinned request replays identically after later appends,
+                # other ledger changes and restarts. Validation, pagination
+                # and the signing material all come from this one locked view.
+                events = self.store.audit_events
+                if pinned_id > len(events):
+                    return 409, {"error": "checkpoint_conflict"}
+                actual_hash = (
+                    audit.ZERO_HASH
+                    if pinned_id == 0
+                    else events[pinned_id - 1]["event_hash"]
+                )
+                if actual_hash != pinned_hash:
+                    return 409, {"error": "checkpoint_conflict"}
+                total = pinned_id
+                checkpoint = {"event_id": pinned_id, "event_hash": pinned_hash}
+                checkpoint_auth = self.store.sign_checkpoint_for(checkpoint)
             if cursor > total:
                 return 400, {"error": "cursor is beyond the result set"}
-            page = [dict(event) for event in events[cursor : cursor + limit]]
+            # The page never crosses the (possibly pinned) prefix end: a
+            # pinned export returns only events inside the pinned prefix even
+            # when the live log has since grown beyond it.
+            page = [
+                dict(event) for event in events[cursor : min(cursor + limit, total)]
+            ]
             # The anchor is the predecessor hash of the page's first event;
-            # for an empty terminal page it is the current log head, which the
-            # offline verifier requires the last page to meet.
+            # for an empty terminal page it is the (possibly pinned) log head,
+            # which the offline verifier requires the last page to meet.
             if cursor == 0:
                 anchor_hash = audit.ZERO_HASH
             else:
@@ -6055,11 +6144,8 @@ class LedgerService:
                 "total": total,
                 "next_cursor": next_cursor,
                 "anchor_hash": anchor_hash,
-                "checkpoint": dict(self.store.audit_checkpoint),
-                # One fresh signature over the current head on every request;
-                # every page fetched in the same export binds the identical
-                # checkpoint and therefore the same verifiable envelope.
-                "checkpoint_auth": self.store.sign_checkpoint(),
+                "checkpoint": checkpoint,
+                "checkpoint_auth": checkpoint_auth,
             }
         return 200, body
 

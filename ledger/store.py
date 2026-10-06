@@ -454,6 +454,13 @@ class LedgerStore:
         # audit_signer_rotated event id. Public keys are retained forever so
         # historical checkpoints stay verifiable offline.
         self.audit_signer_history: list[dict] = []
+        # Every signer seed ever held, {version: private_key}, persisted in
+        # the same atomic snapshot as the signer sections so a checkpoint
+        # pinned to an audit-chain prefix stays exportable (and signed by the
+        # key that was current at that prefix) after later rotations and
+        # restarts. Snapshots written before key retention carry no section;
+        # they recover with only the current seed known.
+        self.audit_signer_keys: dict[int, str] = {}
         # Per-identity endowment used for candidate replay checks; recorded in
         # the snapshot so recovery validates against the same convention.
         self.initial_balance: int | None = initial_balance
@@ -531,6 +538,7 @@ class LedgerStore:
                 # first signer is activated at event 0 (the empty log).
                 self.audit_signer = self._make_audit_signer(1, 0)
                 self.audit_signer_history = [self._public_signer_entry(self.audit_signer)]
+                self.audit_signer_keys = {1: self.audit_signer["private_key"]}
                 self.generation = 0
                 self.rebuild_derived()
                 self.save()
@@ -734,10 +742,11 @@ class LedgerStore:
             # durable candidates, exactly as for the hash-chain repair). The
             # new key is persisted atomically together with the (possibly
             # relinked) log and checkpoint in the single save() below.
-            audit_signer, signer_history, signer_migration = signer_state
+            audit_signer, signer_history, signer_migration, signer_keys = signer_state
             if signer_migration:
                 audit_signer = self._make_audit_signer(1, 0)
                 signer_history = [self._public_signer_entry(audit_signer)]
+                signer_keys = {1: audit_signer["private_key"]}
 
             self.chain = chain
             self.pending = pending
@@ -751,6 +760,7 @@ class LedgerStore:
             self.audit_checkpoint = audit_checkpoint
             self.audit_signer = audit_signer
             self.audit_signer_history = signer_history
+            self.audit_signer_keys = signer_keys
             self.history_credential = history_credential
             self.idempotency = idempotency
             self.generation = generation
@@ -1437,10 +1447,12 @@ class LedgerStore:
         audit_checkpoint: dict,
         path: str,
         state_version: int | None,
-    ) -> tuple[dict | None, list[dict], bool]:
+    ) -> tuple[dict | None, list[dict], bool, dict[int, str]]:
         """Strictly validate the persisted Ed25519 audit checkpoint signer.
 
-        Returns ``(current_signer, history, needs_migration)``. The one-time
+        Returns ``(current_signer, history, needs_migration, signer_keys)``
+        where ``signer_keys`` maps every retained signer version to its seed.
+        The one-time
         migration that mints a version 1 key is allowed *only* for a snapshot
         whose ``state.version`` explicitly predates 9 and which carries neither
         an ``audit_signer`` nor an ``audit_signer_history`` section. When the
@@ -1458,6 +1470,12 @@ class LedgerStore:
         public key match, no orphan rotation events may exist, and a signature
         produced by the stored key over the current checkpoint must verify
         under its public key. Any defect fails recovery.
+
+        The optional ``audit_signer_keys`` section (absent only on snapshots
+        written before key retention) records every version's seed so
+        checkpoints pinned to a rotated-away key stay exportable; when present
+        it is strictly verified against the history (dense versions, each seed
+        deriving its history public key, the current seed retained verbatim).
         """
 
         def fail(reason: str) -> None:
@@ -1468,13 +1486,16 @@ class LedgerStore:
         if raw is None or history_raw is None:
             # The two sections are a single unit on every current snapshot.
             # Only an explicitly old-version snapshot (state.version < 9) may
-            # predate both; anything else is corruption, never a reset.
+            # predate both; anything else is corruption, never a reset. The
+            # retained-seed section can never stand alone either.
+            if state.get("audit_signer_keys") is not None:
+                fail("audit_signer_keys present without an audit_signer")
             if raw is None and history_raw is not None:
                 fail("audit_signer_history present without an audit_signer")
             if history_raw is None and raw is not None:
                 fail("audit_signer present without an audit_signer_history")
             if state_version is not None and state_version < STATE_VERSION:
-                return None, [], True
+                return None, [], True, {}
             if state_version is None:
                 fail(
                     "snapshot without a state.version is missing both "
@@ -1598,7 +1619,51 @@ class LedgerStore:
             "public_key": public_key,
             "activated_event_id": activated,
         }
-        return current, history, False
+        signer_keys = self._parse_persisted_audit_signer_keys(
+            state.get("audit_signer_keys"), history, current, fail
+        )
+        return current, history, False, signer_keys
+
+    @staticmethod
+    def _parse_persisted_audit_signer_keys(
+        raw: object, history: list[dict], current: dict, fail
+    ) -> dict[int, str]:
+        """Validate the retained signer-seed section against the history.
+
+        Returns ``{version: private_key}`` covering every history version. A
+        snapshot written before key retention carries no section and recovers
+        with only the current seed known (checkpoints pinned before its
+        activation then export without authentication, like a legacy unsigned
+        snapshot). A present section must list exactly the history versions,
+        dense from 1, each seed deriving its history public key and the
+        current version's seed matching the current signer record verbatim.
+        """
+        if raw is None:
+            return {current["version"]: current["private_key"]}
+        if not isinstance(raw, list) or not raw:
+            fail("state.audit_signer_keys must be a non-empty list")
+        if len(raw) != len(history):
+            fail("audit_signer_keys must retain exactly the history versions")
+        keys: dict[int, str] = {}
+        for position, entry in enumerate(raw):
+            if not isinstance(entry, dict):
+                fail("audit_signer_keys entry must be an object")
+            k_version = entry.get("version")
+            k_private = entry.get("private_key")
+            if (
+                isinstance(k_version, bool)
+                or not isinstance(k_version, int)
+                or k_version != position + 1
+            ):
+                fail("audit_signer_keys versions must be dense from 1")
+            if not crypto.is_hex64(k_private):
+                fail("audit_signer_keys private_key must be 64 lowercase hex chars")
+            if crypto.derive_public_key(k_private) != history[position]["public_key"]:
+                fail("audit_signer_keys private_key does not derive its public_key")
+            keys[k_version] = k_private
+        if keys.get(current["version"]) != current["private_key"]:
+            fail("audit_signer_keys does not retain the current signer seed")
+        return keys
 
     @staticmethod
     def _backfill_expired_events(
@@ -4152,6 +4217,7 @@ class LedgerStore:
         "history_credential",
         "audit_signer",
         "audit_signer_history",
+        "audit_signer_keys",
         "idempotency",
         "generation",
         "tx_index",
@@ -4246,6 +4312,33 @@ class LedgerStore:
                 "public_key": self.audit_signer["public_key"],
                 "activated_event_id": self.audit_signer["activated_event_id"],
             }
+            # Every retained seed must name a known history version and derive
+            # its public key, so a persisted document never carries signing
+            # material that disagrees with the signer history it accompanies.
+            history_by_version = {
+                entry["version"]: entry for entry in self.audit_signer_history
+            }
+            for key_version, key_seed in self.audit_signer_keys.items():
+                entry = history_by_version.get(key_version)
+                if entry is None or crypto.derive_public_key(key_seed) != (
+                    entry["public_key"]
+                ):
+                    raise RuntimeError(
+                        "retained audit signer keys do not match the signer "
+                        "history; refusing to persist an inconsistent snapshot"
+                    )
+            audit_signer_keys_state = None
+            if len(self.audit_signer_keys) == len(self.audit_signer_history):
+                # A complete retention map (every snapshot written by current
+                # code) is persisted; a pre-retention snapshot that recovered
+                # with only the current seed keeps the section absent rather
+                # than recording a partial map that strict recovery would
+                # reject on the next load.
+                audit_signer_keys_state = [
+                    {"version": entry["version"],
+                     "private_key": self.audit_signer_keys[entry["version"]]}
+                    for entry in self.audit_signer_history
+                ]
         data = {
             "state": {
                 "version": STATE_VERSION,
@@ -4272,6 +4365,8 @@ class LedgerStore:
             data["state"]["audit_signer_history"] = [
                 dict(entry) for entry in self.audit_signer_history
             ]
+            if audit_signer_keys_state is not None:
+                data["state"]["audit_signer_keys"] = audit_signer_keys_state
         # Only persist a forks section when candidates exist so a chain with
         # no forks keeps the canonical snapshot layout; loads default to [].
         if self.forks:
@@ -4907,6 +5002,45 @@ class LedgerStore:
             raise RuntimeError("current audit signer key is invalid")
         return {
             "key_version": self.audit_signer["version"],
+            "signature": signature,
+        }
+
+    def sign_checkpoint_for(self, checkpoint: dict) -> dict | None:
+        """Return ``{key_version, signature}`` for an arbitrary pinned checkpoint.
+
+        The signing key is the retained signer with the greatest
+        ``activated_event_id`` not later than the checkpoint's ``event_id`` —
+        the key that was current when the pinned prefix was the log head — so
+        a checkpoint pinned before a later rotation is still authenticated by
+        a key the trust document shows activated at or before it. Returns None
+        when no eligible seed is retained (a legacy unsigned snapshot, or a
+        pre-retention snapshot whose rotated-away seeds were never recorded).
+        Caller must hold the lock.
+        """
+        if self.audit_signer is None:
+            return None
+        event_id = checkpoint["event_id"]
+        eligible = [
+            entry["version"]
+            for entry in self.audit_signer_history
+            if entry["activated_event_id"] <= event_id
+            and entry["version"] in self.audit_signer_keys
+        ]
+        if not eligible:
+            return None
+        version = max(eligible)
+        signature = audit.sign_checkpoint_auth(
+            self.audit_signer_keys[version],
+            self.chain[0].block_hash,
+            checkpoint,
+            version,
+        )
+        # A locally generated/validated key cannot fail; treat it as a
+        # programming error rather than emitting an unsigned export.
+        if signature is None:
+            raise RuntimeError("retained audit signer key is invalid")
+        return {
+            "key_version": version,
             "signature": signature,
         }
 

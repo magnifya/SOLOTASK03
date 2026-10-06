@@ -519,6 +519,7 @@ class RecoverySignerTests(unittest.TestCase):
         data["state"]["version"] = STATE_VERSION - 1
         data["state"].pop("audit_signer", None)
         data["state"].pop("audit_signer_history", None)
+        data["state"].pop("audit_signer_keys", None)
         # Drop the v2 rotation event too, so the migrated v1 has no dangling
         # history to reconcile (modeling a genuinely older snapshot).
         data["audit_events"] = []
@@ -633,6 +634,9 @@ class RecoverySignerTests(unittest.TestCase):
             "activated_event_id": 1,
         }
         data["state"]["audit_signer_history"][1]["public_key"] = alt_pub
+        # The retained-seed section must track the twin's alternate v2 key so
+        # the snapshot stays individually valid and reaches conflict detection.
+        data["state"]["audit_signer_keys"][1]["private_key"] = alt_priv
         snapshot = os.path.join(self.tmp, f".ledger-twin.gen{generation}")
         write_json(snapshot, data)
         with self.assertRaises(StateRecoveryError) as ctx:

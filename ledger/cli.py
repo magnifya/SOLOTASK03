@@ -800,9 +800,18 @@ def cmd_sync_state_audit(args: argparse.Namespace) -> int:
 
 
 def cmd_audit_export(args: argparse.Namespace) -> int:
+    """GET /v1/audit/export, optionally pinned to an explicit checkpoint.
+
+    ``--checkpoint-event-id``/``--checkpoint-hash`` are forwarded verbatim;
+    the server rejects a lone or malformed pair (and every other failure
+    mode) with a non-2xx status, which ``_emit`` prints as one JSON line and
+    reports as exit code 1.
+    """
     filters = {
         "cursor": args.cursor,
         "limit": args.limit,
+        "checkpoint_event_id": args.checkpoint_event_id,
+        "checkpoint_hash": args.checkpoint_hash,
     }
     query = urllib.parse.urlencode(
         {key: value for key, value in filters.items() if value is not None}
@@ -1875,6 +1884,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_audit_export.add_argument(
         "--limit", help="page size (decimal, 1-200, default 50)"
+    )
+    p_audit_export.add_argument(
+        "--checkpoint-event-id",
+        help="pin the export to this audit event id (requires "
+        "--checkpoint-hash; decimal without leading zeros)",
+    )
+    p_audit_export.add_argument(
+        "--checkpoint-hash",
+        help="expected event_hash of the pinned event (64 lowercase hex; "
+        "requires --checkpoint-event-id)",
     )
     p_audit_export.set_defaults(func=cmd_audit_export)
 

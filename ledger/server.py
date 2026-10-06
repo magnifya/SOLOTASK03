@@ -783,10 +783,21 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 status, body = service.list_audit_events(params)
                 self._send_json(status, body)
             elif path == "/v1/audit/export":
-                # GET /v1/audit/export?cursor=&limit= — hash-anchored export
-                # pages for offline audit verification. Repeated query
-                # parameters are rejected 400 like the other strict endpoints.
+                # GET /v1/audit/export?cursor=&limit=&checkpoint_event_id=&
+                # checkpoint_hash= — hash-anchored export pages for offline
+                # audit verification. The optional checkpoint pair pins the
+                # export to one explicit audit-chain prefix; a repeated
+                # checkpoint parameter is the fixed 400 {"error": "input"},
+                # other repeated query parameters are rejected 400 like the
+                # other strict endpoints.
                 parsed = parse_qs(query, keep_blank_values=True)
+                if any(
+                    len(parsed[name]) > 1
+                    for name in ("checkpoint_event_id", "checkpoint_hash")
+                    if name in parsed
+                ):
+                    self._send_json(400, {"error": "input"})
+                    return
                 if any(len(values) > 1 for values in parsed.values()):
                     self._send_json(
                         400, {"error": "query parameters must not be repeated"}
