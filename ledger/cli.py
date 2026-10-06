@@ -1,4 +1,5 @@
 """Command line interface: send, send-sequenced, send-sequenced-batch, sequence, tx, txs, mine, block, account, proof, proofs,
+absence-proof,
 state-root,
 state-proof, state-proofs, confirm, rollback, status, candidates, chain, adopt, export,
 index, pending, sync, sync-range, sync-attested, sync-range-attested, syncs,
@@ -345,6 +346,19 @@ def cmd_proofs(args: argparse.Namespace) -> int:
     payload = {"tx_ids": args.tx_ids}
     status, body = _request(
         "POST", f"{args.base_url}/v1/blocks/{args.height}/proofs", payload
+    )
+    return _emit(status, body, sort_keys=False)
+
+
+def cmd_absence_proof(args: argparse.Namespace) -> int:
+    # Transaction non-inclusion proof. The success document has a
+    # contract-fixed key order (height, tx_id, transaction_count,
+    # merkle_root, block_hash, lower, upper), so it is printed in insertion
+    # order; any non-2xx response or a connection failure exits 1.
+    status, body = _request(
+        "GET",
+        f"{args.base_url}/v1/blocks/{args.height}/absence-proof/{args.tx_id}",
+        None,
     )
     return _emit(status, body, sort_keys=False)
 
@@ -1446,6 +1460,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="one or more transaction ids (64 lowercase hex characters)",
     )
     p_proofs.set_defaults(func=cmd_proofs)
+
+    p_absence_proof = sub.add_parser(
+        "absence-proof",
+        help="fetch a Merkle non-inclusion proof for a transaction",
+    )
+    p_absence_proof.add_argument(
+        "height", help="block height to prove the transaction absent from"
+    )
+    p_absence_proof.add_argument("tx_id", help="transaction id (64-char hex)")
+    p_absence_proof.set_defaults(func=cmd_absence_proof)
 
     p_confirm = sub.add_parser("confirm", help="confirm a pending tip block")
     p_confirm.add_argument("height", help="block height to confirm")

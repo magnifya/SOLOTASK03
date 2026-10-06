@@ -1050,7 +1050,28 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 self._send_json(status, body)
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
-                if "/proof/" in remainder:
+                if "/absence-proof/" in remainder:
+                    # GET /v1/blocks/{height}/absence-proof/{tx_id} — a Merkle
+                    # non-inclusion proof: the target transaction is absent
+                    # from the confirmed canonical block at that height. The
+                    # endpoint takes no query parameters (any are 400
+                    # {"error": "input"}); a malformed/unknown height is 404
+                    # block_not_found, a malformed tx_id 404
+                    # transaction_not_found, a pending block 409
+                    # block_pending and an already-present transaction 409
+                    # transaction_present. The success document keeps the
+                    # contract-fixed order height, tx_id, transaction_count,
+                    # merkle_root, block_hash, lower, upper, so it is
+                    # serialized in insertion order.
+                    height_raw, tx_raw = remainder.split("/absence-proof/", 1)
+                    if parse_qs(query, keep_blank_values=True):
+                        self._send_json(400, {"error": "input"})
+                        return
+                    status, body = service.get_transaction_absence_proof(
+                        unquote(height_raw), unquote(tx_raw)
+                    )
+                    self._send_json(status, body, sort_keys=False)
+                elif "/proof/" in remainder:
                     # GET /v1/blocks/{height}/proof/{tx_id}
                     height_raw, tx_raw = remainder.split("/proof/", 1)
                     if not height_raw or not tx_raw:

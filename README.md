@@ -1510,6 +1510,35 @@ expected_root)`（本身不变）同时暴露为 HTTP 接口与 CLI 子命令：
   `merkle_root` 与 `trusted_merkle_root`、`block_hash ==
   trusted_block_hash`。任何不符返回 `False`，全程不抛异常。
 
+## 交易非包含证明（absence-proof）
+
+包含证明只能证明某笔交易在块内；非包含证明复用同一棵按 tx_id 升序的
+Merkle 树，证明某笔交易**不在**某个已确认 canonical 块中：
+
+- **请求**：`GET /v1/blocks/{height}/absence-proof/{tx_id}`，只读，不接受任何
+  查询参数（带查询参数一律 `400 {"error":"input"}`）。`height` 必须是无前导零
+  的非负十进制，`tx_id` 必须是 64 位小写十六进制。高度非法或未知
+  `404 {"error":"block_not_found"}`，tx_id 非法
+  `404 {"error":"transaction_not_found"}`，区块待定
+  `409 {"error":"block_pending"}`，目标已在块内
+  `409 {"error":"transaction_present"}`。文档在锁内从 canonical 快照构造，
+  不含待处理集合与候选分叉，读取不改变任何账本/索引/审计状态。
+- **响应**：键序固定为 `height, tx_id, transaction_count, merkle_root,
+  block_hash, lower, upper`。`lower`/`upper` 是目标在升序叶子序列中
+  前驱/后继的包含证明（键序 `tx_id, index, siblings`，路径方向与奇数层
+  自配规则同包含证明），缺失一侧为 `null`：双侧索引相邻且
+  `lower.tx_id < tx_id < upper.tx_id`；单侧时 `upper` 必为首项（目标小于
+  所有叶子）或 `lower` 必为末项（目标大于所有叶子）；空块两侧均为 `null`
+  且 `merkle_root` 为固定的空树根。
+- **离线校验**：`ledger.crypto.verify_transaction_absence_proof(document,
+  expected_tx_id, expected_height, expected_block_hash,
+  expected_merkle_root) -> bool`。检查结构/类型/锚点一致、
+  `transaction_count` 边界、邻居顺序与索引相邻/边界规则，并按索引重放
+  每条邻居路径到根（拒绝方向错误、幻像左自配、过深路径、伪造邻居与根
+  不一致），任何畸形或篡改返回 `False` 而不抛异常。
+- **CLI**：`absence-proof HEIGHT TX_ID` 输出响应文档；非 2xx 或连接失败
+  退出码 1。
+
 ## 离线轻客户端验证
 
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
@@ -2345,6 +2374,11 @@ curl -s "localhost:8080/v1/accounts/<pubkey-hex>/attested-proof?height=H"
 #         "auth":{"key_version":1,"signature":"..."}}
 # 已确认交易的 Merkle 包含证明（区块不存在/交易不在该高度/tx_id 非法 -> 404；区块待定 -> 409）
 curl -s localhost:8080/v1/blocks/1/proof/<tx-id-hex>
+# 交易非包含证明（不接受查询参数，带参 400 {"error":"input"}；高度非法/未知 404 block_not_found；
+# tx_id 非法 404 transaction_not_found；区块待定 409 block_pending；目标已在块内 409 transaction_present；
+# 200 键序 height,tx_id,transaction_count,merkle_root,block_hash,lower,upper，
+# 离线用 verify_transaction_absence_proof 校验）
+curl -s localhost:8080/v1/blocks/1/absence-proof/<tx-id-hex>
 # 批量 Merkle 证明（tx_ids 须非空、互异、各为 64 位小写 hex；畸形请求体 -> 400；
 # 未知高度或缺交易 -> 404；区块待定 -> 409；成功顶层键序固定）
 curl -s -X POST localhost:8080/v1/blocks/1/proofs \
@@ -2565,6 +2599,7 @@ python -m ledger.cli txs <tx-id-hex-1> <tx-id-hex-2>  # 批量普通回执（1-2
 python -m ledger.cli account <pubkey-hex>
 python -m ledger.cli proof 1 <tx-id-hex>
 python -m ledger.cli proofs 1 <tx-id-hex-1> <tx-id-hex-2>  # 批量；非 2xx 退出 1
+python -m ledger.cli absence-proof 1 <tx-id-hex>  # 交易非包含证明；非 2xx 或连接失败退出 1
 python -m ledger.cli state-root                 # 锚定最高已确认块
 python -m ledger.cli state-root --height H      # 历史已确认前缀
 python -m ledger.cli state-proof <pubkey-hex>
@@ -2695,6 +2730,7 @@ python tests/smoke_test.py       # 不依赖网络的全流程冒烟测试
 python tests/merkle_proof_test.py  # Merkle 证明（crypto/service/HTTP/CLI）与接口回归
 python tests/merkle_proof_bundle_test.py  # 批量 Merkle 证明（verify_merkle_proof_bundle 键序/类型/唯一性/index 映射/路径/根/区块哈希、严格 400、404/409、POST /v1/blocks/{height}/proofs、CLI proofs）
 python tests/merkle_multiproof_test.py  # 紧凑多笔 Merkle 证明（merkle_multiproof/verify_merkle_multiproof 精确节点集、排序/类型/布尔拒绝、锚点绑定、严格 400 与 ASCII 高度、404/409、重排不变、重启一致、POST /v1/blocks/{height}/multiproof）
+python tests/transaction_absence_proof_test.py  # 交易非包含证明 GET /v1/blocks/{height}/absence-proof/{tx_id}（不接受查询参数，带参 400 {"error":"input"}；高度非法/未知 404 block_not_found、tx_id 非法 404 transaction_not_found、pending 409 block_pending、已在块内 409 transaction_present；200 固定键序 height,tx_id,transaction_count,merkle_root,block_hash,lower,upper，前驱/后继包含证明相邻与边界 null、空块空树根；verify_transaction_absence_proof 严格字段/类型/布尔、锚点绑定、索引重放路径、幻像槽位/过深路径/篡改不抛异常；纯读、重启一致、HTTP 线序、CLI absence-proof）
 python tests/state_proof_test.py   # 账户状态 Merkle 根与包含证明（canonical 叶子、verify_account_proof、/v1/state/root、/v1/accounts/{account}/proof、pending 404、HTTP/CLI、快照 state_root 恢复拒绝）
 python tests/history_state_test.py # 历史高度状态根/账户证明（/v1/state/root/{height}、?height=H 严格校验与 400/404 语义、canonical 前缀确定性重放、历史 proof 离线验证、CLI 转发、重启/分叉采用/回滚/并发一致性）
 python tests/absence_proof_test.py  # 账户不存在证明 GET /v1/accounts/{account}/absence-proof（height 可选单值严格十进制；非法/重复/未知 400、未知/pending 锚点 404、已存在 409；200 固定键序 account,state,lower,upper，前驱/后继完整包含证明与边界 null、空树根；纯读不改账本/索引/审计；verify_account_absence_proof 严格字段/类型/布尔、锚点绑定、邻居有效性/相邻/边界、幻像槽位/篡改/混用锚点不抛异常；HTTP/重启/分叉/并发一致性）
