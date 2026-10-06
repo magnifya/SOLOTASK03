@@ -362,6 +362,26 @@ def cmd_absence_proof(args: argparse.Namespace) -> int:
     return _emit(status, body, sort_keys=False)
 
 
+def cmd_absence_proofs(args: argparse.Namespace) -> int:
+    # Batch transaction non-inclusion proofs: POST the requested ids
+    # verbatim; the server applies the strict 1–128 distinct
+    # 64-lowercase-hex validation (400 {"error": "input"} on error). A
+    # missing tx_id list is rejected locally with the same body and exit
+    # code 1 instead of an argparse usage error. The success document has
+    # a contract-fixed key order (height, block_hash, merkle_root,
+    # transaction_count, tx_ids, proofs), so it is printed in insertion
+    # order rather than alphabetically (error bodies are single-key).
+    if not args.tx_ids:
+        return _emit(400, {"error": "input"}, sort_keys=False)
+    payload = {"tx_ids": args.tx_ids}
+    status, body = _request(
+        "POST",
+        f"{args.base_url}/v1/blocks/{args.height}/absence-proofs",
+        payload,
+    )
+    return _emit(status, body, sort_keys=False)
+
+
 def cmd_confirm(args: argparse.Namespace) -> int:
     status, body = _request(
         "POST", f"{args.base_url}/v1/blocks/{args.height}/confirm", {}
@@ -1471,6 +1491,23 @@ def build_parser() -> argparse.ArgumentParser:
         "tx_id", help="transaction id (64 lowercase hex characters)"
     )
     p_absence_proof.set_defaults(func=cmd_absence_proof)
+
+    p_absence_proofs = sub.add_parser(
+        "absence-proofs",
+        help="fetch transaction non-inclusion (absence) proofs for several "
+        "transactions",
+    )
+    p_absence_proofs.add_argument(
+        "height", help="block height that must not contain the transactions"
+    )
+    p_absence_proofs.add_argument(
+        "tx_ids",
+        metavar="tx_id",
+        nargs="*",
+        help="one or more distinct transaction ids (64 lowercase hex "
+        "characters)",
+    )
+    p_absence_proofs.set_defaults(func=cmd_absence_proofs)
 
     p_confirm = sub.add_parser("confirm", help="confirm a pending tip block")
     p_confirm.add_argument("height", help="block height to confirm")

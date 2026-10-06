@@ -1545,6 +1545,36 @@ tx_id 升序排列这一事实，用目标的前后邻居证明它不在区块�
   JSON；任何非 2xx 响应（含连接失败）退出码为 1。既有 CLI 与查询接口
   行为不变，重启后同一 canonical 区块的证明结果不变。
 
+### 批量交易非包含证明
+
+同一已确认 canonical 区块可以一次证明多笔交易不存在：
+
+- **请求**：`POST /v1/blocks/{height}/absence-proofs`，只读，在同一锁
+  快照下从 canonical 链构造，不写 generation、审计、内存池或快照。请求
+  体只能是 `{"tx_ids": [...]}`：1–128 个互异的 64 位小写十六进制
+  tx_id。JSON 非对象、键不符、类型错误、空数组、越界、重复或格式错误
+  （含 JSON 解析失败）一律 `400 {"error":"input"}`。
+- **状态码**：`height` 按 ASCII 非负十进制解析（无前导零），格式错或
+  高度未知返回 `404 {"error":"block_not_found"}`；区块 pending 返回
+  `409 {"error":"block_pending"}`；任一目标已在块中返回
+  `409 {"error":"transaction_present"}`（整批失败，不出部分证明）。
+- **响应**：顶层键序固定为 `{height, block_hash, merkle_root,
+  transaction_count, tx_ids, proofs}`。`tx_ids` 为按字典序升序的目标
+  集合（与请求顺序无关）；`proofs` 与之一一对应，每项仅含 `{tx_id,
+  lower, upper}`，`lower`/`upper` 语义与单笔接口相同（目标两侧交易的
+  包含证明，边界为 `null`，空块两侧均为 `null`）。
+- **离线校验**：`ledger.crypto.verify_transaction_absence_proof_bundle(
+  bundle, expected_height, expected_block_hash, expected_merkle_root)
+  -> bool`。严格校验结构（缺失/额外键即 False，键序无关；整数拒绝布尔
+  值，哈希为 64 位小写 hex）、目标唯一且升序（1–128 个）、`proofs` 与
+  目标一一对齐、三个锚点与钉住值相等，并把每个邻居的 siblings 按其
+  `index` 重放到同一 `merkle_root`，再逐目标确认其位于相邻区间或边界
+  之外；目标存在、虚构或重复邻居、方向或深度错误、篡改或锚点不一致均
+  返回 `False`，全程不抛异常。
+- **CLI**：`absence-proofs HEIGHT TX_ID...` 组装 `{"tx_ids": [...]}`
+  请求服务并输出与接口字段、键序一致的单行 JSON；参数错误（如缺少
+  tx_id）或任何非 2xx 响应退出码为 1。
+
 ## 离线轻客户端验证
 
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
