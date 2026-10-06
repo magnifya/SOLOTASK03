@@ -7,7 +7,8 @@ sync-state-audit, sync-plan,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
-subcommands, the receipt-proofs-audit batch audit subcommand, plus the
+subcommands, the receipt-proofs-audit batch audit subcommand, the offline
+audit-report-proof/audit-report-verify inclusion-proof subcommands, plus the
 offline checkpoint-history history-trust,
 history-export and header-locators subcommands.
 
@@ -1184,6 +1185,76 @@ def cmd_receipt_proofs_audit(args: argparse.Namespace) -> int:
     return 0 if 200 <= status < 300 and body.get("ok") is True else 1
 
 
+def cmd_audit_report_proof(args: argparse.Namespace) -> int:
+    """Merkle inclusion proof for one archived audit report; no server contact.
+
+    ``ARCHIVE`` is the audit-report archive maintained by
+    ``record_state_anchors_audit_report`` and ``DIGEST`` the report's
+    64-lowercase-hex body digest. Prints the proof document as one JSON
+    line in the contract key order (``ok, generation, archive_root,
+    digest, index, total, report, siblings``) or the ordered
+    ``{"ok": false, "error"}`` failure body; the exit code is 0 only when
+    the proof was produced. A missing argument prints the ``input``
+    failure body and exits 1.
+    """
+    from .light_client import audit_report_proof
+
+    if not args.archive or not args.digest:
+        return _input_failure()
+    body = audit_report_proof(args.archive, args.digest)
+    return _emit_result_document(body)
+
+
+def cmd_audit_report_verify(args: argparse.Namespace) -> int:
+    """Offline-verify one audit-report inclusion proof; no server contact.
+
+    ``PROOF`` (or standard input when ``-``) supplies the proof document
+    printed by ``audit-report-proof``; ``--expected-root`` and
+    ``--expected-digest`` pin the archive Merkle root and the report
+    digest, ``--pairs FILE`` (``-`` reads standard input) the pinned
+    ``{"height", "account"}`` list and ``--public-key`` the pinned Ed25519
+    key. Prints the verdict as one JSON line in the contract key order
+    (``ok, archive_root, digest, index``) or the ordered
+    ``{"ok": false, "error"}`` failure body; the exit code is 0 only when
+    the proof verifies. A missing argument or an unreadable/non-JSON
+    input prints the ``input`` failure body and exits 1.
+    """
+    from .light_client import verify_audit_report_proof
+
+    if (
+        not args.proof_file
+        or not args.expected_root
+        or not args.expected_digest
+        or not args.pairs
+        or not args.public_key
+    ):
+        return _input_failure()
+    try:
+        if args.proof_file == "-":
+            document = json.loads(sys.stdin.read())
+        else:
+            with open(args.proof_file, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return _input_failure()
+    try:
+        if args.pairs == "-":
+            pairs = json.loads(sys.stdin.read())
+        else:
+            with open(args.pairs, "r", encoding="utf-8") as fh:
+                pairs = json.load(fh)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return _input_failure()
+    body = verify_audit_report_proof(
+        document,
+        args.expected_root,
+        args.expected_digest,
+        pairs,
+        args.public_key,
+    )
+    return _emit_result_document(body)
+
+
 # -- argparse wiring ---------------------------------------------------------
 
 
@@ -1699,6 +1770,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="expected receipt-index Merkle root (64 lowercase hex characters)",
     )
     p_receipt_proofs_audit.set_defaults(func=cmd_receipt_proofs_audit)
+
+    p_audit_report_proof = sub.add_parser(
+        "audit-report-proof",
+        help="Merkle inclusion proof for one report in the audit-report "
+        "archive (offline, read-only)",
+    )
+    p_audit_report_proof.add_argument(
+        "archive",
+        nargs="?",
+        help="audit-report archive path (read only)",
+    )
+    p_audit_report_proof.add_argument(
+        "digest",
+        nargs="?",
+        help="report body digest (64 lowercase hex characters)",
+    )
+    p_audit_report_proof.set_defaults(func=cmd_audit_report_proof)
+
+    p_audit_report_verify = sub.add_parser(
+        "audit-report-verify",
+        help="offline-verify one audit-report inclusion proof against the "
+        "pinned archive root, digest, pairs and public key",
+    )
+    p_audit_report_verify.add_argument(
+        "proof_file",
+        metavar="PROOF|-",
+        nargs="?",
+        help="proof JSON document, or - to read it from standard input",
+    )
+    p_audit_report_verify.add_argument(
+        "--expected-root",
+        help="pinned archive Merkle root (64 lowercase hex characters)",
+    )
+    p_audit_report_verify.add_argument(
+        "--expected-digest",
+        help="pinned report body digest (64 lowercase hex characters)",
+    )
+    p_audit_report_verify.add_argument(
+        "--pairs",
+        metavar="FILE|-",
+        help='JSON list of pinned {"height", "account"} pairs, or - to '
+        "read it from standard input",
+    )
+    p_audit_report_verify.add_argument(
+        "--public-key",
+        help="pinned Ed25519 public key (64 lowercase hex characters)",
+    )
+    p_audit_report_verify.set_defaults(func=cmd_audit_report_verify)
 
     # Source-trust management: `trust <action> ...`.
     p_trust = sub.add_parser("trust", help="manage trusted sources and export the trust document")

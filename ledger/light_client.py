@@ -12904,3 +12904,257 @@ def list_state_anchors_audit_reports(
             }
     except _CheckpointError as failure:
         return {"ok": False, "error": failure.category}
+
+
+# -- audit-report archive inclusion proofs -----------------------------------
+#
+# An offline Merkle credential binding one recorded audit report to the
+# archive version that holds it: the leaves are the stored report digests in
+# their first-recorded order and the tree follows the ledger's usual pairing
+# rules (``SHA256(ascii(left_hex + right_hex))``, a lone odd node paired with
+# itself). An auditor needs only the single proof document and the pinned
+# archive root to re-verify membership — the archive itself is not needed.
+
+AUDIT_REPORT_PROOF_RESULT_KEYS = (
+    "ok",
+    "generation",
+    "archive_root",
+    "digest",
+    "index",
+    "total",
+    "report",
+    "siblings",
+)
+VERIFY_AUDIT_REPORT_PROOF_RESULT_KEYS = ("ok", "archive_root", "digest", "index")
+
+
+def _audit_report_tree_depth(total: int) -> int:
+    """Sibling-path length of every leaf in a ``total``-leaf Merkle tree.
+
+    With the ledger's pairing rules a lone odd node is paired with itself,
+    so every leaf — independent of its position — gets exactly one sibling
+    per level and the level count is shared by the whole tree.
+    """
+    depth = 0
+    width = total
+    while width > 1:
+        width = (width + 1) // 2
+        depth += 1
+    return depth
+
+
+def audit_report_proof(path: object, digest: object) -> dict:
+    """Merkle inclusion proof for one report in the audit-report archive.
+
+    ``path`` is the archive maintained by
+    :func:`record_state_anchors_audit_report` and ``digest`` the report's
+    64-lowercase-hex body digest. The tree is computed over the stored
+    report digests in their first-recorded (recording) order: each leaf is
+    the report digest itself and each parent
+    ``SHA256(ascii(left_hex + right_hex))`` with a lone odd node paired
+    with itself — the ledger's usual pairing rules. The call is serialized
+    with appends through the same cross-process archive lock, strictly
+    validates the whole archive and never writes, rewrites or cleans any
+    file.
+
+    Success returns ``{"ok": True, "generation", "archive_root", "digest",
+    "index", "total", "report", "siblings"}`` in that key order:
+    ``generation`` the archive's current generation, ``archive_root`` the
+    recomputed Merkle root, ``index`` the report's zero-based leaf
+    position, ``total`` the number of archived reports, ``report`` the
+    full recorded report document (carried so an auditor can re-verify it
+    independently) and ``siblings`` the path from leaf to root, each item
+    ``{"direction", "hash"}`` with ``direction`` the sibling's side
+    (``left``/``right``) and ``hash`` 64 lowercase hex.
+
+    Failure returns only ``{"ok": False, "error": category}``: ``input``
+    for a bad path or digest shape, ``not_found`` for a missing archive or
+    a digest the archive does not hold, ``state`` for archive
+    parse/digest/ordering/replay corruption and ``io`` for a read failure.
+    Nothing is raised, a failure never changes a file, and identical file
+    bytes yield identical roots and paths across repeated reads, concurrent
+    appends and restarts.
+    """
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": ERR_INPUT}
+    if not isinstance(digest, str) or not crypto.is_hex64(digest):
+        return {"ok": False, "error": ERR_INPUT}
+
+    try:
+        with _AuditReportArchiveLock(path, create=False):
+            try:
+                stored = _load_audit_report_archive(path)
+            except _CheckpointError as failure:
+                return {"ok": False, "error": failure.category}
+            except Exception:
+                return {"ok": False, "error": ERR_STATE}
+            if stored is None:
+                return {"ok": False, "error": ERR_NOT_FOUND}
+            reports = stored["reports"]
+            for position, report in enumerate(reports):
+                if report["digest"] != digest:
+                    continue
+                leaves = [item["digest"] for item in reports]
+                return {
+                    "ok": True,
+                    "generation": stored["generation"],
+                    "archive_root": crypto.merkle_root(leaves),
+                    "digest": digest,
+                    "index": position,
+                    "total": len(reports),
+                    "report": copy.deepcopy(report),
+                    "siblings": crypto.merkle_proof(leaves, position),
+                }
+            return {"ok": False, "error": ERR_NOT_FOUND}
+    except _CheckpointError as failure:
+        return {"ok": False, "error": failure.category}
+
+
+def verify_audit_report_proof(
+    document: object,
+    expected_root: object,
+    expected_digest: object,
+    expected_pairs: object,
+    public_key: object,
+) -> dict:
+    """Offline-verify one :func:`audit_report_proof` success document.
+
+    ``document`` is the decoded ``{"ok": True, "generation", "archive_root",
+    "digest", "index", "total", "report", "siblings"}`` document exactly as
+    :func:`audit_report_proof` issues it (strictly that key order, no
+    missing or extra keys, ``ok`` true); ``expected_root`` and
+    ``expected_digest`` are the caller-pinned 64-lowercase-hex archive
+    Merkle root and report digest, ``expected_pairs`` the pinned non-empty
+    duplicate-free ``{"height", "account"}`` list and ``public_key`` the
+    pinned 64-lowercase-hex Ed25519 key. Verification is purely offline:
+    no file is read or written, the arguments are never mutated and
+    nothing is raised.
+
+    Stage 1 (``input``) settles the exact key order and raw types:
+    ``generation`` and ``total`` positive plain integers, ``index`` a
+    non-negative plain integer, every hash 64 lowercase hex, the pinned
+    pairs and public key well-formed, the carried report shape-valid under
+    the existing report rules and ``siblings`` a ``{direction, hash}``
+    list within the depth limit.
+
+    Stage 2 (``auth``/``integrity``) re-runs the existing offline report
+    verification on the carried report: a report public key different
+    from the pinned key or a failing Ed25519 seal is ``auth``; a
+    body-digest, evidence-replay or grouping mismatch is ``integrity``.
+
+    Stage 3 (``integrity``) binds the proof to the pinned values and
+    re-walks the Merkle path: the proof ``digest`` must equal both the
+    verified report digest and ``expected_digest``, ``generation`` must
+    equal ``total``, ``index`` must be below ``total`` and the sibling
+    count must be exactly the path length of a ``total``-leaf tree. The
+    leaf is the report digest itself; each level pairs
+    ``SHA256(ascii(left_hex + right_hex))`` with the index bit fixing the
+    sibling side (even positions only accept a right sibling — which may
+    be the current digest itself for an odd-node self-pair — and odd
+    positions only a left one, never the phantom self-pair). The
+    recomputed root must equal both the document's ``archive_root`` and
+    ``expected_root``.
+
+    Success returns ``{"ok": True, "archive_root", "digest", "index"}`` in
+    that key order; failure returns only ``{"ok": False, "error":
+    category}`` with category ``input`` (structure, type, encoding or
+    parameter defects), ``auth`` (report signature or public key) or
+    ``integrity`` (digest, ordering, path, root or total mismatches).
+    """
+    try:
+        # Stage 1 (input): exact key order and raw types of the document
+        # and the caller-pinned parameters.
+        if not isinstance(document, dict) or tuple(document.keys()) != (
+            AUDIT_REPORT_PROOF_RESULT_KEYS
+        ):
+            raise _Failure(ERR_INPUT)
+        if document["ok"] is not True:
+            raise _Failure(ERR_INPUT)
+        generation = document["generation"]
+        if not _is_int(generation) or generation < 1:
+            raise _Failure(ERR_INPUT)
+        archive_root = document["archive_root"]
+        if not crypto.is_hex64(archive_root):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(expected_root):
+            raise _Failure(ERR_INPUT)
+        digest = document["digest"]
+        if not crypto.is_hex64(digest):
+            raise _Failure(ERR_INPUT)
+        if not crypto.is_hex64(expected_digest):
+            raise _Failure(ERR_INPUT)
+        index = document["index"]
+        if not _is_int(index) or index < 0:
+            raise _Failure(ERR_INPUT)
+        total = document["total"]
+        if not _is_int(total) or total < 1:
+            raise _Failure(ERR_INPUT)
+        pairs = _validate_state_anchors_audit_pairs(expected_pairs)
+        _stable_canonical_json_bytes(expected_pairs)
+        if not isinstance(public_key, str) or not crypto.is_hex64(public_key):
+            raise _Failure(ERR_INPUT)
+        parsed = _parse_state_anchors_audit_report(document["report"])
+        siblings = document["siblings"]
+        if not isinstance(siblings, list) or len(siblings) > (
+            crypto.MAX_MERKLE_DEPTH
+        ):
+            raise _Failure(ERR_INPUT)
+        for sibling in siblings:
+            if not isinstance(sibling, dict) or tuple(sibling.keys()) != (
+                PROOF_SIBLING_KEYS
+            ):
+                raise _Failure(ERR_INPUT)
+            direction = sibling["direction"]
+            if not isinstance(direction, str):
+                raise _Failure(ERR_INPUT)
+            if direction not in ("left", "right"):
+                raise _Failure(ERR_INTEGRITY)
+            if not crypto.is_hex64(sibling["hash"]):
+                raise _Failure(ERR_INPUT)
+
+        # Stage 2 (auth/integrity): the carried report must pass the
+        # existing offline report rules against the pinned pairs and key.
+        if parsed["public_key"] != public_key:
+            raise _Failure(ERR_AUTH)
+        _replay_state_anchors_audit_report(parsed, set(pairs), False)
+
+        # Stage 3 (integrity): bind the digest, ordering and total, then
+        # re-walk the Merkle path from the report-digest leaf up to the
+        # declared archive root with the ledger pairing rules.
+        if digest != parsed["digest"] or digest != expected_digest:
+            raise _Failure(ERR_INTEGRITY)
+        if generation != total or index >= total:
+            raise _Failure(ERR_INTEGRITY)
+        if len(siblings) != _audit_report_tree_depth(total):
+            raise _Failure(ERR_INTEGRITY)
+        current = digest
+        position = index
+        for sibling in siblings:
+            sibling_hash = sibling["hash"]
+            if sibling["direction"] == "left":
+                # A genuine odd-node self-pair always points right; a
+                # left sibling equal to the path node addresses the
+                # phantom duplicate slot.
+                if position % 2 == 0 or sibling_hash == current:
+                    raise _Failure(ERR_INTEGRITY)
+                pair = sibling_hash + current
+            else:
+                if position % 2 == 1:
+                    raise _Failure(ERR_INTEGRITY)
+                pair = current + sibling_hash
+            current = crypto.sha256_hex(pair.encode("ascii"))
+            position //= 2
+        if current != archive_root or current != expected_root:
+            raise _Failure(ERR_INTEGRITY)
+    except _Failure as failure:
+        return {"ok": False, "error": failure.category}
+    except Exception:
+        # Defensive: structurally unforeseeable inputs must report rather
+        # than crash the verifying process.
+        return {"ok": False, "error": ERR_INPUT}
+    return {
+        "ok": True,
+        "archive_root": archive_root,
+        "digest": digest,
+        "index": index,
+    }
