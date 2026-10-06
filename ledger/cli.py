@@ -7,7 +7,8 @@ sync-state-audit, sync-plan,
 audit, audit-export, trust
 (add/rotate/revoke/export/allowlist-add/allowlist-remove) and offline
 verify/audit-verify/consistency and offline verify-range/verify-range-batch
-subcommands, the receipt-proofs-audit batch audit subcommand, the offline
+subcommands, the online consistency-http audit subcommand, the
+receipt-proofs-audit batch audit subcommand, the offline
 audit-report-proof/audit-report-verify inclusion-proof subcommands, plus the
 offline checkpoint-history history-trust,
 history-export and header-locators subcommands.
@@ -913,6 +914,25 @@ def cmd_consistency(args: argparse.Namespace) -> int:
         body = verify_snapshot(document)
     print(json.dumps(body, sort_keys=False, ensure_ascii=False))
     return 0 if body.get("ok") is True else 1
+
+
+def cmd_consistency_http(args: argparse.Namespace) -> int:
+    """GET /v1/audit/consistency — the online whole-ledger consistency audit.
+
+    Takes no positional arguments: the audited ledger is the one the
+    ``--base-url`` server serves. The response is printed verbatim as one
+    single-line JSON document preserving its contract key order
+    (``ok, error, generation, height, tip_hash, state_root,
+    audit_checkpoint``; the ordered ``{"ok", "error"}`` failure body
+    otherwise). Exit code is 0 only for a 200 response with ``ok`` true;
+    ``input``/``integrity``/``io`` results, HTTP errors and connection
+    failures all exit 1.
+    """
+    status, body = _request(
+        "GET", f"{args.base_url}/v1/audit/consistency", None
+    )
+    print(json.dumps(body, sort_keys=False, ensure_ascii=False))
+    return 0 if status == 200 and body.get("ok") is True else 1
 
 
 def _decimal_int(value: str) -> int | None:
@@ -1958,6 +1978,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="snapshot JSON file, or - to read the document from stdin",
     )
     p_consistency.set_defaults(func=cmd_consistency)
+
+    p_consistency_http = sub.add_parser(
+        "consistency-http",
+        help="online-verify the server's live ledger (GET /v1/audit/consistency)",
+    )
+    # The audited ledger is pinned by --base-url; this command deliberately
+    # takes no positional arguments or query parameters.
+    p_consistency_http.set_defaults(func=cmd_consistency_http)
 
     p_audit_signer = sub.add_parser(
         "audit-signer-rotate",

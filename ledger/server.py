@@ -774,6 +774,37 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 # rather than alphabetically.
                 status, body = service.get_trust_document()
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/audit/consistency":
+                # GET /v1/audit/consistency — the online whole-ledger
+                # consistency audit. The endpoint takes no query parameters
+                # and no request body: any parameter (including a blank one)
+                # or a non-empty body is 400 with the ordered {"ok", "error"}
+                # input body; a bare trailing "?" carries no parameter and
+                # is accepted. The audit is strictly read-only (no state,
+                # audit, idempotency or file side effects) and its document
+                # has the contract-fixed key order ok, error, generation,
+                # height, tip_hash, state_root, audit_checkpoint, so it is
+                # serialized in insertion order rather than alphabetically.
+                if parse_qs(query, keep_blank_values=True):
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                try:
+                    body_length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    body_length = -1
+                if body_length != 0:
+                    # The body is deliberately unread: close the connection
+                    # so it cannot desync the next pipelined request on a
+                    # keep-alive socket.
+                    self.close_connection = True
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.get_audit_consistency()
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/audit/events":
                 # GET /v1/audit/events?source=&kind=&cursor=&limit=
                 params = {

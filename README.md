@@ -2101,6 +2101,34 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 `consistency` 不发起任何网络请求；文件无法读取或内容不是 JSON 时输出
 `{"ok": false, "error": "input"}`，退出码成功 0、任何失败 1。
 
+## 账本当前摘要的在线一致性审计
+
+不读取节点文件，调用方也能核对运行中账本的当前摘要：
+`GET /v1/audit/consistency` 在一次存储锁内把当前内存状态装配成与持久化
+快照完全相同的文档（当前代际号，不推进），并原样复用上一节的
+`verify_snapshot` 重算核对 canonical 链、pending 集合、交易索引、账户
+汇总、状态根、审计哈希链与检查点，以及存在时的信任、公钥历史、序列、
+幂等与历史凭据区段。
+
+- 端点**不接受任何查询参数和请求体**：裸的尾随 `?` 按无参数处理；
+  任何查询参数（含空值）或非空请求体一律 **400**
+  `{"ok": false, "error": "input"}`；
+- 成功恒为 **200**，顶层键序固定为
+  `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`：
+  健康结果 `ok=true`、`error=null`，其余字段给出同一代的生成号、链尾
+  摘要、状态根与审计检查点；结构缺陷（`input`）或重算不一致
+  （`integrity`）同样返回 200，但五个摘要字段全部为 `null`；
+- 接口**严格只读**：不执行任何账本/同步/信任/凭据写操作，不推进
+  generation、不追加审计事件、不产生幂等记录、不写任何文件；并发写入
+  时整份响应只来自一个代际；重启前后同一持久状态得到相同结果；
+- 无法读取账本视图时返回 **500** `{"ok": false, "error": "io"}`。
+
+CLI 新增 `consistency-http` 子命令（**无位置参数**，账本由全局
+`--base-url` 固定）：`python -m ledger.cli consistency-http` 以 GET 调用
+该路由并原序打印一行 JSON；仅当 HTTP 200 且 `ok=true` 时退出码为 0，
+`input`/`integrity`/`io`、HTTP 错误或连接失败均退出码为 1。离线
+`consistency` 命令、其他路由与审计导出格式均不受影响。
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：

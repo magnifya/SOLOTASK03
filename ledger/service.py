@@ -43,6 +43,7 @@ from .store import (
     HISTORY_CREDENTIAL_REVOKED,
     HISTORY_PERMISSION_ORDER,
     HISTORY_PERMISSION_SET,
+    IDEMPOTENCY_SECTION,
     SYNC_MODE_ATTESTED,
     SYNC_MODE_PLAIN,
     TRUST_ACTIVE,
@@ -6672,3 +6673,133 @@ class LedgerService:
             # rather than a server error.
             return 400, {"ok": False, "error": "input"}
         return 500, {"ok": False, "error": "io"}
+
+    # -- online whole-ledger consistency audit -------------------------------
+
+    def get_audit_consistency(self) -> tuple[int, dict]:
+        """GET /v1/audit/consistency — online whole-ledger consistency audit.
+
+        Assembles the persisted-snapshot document for the current in-memory
+        state under one store lock (the same sections and values a
+        successful ``save()`` would write, at the current generation) and
+        runs the offline ``consistency.verify_snapshot`` recomputation over
+        it, so a caller can audit the live canonical chain, mempool,
+        transaction index, account summaries, state root, audit hash chain
+        and checkpoint — plus the trust, key-history, sequences, idempotency
+        and history-credential sections when present — without reading the
+        node files. The check is strictly read-only: no ledger/sync/trust/
+        credential write, no audit event, no idempotency record, no
+        generation bump and no file is touched, and holding the store lock
+        for the whole assembly+verification guarantees every section of the
+        response comes from one persisted generation. The result keeps the
+        offline verifier's contract key order ``ok, error, generation,
+        height, tip_hash, state_root, audit_checkpoint``: a healthy ledger
+        is 200 with ``ok`` true, a structural defect is 200 with ``error``
+        ``"input"`` and a recomputed mismatch 200 with ``error``
+        ``"integrity"`` (both with every summary field null). A ledger view
+        that cannot be read (or whose lock cannot be taken) is 500 with the
+        ordered ``{"ok": false, "error": "io"}`` body.
+        """
+        from . import consistency
+
+        try:
+            with self.store.lock:
+                document = self._consistency_snapshot_document()
+                result = consistency.verify_snapshot(document)
+        except Exception:
+            # Defensive HTTP boundary: an unreadable ledger view is an
+            # internal error, never a crash.
+            return 500, {"ok": False, "error": "io"}
+        return 200, result
+
+    def _consistency_snapshot_document(self) -> dict:
+        """Assemble the snapshot document the online audit verifies.
+
+        Mirrors ``LedgerStore.save()`` section-for-section at the *current*
+        generation (no next-generation advance) and with the currently
+        persisted derived views (index/accounts/sequences), so the online
+        check audits exactly what a restart would recover — including any
+        divergence between the maintained derived views and the chain. Only
+        the sections ``consistency.verify_snapshot`` re-derives are
+        assembled; forks/syncs/attested_syncs carry no self-contained
+        invariants and are left out. Called with the store lock held.
+        """
+        store = self.store
+        endowment = (
+            store.initial_balance
+            if store.initial_balance is not None
+            else DEFAULT_INITIAL_BALANCE
+        )
+        state_root, _ = store.state_root_for(store.chain, endowment)
+        document: dict = {
+            "state": {
+                "generation": store.generation,
+                "height": store.chain[-1].height,
+                "tip_hash": store.chain[-1].block_hash,
+                "tip_status": store.chain[-1].status,
+                "initial_balance": store.initial_balance,
+                "state_root": state_root,
+            },
+            "chain": [block.to_dict() for block in store.chain],
+            "pending": [tx.to_dict() for tx in store.pending.values()],
+            "index": dict(store.tx_index),
+            "accounts": store.accounts,
+            "audit_checkpoint": dict(store.audit_checkpoint),
+        }
+        if store.trust_sources:
+            document["trust_sources"] = [
+                {"source": source, **store.trust_sources[source]}
+                for source in sorted(store.trust_sources)
+            ]
+        if store.source_key_history:
+            document["source_key_history"] = [
+                {
+                    "source": source,
+                    "keys": [
+                        dict(entry) for entry in store.source_key_history[source]
+                    ],
+                }
+                for source in sorted(store.source_key_history)
+            ]
+        if store.allowlist:
+            document["allowlist"] = dict(sorted(store.allowlist.items()))
+        if store.audit_events:
+            document["audit_events"] = list(store.audit_events)
+        if store.history_credential is not None:
+            document["history_credential"] = {
+                key: (
+                    list(store.history_credential[key])
+                    if key == "permissions"
+                    else store.history_credential[key]
+                )
+                for key in HISTORY_CREDENTIAL_KEYS
+            }
+        if store.idempotency:
+            document[IDEMPOTENCY_SECTION] = [
+                {
+                    "key": key,
+                    "method": rec["method"],
+                    "target": rec["target"],
+                    "request": rec["request"],
+                    "fingerprint": rec["fingerprint"],
+                    "status": rec["status"],
+                    "body": rec["body"],
+                }
+                for key, rec in sorted(store.idempotency.items())
+            ]
+        if store.sequences:
+            document["sequences"] = [
+                {
+                    "account": account,
+                    "confirmed": [
+                        {"nonce": nonce, "tx_id": store.sequences[account]["confirmed"][nonce]}
+                        for nonce in sorted(store.sequences[account]["confirmed"])
+                    ],
+                    "pending": [
+                        {"nonce": nonce, "tx_id": store.sequences[account]["pending"][nonce]}
+                        for nonce in sorted(store.sequences[account]["pending"])
+                    ],
+                }
+                for account in sorted(store.sequences)
+            ]
+        return document
