@@ -4234,71 +4234,54 @@ class LedgerStore:
         for attr in self._MUTABLE_STATE_ATTRS:
             setattr(self, attr, copy.deepcopy(snapshot[attr]))
 
-    def save(self) -> None:
-        """Atomically persist chain, state, pending set, index and accounts.
+    def _snapshot_document(
+        self,
+        generation: int,
+        state_root: str,
+        index: dict[str, int],
+        accounts: dict[str, dict],
+        sequences: dict[str, dict],
+    ) -> dict:
+        """Assemble the canonical snapshot document over one state view.
 
-        The new state is first written to a uniquely named ``.ledger-*``
-        snapshot in the same directory and force-fsynced; only after that does
-        an atomic ``os.replace`` promote it to the main file. A crash between
-        the fsync and the promotion leaves the snapshot behind, where the
-        startup scan finds it as a recovery candidate. The in-memory
-        ``generation`` is advanced only after the promotion succeeds, so every
-        *successful* atomic write corresponds to exactly one generation.
-
-        In deferred-persistence mode (:meth:`begin_persistence`) the call is a
-        no-op: the idempotency wrapper performs one real write via
-        :meth:`commit_persistence` once the response and the idempotency
-        record are ready.
+        This is the single source of truth for the persisted snapshot
+        layout: :meth:`save` persists exactly this document for the
+        prospective post-write views, and :meth:`current_snapshot_document`
+        builds it for the current in-memory views, so the online
+        consistency audit and the offline snapshot verifier always check
+        the same artifact. Optional sections are included only when
+        non-empty, exactly like a persisted snapshot.
         """
-        if self._persist_deferred:
-            return
-        # Compute the prospective confirmed-only views WITHOUT publishing them:
-        # they describe the *post-write* chain and must not become visible in
-        # memory until the promotion succeeds. A failure anywhere below leaves
-        # ``self.tx_index``/``self.accounts`` describing the last durably
-        # committed chain, which is exactly the state the caller's own rollback
-        # restores the rest of the fields to.
-        next_index, next_accounts, next_sequences = self._compute_derived()
-        next_generation = self.generation + 1
-        # The account-state Merkle root covers confirmed accounts only. It is
-        # anchored to the highest block by the API; while a pending tip exists
-        # the state endpoints report 404, but the root itself is still
-        # persisted so recovery can recompute and compare it byte-for-byte
-        # (the confirmed account set is unchanged by a pending tip).
-        endowment = (
-            self.initial_balance
-            if self.initial_balance is not None
-            else DEFAULT_INITIAL_BALANCE
-        )
-        next_state_root, _ = self.state_root_for(self.chain, endowment)
-        # The in-memory log, its hash head and checkpoint always move together:
-        # refuse to persist a document where they disagree, since that could
-        # never recover. Callers append through append_audit_event(), which
-        # advances both atomically.
-        if self.audit_checkpoint != audit.make_checkpoint(self.audit_events):
-            raise RuntimeError(
-                "audit_checkpoint does not match the audit log head; refusing "
-                "to persist an inconsistent snapshot"
-            )
-        # The current signer must agree with the newest retained history entry
-        # and its seed must derive its public key, so a persisted document
-        # never carries an internally inconsistent checkpoint key.
-        audit_signer_state = None
+        data = {
+            "state": {
+                "version": STATE_VERSION,
+                "generation": generation,
+                "height": self.chain[-1].height,
+                "tip_hash": self.chain[-1].block_hash,
+                "tip_status": self.chain[-1].status,
+                "initial_balance": self.initial_balance,
+                # Confirmed-account Merkle root; recovery recomputes it from
+                # the validated confirmed chain and must get the same value.
+                "state_root": state_root,
+            },
+            "chain": [block.to_dict() for block in self.chain],
+            "pending": [tx.to_dict() for tx in self.pending.values()],
+            "index": dict(index),
+            "accounts": accounts,
+            # A well-formed store always carries a dict checkpoint; the copy
+            # is transparent for a corrupt value so the consistency verifier
+            # (not this assembler) classifies the structural defect.
+            "audit_checkpoint": (
+                dict(self.audit_checkpoint)
+                if isinstance(self.audit_checkpoint, dict)
+                else self.audit_checkpoint
+            ),
+        }
+        # The rotatable checkpoint key and every retained public key live in
+        # the state section (not a new top-level key) and are persisted in the
+        # same atomic document as the checkpoint they authenticate.
         if self.audit_signer is not None:
-            derived = crypto.derive_public_key(self.audit_signer["private_key"])
-            latest = self.audit_signer_history[-1]
-            if (
-                derived != self.audit_signer["public_key"]
-                or self.audit_signer["version"] != latest["version"]
-                or self.audit_signer["public_key"] != latest["public_key"]
-                or self.audit_signer["activated_event_id"]
-                != latest["activated_event_id"]
-            ):
-                raise RuntimeError(
-                    "audit signer does not match its history; refusing to "
-                    "persist an inconsistent snapshot"
-                )
-            audit_signer_state = {
+            data["state"]["audit_signer"] = {
                 "version": self.audit_signer["version"],
                 "private_key": self.audit_signer["private_key"],
                 "public_key": self.audit_signer["public_key"],
@@ -4312,29 +4295,6 @@ class LedgerStore:
                     if key_version != self.audit_signer["version"]
                 },
             }
-        data = {
-            "state": {
-                "version": STATE_VERSION,
-                "generation": next_generation,
-                "height": self.chain[-1].height,
-                "tip_hash": self.chain[-1].block_hash,
-                "tip_status": self.chain[-1].status,
-                "initial_balance": self.initial_balance,
-                # Confirmed-account Merkle root; recovery recomputes it from
-                # the validated confirmed chain and must get the same value.
-                "state_root": next_state_root,
-            },
-            "chain": [block.to_dict() for block in self.chain],
-            "pending": [tx.to_dict() for tx in self.pending.values()],
-            "index": dict(next_index),
-            "accounts": next_accounts,
-            "audit_checkpoint": dict(self.audit_checkpoint),
-        }
-        # The rotatable checkpoint key and every retained public key live in
-        # the state section (not a new top-level key) and are persisted in the
-        # same atomic document as the checkpoint they authenticate.
-        if audit_signer_state is not None:
-            data["state"]["audit_signer"] = audit_signer_state
             data["state"]["audit_signer_history"] = [
                 dict(entry) for entry in self.audit_signer_history
             ]
@@ -4449,21 +4409,115 @@ class LedgerStore:
         # sequenced transfer, so a ledger that never uses the feature keeps
         # the legacy snapshot layout; a snapshot missing the section
         # recovers the same empty view.
-        if next_sequences:
+        if sequences:
             data["sequences"] = [
                 {
                     "account": account,
                     "confirmed": [
-                        {"nonce": nonce, "tx_id": next_sequences[account]["confirmed"][nonce]}
-                        for nonce in sorted(next_sequences[account]["confirmed"])
+                        {"nonce": nonce, "tx_id": sequences[account]["confirmed"][nonce]}
+                        for nonce in sorted(sequences[account]["confirmed"])
                     ],
                     "pending": [
-                        {"nonce": nonce, "tx_id": next_sequences[account]["pending"][nonce]}
-                        for nonce in sorted(next_sequences[account]["pending"])
+                        {"nonce": nonce, "tx_id": sequences[account]["pending"][nonce]}
+                        for nonce in sorted(sequences[account]["pending"])
                     ],
                 }
-                for account in sorted(next_sequences)
+                for account in sorted(sequences)
             ]
+        return data
+
+    def current_snapshot_document(self) -> dict:
+        """Build the snapshot document over the current in-memory state.
+
+        Purely read-only: nothing is written, no audit event is appended,
+        no idempotency record is installed and the generation does not
+        advance. The caller must hold the store lock so the whole document
+        comes from one generation. The result is exactly what :meth:`save`
+        would persist for this state, so the online consistency audit and
+        the offline verifier check the same artifact and a restart changes
+        no outcome.
+        """
+        endowment = (
+            self.initial_balance
+            if self.initial_balance is not None
+            else DEFAULT_INITIAL_BALANCE
+        )
+        state_root, _ = self.state_root_for(self.chain, endowment)
+        return self._snapshot_document(
+            self.generation,
+            state_root,
+            self.tx_index,
+            self.accounts,
+            self.sequences,
+        )
+
+    def save(self) -> None:
+        """Atomically persist chain, state, pending set, index and accounts.
+
+        The new state is first written to a uniquely named ``.ledger-*``
+        snapshot in the same directory and force-fsynced; only after that does
+        an atomic ``os.replace`` promote it to the main file. A crash between
+        the fsync and the promotion leaves the snapshot behind, where the
+        startup scan finds it as a recovery candidate. The in-memory
+        ``generation`` is advanced only after the promotion succeeds, so every
+        *successful* atomic write corresponds to exactly one generation.
+
+        In deferred-persistence mode (:meth:`begin_persistence`) the call is a
+        no-op: the idempotency wrapper performs one real write via
+        :meth:`commit_persistence` once the response and the idempotency
+        record are ready.
+        """
+        if self._persist_deferred:
+            return
+        # Compute the prospective confirmed-only views WITHOUT publishing them:
+        # they describe the *post-write* chain and must not become visible in
+        # memory until the promotion succeeds. A failure anywhere below leaves
+        # ``self.tx_index``/``self.accounts`` describing the last durably
+        # committed chain, which is exactly the state the caller's own rollback
+        # restores the rest of the fields to.
+        next_index, next_accounts, next_sequences = self._compute_derived()
+        next_generation = self.generation + 1
+        # The account-state Merkle root covers confirmed accounts only. It is
+        # anchored to the highest block by the API; while a pending tip exists
+        # the state endpoints report 404, but the root itself is still
+        # persisted so recovery can recompute and compare it byte-for-byte
+        # (the confirmed account set is unchanged by a pending tip).
+        endowment = (
+            self.initial_balance
+            if self.initial_balance is not None
+            else DEFAULT_INITIAL_BALANCE
+        )
+        next_state_root, _ = self.state_root_for(self.chain, endowment)
+        # The in-memory log, its hash head and checkpoint always move together:
+        # refuse to persist a document where they disagree, since that could
+        # never recover. Callers append through append_audit_event(), which
+        # advances both atomically.
+        if self.audit_checkpoint != audit.make_checkpoint(self.audit_events):
+            raise RuntimeError(
+                "audit_checkpoint does not match the audit log head; refusing "
+                "to persist an inconsistent snapshot"
+            )
+        # The current signer must agree with the newest retained history entry
+        # and its seed must derive its public key, so a persisted document
+        # never carries an internally inconsistent checkpoint key.
+        if self.audit_signer is not None:
+            derived = crypto.derive_public_key(self.audit_signer["private_key"])
+            latest = self.audit_signer_history[-1]
+            if (
+                derived != self.audit_signer["public_key"]
+                or self.audit_signer["version"] != latest["version"]
+                or self.audit_signer["public_key"] != latest["public_key"]
+                or self.audit_signer["activated_event_id"]
+                != latest["activated_event_id"]
+            ):
+                raise RuntimeError(
+                    "audit signer does not match its history; refusing to "
+                    "persist an inconsistent snapshot"
+                )
+        data = self._snapshot_document(
+            next_generation, next_state_root, next_index, next_accounts,
+            next_sequences,
+        )
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         os.makedirs(directory, exist_ok=True)
         # Hold the class-wide recovery lock while a .ledger-* snapshot exists

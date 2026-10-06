@@ -2101,6 +2101,39 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 `consistency` 不发起任何网络请求；文件无法读取或内容不是 JSON 时输出
 `{"ok": false, "error": "input"}`，退出码成功 0、任何失败 1。
 
+## 在线一致性审计
+
+`GET /v1/audit/consistency` 让调用方**不读取节点文件**也能核对当前账本
+摘要：服务端在同一个 store 锁内把当前内存状态装配成与持久化快照完全
+同构的文档（同一构建函数，可选区段的缺省规则一致），并对其运行与离线
+`consistency` 完全相同的 `verify_snapshot` 核验——canonical 链、
+pending 集合、交易索引、账户汇总、状态根、审计哈希链与检查点，以及
+存在时的信任、公钥历史、序列、幂等和历史凭据区段。整份响应因此只来自
+一个代际，并发写入不会把不同代的链、索引、状态根或检查点混入同一响应。
+
+该端点**只读**：不执行任何账本、同步、信任或凭据写操作，不追加审计
+事件、不安装幂等记录、不写文件、也不推进 generation（也不会顺带清理
+过期同步）。它**不接受查询参数与请求体**：任何查询参数（含空值参数）
+或非空请求体都是 **400** `{"ok": false, "error": "input"}`；裸的尾随
+`?` 视为无参数。响应恒为单行 JSON，顶层键序固定为
+`ok,error,generation,height,tip_hash,state_root,audit_checkpoint`：
+
+- **200** 健康：`ok=true`、`error=null`，其余字段给出同一代的
+  generation、链尾高度/哈希、状态根与审计检查点；
+- **200** 结构/类型不符：`ok=false`、`error="input"`，五个摘要字段
+  全为 `null`；结构合法但重算值、哈希链或派生索引不一致时 **200**
+  `error="integrity"`，同样清空摘要；
+- **500** 无法读取账本或取得所需锁：`{"ok": false, "error": "io"}`。
+
+旧快照缺少既有可选区段时沿用离线校验的兼容规则，重启前后同一持久状态
+得到相同结果（在线结果与对该状态落盘快照的离线核验逐字一致）。
+
+CLI 新增 `consistency-http` 子命令（**无位置参数**，沿用全局
+`--base-url`）：`python -m ledger.cli consistency-http` 以 GET 调用该
+端点并**原序**打印一行响应 JSON；只有 HTTP 200 且 `ok=true` 时退出码
+为 0，`input`/`integrity`/`io`、HTTP 错误或连接失败均为 1。既有离线
+`consistency` 命令、其他路由、错误语义与审计导出格式均不变。
+
 ## 实现说明
 
 代码全部在 `ledger/` 包中：
@@ -2119,7 +2152,7 @@ state_root、pending 唯一性、审计事件链或检查点）均为 `integrity
 read/update/export，401/403 无副作用）与 `history_credential_changed` 事件 |
 | `ledger/server.py` | 标准库 `http.server` 实现的 REST 接口 |
 | `ledger/light_client.py` | 离线轻客户端：受信来源/过期/Ed25519 验签、从创世锚重算整条候选链、核对 response 与 Merkle proofs；区间导出文档的离线核验（钉住锚点、尾部重算、tip 摘要、plain allowlist / attested `ledger-sync-range-v1` 签名）；`advance` 检查点与代际历史侧车的维护/查询/裁剪，检查点历史的签名分页导出 `export_history`、多页离线连续校验 `verify_history`，以及带签名者轮换/撤销日志（根密钥锚定证书链）的 `verify_history_trust` |
-| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `state-proofs` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 离线 `verify-range` 子命令 |
+| `ledger/cli.py` | `send` / `mine` / `block` / `account` / `proof` / `proofs` / `state-root` / `state-proof` / `state-proofs` / `confirm` / `rollback` / `status` / `candidates` / `chain` / `chain-range` / `adopt` / `export` / `index` / `sync` / `sync-range` / `sync-attested` / `sync-range-attested` / `syncs` / `sync-history` / `sync-export` / `sync-range-export` / `trust add|rotate|revoke|export|allowlist-add|allowlist-remove` / `audit` / `audit-export` / `audit-signer-rotate` / 离线 `verify` / 离线 `audit-verify [--trust]` / 离线 `consistency` / 在线 `consistency-http` / 离线 `verify-range` 子命令 |
 
 约定：
 

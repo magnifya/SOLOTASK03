@@ -808,6 +808,40 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 # checkpoint_auth), so it is serialized in insertion order
                 # rather than alphabetically.
                 self._send_json(status, body, sort_keys=False)
+            elif path == "/v1/audit/consistency":
+                # GET /v1/audit/consistency — the online whole-ledger
+                # consistency audit. The endpoint takes no query parameters
+                # and carries no request body: any parameter (including a
+                # blank one) or a non-empty body is 400 {"ok": false,
+                # "error": "input"}; a bare trailing "?" carries none and is
+                # accepted. The audit is read-only (no ledger/trust/
+                # credential write, no audit event, no idempotency record,
+                # no file write, no generation advance) and the response
+                # has the contract-fixed key order ok, error, generation,
+                # height, tip_hash, state_root, audit_checkpoint, so it is
+                # serialized in insertion order rather than alphabetically.
+                if parse_qs(query, keep_blank_values=True):
+                    # The body is deliberately unread: close the connection
+                    # so it cannot desync the next pipelined request.
+                    self.close_connection = True
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                try:
+                    body_length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    body_length = -1
+                if body_length != 0:
+                    # A GET with a body is an input error; the body is
+                    # deliberately unread, so close the connection.
+                    self.close_connection = True
+                    self._send_json(
+                        400, {"ok": False, "error": "input"}, sort_keys=False
+                    )
+                    return
+                status, body = service.get_audit_consistency()
+                self._send_json(status, body, sort_keys=False)
             elif path == "/v1/chain/range":
                 # GET /v1/chain/range?after_height=&after_hash=&limit=
                 # Incremental canonical-chain page after an anchor. Repeated

@@ -6118,6 +6118,39 @@ class LedgerService:
             }
         return 200, body
 
+    def get_audit_consistency(self) -> tuple[int, dict]:
+        """GET /v1/audit/consistency — online whole-ledger consistency audit.
+
+        Builds the canonical snapshot document over the current in-memory
+        state and runs the same self-contained verification the offline
+        ``consistency`` command performs on a persisted snapshot: the
+        canonical chain, the mempool, the derived transaction index and
+        account summaries, the confirmed-account state root, the audit hash
+        chain and checkpoint, plus every present trust, key-history,
+        sequences, idempotency and history-credential section.
+
+        The whole document is assembled and verified under the store lock,
+        so a concurrent write can never mix generations into one response.
+        The read is pure: no ledger, sync, trust or credential state
+        changes, no audit event, no idempotency record, no file write and
+        no generation advance (in particular no expired-sync sweep). The
+        success/failure document keeps the verifier's fixed key order
+        ``ok,error,generation,height,tip_hash,state_root,audit_checkpoint``
+        (a 200 ``input``/``integrity`` failure nulls the five summaries);
+        a ledger that cannot be read answers 500
+        ``{"ok": false, "error": "io"}``.
+        """
+        from .consistency import verify_snapshot
+
+        try:
+            with self.store.lock:
+                document = self.store.current_snapshot_document()
+                result = verify_snapshot(document)
+        except Exception:
+            # The ledger view could not be assembled/read at all.
+            return 500, {"ok": False, "error": "io"}
+        return 200, result
+
     # -- node-managed checkpoint history -------------------------------------
 
     HISTORY_TRUST_UPDATE_FIELDS = ("root_seed", "at", "key", "status")
