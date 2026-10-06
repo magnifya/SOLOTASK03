@@ -658,6 +658,191 @@ def verify_transaction_absence_proof(
         return False
 
 
+# Exact key sets of a batch transaction-absence proof bundle and of each
+# per-target proof item. Verification is order-insensitive: only the key
+# *sets* must match, never their insertion order.
+_TX_ABSENCE_BUNDLE_TOP_KEYS = frozenset(
+    {
+        "height",
+        "block_hash",
+        "merkle_root",
+        "transaction_count",
+        "tx_ids",
+        "proofs",
+    }
+)
+_TX_ABSENCE_BUNDLE_PROOF_KEYS = frozenset({"tx_id", "lower", "upper"})
+
+# A batch absence-proof request/bundle carries 1..128 target tx_ids.
+MAX_ABSENCE_PROOF_TARGETS = 128
+
+
+def verify_transaction_absence_proof_bundle(
+    bundle: object,
+    expected_height: object,
+    expected_block_hash: object,
+    expected_merkle_root: object,
+) -> bool:
+    """Verify a batch transaction-absence (non-inclusion) proof offline.
+
+    The bundle mirrors ``POST /v1/blocks/{height}/absence-proofs``::
+
+        {"height": H, "block_hash": B, "merkle_root": R,
+         "transaction_count": N,
+         "tx_ids": [t, ...],                       # targets, ascending
+         "proofs": [{"tx_id", "lower", "upper"}, ...]}  # same order
+
+    where each ``lower``/``upper`` is a neighbor inclusion proof
+    ``{"tx_id", "index", "siblings"}`` or None. The bundle is valid only
+    when:
+
+    * every bundle/proof/neighbor field is present exactly once with the
+      right type and format (booleans are never integers; sibling items
+      carry exactly ``direction``/``hash``);
+    * the anchors equal the caller-pinned values: ``height`` equals
+      ``expected_height``, ``block_hash`` equals ``expected_block_hash``
+      and ``merkle_root`` equals ``expected_merkle_root``;
+    * ``tx_ids`` holds 1-128 distinct 64-lowercase-hex targets in strictly
+      ascending order and ``proofs`` has exactly one item per target, in
+      the same order, each item's ``tx_id`` equal to its target;
+    * ``transaction_count`` is a non-negative integer bounding every
+      neighbor index, and each non-null neighbor's sibling path replays
+      from its ``index`` to the shared ``merkle_root`` with the same
+      pairing rules as :func:`merkle_root` (an illegal direction, a path
+      inconsistent with the index, a phantom left self-pair, or a depth
+      other than the tree's exact depth fails);
+    * every target is genuinely framed in the block's ascending tx_id
+      leaf order: a present ``lower`` sorts before it, a present ``upper``
+      after it, both present sit at adjacent indices; a boundary proof
+      uses only index 0 or ``transaction_count - 1``; an empty block has
+      ``transaction_count == 0``, the fixed empty Merkle root and every
+      proof's two sides null.
+
+    Returns False — never raises — for any malformed, tampered or
+    mis-anchored input. Key order is irrelevant (but missing/extra keys
+    still fail).
+    """
+    try:
+        if not isinstance(bundle, dict):
+            return False
+        if set(bundle.keys()) != _TX_ABSENCE_BUNDLE_TOP_KEYS:
+            return False
+        if (
+            isinstance(expected_height, bool)
+            or not isinstance(expected_height, int)
+            or expected_height < 0
+        ):
+            return False
+        if not _is_hex64(expected_block_hash) or not _is_hex64(
+            expected_merkle_root
+        ):
+            return False
+
+        height = bundle["height"]
+        block_hash = bundle["block_hash"]
+        root = bundle["merkle_root"]
+        transaction_count = bundle["transaction_count"]
+        tx_ids = bundle["tx_ids"]
+        proofs = bundle["proofs"]
+
+        if (
+            isinstance(height, bool)
+            or not isinstance(height, int)
+            or height < 0
+        ):
+            return False
+        if height != expected_height:
+            return False
+        if not _is_hex64(block_hash) or not _is_hex64(root):
+            return False
+        if not hmac.compare_digest(block_hash, expected_block_hash):
+            return False
+        if not hmac.compare_digest(root, expected_merkle_root):
+            return False
+        if (
+            isinstance(transaction_count, bool)
+            or not isinstance(transaction_count, int)
+            or transaction_count < 0
+        ):
+            return False
+        if not isinstance(tx_ids, list) or not 1 <= len(tx_ids) <= (
+            MAX_ABSENCE_PROOF_TARGETS
+        ):
+            return False
+        if any(not _is_hex64(tx_id) for tx_id in tx_ids):
+            return False
+        # Strictly ascending targets: unique and sorted.
+        if any(
+            tx_ids[i] >= tx_ids[i + 1] for i in range(len(tx_ids) - 1)
+        ):
+            return False
+        if not isinstance(proofs, list) or len(proofs) != len(tx_ids):
+            return False
+
+        if transaction_count == 0:
+            if root != EMPTY_MERKLE_ROOT:
+                return False
+            for target, proof in zip(tx_ids, proofs):
+                if not isinstance(proof, dict):
+                    return False
+                if set(proof.keys()) != _TX_ABSENCE_BUNDLE_PROOF_KEYS:
+                    return False
+                if proof["tx_id"] != target:
+                    return False
+                if proof["lower"] is not None or proof["upper"] is not None:
+                    return False
+            return True
+
+        depth = _tree_depth(transaction_count)
+        for target, proof in zip(tx_ids, proofs):
+            if not isinstance(proof, dict):
+                return False
+            if set(proof.keys()) != _TX_ABSENCE_BUNDLE_PROOF_KEYS:
+                return False
+            if proof["tx_id"] != target:
+                return False
+            lower = proof["lower"]
+            upper = proof["upper"]
+            lower_result = None
+            upper_result = None
+            if lower is not None:
+                lower_result = _validated_tx_absence_neighbor(
+                    lower, root, transaction_count, depth
+                )
+                if lower_result is None:
+                    return False
+                if not lower_result[0] < target:
+                    return False
+            if upper is not None:
+                upper_result = _validated_tx_absence_neighbor(
+                    upper, root, transaction_count, depth
+                )
+                if upper_result is None:
+                    return False
+                if not target < upper_result[0]:
+                    return False
+            if lower_result is not None and upper_result is not None:
+                if lower_result[1] + 1 != upper_result[1]:
+                    return False
+            elif lower_result is not None:
+                # Target past the last transaction: the only neighbor is
+                # the last leaf.
+                if lower_result[1] != transaction_count - 1:
+                    return False
+            elif upper_result is not None:
+                # Target before the first transaction: the only neighbor
+                # is leaf zero.
+                if upper_result[1] != 0:
+                    return False
+            else:
+                # A non-empty block must name at least one framing
+                # neighbor per target.
+                return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def merkle_multiproof(tx_ids: list[str], indices: list[int]) -> list[dict]:
     """Compact multi-leaf inclusion proof: the sibling subtree roots that
     together with the selected leaves determine the Merkle root.

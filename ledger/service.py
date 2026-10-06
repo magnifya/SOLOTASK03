@@ -1864,6 +1864,89 @@ class LedgerService:
                 "upper": neighbor(upper_index),
             }
 
+    def get_transaction_absence_proofs(
+        self, height: object, payload: object
+    ) -> tuple[int, dict]:
+        """POST /v1/blocks/{height}/absence-proofs — batch non-inclusion
+        proofs for several transactions in one confirmed canonical block.
+
+        The body must be a JSON object containing exactly the ``tx_ids``
+        key: a list of 1-128 distinct 64-lowercase-hex strings. Every
+        violation — a parse failure, a non-object body, missing/extra keys,
+        a wrong type, an empty or over-long list, duplicates or a wrongly
+        formatted id — is 400 ``{"error": "input"}`` and never touches
+        state. The height must be a non-negative ASCII decimal without
+        leading zeros; a malformed or unknown height is
+        404 ``{"error": "block_not_found"}``, a pending block is
+        409 ``{"error": "block_pending"}`` and any target already present
+        in the block is 409 ``{"error": "transaction_present"}`` (the whole
+        batch fails, never a partial proof).
+
+        On success the body has the fixed key order ``height, block_hash,
+        merkle_root, transaction_count, tx_ids, proofs``: ``tx_ids`` is the
+        requested id set sorted ascending and ``proofs`` holds one
+        ``{tx_id, lower, upper}`` item per id in the same order, where
+        ``lower``/``upper`` are exactly the single-proof neighbors of
+        :meth:`get_transaction_absence_proof` (inclusion proofs ``tx_id,
+        index, siblings`` of the adjacent block transactions, ``null`` on
+        the missing side; an empty block has both sides null). The response
+        depends only on the requested id set, never on request order, and
+        is computed from the canonical block snapshot under the store lock
+        — the read is pure.
+        """
+        if not isinstance(payload, dict) or set(payload) != {"tx_ids"}:
+            return 400, {"error": "input"}
+        tx_ids_raw = payload["tx_ids"]
+        if not isinstance(tx_ids_raw, list) or not 1 <= len(tx_ids_raw) <= 128:
+            return 400, {"error": "input"}
+        if any(not crypto.is_hex64(tx_id) for tx_id in tx_ids_raw):
+            return 400, {"error": "input"}
+        if len(set(tx_ids_raw)) != len(tx_ids_raw):
+            return 400, {"error": "input"}
+
+        height_int = _parse_height_decimal(height)
+        if height_int is None:
+            return 404, {"error": "block_not_found"}
+        with self.store.lock:
+            block = self.store.block_at(height_int)
+            if block is None:
+                return 404, {"error": "block_not_found"}
+            if block.status != STATUS_CONFIRMED:
+                return 409, {"error": "block_pending"}
+            tx_ids = [tx.tx_id for tx in block.transactions]
+            present = set(tx_ids)
+            if any(tx_id in present for tx_id in tx_ids_raw):
+                return 409, {"error": "transaction_present"}
+
+            def neighbor(index: int | None) -> dict | None:
+                if index is None:
+                    return None
+                return {
+                    "tx_id": tx_ids[index],
+                    "index": index,
+                    "siblings": crypto.merkle_proof(tx_ids, index),
+                }
+
+            requested = sorted(tx_ids_raw)
+            proofs = []
+            for target in requested:
+                position = bisect_left(tx_ids, target)
+                lower_index = position - 1 if position > 0 else None
+                upper_index = position if position < len(tx_ids) else None
+                proofs.append({
+                    "tx_id": target,
+                    "lower": neighbor(lower_index),
+                    "upper": neighbor(upper_index),
+                })
+            return 200, {
+                "height": block.height,
+                "block_hash": block.block_hash,
+                "merkle_root": block.merkle_root,
+                "transaction_count": len(tx_ids),
+                "tx_ids": requested,
+                "proofs": proofs,
+            }
+
     # -- accounts -----------------------------------------------------------
 
     def get_account(self, account: str) -> tuple[int, dict]:

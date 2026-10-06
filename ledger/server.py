@@ -642,7 +642,29 @@ def build_handler(service: LedgerService) -> type[BaseHTTPRequestHandler]:
                 )
             elif path.startswith("/v1/blocks/"):
                 remainder = path[len("/v1/blocks/") :]
-                if remainder.endswith("/multiproof"):
+                if remainder.endswith("/absence-proofs"):
+                    # POST /v1/blocks/{height}/absence-proofs — batch
+                    # transaction non-inclusion proofs. Read-only like
+                    # /proofs: no ledger/admin state changes, so it is not
+                    # covered by uniform idempotency. The body is
+                    # {"tx_ids": [...]} (1-128 distinct 64-lowercase-hex
+                    # ids); every body violation — including a JSON parse
+                    # failure — is the fixed 400 {"error": "input"} and is
+                    # validated by the service before any state is read.
+                    # The success document has a contract-fixed key order
+                    # (height, block_hash, merkle_root, transaction_count,
+                    # tx_ids, proofs), so it is serialized in insertion
+                    # order rather than alphabetically.
+                    height = unquote(remainder[: -len("/absence-proofs")])
+                    ok, payload = self._read_json()
+                    if not ok:
+                        self._send_json(400, {"error": "input"})
+                        return
+                    status, body = service.get_transaction_absence_proofs(
+                        height, payload
+                    )
+                    self._send_json(status, body, sort_keys=False)
+                elif remainder.endswith("/multiproof"):
                     # POST /v1/blocks/{height}/multiproof — compact multi-leaf
                     # Merkle proof. Read-only like /proofs: no ledger/admin
                     # state changes, so it is not covered by uniform
