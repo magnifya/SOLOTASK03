@@ -1510,6 +1510,41 @@ expected_root)`（本身不变）同时暴露为 HTTP 接口与 CLI 子命令：
   `merkle_root` 与 `trusted_merkle_root`、`block_hash ==
   trusted_block_hash`。任何不符返回 `False`，全程不抛异常。
 
+## 交易非包含（不存在）证明
+
+包含证明只能证明某笔交易在区块中；非包含证明利用区块 Merkle 树本身按
+tx_id 升序排列这一事实，用目标的前后邻居证明它不在区块中：
+
+- **请求**：`GET /v1/blocks/{height}/absence-proof/{tx_id}`，只读，在锁内
+  从 canonical 链快照构造，不含待打包集合与候选分叉。该接口**不接受任何
+  查询参数**：带查询参数一律 `400 {"error":"input"}`。
+- **状态码**：`height` 必须是无前导零的非负十进制（`0` 合法），格式错或
+  高度未知返回 `404 {"error":"block_not_found"}`；`tx_id` 必须是 64 位
+  小写十六进制，否则 `404 {"error":"transaction_not_found"}`；区块仍为
+  pending 返回 `409 {"error":"block_pending"}`；目标交易已在该块中返回
+  `409 {"error":"transaction_present"}`。成功返回 `200`。
+- **响应**：顶层键序固定为 `{height, tx_id, transaction_count,
+  merkle_root, block_hash, lower, upper}`。`transaction_count` 是该块
+  交易叶子数；`lower`/`upper` 是目标在升序叶子序列中前驱/后继的包含
+  证明（键序 `tx_id, index, siblings`，路径规则与单笔 proof 相同：
+  自叶向根、`{direction, hash}`、奇数层末节点自配），缺失一侧为
+  `null`。目标位于两笔交易之间时两侧索引相邻且
+  `lower.tx_id < tx_id < upper.tx_id`；目标在首叶之前（末叶之后）时
+  只有 `upper`（`lower`），其索引为 `0`（`transaction_count - 1`）；
+  空块两侧均为 `null`，`merkle_root` 为既有空树根。
+- **离线校验**：`ledger.crypto.verify_transaction_absence_proof(document,
+  expected_tx_id, expected_height, expected_block_hash,
+  expected_merkle_root) -> bool`。检查键集（缺失/额外键即 False，键序
+  无关）、原始类型（整数拒绝布尔值，哈希为 64 位小写 hex）、四个锚点与
+  钉住值逐一相等、`transaction_count` 非负并约束邻居索引范围、空块根为
+  固定空树根且两侧为 null、邻居顺序与索引相邻/边界规则，并按邻居
+  `index` 把 siblings 重放到 `merkle_root`：方向非法、路径与索引不一致、
+  幻像左自配槽位、路径深度不等于该叶子数的真实深度、根不一致均判
+  `False`，全程不抛异常。
+- **CLI**：`absence-proof HEIGHT TX_ID` 输出与接口字段、键序一致的单行
+  JSON；任何非 2xx 响应（含连接失败）退出码为 1。既有 CLI 与查询接口
+  行为不变，重启后同一 canonical 区块的证明结果不变。
+
 ## 离线轻客户端验证
 
 不持有链状态、也不连接服务端的客户端，可以凭一份**证明束**（bundle）与本地
@@ -2140,7 +2175,7 @@ CLI 新增 `consistency-http` 子命令（**无位置参数**，沿用全局
 
 | 文件 | 职责 |
 | --- | --- |
-| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息（含序列转账与 `ledger-cancel-v1` 取消消息）、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof`、批量束 `verify_merkle_proof_bundle` 与紧凑多笔 `merkle_multiproof`/`verify_merkle_multiproof`）、账户状态叶子/状态根、`verify_account_proof` 包含验证与 `verify_account_absence_proof` 不存在（非包含）验证 |
+| `ledger/crypto.py` | Ed25519 验签/签名/密钥推导与生成、规范化交易消息（含序列转账与 `ledger-cancel-v1` 取消消息）、SHA-256 tx_id、Merkle 根与包含证明（单笔 `verify_merkle_proof`、批量束 `verify_merkle_proof_bundle` 与紧凑多笔 `merkle_multiproof`/`verify_merkle_multiproof`）、账户状态叶子/状态根、`verify_account_proof` 包含验证与 `verify_account_absence_proof` 不存在（非包含）验证、交易非包含证明 `verify_transaction_absence_proof` |
 | `ledger/models.py` | Transaction / Block 模型（含 pending/confirmed 状态）与确定性区块哈希 |
 | `ledger/audit.py` | 审计事件哈希链：规范化事件哈希、整链链接、`audit_checkpoint` 计算与严格校验，检查点 Ed25519 认证对象的签名/验签，以及导出页的离线核验（锚点、连续编号、哈希、跨页一致的检查点、末页检查点、可选信任文档下的检查点认证） |
 | `ledger/consistency.py` | 快照整体一致性的离线核验：重算交易 tx_id/签名、Merkle 根、区块哈希与链接、pending 唯一性、已确认 `index`/`accounts`、账户 `state_root`，以及审计事件哈希链与检查点；输出固定键序的 `ok,error,generation,height,tip_hash,state_root,audit_checkpoint`，错误分 `input`/`integrity` |

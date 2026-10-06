@@ -1800,6 +1800,70 @@ class LedgerService:
                 "nodes": crypto.merkle_multiproof(tx_ids, indices),
             }
 
+    def get_transaction_absence_proof(
+        self, height: object, tx_id: object, params: dict | None = None
+    ) -> tuple[int, dict]:
+        """GET /v1/blocks/{height}/absence-proof/{tx_id} — a non-inclusion
+        proof for a transaction in one confirmed canonical block.
+
+        The endpoint takes no query parameters: any parameter is
+        400 ``{"error": "input"}``. The height must be a non-negative ASCII
+        decimal without leading zeros and the tx_id 64 lowercase hex
+        characters; a malformed or unknown height is
+        404 ``{"error": "block_not_found"}``, a malformed tx_id is
+        404 ``{"error": "transaction_not_found"}``, a pending block is
+        409 ``{"error": "block_pending"}`` and a transaction already present
+        in the block is 409 ``{"error": "transaction_present"}``.
+
+        On success the body has the fixed key order ``height, tx_id,
+        transaction_count, merkle_root, block_hash, lower, upper``:
+        ``lower`` / ``upper`` are the inclusion proofs (``tx_id, index,
+        siblings``) of the block's transactions immediately before / after
+        the target in the block's ascending tx_id leaf order, or ``null`` on
+        the missing side; an empty block has both sides null and the fixed
+        empty Merkle root. Everything is computed from the canonical block
+        snapshot under the store lock — the pending mempool and candidate
+        forks never contribute — and the read is pure.
+        """
+        if params:
+            return 400, {"error": "input"}
+        height_int = _parse_height_decimal(height)
+        if height_int is None:
+            return 404, {"error": "block_not_found"}
+        if not crypto.is_hex64(tx_id):
+            return 404, {"error": "transaction_not_found"}
+        with self.store.lock:
+            block = self.store.block_at(height_int)
+            if block is None:
+                return 404, {"error": "block_not_found"}
+            if block.status != STATUS_CONFIRMED:
+                return 409, {"error": "block_pending"}
+            tx_ids = [tx.tx_id for tx in block.transactions]
+            position = bisect_left(tx_ids, tx_id)
+            if position < len(tx_ids) and tx_ids[position] == tx_id:
+                return 409, {"error": "transaction_present"}
+
+            def neighbor(index: int | None) -> dict | None:
+                if index is None:
+                    return None
+                return {
+                    "tx_id": tx_ids[index],
+                    "index": index,
+                    "siblings": crypto.merkle_proof(tx_ids, index),
+                }
+
+            lower_index = position - 1 if position > 0 else None
+            upper_index = position if position < len(tx_ids) else None
+            return 200, {
+                "height": block.height,
+                "tx_id": tx_id,
+                "transaction_count": len(tx_ids),
+                "merkle_root": block.merkle_root,
+                "block_hash": block.block_hash,
+                "lower": neighbor(lower_index),
+                "upper": neighbor(upper_index),
+            }
+
     # -- accounts -----------------------------------------------------------
 
     def get_account(self, account: str) -> tuple[int, dict]:

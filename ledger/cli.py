@@ -349,6 +349,19 @@ def cmd_proofs(args: argparse.Namespace) -> int:
     return _emit(status, body, sort_keys=False)
 
 
+def cmd_absence_proof(args: argparse.Namespace) -> int:
+    # Transaction non-inclusion proof: the success document has a
+    # contract-fixed key order (height, tx_id, transaction_count,
+    # merkle_root, block_hash, lower, upper), so it is printed in insertion
+    # order rather than alphabetically (error bodies are single-key).
+    status, body = _request(
+        "GET",
+        f"{args.base_url}/v1/blocks/{args.height}/absence-proof/{args.tx_id}",
+        None,
+    )
+    return _emit(status, body, sort_keys=False)
+
+
 def cmd_confirm(args: argparse.Namespace) -> int:
     status, body = _request(
         "POST", f"{args.base_url}/v1/blocks/{args.height}/confirm", {}
@@ -1446,6 +1459,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="one or more transaction ids (64 lowercase hex characters)",
     )
     p_proofs.set_defaults(func=cmd_proofs)
+
+    p_absence_proof = sub.add_parser(
+        "absence-proof",
+        help="fetch a transaction non-inclusion (absence) proof",
+    )
+    p_absence_proof.add_argument(
+        "height", help="block height that must not contain the transaction"
+    )
+    p_absence_proof.add_argument(
+        "tx_id", help="transaction id (64 lowercase hex characters)"
+    )
+    p_absence_proof.set_defaults(func=cmd_absence_proof)
 
     p_confirm = sub.add_parser("confirm", help="confirm a pending tip block")
     p_confirm.add_argument("height", help="block height to confirm")
